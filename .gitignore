@@ -1,0 +1,19 @@
+# Build artifacts
+.zig-cache/
+zig-out/
+
+# macOS
+.DS_Store
+
+# Data store (multi-GB; not source-controlled)
+data/store_dash/
+data/store/
+data/store_hot/
+data/hits.parquet
+data/fixture_hits.parquet
+data/fixture_store/
+
+# Temp / scratch
+.tmp/
+*.tmp
+*.heapsnapshot
