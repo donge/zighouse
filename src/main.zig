@@ -116,6 +116,11 @@ fn runCommand(init: std.process.Init, allocator: std.mem.Allocator, args: *std.p
         var native_backend = @import("native.zig").Native.init(allocator, init.io, data_dir);
         defer native_backend.deinit();
         try native_backend.convertUrlToId();
+    } else if (std.mem.eql(u8, command, "convert-i64-csv")) {
+        const csv_path = args.next() orelse return error.MissingCsvPath;
+        const out_path = args.next() orelse return error.MissingOutputPath;
+        try @import("native.zig").convertU64CsvToI64BinaryStreaming(allocator, init.io, csv_path, out_path);
+        try printOut(init.io, "converted {s} -> {s}\n", .{ csv_path, out_path });
     } else if (std.mem.eql(u8, command, "convert-user-id-id")) {
         const data_dir = args.next() orelse return error.MissingDataDir;
         var native_backend = @import("native.zig").Native.init(allocator, init.io, data_dir);

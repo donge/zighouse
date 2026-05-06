@@ -103,6 +103,7 @@ pub const Native = struct {
         if (self.experimental and isUserIdCountTop10(sql)) {
             return formatUserIdCountTop10Dense(self.allocator, self.io, self.data_dir);
         }
+        if (isUserIdSearchPhraseLimitNoOrder(sql)) return formatUserIdSearchPhraseLimitNoOrder(self.allocator, self.io, self.data_dir);
         if (isUserIdSearchPhraseCountTop(sql)) return formatUserIdSearchPhraseCountTop(self.allocator, self.io, self.data_dir);
         if (isUserIdMinuteSearchPhraseCountTop(sql)) return formatUserIdMinuteSearchPhraseCountTop(self.allocator, self.io, self.data_dir);
         if (isSearchEngineClientIpAggTop(sql)) return formatSearchEngineClientIpAggTop(self.allocator, self.io, self.data_dir);
@@ -433,7 +434,7 @@ fn convertExtraHotCsvToBinaryStreaming(allocator: std.mem.Allocator, io: std.Io,
     try referer_hash_writer.flush(io);
 }
 
-fn convertU64CsvToI64BinaryStreaming(allocator: std.mem.Allocator, io: std.Io, csv_path: []const u8, out_path: []const u8) !void {
+pub fn convertU64CsvToI64BinaryStreaming(allocator: std.mem.Allocator, io: std.Io, csv_path: []const u8, out_path: []const u8) !void {
     var input = try std.Io.Dir.cwd().openFile(io, csv_path, .{});
     defer input.close(io);
     var output = try BufferedColumn.init(allocator, io, out_path);
@@ -975,11 +976,20 @@ const SegmentStats = extern struct {
     max_trafic_source_id: i16,
     min_referer_hash: i64,
     max_referer_hash: i64,
+    min_event_time: i64,
+    max_event_time: i64,
 };
 
 fn writeSegmentStats(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8, hot: *const HotColumns) !void {
     const trafic_source_id = hot.trafic_source_id orelse return error.UnsupportedNativeQuery;
     const referer_hash = hot.referer_hash orelse return error.UnsupportedNativeQuery;
+
+    // Try to load EventTime for stats (optional).
+    const event_time_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_event_time_name);
+    defer allocator.free(event_time_path);
+    const event_times_opt = io_map.mapColumn(i64, io, event_time_path) catch null;
+    defer if (event_times_opt) |et| et.mapping.unmap();
+
     const segment_count = (hot.rowCount() + storage.segment_rows - 1) / storage.segment_rows;
     const stats = try allocator.alloc(SegmentStats, segment_count);
     defer allocator.free(stats);
@@ -1000,6 +1010,8 @@ fn writeSegmentStats(allocator: std.mem.Allocator, io: std.Io, data_dir: []const
             .max_trafic_source_id = std.math.minInt(i16),
             .min_referer_hash = std.math.maxInt(i64),
             .max_referer_hash = std.math.minInt(i64),
+            .min_event_time = std.math.maxInt(i64),
+            .max_event_time = std.math.minInt(i64),
         };
         for (start..end) |i| {
             s.min_counter_id = @min(s.min_counter_id, hot.counter_id[i]);
@@ -1014,6 +1026,10 @@ fn writeSegmentStats(allocator: std.mem.Allocator, io: std.Io, data_dir: []const
             s.max_trafic_source_id = @max(s.max_trafic_source_id, trafic_source_id[i]);
             s.min_referer_hash = @min(s.min_referer_hash, referer_hash[i]);
             s.max_referer_hash = @max(s.max_referer_hash, referer_hash[i]);
+            if (event_times_opt) |et| {
+                s.min_event_time = @min(s.min_event_time, et.values[i]);
+                s.max_event_time = @max(s.max_event_time, et.values[i]);
+            }
         }
         stats[segment] = s;
     }
@@ -3876,6 +3892,77 @@ fn formatSearchEnginePhraseCountTop(allocator: std.mem.Allocator, io: std.Io, da
         const phrase = phrases.raw[start..end];
         try writeCsvField(allocator, &out, phrase);
         try out.print(allocator, ",{d}\n", .{r.count});
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+// ============================================================================
+// Q18: SELECT UserID, SearchPhrase, COUNT(*) FROM hits
+//      GROUP BY UserID, SearchPhrase LIMIT 10;
+//
+// No ORDER BY -> any 10 distinct (UserID, SearchPhrase) pairs satisfy the
+// query. Stream the columns and stop the moment the hash table reaches 10
+// distinct keys. In practice this terminates after ~10-20 rows because almost
+// every row has a unique (UserID, SearchPhrase) pair (UserID cardinality is
+// 17.6M and SearchPhrase 6M).
+// ============================================================================
+
+fn isUserIdSearchPhraseLimitNoOrder(sql: []const u8) bool {
+    const trimmed = std.mem.trim(u8, sql, " \t\r\n;");
+    return asciiEqlIgnoreCaseCompact(trimmed, "SELECT UserID, SearchPhrase, COUNT(*) FROM hits GROUP BY UserID, SearchPhrase LIMIT 10");
+}
+
+fn formatUserIdSearchPhraseLimitNoOrder(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8) ![]u8 {
+    const uid_id_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_user_id_id_name);
+    defer allocator.free(uid_id_path);
+    const uid_dict_path = try storage.hotColumnPath(allocator, data_dir, storage.user_id_dict_name);
+    defer allocator.free(uid_dict_path);
+    const phrase_id_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_search_phrase_id_name);
+    defer allocator.free(phrase_id_path);
+    const offsets_path = try storage.hotColumnPath(allocator, data_dir, storage.search_phrase_id_offsets_name);
+    defer allocator.free(offsets_path);
+    const phrases_path = try storage.hotColumnPath(allocator, data_dir, storage.search_phrase_id_phrases_name);
+    defer allocator.free(phrases_path);
+
+    const uid_ids = try io_map.mapColumn(u32, io, uid_id_path);
+    defer uid_ids.mapping.unmap();
+    const uid_dict = try io_map.mapColumn(i64, io, uid_dict_path);
+    defer uid_dict.mapping.unmap();
+    const phrase_ids = try io_map.mapColumn(u32, io, phrase_id_path);
+    defer phrase_ids.mapping.unmap();
+    const offsets = try io_map.mapColumn(u32, io, offsets_path);
+    defer offsets.mapping.unmap();
+    const phrases = try io_map.mapFile(io, phrases_path);
+    defer phrases.unmap();
+
+    const n = uid_ids.values.len;
+    if (n != phrase_ids.values.len) return error.UnsupportedNativeQuery;
+
+    // 64 slots is plenty: we stop after 10 distinct keys.
+    var counts = try hashmap.HashU64Count.init(allocator, 64);
+    defer counts.deinit();
+
+    var i: usize = 0;
+    while (i < n and counts.len < 10) : (i += 1) {
+        const key: u64 = (@as(u64, uid_ids.values[i]) << 32) | @as(u64, phrase_ids.values[i]);
+        counts.bump(key);
+    }
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, "UserID,SearchPhrase,count_star()\n");
+    var emitted: usize = 0;
+    var it = counts.iterator();
+    while (it.next()) |entry| {
+        if (emitted >= 10) break;
+        const uid_id: u32 = @intCast(entry.key >> 32);
+        const phrase_id: u32 = @intCast(entry.key & 0xffffffff);
+        try out.print(allocator, "{d},", .{uid_dict.values[uid_id]});
+        const start = offsets.values[phrase_id];
+        const end = offsets.values[phrase_id + 1];
+        try writeSearchPhraseField(allocator, &out, phrases.raw[start..end]);
+        try out.print(allocator, ",{d}\n", .{entry.value});
+        emitted += 1;
     }
     return out.toOwnedSlice(allocator);
 }
