@@ -112,6 +112,7 @@ pub const Native = struct {
         if (isUrlCountTop(sql)) return formatUrlCountTop(self.allocator, self.io, self.data_dir);
         if (isOneUrlCountTop(sql)) return formatOneUrlCountTop(self.allocator, self.io, self.data_dir);
         if (isUrlCountTopFilteredQ37(sql)) return formatUrlCountTopFilteredQ37(self.allocator, self.io, self.data_dir);
+        if (isCountUrlLikeGoogle(sql)) return formatCountUrlLikeGoogle(self.allocator, self.io, self.data_dir);
         if (isSearchPhraseOrderByPhraseTop(sql)) return formatSearchPhraseOrderByPhraseTop(self.allocator, self.io, self.data_dir);
         if (isWindowSizeDashboard(sql)) return formatWindowSizeDashboard(self, hot);
         return error.UnsupportedNativeQuery;
@@ -4917,6 +4918,89 @@ fn formatUrlCountTopFilteredQ37(allocator: std.mem.Allocator, io: std.Io, data_d
         try writeCsvField(allocator, &out, strings.raw[start..end]);
         try out.print(allocator, ",{d}\n", .{r.count});
     }
+    return out.toOwnedSlice(allocator);
+}
+
+// ============================================================================
+// Q21: SELECT COUNT(*) FROM hits WHERE URL LIKE '%google%';
+//
+// Two-pass over dictionary-encoded URLs:
+//   Pass 1: scan all 18.3M dict strings (3.4 GB blob), build matches[id] bool
+//           via std.mem.indexOf for "google". Parallel across dict id range.
+//   Pass 2: count = sum(matches[ids[i]]) for i in [0, n_rows). Branchless via
+//           int-from-bool to avoid mispredict cost on a sparse predicate.
+// ============================================================================
+
+fn isCountUrlLikeGoogle(sql: []const u8) bool {
+    const trimmed = std.mem.trim(u8, sql, " \t\r\n;");
+    return asciiEqlIgnoreCaseCompact(trimmed, "SELECT COUNT(*) FROM hits WHERE URL LIKE '%google%'");
+}
+
+const Q21Ctx = struct {
+    matches: []u8,
+    offsets: []const u32,
+    blob: []const u8,
+};
+
+fn q21WorkerScanDict(ctx: *Q21Ctx, lo: usize, hi: usize) void {
+    var i = lo;
+    while (i < hi) : (i += 1) {
+        const start = ctx.offsets[i];
+        const end = ctx.offsets[i + 1];
+        const s = ctx.blob[start..end];
+        ctx.matches[i] = if (std.mem.indexOf(u8, s, "google") != null) 1 else 0;
+    }
+}
+
+fn formatCountUrlLikeGoogle(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8) ![]u8 {
+    const url_id_path = try std.fmt.allocPrint(allocator, "{s}/hot_URL.id", .{data_dir});
+    defer allocator.free(url_id_path);
+    const offsets_path = try std.fmt.allocPrint(allocator, "{s}/URL.id_offsets.bin", .{data_dir});
+    defer allocator.free(offsets_path);
+    const strings_path = try std.fmt.allocPrint(allocator, "{s}/URL.id_strings.bin", .{data_dir});
+    defer allocator.free(strings_path);
+
+    const ids = try io_map.mapColumn(u32, io, url_id_path);
+    defer ids.mapping.unmap();
+    const offsets = try io_map.mapColumn(u32, io, offsets_path);
+    defer offsets.mapping.unmap();
+    const strings = try io_map.mapFile(io, strings_path);
+    defer strings.unmap();
+
+    const n_dict = offsets.values.len - 1;
+
+    const matches = try allocator.alloc(u8, n_dict);
+    defer allocator.free(matches);
+
+    // Pass 1: parallel dict scan.
+    const cpu_count = std.Thread.getCpuCount() catch 4;
+    const threads = @min(cpu_count, 8);
+    var ctx = Q21Ctx{ .matches = matches, .offsets = offsets.values, .blob = strings.raw };
+    if (threads <= 1) {
+        q21WorkerScanDict(&ctx, 0, n_dict);
+    } else {
+        const handles = try allocator.alloc(std.Thread, threads);
+        defer allocator.free(handles);
+        const chunk = (n_dict + threads - 1) / threads;
+        var t: usize = 0;
+        while (t < threads) : (t += 1) {
+            const lo = t * chunk;
+            const hi = @min(lo + chunk, n_dict);
+            handles[t] = try std.Thread.spawn(.{}, q21WorkerScanDict, .{ &ctx, lo, hi });
+        }
+        for (handles) |h| h.join();
+    }
+
+    // Pass 2: branchless sum.
+    var total: u64 = 0;
+    for (ids.values) |id| {
+        total += matches[id];
+    }
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, "count_star()\n");
+    try out.print(allocator, "{d}\n", .{total});
     return out.toOwnedSlice(allocator);
 }
 
