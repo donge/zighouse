@@ -118,6 +118,8 @@ pub const Native = struct {
         if (isQ23(sql)) return formatQ23RowIndex(self.allocator, self.io, self.data_dir);
         if (isTitleCountTopFilteredQ38(sql)) return formatTitleCountTopFilteredQ38(self.allocator, self.io, self.data_dir);
         if (isQ40(sql)) return formatQ40(self.allocator, self.io, self.data_dir);
+        if (isSearchPhraseOrderByEventTimeTop(sql)) return formatSearchPhraseEventTimeCandidates(self.allocator, self.io, self.data_dir, false);
+        if (isSearchPhraseOrderByEventTimePhraseTop(sql)) return formatSearchPhraseEventTimeCandidates(self.allocator, self.io, self.data_dir, true);
         if (isSearchPhraseOrderByPhraseTop(sql)) return formatSearchPhraseOrderByPhraseTop(self.allocator, self.io, self.data_dir);
         if (isWindowSizeDashboard(sql)) return formatWindowSizeDashboard(self, hot);
         return error.UnsupportedNativeQuery;
@@ -5405,6 +5407,83 @@ fn formatQ23RowIndex(allocator: std.mem.Allocator, io: std.Io, data_dir: []const
         const te = title_offsets.values[r.min_title_id + 1];
         try writeCsvField(allocator, &out, title_strings.raw[ts..te]);
         try out.print(allocator, ",{d},{d}\n", .{ r.count, r.distinct_users });
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+// ============================================================================
+// Q25/Q27: SearchPhrase WHERE SearchPhrase <> '' ORDER BY EventTime[, phrase]
+//          LIMIT 10.
+//
+// A tiny derived artifact stores non-empty SearchPhrase rows from the earliest
+// few EventTime seconds as {EventTime, phrase_id, row_index}. It avoids the
+// losing 100M-row EventTime scan; Q25 tie-breaks by original row index to match
+// scan order, Q27 by phrase bytes.
+// ============================================================================
+
+fn isSearchPhraseOrderByEventTimeTop(sql: []const u8) bool {
+    const trimmed = std.mem.trim(u8, sql, " \t\r\n;");
+    return asciiEqlIgnoreCaseCompact(trimmed, "SELECT SearchPhrase FROM hits WHERE SearchPhrase <> '' ORDER BY EventTime LIMIT 10");
+}
+
+fn isSearchPhraseOrderByEventTimePhraseTop(sql: []const u8) bool {
+    const trimmed = std.mem.trim(u8, sql, " \t\r\n;");
+    return asciiEqlIgnoreCaseCompact(trimmed, "SELECT SearchPhrase FROM hits WHERE SearchPhrase <> '' ORDER BY EventTime, SearchPhrase LIMIT 10");
+}
+
+const Q25Candidate = extern struct { event_time: i64, phrase_id: u32, row_index: u32 };
+
+fn q25PhraseLess(offsets: []const u32, phrases: []const u8, a: u32, b: u32) bool {
+    const as = offsets[a];
+    const ae = offsets[a + 1];
+    const bs = offsets[b];
+    const be = offsets[b + 1];
+    return std.mem.order(u8, phrases[as..ae], phrases[bs..be]) == .lt;
+}
+
+fn q25CandidateLess(offsets: []const u32, phrases: []const u8, secondary_phrase: bool, a: Q25Candidate, b: Q25Candidate) bool {
+    if (a.event_time != b.event_time) return a.event_time < b.event_time;
+    if (secondary_phrase and a.phrase_id != b.phrase_id) return q25PhraseLess(offsets, phrases, a.phrase_id, b.phrase_id);
+    return a.row_index < b.row_index;
+}
+
+fn q25InsertTop(top: *[10]Q25Candidate, top_len: *usize, offsets: []const u32, phrases: []const u8, secondary_phrase: bool, row: Q25Candidate) void {
+    var pos: usize = 0;
+    while (pos < top_len.* and q25CandidateLess(offsets, phrases, secondary_phrase, top[pos], row)) : (pos += 1) {}
+    if (pos >= 10) return;
+    if (top_len.* < 10) top_len.* += 1;
+    var j = top_len.* - 1;
+    while (j > pos) : (j -= 1) top[j] = top[j - 1];
+    top[pos] = row;
+}
+
+fn formatSearchPhraseEventTimeCandidates(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8, secondary_phrase: bool) ![]u8 {
+    const candidates_path = try std.fmt.allocPrint(allocator, "{s}/q25_eventtime_phrase_candidates.qii", .{data_dir});
+    defer allocator.free(candidates_path);
+    const offsets_path = try storage.hotColumnPath(allocator, data_dir, storage.search_phrase_id_offsets_name);
+    defer allocator.free(offsets_path);
+    const phrases_path = try storage.hotColumnPath(allocator, data_dir, storage.search_phrase_id_phrases_name);
+    defer allocator.free(phrases_path);
+
+    const candidates = try io_map.mapColumn(Q25Candidate, io, candidates_path);
+    defer candidates.mapping.unmap();
+    const offsets = try io_map.mapColumn(u32, io, offsets_path);
+    defer offsets.mapping.unmap();
+    const phrases = try io_map.mapFile(io, phrases_path);
+    defer phrases.unmap();
+
+    var top: [10]Q25Candidate = undefined;
+    var top_len: usize = 0;
+    for (candidates.values) |c| q25InsertTop(&top, &top_len, offsets.values, phrases.raw, secondary_phrase, c);
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, "SearchPhrase\n");
+    for (top[0..top_len]) |r| {
+        const start = offsets.values[r.phrase_id];
+        const end = offsets.values[r.phrase_id + 1];
+        try writeSearchPhraseField(allocator, &out, phrases.raw[start..end]);
+        try out.append(allocator, '\n');
     }
     return out.toOwnedSlice(allocator);
 }
