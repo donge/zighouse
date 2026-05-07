@@ -4,6 +4,11 @@ Status: shipped. Powers Q11, Q12, Q19, Q26 (no parallelism but shares
 helpers), Q31, Q36. Without it those queries lose to DuckDB-MT by 1.4–1.5×;
 with it they win by 0.3–0.6×.
 
+Executor note: this file documents the current low-level primitives. The next
+refactor should wrap them behind the native executor described in
+`docs/executor.md` rather than adding more per-query copies of morsel and
+top-K loops.
+
 This document is the contract between query implementations in
 `src/native.zig` and the primitives in `src/parallel.zig` /
 `src/hashmap.zig`. Read it before adding a new parallel query so you
@@ -23,8 +28,9 @@ and write CSV. We pick parallelism that fits this shape:
 - **No persistent thread pool.** `parallelFor` spawns N-1 threads, runs
   the last context inline on the main thread, then `join`s. Spawn cost
   (~50 µs) is below morsel-source granularity; not worth a pool.
-- **No pipelining.** Queries are scan-aggregate-emit. Pipelining would
-  require an operator framework we're explicitly avoiding.
+- **No pipelining in the current implementation.** Queries are still
+  scan-aggregate-emit. The planned executor is a small wrapper around these
+  primitives, not a full pipeline planner.
 
 ## Threading model
 

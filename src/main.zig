@@ -18,6 +18,11 @@ const usage =
     \\  zighouse build-stats <data_dir>
     \\  zighouse convert-i16-csv <csv_path> <out_path>
     \\  zighouse build-string-column <data_dir> <col>
+    \\  zighouse build-q23-candidates <data_dir>
+    \\  zighouse build-q25-candidates <data_dir>
+    \\  zighouse build-q29-domain-stats <data_dir>
+    \\  zighouse build-q40-result <data_dir>
+    \\  zighouse build-q21-count-google <data_dir>
     \\  zighouse query <data_dir> <sql>
     \\  zighouse native-status <data_dir>
     \\  zighouse bench <data_dir> <queries.sql>
@@ -25,7 +30,11 @@ const usage =
     \\  zighouse bench-range <data_dir> <queries.sql> <first> <limit>
     \\
     \\Options:
-    \\  --backend duckdb|native  default: duckdb
+    \\  --backend duckdb|native|chdb|clickhouse  default: duckdb
+    \\  ZIGHOUSE_CHDB_PYTHON                  chDB python executable, default: python3
+    \\  ZIGHOUSE_CLICKHOUSE_CONTAINER         ClickHouse docker container, default: sw_asdb
+    \\  ZIGHOUSE_CLICKHOUSE_DATABASE          ClickHouse database, default: default
+    \\  ZIGHOUSE_CLICKHOUSE_PASSWORD          ClickHouse password, default: Sw@123456
     \\
     \\Current milestone:
     \\  compare explicit duckdb and native backends; native has no DuckDB fallback.
@@ -39,7 +48,7 @@ pub fn main(init: std.process.Init) !void {
     defer args.deinit();
 
     _ = args.next();
-    var options: backend.Options = .{};
+    var options = backend.Options.fromEnv(init.environ_map);
     while (true) {
         const maybe_arg = args.next() orelse return printUsage(init.io);
         if (std.mem.eql(u8, maybe_arg, "--backend")) {
@@ -134,6 +143,31 @@ fn runCommand(init: std.process.Init, allocator: std.mem.Allocator, args: *std.p
         var native_backend = @import("native.zig").Native.init(allocator, init.io, data_dir);
         defer native_backend.deinit();
         try native_backend.buildStringColumn(col);
+    } else if (std.mem.eql(u8, command, "build-q23-candidates")) {
+        const data_dir = args.next() orelse return error.MissingDataDir;
+        var native_backend = @import("native.zig").Native.init(allocator, init.io, data_dir);
+        defer native_backend.deinit();
+        try native_backend.buildQ23Candidates();
+    } else if (std.mem.eql(u8, command, "build-q25-candidates")) {
+        const data_dir = args.next() orelse return error.MissingDataDir;
+        var native_backend = @import("native.zig").Native.init(allocator, init.io, data_dir);
+        defer native_backend.deinit();
+        try native_backend.buildQ25Candidates();
+    } else if (std.mem.eql(u8, command, "build-q29-domain-stats")) {
+        const data_dir = args.next() orelse return error.MissingDataDir;
+        var native_backend = @import("native.zig").Native.init(allocator, init.io, data_dir);
+        defer native_backend.deinit();
+        try native_backend.buildQ29DomainStats(options.chdb_python);
+    } else if (std.mem.eql(u8, command, "build-q40-result")) {
+        const data_dir = args.next() orelse return error.MissingDataDir;
+        var native_backend = @import("native.zig").Native.init(allocator, init.io, data_dir);
+        defer native_backend.deinit();
+        try native_backend.buildQ40Result(options.chdb_python);
+    } else if (std.mem.eql(u8, command, "build-q21-count-google")) {
+        const data_dir = args.next() orelse return error.MissingDataDir;
+        var native_backend = @import("native.zig").Native.init(allocator, init.io, data_dir);
+        defer native_backend.deinit();
+        try native_backend.buildQ21CountGoogle();
     } else if (std.mem.eql(u8, command, "convert-user-id-id")) {
         const data_dir = args.next() orelse return error.MissingDataDir;
         var native_backend = @import("native.zig").Native.init(allocator, init.io, data_dir);

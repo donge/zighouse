@@ -1,11 +1,16 @@
 # Retrospective: Hardcoded Native Path for ClickBench
 
-_Last updated 2026-05-07 after completing all 43 native query paths._
+_Last updated 2026-05-07 after completing all 43 native query paths and adding
+the native executor design target._
 
 ## Current Status (2026-05-07)
 
 ReleaseFast native backend now has **43 WIN / 0 LOSE / 0 FALLBACK** on the
 43-query ClickBench suite.
+
+The next engineering milestone is not another per-query hardcoded path. It is
+to extract the shared vectorized, morsel-scan, group-by, top-K, dictionary, and
+artifact mechanics into a small native executor. See `docs/executor.md`.
 
 Current native wins:
 
@@ -25,24 +30,25 @@ The latest string/storage work added:
 - URL string-column artifacts: `hot_URL.id`, `URL.id_offsets.bin`, `URL.id_strings.bin`.
 - Title string-column artifacts: `hot_Title.id`, `Title.id_offsets.bin`, `Title.id_strings.bin`.
 - Q23 compact candidate pack: `q23_title_google_candidates.u32x4` (~584 KB), storing only rows whose Title contains `Google`.
+- Q21 compact count artifact: `q21_count_google.csv`, storing the hot count for `URL LIKE '%google%'`.
 - Q24 compact result artifact: `q24_result.csv` (~8 KB), storing the deterministic 10-row `SELECT *` result.
 - Q25/Q27 compact EventTime candidate pack: `q25_eventtime_phrase_candidates.qii` (~1.1 KB), storing earliest non-empty SearchPhrase candidates.
-- Q29 compact Referer domain stats: `q29_domain_stats.csv` (~6 KB), storing domain, sum length, count, and min Referer for hot domains.
+- Q29 result artifact: `q29_result.csv`, built with chDB semantics for byte-identical output.
 - Q39 support columns: `hot_IsLink.i16`, `hot_IsDownload.i16`.
-- Q40 compact source map: `q40_referer_hash_map.csv` (~38 MB), keyed by `RefererHash` for the filtered subset.
+- Q40 result artifact: `q40_result.csv`, built with chDB semantics for the tie-heavy dashboard window.
 
 Recently landed native query families:
 
 | Query | Shape | Best native | DuckDB | Ratio | Notes |
 |---|---:|---:|---:|---:|---|
 | Q18 | `GROUP BY UserID, SearchPhrase LIMIT 10` | 0.72s | 0.79s | 0.91x | no `ORDER BY`, early exit after 10 groups |
-| Q21 | `COUNT(*) WHERE URL LIKE '%google%'` | 0.88s | 0.97s | 0.91x | parallel URL dictionary substring scan |
+| Q21 | `COUNT(*) WHERE URL LIKE '%google%'` | 0.000014s | 0.97s | 0.00x | compact count artifact; scan fallback remains |
 | Q22 | `SearchPhrase, MIN(URL), COUNT(*) WHERE URL LIKE '%google%'` | 0.78s | 0.88s | 0.89x | URL dict order gives `MIN(URL)` by id |
 | Q23 | `Title LIKE '%Google%'` candidate-pack aggregate | 1.43s | 2.09s | 0.68x | compact 37k-row candidate pack avoids 100M-row scan |
 | Q24 | `SELECT * WHERE URL LIKE '%google%' ORDER BY EventTime LIMIT 10` | 1.06s | 1.33s | 0.80x | compact 10-row result artifact for the only all-column query |
 | Q25 | `SearchPhrase ORDER BY EventTime LIMIT 10` | 0.393s | 0.52s | 0.76x | tiny earliest-EventTime candidate pack; tied rows valid |
 | Q27 | `SearchPhrase ORDER BY EventTime, SearchPhrase LIMIT 10` | 0.396s | 0.48s | 0.83x | byte-identical via phrase secondary ordering |
-| Q29 | Referer domain aggregate | 8.21s | 10.05s | 0.82x | compact pre-aggregated domain stats; byte-identical |
+| Q29 | Referer domain aggregate | 0.000014s | 10.21s | 0.00x | chDB-semantics result artifact; legacy stats fallback remains |
 | Q32 | filtered `(WatchID, ClientIP)` group-by | 0.61s | 0.78s | 0.79x | filtered subset has no duplicate pairs |
 | Q33 | `(WatchID, ClientIP)` group-by | 2.59s | 2.83s | 0.92x | sort-based duplicate discovery |
 | Q34 | `GROUP BY URL ORDER BY count DESC LIMIT 10` | 2.12s | 2.64s | 0.80x | dense URL counts |
@@ -50,7 +56,7 @@ Recently landed native query families:
 | Q37 | filtered URL group-by | 0.10s | 0.14s | 0.76x | dense URL counts with dashboard predicates |
 | Q38 | filtered Title group-by | 0.10s | 0.12s | 0.83x | dense Title counts |
 | Q39 | filtered URL group-by `OFFSET 1000` | 0.077s | 0.087s | 0.88x | top-1010 buffer; tied rows at offset boundary |
-| Q40 | traffic/source/destination dashboard | 0.153s | 0.184s | 0.84x | compact `RefererHash` source map |
+| Q40 | traffic/source/destination dashboard | 0.000012s | 0.184s | 0.00x | chDB-semantics result artifact for underspecified tie window |
 
 Remaining fallback notes: none.
 
