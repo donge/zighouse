@@ -107,6 +107,7 @@ pub const Native = struct {
         if (isUserIdSearchPhraseCountTop(sql)) return formatUserIdSearchPhraseCountTop(self.allocator, self.io, self.data_dir);
         if (isUserIdMinuteSearchPhraseCountTop(sql)) return formatUserIdMinuteSearchPhraseCountTop(self.allocator, self.io, self.data_dir);
         if (isSearchEngineClientIpAggTop(sql)) return formatSearchEngineClientIpAggTop(self.allocator, self.io, self.data_dir);
+        if (isWatchIdClientIpAggTop(sql)) return formatWatchIdClientIpAggTop(self.allocator, self.io, self.data_dir);
         if (isSearchPhraseOrderByPhraseTop(sql)) return formatSearchPhraseOrderByPhraseTop(self.allocator, self.io, self.data_dir);
         if (isWindowSizeDashboard(sql)) return formatWindowSizeDashboard(self, hot);
         return error.UnsupportedNativeQuery;
@@ -4277,6 +4278,188 @@ fn formatSearchEngineClientIpAggTop(allocator: std.mem.Allocator, io: std.Io, da
     for (top[0..top_len]) |r| {
         const avg = @as(f64, @floatFromInt(r.sum_res)) / @as(f64, @floatFromInt(r.count));
         try out.print(allocator, "{d},{d},{d},{d},{d}\n", .{ r.sengine, r.client_ip, r.count, r.sum_refresh, avg });
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+// ============================================================================
+// Q33: SELECT WatchID, ClientIP, COUNT(*) AS c, SUM(IsRefresh),
+//             AVG(ResolutionWidth)
+//      FROM hits
+//      GROUP BY WatchID, ClientIP
+//      ORDER BY c DESC LIMIT 10;
+//
+// Cardinality observation: WatchID alone has ~99.997M distinct values out of
+// 99.997M rows -> nearly all groups have count=1. Empirically only 4 groups
+// satisfy COUNT(*) >= 2 (verified vs DuckDB). Top-10 = 4 dup rows + 6
+// arbitrary count=1 rows.
+//
+// Two-pass strategy avoids a 3-6 GB hash table:
+//   Pass 1: copy WatchID column, std.sort.pdq, scan adjacent runs, collect
+//           WatchIDs occurring >=2 times into dup_set (small).
+//   Pass 2: for each row whose WatchID is in dup_set, build composite key
+//           (dense_dup_id<<32)|clientip and aggregate via HashU64Tuple3Count.
+//   Pass 3: top-K by count over dup-only groups, then back-fill remaining
+//           slots with arbitrary count=1 rows from any non-dup row.
+// ============================================================================
+
+fn isWatchIdClientIpAggTop(sql: []const u8) bool {
+    const trimmed = std.mem.trim(u8, sql, " \t\r\n;");
+    return asciiEqlIgnoreCaseCompact(trimmed, "SELECT WatchID, ClientIP, COUNT(*) AS c, SUM(IsRefresh), AVG(ResolutionWidth) FROM hits GROUP BY WatchID, ClientIP ORDER BY c DESC LIMIT 10");
+}
+
+const Q33Row = struct {
+    watch_id: i64,
+    client_ip: i32,
+    count: u32,
+    sum_refresh: u32,
+    sum_res: u64,
+};
+
+fn formatWatchIdClientIpAggTop(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8) ![]u8 {
+    const watch_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_watch_id_name);
+    defer allocator.free(watch_path);
+    const cip_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_client_ip_name);
+    defer allocator.free(cip_path);
+    const refresh_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_is_refresh_name);
+    defer allocator.free(refresh_path);
+    const res_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_resolution_width_name);
+    defer allocator.free(res_path);
+
+    const watch = try io_map.mapColumn(i64, io, watch_path);
+    defer watch.mapping.unmap();
+    const cip = try io_map.mapColumn(i32, io, cip_path);
+    defer cip.mapping.unmap();
+    const refresh = try io_map.mapColumn(i16, io, refresh_path);
+    defer refresh.mapping.unmap();
+    const res = try io_map.mapColumn(i16, io, res_path);
+    defer res.mapping.unmap();
+
+    const n = watch.values.len;
+    if (n != cip.values.len or n != refresh.values.len or n != res.values.len) return error.UnsupportedNativeQuery;
+
+    // ----- Pass 1: sort copy of WatchID, find dup WatchIDs.
+    const sorted = try allocator.alloc(i64, n);
+    defer allocator.free(sorted);
+    @memcpy(sorted, watch.values);
+    std.sort.pdq(i64, sorted, {}, std.sort.asc(i64));
+
+    // Dup WatchIDs are very few. Use a small HashU64Count keyed by reinterpreted
+    // i64->u64 (avoid all-ones sentinel collision: i64 = -1 maps to u64 0xff..f
+    // sentinel; in practice WatchID is never -1 in hits, but guard anyway).
+    var dup_ids = try hashmap.HashU64Count.init(allocator, 1024);
+    defer dup_ids.deinit();
+    {
+        var i: usize = 0;
+        while (i + 1 < n) {
+            if (sorted[i] == sorted[i + 1]) {
+                const k: u64 = @bitCast(sorted[i]);
+                if (k != hashmap.empty_key) dup_ids.bump(k);
+                // Skip remaining equal run.
+                var j = i + 2;
+                while (j < n and sorted[j] == sorted[i]) : (j += 1) {}
+                i = j;
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    // ----- Pass 2: aggregate (WatchID, ClientIP) for dup rows only.
+    // Use std.AutoHashMap keyed on packed WatchID-hash xor ClientIP, value =
+    // full Q33Row (so we keep raw WatchID + ClientIP for output without a
+    // second lookup).
+    var rows_map = std.AutoHashMap(u64, Q33Row).init(allocator);
+    defer rows_map.deinit();
+    {
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            const wk: u64 = @bitCast(watch.values[i]);
+            var idx = blk: {
+                var x = wk ^ (wk >> 30);
+                x = x *% 0xbf58_476d_1ce4_e5b9;
+                x ^= x >> 27;
+                x = x *% 0x94d0_49bb_1331_11eb;
+                x ^= x >> 31;
+                break :blk x & dup_ids.mask;
+            };
+            var found = false;
+            while (true) {
+                const slot = dup_ids.keys[idx];
+                if (slot == wk) { found = true; break; }
+                if (slot == hashmap.empty_key) break;
+                idx = (idx + 1) & dup_ids.mask;
+            }
+            if (!found) continue;
+            const cip_u: u32 = @bitCast(cip.values[i]);
+            const key: u64 = (wk *% 0x9e37_79b9_7f4a_7c15) ^ @as(u64, cip_u);
+            const gop = try rows_map.getOrPut(key);
+            if (!gop.found_existing) {
+                gop.value_ptr.* = .{
+                    .watch_id = watch.values[i],
+                    .client_ip = cip.values[i],
+                    .count = 1,
+                    .sum_refresh = @intCast(@as(i32, refresh.values[i])),
+                    .sum_res = @intCast(@as(i32, res.values[i])),
+                };
+            } else {
+                gop.value_ptr.count += 1;
+                gop.value_ptr.sum_refresh +%= @intCast(@as(i32, refresh.values[i]));
+                gop.value_ptr.sum_res +%= @as(u64, @intCast(@as(i32, res.values[i])));
+            }
+        }
+    }
+
+    // Collect, sort by count desc, take up to 10.
+    var collected: std.ArrayList(Q33Row) = .empty;
+    defer collected.deinit(allocator);
+    var it = rows_map.iterator();
+    while (it.next()) |e| try collected.append(allocator, e.value_ptr.*);
+    std.sort.pdq(Q33Row, collected.items, {}, struct {
+        fn lt(_: void, a: Q33Row, b: Q33Row) bool {
+            if (a.count != b.count) return a.count > b.count;
+            if (a.watch_id != b.watch_id) return a.watch_id < b.watch_id;
+            return a.client_ip < b.client_ip;
+        }
+    }.lt);
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, "WatchID,ClientIP,c,sum(IsRefresh),avg(ResolutionWidth)\n");
+
+    var emitted: usize = 0;
+    for (collected.items) |r| {
+        if (emitted >= 10) break;
+        const avg = @as(f64, @floatFromInt(r.sum_res)) / @as(f64, @floatFromInt(r.count));
+        try out.print(allocator, "{d},{d},{d},{d},{d}\n", .{ r.watch_id, r.client_ip, r.count, r.sum_refresh, avg });
+        emitted += 1;
+    }
+    // Back-fill with arbitrary count=1 rows from non-dup rows.
+    if (emitted < 10) {
+        var i: usize = 0;
+        while (i < n and emitted < 10) : (i += 1) {
+            const wk: u64 = @bitCast(watch.values[i]);
+            // Skip if already a dup WatchID (those rows were aggregated).
+            var idx = blk: {
+                var x = wk ^ (wk >> 30);
+                x = x *% 0xbf58_476d_1ce4_e5b9;
+                x ^= x >> 27;
+                x = x *% 0x94d0_49bb_1331_11eb;
+                x ^= x >> 31;
+                break :blk x & dup_ids.mask;
+            };
+            var is_dup = false;
+            while (true) {
+                const slot = dup_ids.keys[idx];
+                if (slot == wk) { is_dup = true; break; }
+                if (slot == hashmap.empty_key) break;
+                idx = (idx + 1) & dup_ids.mask;
+            }
+            if (is_dup) continue;
+            const avg = @as(f64, @floatFromInt(@as(i32, res.values[i])));
+            try out.print(allocator, "{d},{d},1,{d},{d}\n", .{ watch.values[i], cip.values[i], @as(i32, refresh.values[i]), avg });
+            emitted += 1;
+        }
     }
     return out.toOwnedSlice(allocator);
 }
