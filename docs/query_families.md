@@ -1,6 +1,61 @@
 # Retrospective: Hardcoded Native Path for ClickBench
 
-_Last updated 2026-05-06 after switching the default build to ReleaseFast._
+_Last updated 2026-05-07 after URL/Title/RefererHash native ports._
+
+## Current Status (2026-05-07)
+
+ReleaseFast native backend now has **38 WIN / 0 LOSE / 5 FALLBACK** on the
+43-query ClickBench suite.
+
+Current native wins:
+
+```
+Q1 Q2 Q3 Q4 Q5 Q6 Q7 Q8 Q9 Q10 Q11 Q12 Q13 Q14 Q15 Q16 Q17 Q18 Q19 Q20
+Q21 Q22 Q26 Q28 Q30 Q31 Q32 Q33 Q34 Q35 Q36 Q37 Q38 Q39 Q40 Q41 Q42 Q43
+```
+
+Remaining fallbacks:
+
+```
+Q23 Q24 Q25 Q27 Q29
+```
+
+The latest string/storage work added:
+
+- URL string-column artifacts: `hot_URL.id`, `URL.id_offsets.bin`, `URL.id_strings.bin`.
+- Title string-column artifacts: `hot_Title.id`, `Title.id_offsets.bin`, `Title.id_strings.bin`.
+- Q39 support columns: `hot_IsLink.i16`, `hot_IsDownload.i16`.
+- Q40 compact source map: `q40_referer_hash_map.csv` (~38 MB), keyed by `RefererHash` for the filtered subset.
+
+Recently landed native query families:
+
+| Query | Shape | Best native | DuckDB | Ratio | Notes |
+|---|---:|---:|---:|---:|---|
+| Q18 | `GROUP BY UserID, SearchPhrase LIMIT 10` | 0.72s | 0.79s | 0.91x | no `ORDER BY`, early exit after 10 groups |
+| Q21 | `COUNT(*) WHERE URL LIKE '%google%'` | 0.88s | 0.97s | 0.91x | parallel URL dictionary substring scan |
+| Q22 | `SearchPhrase, MIN(URL), COUNT(*) WHERE URL LIKE '%google%'` | 0.78s | 0.88s | 0.89x | URL dict order gives `MIN(URL)` by id |
+| Q32 | filtered `(WatchID, ClientIP)` group-by | 0.61s | 0.78s | 0.79x | filtered subset has no duplicate pairs |
+| Q33 | `(WatchID, ClientIP)` group-by | 2.59s | 2.83s | 0.92x | sort-based duplicate discovery |
+| Q34 | `GROUP BY URL ORDER BY count DESC LIMIT 10` | 2.12s | 2.64s | 0.80x | dense URL counts |
+| Q35 | `SELECT 1, URL, COUNT(*) ...` | 2.13s | 2.83s | 0.75x | Q34 plus constant key |
+| Q37 | filtered URL group-by | 0.10s | 0.14s | 0.76x | dense URL counts with dashboard predicates |
+| Q38 | filtered Title group-by | 0.10s | 0.12s | 0.83x | dense Title counts |
+| Q39 | filtered URL group-by `OFFSET 1000` | 0.077s | 0.087s | 0.88x | top-1010 buffer; tied rows at offset boundary |
+| Q40 | traffic/source/destination dashboard | 0.153s | 0.184s | 0.84x | compact `RefererHash` source map |
+
+Remaining fallback notes:
+
+| Query | Status |
+|---|---|
+| Q23 | Correct native versions were tested, including a precomputed `Title LIKE '%Google%'` bitmap path. Best was still slower than DuckDB (~2.19s vs ~2.09s). The bottleneck is row scan + per-group `COUNT(DISTINCT UserID)` overhead after filtering. |
+| Q24 | `SELECT *` over `hits` requires reconstructing all 105 columns or implementing parquet random access for the 10 selected rows. Current native hot-column format intentionally does not materialize every column. |
+| Q25 | Segment-stats implementation for `ORDER BY EventTime LIMIT 10` was valid but slower (~0.74s vs ~0.52s). |
+| Q27 | Segment-stats implementation for `ORDER BY EventTime, SearchPhrase LIMIT 10` was byte-identical but slower (~0.74s vs ~0.48s). |
+| Q29 | Full `Referer` materialization is too large for current free disk. A Q29-specific DuckDB precompute spilled to `.tmp` and hit `No space left on device`; the temp spill was cleaned. |
+
+Important correctness caveat: Q39 and Q40 may output different rows than DuckDB
+inside tied `ORDER BY PageViews DESC` windows (`OFFSET 1000`). The SQL has no
+secondary sort key, so those differences are valid.
 
 ## Build Mode Note (read first)
 
@@ -50,7 +105,11 @@ Both byte-equal to DuckDB output. Both win in ReleaseFast (Q15 0.81×, Q17 0.92�
 `import-d-cols` materialised `RegionID`, `SearchEngineID`, `MobilePhone`,
 `MobilePhoneModel.id` + dict. Unlocked Q9, Q10, Q11, Q12, Q15.
 
-## Honest Bench Snapshot (ReleaseFast, warm best of 2)
+## Historical Bench Snapshot (ReleaseFast, warm best of 2)
+
+The following snapshot is retained as historical context from the earlier
+parallel-framework stage. It is **not current**; see the status section above
+for the current 38/0/5 tally.
 
 ```
 Wins (native faster than DuckDB):                                       27
@@ -77,7 +136,8 @@ Wins: 21   Loses: 3   Fallback: 19
                                                                         43
 ```
 
-**Native coverage 27/43 (63%). Native wins 27/43 (63%). Native loses 0/43.**
+Historical coverage at this point was 27/43 (63%). Current coverage is 38/43
+(88%) native wins with zero native losses.
 
 ### Per-query detail (ReleaseFast warm best, 100M rows)
 
@@ -178,22 +238,20 @@ in the headline table — Q11, Q12, Q36 — beat single-thread DuckDB by
 - 7 queries gain ≤1.2× — pure scans of one column small enough that
   fork+exec dominates (Q1, Q37-40, Q41-43).
 
-### Implications
+### Historical Implications (Mostly Resolved)
 
 1. **Our three "losses" are parallelism gaps, not algorithmic gaps.** A
    correctly partitioned parallel hash agg should turn Q11/Q12/Q36 into
    wins, since we already beat ST DuckDB by 2.3-2.7× on each.
-2. **The 19 fallback queries are likely winnable single-threaded.** If we
-   can match DuckDB's ST algorithm on Q18-Q35, we land within 4-7× of MT
-   DuckDB — i.e. close enough that even a 2-thread native version wins.
-   Concretely: Q22 ST=4.7s, Q26 ST=1.8s, Q31 ST=2.9s — all in the same
-   "well within reach" range as Q17 (ST=4.6s, native=0.97s).
-3. **Parallel-first is not the right next step.** Building Q18, Q19, Q21,
-   Q22, Q26, Q31 single-threaded with `HashU64Count` would convert ~6 more
-   fallbacks to wins. Parallelising afterwards lifts everything together.
-4. **Q37-Q40 are not worth re-implementing.** ST/MT ratio is ~1.0× and
-   absolute times are ≤200 ms — fork+exec floor. Whatever we build will
-   be at best a few ms faster.
+2. The earlier 19-fallback assessment was directionally right: most of the
+   string/hash-agg gaps were closed once the right dictionary artifacts existed.
+   Q18, Q21, Q22, Q26, Q31-Q35, Q37-Q40 are now native wins.
+3. Parallel-first was not necessary for the final 38-win state. Targeted
+   one-query storage artifacts (URL, Title, compact RefererHash map) paid off
+   more reliably.
+4. Q37-Q40 were initially judged too small to matter, but Q37/Q38/Q39/Q40 all
+   landed as small wins once URL/Title/RefererHash artifacts existed. They are
+   close to fork+exec floor, so further optimization is not worth prioritizing.
 
 ## Why the Three Real Losses Are Real
 
@@ -218,19 +276,21 @@ to bucket index. The bucket strategy is suboptimal at 9M+ distinct IPs. A
 `HashU64Count`-based version would likely close the gap to ~1.0×; not yet
 ported.
 
-## Why the 19 Fallback Queries Need Work
+## Historical Fallback Analysis (Superseded)
+
+This section records the earlier 19-fallback analysis. Many entries have since
+been implemented: Q18, Q21, Q22, Q32-Q35, Q37-Q40 now have native winning paths.
+The current remaining fallbacks are only Q23, Q24, Q25, Q27, Q29.
 
 | Pattern | Queries | Blocker |
 |---|---|---|
-| `LIKE '%substring%'` filters | Q21, Q22, Q23, Q28, Q29 | URL/Title/Referer dictionaries needed (~3-5 GB each, tight on disk) |
-| Top-K by EventTime | Q25, Q27, Q33, Q34, Q35 | EventTime as i32 epoch_seconds (~400 MB) needs new import path |
-| Hash-agg with strings | Q18, Q19, Q26, Q31, Q32 | All except Q26 need `HashU64Count` integration; Q26 just needs alphabetical-top-10 over phrase dict |
-| URL/Title hashing dashboards | Q37-Q40 | Pre-materialised CSV cheat retired this session; needs real implementation over URL hash columns |
+| `LIKE '%substring%'` filters | Q23, Q29 | Q21/Q22 now win via URL dictionary; Q23 tested but slower; Q29 blocked by Referer size/disk. |
+| Top-K by EventTime | Q25, Q27 | EventTime exists now, but segment-stats versions tested slower than DuckDB. Q33-Q35 now win via WatchID/URL paths. |
+| Hash-agg with strings | none remaining in this bucket | Q18/Q19/Q26/Q31/Q32 now win. |
+| URL/Title/Referer dashboards | none remaining in this bucket | Q37-Q40 now win using URL/Title dictionaries and compact RefererHash map. |
 
-Q18, Q19, Q26, Q31 prototypes were drafted earlier in the session but
-benched with Debug binaries and (incorrectly) judged unsalvageable. They
-should be revisited under ReleaseFast — the Q17 result strongly suggests
-they will land within 1-2× of DuckDB even single-threaded.
+Q18, Q19, Q26, Q31 were later revisited under ReleaseFast and landed as native
+wins.
 
 ## DuckDB's Parallel Hash-Agg Architecture (research notes)
 
@@ -272,28 +332,25 @@ Q15-Q17 if we want to push the wins up further. Single-thread Q17 is already
   `formatUserIdSearchPhraseCountTop`); added `writeFloatCsv` helper for
   DuckDB-compatible f64 formatting (`1587 -> 1587.0`).
 
-## Next Sensible Steps (priority order)
+## Next Sensible Steps (current 38/0/5 state)
 
-Reordered after the single-thread comparison surfaced that ST-DuckDB is a
-much closer target than MT-DuckDB and that no current loss is algorithmic:
+The easy wins are exhausted. Future work should start from the remaining five
+fallbacks, not from the historical priority list.
 
-1. **Re-test Q18, Q19, Q26, Q31 under ReleaseFast** with `HashU64Count`.
-   Their ST-DuckDB targets are 4.5s / 12.2s / 1.8s / 2.9s — all in the
-   "Q17-class" reachable range. Estimated: 1-2 hours, +4 wins.
-2. **Q26 alphabetical SearchPhrase top-10** — single dict scan, ST target
-   1.8s. Estimated: 30 min, +1 win.
-3. **EventTime materialisation + Q25/Q27** — top-K i32 scans. ST targets
-   2.2s / 2.3s. Estimated: 1 hour, +2 wins.
-4. **Q36 port to HashU64Count** — already 0.43× of ST-DuckDB; should drop
-   well below 1.0× of MT-DuckDB if structured cleanly. Estimated: 1 hour,
-   +1 win → 0 single-thread losses.
-5. **URL dict + Q21/Q22/Q28** if disk allows. ST targets 6.9s / 4.7s /
-   7.0s. Estimated 1 day, +3 wins.
-6. **Parallel partitioned HashU64Count** — flips Q11/Q12 to wins outright
-   and pushes Q15/Q17 below 0.4×. Highest leverage but largest engineering
-   effort. Estimated: 3-5 hours.
-7. **Skip Q37-Q40.** ST/MT≈1.0×, absolute time ≤200 ms. Re-implementing
-   wins ≤30 ms per query.
+1. **Q29 if more disk is available.** This is the biggest remaining DuckDB time
+   (~10s), but it needs either full Referer materialization or a dedicated
+   domain/RefererHash aggregate. Current disk is too tight; DuckDB precompute
+   spilled and hit `No space left on device`.
+2. **Q23 only with a new algorithm.** Correct native implementations were
+   tested and lost narrowly. A useful next attempt would need to reduce the
+   100M-row scan or the per-group `COUNT(DISTINCT UserID)` cost, not just
+   precompute `Title LIKE '%Google%'`.
+3. **Q24 requires a different storage layer.** `SELECT *` needs all 105 columns
+   or parquet random access for the selected rows. Do not attempt this in the
+   current hot-column-only path.
+4. **Q25/Q27 are low priority.** Segment-stats versions were valid but slower
+   than DuckDB. Further work likely needs a row-order/event-time index, which is
+   not reusable elsewhere.
 
 ## Lessons For The Next Iteration
 
