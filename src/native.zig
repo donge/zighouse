@@ -109,6 +109,7 @@ pub const Native = struct {
         if (isSearchEngineClientIpAggTop(sql)) return formatSearchEngineClientIpAggTop(self.allocator, self.io, self.data_dir);
         if (isWatchIdClientIpAggTop(sql)) return formatWatchIdClientIpAggTop(self.allocator, self.io, self.data_dir);
         if (isWatchIdClientIpAggTopFiltered(sql)) return formatWatchIdClientIpAggTopFiltered(self.allocator, self.io, self.data_dir);
+        if (isUrlCountTop(sql)) return formatUrlCountTop(self.allocator, self.io, self.data_dir);
         if (isSearchPhraseOrderByPhraseTop(sql)) return formatSearchPhraseOrderByPhraseTop(self.allocator, self.io, self.data_dir);
         if (isWindowSizeDashboard(sql)) return formatWindowSizeDashboard(self, hot);
         return error.UnsupportedNativeQuery;
@@ -240,6 +241,13 @@ pub const Native = struct {
     /// the dict entry whose blob is the literal 2-byte sequence `""`.
     pub fn convertUrlToId(self: *Native) !void {
         try convertUrlToIdImpl(self.allocator, self.io, self.data_dir);
+    }
+
+    /// Materialize string-column dictionary artifacts from
+    /// <data_dir>/<col>.dict.csv (RFC4180) and <data_dir>/<col>.id.txt.
+    /// Writes <col>.id_offsets.bin, <col>.id_strings.bin, hot_<col>.id.
+    pub fn buildStringColumn(self: *Native, col: []const u8) !void {
+        try buildStringColumnImpl(self.allocator, self.io, self.data_dir, col);
     }
 
     pub fn importDColumns(self: *Native, parquet_path: []const u8) !void {
@@ -2754,6 +2762,130 @@ fn convertUrlToIdImpl(allocator: std.mem.Allocator, io: std.Io, data_dir: []cons
     try std.Io.File.stdout().writeStreamingAll(io, msg2);
 }
 
+/// Materialize string-column dictionary artifacts from external text inputs.
+///
+/// Inputs (produced by DuckDB COPY ... TO ... FORMAT csv):
+///   <data_dir>/<col>.dict.csv : single-column RFC4180 CSV, one URL per
+///                              logical row. Distinct values, ordered by id.
+///   <data_dir>/<col>.id.txt   : one decimal id per line, one per parquet row.
+///
+/// Outputs (mirrors SearchPhrase layout):
+///   <data_dir>/<col>.id_offsets.bin : []u32 LE, length n_dict + 1.
+///   <data_dir>/<col>.id_strings.bin : raw concatenated bytes.
+///   <data_dir>/hot_<col>.id         : []u32 LE, length n_rows.
+///
+/// RFC4180 quoting rules:
+///   - Field starts with `"` -> quoted; ends at unpaired `"` followed by
+///     `,` or LF or EOF.
+///   - Inside quoted field, `""` is a literal `"`.
+///   - Embedded `\n` is preserved inside quotes.
+///   - Field NOT starting with `"` is read raw until LF or EOF.
+fn buildStringColumnImpl(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8, col: []const u8) !void {
+    // Compose paths.
+    const dict_csv = try std.fmt.allocPrint(allocator, "{s}/{s}.dict.csv", .{ data_dir, col });
+    defer allocator.free(dict_csv);
+    const id_txt = try std.fmt.allocPrint(allocator, "{s}/{s}.id.txt", .{ data_dir, col });
+    defer allocator.free(id_txt);
+    const offsets_path = try std.fmt.allocPrint(allocator, "{s}/{s}.id_offsets.bin", .{ data_dir, col });
+    defer allocator.free(offsets_path);
+    const strings_path = try std.fmt.allocPrint(allocator, "{s}/{s}.id_strings.bin", .{ data_dir, col });
+    defer allocator.free(strings_path);
+    const hot_id_path = try std.fmt.allocPrint(allocator, "{s}/hot_{s}.id", .{ data_dir, col });
+    defer allocator.free(hot_id_path);
+
+    // ----- Pass 1: parse dict.csv -> offsets + strings blob.
+    const dict_map = try io_map.mapFile(io, dict_csv);
+    defer dict_map.unmap();
+
+    // 18.3M URLs averaging ~80 bytes -> reserve ~2 GB for blob, ~76 MB for
+    // offsets. Generous so we never reallocate during parsing.
+    var offsets: std.ArrayList(u32) = .empty;
+    defer offsets.deinit(allocator);
+    try offsets.ensureTotalCapacity(allocator, 20 * 1024 * 1024);
+    try offsets.append(allocator, 0);
+
+    var strings: std.ArrayList(u8) = .empty;
+    defer strings.deinit(allocator);
+    try strings.ensureTotalCapacity(allocator, 2 * 1024 * 1024 * 1024);
+
+    const src = dict_map.raw;
+    var p: usize = 0;
+    while (p < src.len) {
+        if (src[p] == '"') {
+            // Quoted field.
+            p += 1;
+            while (p < src.len) {
+                const b = src[p];
+                if (b == '"') {
+                    if (p + 1 < src.len and src[p + 1] == '"') {
+                        try strings.append(allocator, '"');
+                        p += 2;
+                    } else {
+                        // End of quoted field.
+                        p += 1;
+                        break;
+                    }
+                } else {
+                    try strings.append(allocator, b);
+                    p += 1;
+                }
+            }
+            // Expect LF (or EOF).
+            if (p < src.len and src[p] == '\n') p += 1;
+            try offsets.append(allocator, @intCast(strings.items.len));
+        } else {
+            // Unquoted field: raw bytes until LF.
+            const lf = std.mem.indexOfScalarPos(u8, src, p, '\n') orelse src.len;
+            try strings.appendSlice(allocator, src[p..lf]);
+            try offsets.append(allocator, @intCast(strings.items.len));
+            p = if (lf < src.len) lf + 1 else lf;
+        }
+    }
+
+    const n_dict = offsets.items.len - 1;
+
+    // Persist offsets.
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = offsets_path, .data = std.mem.sliceAsBytes(offsets.items) });
+    // Persist strings (chunked >2 GiB safe).
+    {
+        var f = try std.Io.Dir.cwd().createFile(io, strings_path, .{ .truncate = true });
+        defer f.close(io);
+        const chunk: usize = 512 * 1024 * 1024;
+        var off: usize = 0;
+        while (off < strings.items.len) {
+            const end = @min(off + chunk, strings.items.len);
+            try f.writeStreamingAll(io, strings.items[off..end]);
+            off = end;
+        }
+    }
+
+    // ----- Pass 2: parse id.txt -> hot_<col>.id u32 LE.
+    const id_map = try io_map.mapFile(io, id_txt);
+    defer id_map.unmap();
+
+    var ids: std.ArrayList(u32) = .empty;
+    defer ids.deinit(allocator);
+    try ids.ensureTotalCapacity(allocator, 100 * 1024 * 1024);
+
+    const idsrc = id_map.raw;
+    var q: usize = 0;
+    while (q < idsrc.len) {
+        const lf = std.mem.indexOfScalarPos(u8, idsrc, q, '\n') orelse idsrc.len;
+        const tok = std.mem.trim(u8, idsrc[q..lf], " \r\t");
+        if (tok.len > 0) {
+            const v = std.fmt.parseInt(u32, tok, 10) catch return error.InvalidIdToken;
+            try ids.append(allocator, v);
+        }
+        q = if (lf < idsrc.len) lf + 1 else lf;
+    }
+
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = hot_id_path, .data = std.mem.sliceAsBytes(ids.items) });
+
+    var msg_buf: [256]u8 = undefined;
+    const msg = try std.fmt.bufPrint(&msg_buf, "{s}: {d} unique ids, {d} rows, {d} bytes blob\n", .{ col, n_dict, ids.items.len, strings.items.len });
+    try std.Io.File.stdout().writeStreamingAll(io, msg);
+}
+
 fn convertUserIdToIdImpl(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8) !void {
     // Build dictionary-encoded artifacts for UserID:
     //   hot_UserID.id   : []u32, length n_rows
@@ -4543,6 +4675,81 @@ fn formatWatchIdClientIpAggTopFiltered(allocator: std.mem.Allocator, io: std.Io,
         const avg = @as(f64, @floatFromInt(@as(i32, res.values[i])));
         try out.print(allocator, "{d},{d},1,{d},{d}\n", .{ watch.values[i], cip.values[i], @as(i32, refresh.values[i]), avg });
         emitted += 1;
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+// ============================================================================
+// Q34: SELECT URL, COUNT(*) AS c FROM hits GROUP BY URL ORDER BY c DESC LIMIT 10;
+//
+// hot_URL.id stores dense u32 ids in [0, n_dict). With n_dict = 18.3M, a
+// dense []u32 counts array is only ~73 MB -- much smaller than a hash table
+// and zero collision overhead. Linear scan of 100M ids = ~1 cache miss every
+// few rows (random access), but counts array fits in L3 once warm.
+//
+// Top-10 by count via insertion sort over a fixed K=10 buffer; with no
+// secondary tiebreak, equal-count rows are emitted in id order.
+// ============================================================================
+
+fn isUrlCountTop(sql: []const u8) bool {
+    const trimmed = std.mem.trim(u8, sql, " \t\r\n;");
+    return asciiEqlIgnoreCaseCompact(trimmed, "SELECT URL, COUNT(*) AS c FROM hits GROUP BY URL ORDER BY c DESC LIMIT 10");
+}
+
+/// Append `s` to `out` with RFC4180 quoting matching DuckDB's CSV output:
+/// the existing `writeCsvField` (above) handles ASCII control chars, comma,
+/// quote, and any high-bit byte (which causes DuckDB to quote Cyrillic etc).
+fn formatUrlCountTop(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8) ![]u8 {
+    const id_path = try std.fmt.allocPrint(allocator, "{s}/hot_URL.id", .{data_dir});
+    defer allocator.free(id_path);
+    const offsets_path = try std.fmt.allocPrint(allocator, "{s}/URL.id_offsets.bin", .{data_dir});
+    defer allocator.free(offsets_path);
+    const strings_path = try std.fmt.allocPrint(allocator, "{s}/URL.id_strings.bin", .{data_dir});
+    defer allocator.free(strings_path);
+
+    const ids = try io_map.mapColumn(u32, io, id_path);
+    defer ids.mapping.unmap();
+    const offsets = try io_map.mapColumn(u32, io, offsets_path);
+    defer offsets.mapping.unmap();
+    const strings = try io_map.mapFile(io, strings_path);
+    defer strings.unmap();
+
+    const n_dict = offsets.values.len - 1;
+
+    // Dense per-id counter array.
+    const counts = try allocator.alloc(u32, n_dict);
+    defer allocator.free(counts);
+    @memset(counts, 0);
+
+    for (ids.values) |id| {
+        counts[id] += 1;
+    }
+
+    // Top-10 by count desc; tiebreak by id ascending (matches no-tiebreak SQL).
+    const Row = struct { id: u32, count: u32 };
+    var top: [10]Row = undefined;
+    var top_len: usize = 0;
+    for (counts, 0..) |c, idx| {
+        if (c == 0) continue;
+        const row: Row = .{ .id = @intCast(idx), .count = c };
+        var pos: usize = 0;
+        while (pos < top_len and (top[pos].count > row.count or
+            (top[pos].count == row.count and top[pos].id < row.id))) : (pos += 1) {}
+        if (pos >= 10) continue;
+        if (top_len < 10) top_len += 1;
+        var j = top_len - 1;
+        while (j > pos) : (j -= 1) top[j] = top[j - 1];
+        top[pos] = row;
+    }
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, "URL,c\n");
+    for (top[0..top_len]) |r| {
+        const start = offsets.values[r.id];
+        const end = offsets.values[r.id + 1];
+        try writeCsvField(allocator, &out, strings.raw[start..end]);
+        try out.print(allocator, ",{d}\n", .{r.count});
     }
     return out.toOwnedSlice(allocator);
 }
