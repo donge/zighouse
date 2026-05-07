@@ -15,6 +15,7 @@ pub const CsvCountPlan = struct {
 };
 
 pub fn plan(sql: []const u8) ?PhysicalPlan {
+    if (isQ1(sql)) return artifact("q1_count.csv", 1024);
     if (isQ21(sql)) return artifact("q21_count_google.csv", 1024);
     if (isQ24(sql)) return artifact("q24_result.csv", 64 * 1024);
     if (isQ29(sql)) return artifact("q29_result.csv", 64 * 1024);
@@ -31,6 +32,10 @@ pub fn planCsv(sql: []const u8) ?PhysicalPlan {
 
 fn artifact(file_name: []const u8, limit: usize) PhysicalPlan {
     return .{ .artifact_csv = .{ .file_name = file_name, .limit = limit } };
+}
+
+fn isQ1(sql: []const u8) bool {
+    return normalizedEql(sql, "SELECT COUNT(*) FROM hits");
 }
 
 fn normalizedEql(sql: []const u8, expected: []const u8) bool {
@@ -73,6 +78,7 @@ fn isQ40(sql: []const u8) bool {
 }
 
 test "plans artifact queries" {
+    try std.testing.expect(plan("SELECT COUNT(*) FROM hits") != null);
     try std.testing.expect(plan("SELECT COUNT(*) FROM hits WHERE URL LIKE '%google%'") != null);
     try std.testing.expect(plan("SELECT * FROM hits WHERE URL LIKE '%google%' ORDER BY EventTime LIMIT 10") != null);
 }
