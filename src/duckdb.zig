@@ -105,6 +105,11 @@ pub fn benchWithRunner(allocator: std.mem.Allocator, io: std.Io, queries_path: [
     const queries = try std.Io.Dir.cwd().readFileAlloc(io, queries_path, allocator, .limited(512 * 1024));
     defer allocator.free(queries);
 
+    var query_count: usize = 0;
+    var null_count: usize = 0;
+    var first_sum_ns: u64 = 0;
+    var warm_best_sum_ns: u64 = 0;
+    var all_sum_ns: u64 = 0;
     var query_num: usize = 1;
     var line_it = std.mem.splitScalar(u8, queries, '\n');
     while (line_it.next()) |raw_line| : (query_num += 1) {
@@ -113,14 +118,16 @@ pub fn benchWithRunner(allocator: std.mem.Allocator, io: std.Io, queries_path: [
         if (!range.contains(query_num)) continue;
 
         try writeOut(io, "[");
+        var row_ns: [3]?u64 = .{ null, null, null };
         for (0..3) |i| {
             const started = std.Io.Clock.Timestamp.now(io, .awake);
             const result = runner.runQuery(query_text) catch null;
             const elapsed = if (result) |output| blk: {
                 allocator.free(output);
                 const ended = std.Io.Clock.Timestamp.now(io, .awake);
-                break :blk started.durationTo(ended).raw.nanoseconds;
+                break :blk @as(u64, @intCast(started.durationTo(ended).raw.nanoseconds));
             } else null;
+            row_ns[i] = elapsed;
 
             if (elapsed) |ns| {
                 const seconds = @as(f64, @floatFromInt(ns)) / std.time.ns_per_s;
@@ -133,7 +140,40 @@ pub fn benchWithRunner(allocator: std.mem.Allocator, io: std.Io, queries_path: [
             if (i != 2) try writeOut(io, ", ");
         }
         try writeOut(io, "],\n");
+        query_count += 1;
+        if (row_ns[0]) |ns| {
+            first_sum_ns += ns;
+            all_sum_ns += ns;
+        }
+        var warm_best: ?u64 = null;
+        for (row_ns[1..]) |maybe_ns| {
+            if (maybe_ns) |ns| {
+                all_sum_ns += ns;
+                warm_best = if (warm_best) |best| @min(best, ns) else ns;
+            }
+        }
+        if (warm_best) |ns| {
+            warm_best_sum_ns += ns;
+        } else {
+            null_count += 1;
+        }
     }
+    try writeBenchSummary(io, query_count, null_count, first_sum_ns, warm_best_sum_ns, all_sum_ns);
+}
+
+fn writeBenchSummary(io: std.Io, query_count: usize, null_count: usize, first_sum_ns: u64, warm_best_sum_ns: u64, all_sum_ns: u64) !void {
+    var buf: [256]u8 = undefined;
+    const text = try std.fmt.bufPrint(&buf,
+        "summary: queries={d} nulls={d} first_sum={d:.6} warm_best_sum={d:.6} all_runs_sum={d:.6}\n",
+        .{
+            query_count,
+            null_count,
+            @as(f64, @floatFromInt(first_sum_ns)) / std.time.ns_per_s,
+            @as(f64, @floatFromInt(warm_best_sum_ns)) / std.time.ns_per_s,
+            @as(f64, @floatFromInt(all_sum_ns)) / std.time.ns_per_s,
+        },
+    );
+    try writeOut(io, text);
 }
 
 pub fn sqlStringLiteral(allocator: std.mem.Allocator, value: []const u8) ![]u8 {

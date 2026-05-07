@@ -13,11 +13,15 @@ const usage =
     \\  zighouse init <data_dir>
     \\  zighouse import <hits.parquet> <data_dir>
     \\  zighouse import-hot <hits.parquet> <data_dir>
+    \\  zighouse import-clickbench-csv-hot <hits.csv> <data_dir>
     \\  zighouse import-hot-extra <hits.parquet> <data_dir>
     \\  zighouse convert-hot <data_dir>
     \\  zighouse build-stats <data_dir>
     \\  zighouse convert-i16-csv <csv_path> <out_path>
     \\  zighouse build-string-column <data_dir> <col>
+    \\  zighouse build-clickbench-mobile-phone-model <data_dir>
+    \\  zighouse build-clickbench-search-phrase <data_dir>
+    \\  zighouse build-clickbench-url <data_dir>
     \\  zighouse build-q23-candidates <data_dir>
     \\  zighouse build-q25-candidates <data_dir>
     \\  zighouse build-q29-domain-stats <data_dir>
@@ -91,6 +95,13 @@ fn runCommand(init: std.process.Init, allocator: std.mem.Allocator, args: *std.p
         defer selected.deinit();
         try selected.importParquet(parquet_path);
         try printOut(init.io, "imported hot columns {s} -> {s}\n", .{ parquet_path, data_dir });
+    } else if (std.mem.eql(u8, command, "import-clickbench-csv-hot")) {
+        const csv_path = args.next() orelse return error.MissingCsvPath;
+        const data_dir = args.next() orelse return error.MissingDataDir;
+        var native_backend = @import("native.zig").Native.init(allocator, init.io, data_dir);
+        defer native_backend.deinit();
+        try native_backend.importClickBenchCsvHot(csv_path);
+        try printOut(init.io, "imported ClickBench CSV hot columns {s} -> {s}\n", .{ csv_path, data_dir });
     } else if (std.mem.eql(u8, command, "import-hot-extra")) {
         const parquet_path = args.next() orelse return error.MissingParquetPath;
         const data_dir = args.next() orelse return error.MissingDataDir;
@@ -144,6 +155,21 @@ fn runCommand(init: std.process.Init, allocator: std.mem.Allocator, args: *std.p
         var native_backend = @import("native.zig").Native.init(allocator, init.io, data_dir);
         defer native_backend.deinit();
         try native_backend.buildStringColumn(col);
+    } else if (std.mem.eql(u8, command, "build-clickbench-mobile-phone-model")) {
+        const data_dir = args.next() orelse return error.MissingDataDir;
+        var native_backend = @import("native.zig").Native.init(allocator, init.io, data_dir);
+        defer native_backend.deinit();
+        try native_backend.buildClickBenchMobilePhoneModel();
+    } else if (std.mem.eql(u8, command, "build-clickbench-search-phrase")) {
+        const data_dir = args.next() orelse return error.MissingDataDir;
+        var native_backend = @import("native.zig").Native.init(allocator, init.io, data_dir);
+        defer native_backend.deinit();
+        try native_backend.buildClickBenchSearchPhrase();
+    } else if (std.mem.eql(u8, command, "build-clickbench-url")) {
+        const data_dir = args.next() orelse return error.MissingDataDir;
+        var native_backend = @import("native.zig").Native.init(allocator, init.io, data_dir);
+        defer native_backend.deinit();
+        try native_backend.buildClickBenchUrl();
     } else if (std.mem.eql(u8, command, "build-q23-candidates")) {
         const data_dir = args.next() orelse return error.MissingDataDir;
         var native_backend = @import("native.zig").Native.init(allocator, init.io, data_dir);
@@ -214,7 +240,7 @@ fn runCommand(init: std.process.Init, allocator: std.mem.Allocator, args: *std.p
         try printOut(init.io, "native q5/q6/q9-q15: yes if id/dict hot data exists (run convert-user-id-id, import-search-phrase-hot, convert-search-phrase-id, import-d-cols)\n", .{});
         try printOut(init.io, "native q6/q13 SearchPhrase hot: {s}\n", .{if (search_phrase_hot) "yes" else "no (run import-search-phrase-hot and convert-search-phrase-id)"});
         try printOut(init.io, "native q28: {s}\n", .{if (hot and extra_hot) "yes (extra hot columns)" else "no (run import-hot-extra)"});
-        try printOut(init.io, "native q37/q38/q39/q40: no (URL/Title/Referer dictionary native paths TODO)\n", .{});
+        try printOut(init.io, "native q37/q38/q39/q40: yes with ClickBench CSV hot import artifacts\n", .{});
         try printOut(init.io, "native q41/q42/q43: {s}\n", .{if (hot and extra_hot) "yes (segment stats recommended; run build-stats)" else "no (run import-hot-extra and build-stats)"});
     } else if (std.mem.eql(u8, command, "bench")) {
         const data_dir = args.next() orelse return error.MissingDataDir;
