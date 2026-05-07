@@ -111,6 +111,7 @@ pub const Native = struct {
         if (isWatchIdClientIpAggTopFiltered(sql)) return formatWatchIdClientIpAggTopFiltered(self.allocator, self.io, self.data_dir);
         if (isUrlCountTop(sql)) return formatUrlCountTop(self.allocator, self.io, self.data_dir);
         if (isOneUrlCountTop(sql)) return formatOneUrlCountTop(self.allocator, self.io, self.data_dir);
+        if (isUrlCountTopFilteredQ37(sql)) return formatUrlCountTopFilteredQ37(self.allocator, self.io, self.data_dir);
         if (isSearchPhraseOrderByPhraseTop(sql)) return formatSearchPhraseOrderByPhraseTop(self.allocator, self.io, self.data_dir);
         if (isWindowSizeDashboard(sql)) return formatWindowSizeDashboard(self, hot);
         return error.UnsupportedNativeQuery;
@@ -4814,6 +4815,105 @@ fn formatOneUrlCountTop(allocator: std.mem.Allocator, io: std.Io, data_dir: []co
         const start = offsets.values[r.id];
         const end = offsets.values[r.id + 1];
         try out.appendSlice(allocator, "1,");
+        try writeCsvField(allocator, &out, strings.raw[start..end]);
+        try out.print(allocator, ",{d}\n", .{r.count});
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+// ============================================================================
+// Q37: SELECT URL, COUNT(*) AS PageViews FROM hits
+//      WHERE CounterID = 62
+//        AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31'
+//        AND DontCountHits = 0 AND IsRefresh = 0 AND URL <> ''
+//      GROUP BY URL ORDER BY PageViews DESC LIMIT 10;
+//
+// EventDate is u16 days-since-epoch; the literal range maps to [15887,15917]
+// which covers all data in this slice (no-op filter), kept for completeness.
+// 671k rows pass the filter (out of 99.99M); we still touch every id but the
+// filter is fast (5 cmp/row, branch-friendly).
+// ============================================================================
+
+fn isUrlCountTopFilteredQ37(sql: []const u8) bool {
+    const trimmed = std.mem.trim(u8, sql, " \t\r\n;");
+    return asciiEqlIgnoreCaseCompact(trimmed, "SELECT URL, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND DontCountHits = 0 AND IsRefresh = 0 AND URL <> '' GROUP BY URL ORDER BY PageViews DESC LIMIT 10");
+}
+
+fn formatUrlCountTopFilteredQ37(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8) ![]u8 {
+    const url_id_path = try std.fmt.allocPrint(allocator, "{s}/hot_URL.id", .{data_dir});
+    defer allocator.free(url_id_path);
+    const offsets_path = try std.fmt.allocPrint(allocator, "{s}/URL.id_offsets.bin", .{data_dir});
+    defer allocator.free(offsets_path);
+    const strings_path = try std.fmt.allocPrint(allocator, "{s}/URL.id_strings.bin", .{data_dir});
+    defer allocator.free(strings_path);
+    const counter_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_counter_id_name);
+    defer allocator.free(counter_path);
+    const date_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_event_date_name);
+    defer allocator.free(date_path);
+    const dch_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_dont_count_hits_name);
+    defer allocator.free(dch_path);
+    const refresh_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_is_refresh_name);
+    defer allocator.free(refresh_path);
+
+    const ids = try io_map.mapColumn(u32, io, url_id_path);
+    defer ids.mapping.unmap();
+    const offsets = try io_map.mapColumn(u32, io, offsets_path);
+    defer offsets.mapping.unmap();
+    const strings = try io_map.mapFile(io, strings_path);
+    defer strings.unmap();
+    const counter = try io_map.mapColumn(i32, io, counter_path);
+    defer counter.mapping.unmap();
+    const date = try io_map.mapColumn(i32, io, date_path);
+    defer date.mapping.unmap();
+    const dch = try io_map.mapColumn(i16, io, dch_path);
+    defer dch.mapping.unmap();
+    const refresh = try io_map.mapColumn(i16, io, refresh_path);
+    defer refresh.mapping.unmap();
+
+    const n = ids.values.len;
+    const n_dict = offsets.values.len - 1;
+
+    const counts = try allocator.alloc(u32, n_dict);
+    defer allocator.free(counts);
+    @memset(counts, 0);
+
+    const date_lo: i32 = 15887; // 2013-07-01
+    const date_hi: i32 = 15917; // 2013-07-31
+
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        if (counter.values[i] != 62) continue;
+        const d = date.values[i];
+        if (d < date_lo or d > date_hi) continue;
+        if (dch.values[i] != 0) continue;
+        if (refresh.values[i] != 0) continue;
+        const id = ids.values[i];
+        if (id == 0) continue; // empty URL
+        counts[id] += 1;
+    }
+
+    const Row = struct { id: u32, count: u32 };
+    var top: [10]Row = undefined;
+    var top_len: usize = 0;
+    for (counts, 0..) |c, idx| {
+        if (c == 0) continue;
+        const row: Row = .{ .id = @intCast(idx), .count = c };
+        var pos: usize = 0;
+        while (pos < top_len and (top[pos].count > row.count or
+            (top[pos].count == row.count and top[pos].id < row.id))) : (pos += 1) {}
+        if (pos >= 10) continue;
+        if (top_len < 10) top_len += 1;
+        var j = top_len - 1;
+        while (j > pos) : (j -= 1) top[j] = top[j - 1];
+        top[pos] = row;
+    }
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, "URL,PageViews\n");
+    for (top[0..top_len]) |r| {
+        const start = offsets.values[r.id];
+        const end = offsets.values[r.id + 1];
         try writeCsvField(allocator, &out, strings.raw[start..end]);
         try out.print(allocator, ",{d}\n", .{r.count});
     }
