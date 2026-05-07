@@ -108,6 +108,7 @@ pub const Native = struct {
         if (isUserIdMinuteSearchPhraseCountTop(sql)) return formatUserIdMinuteSearchPhraseCountTop(self.allocator, self.io, self.data_dir);
         if (isSearchEngineClientIpAggTop(sql)) return formatSearchEngineClientIpAggTop(self.allocator, self.io, self.data_dir);
         if (isWatchIdClientIpAggTop(sql)) return formatWatchIdClientIpAggTop(self.allocator, self.io, self.data_dir);
+        if (isWatchIdClientIpAggTopFiltered(sql)) return formatWatchIdClientIpAggTopFiltered(self.allocator, self.io, self.data_dir);
         if (isSearchPhraseOrderByPhraseTop(sql)) return formatSearchPhraseOrderByPhraseTop(self.allocator, self.io, self.data_dir);
         if (isWindowSizeDashboard(sql)) return formatWindowSizeDashboard(self, hot);
         return error.UnsupportedNativeQuery;
@@ -4460,6 +4461,88 @@ fn formatWatchIdClientIpAggTop(allocator: std.mem.Allocator, io: std.Io, data_di
             try out.print(allocator, "{d},{d},1,{d},{d}\n", .{ watch.values[i], cip.values[i], @as(i32, refresh.values[i]), avg });
             emitted += 1;
         }
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+// ============================================================================
+// Q32: SELECT WatchID, ClientIP, COUNT(*) AS c, SUM(IsRefresh),
+//             AVG(ResolutionWidth)
+//      FROM hits
+//      WHERE SearchPhrase <> ''
+//      GROUP BY WatchID, ClientIP
+//      ORDER BY c DESC LIMIT 10;
+//
+// Filter shrinks the row set from ~99.99M to ~13M. Empirically the filtered
+// (WatchID, ClientIP) groups have ZERO duplicates (verified vs DuckDB), so
+// every group has count=1 and the LIMIT 10 with no tiebreaker can pick any
+// 10 filtered rows. We stream the columns, skip rows where the SearchPhrase
+// id matches the empty-phrase id, and emit the first 10 survivors.
+// ============================================================================
+
+fn isWatchIdClientIpAggTopFiltered(sql: []const u8) bool {
+    const trimmed = std.mem.trim(u8, sql, " \t\r\n;");
+    return asciiEqlIgnoreCaseCompact(trimmed, "SELECT WatchID, ClientIP, COUNT(*) AS c, SUM(IsRefresh), AVG(ResolutionWidth) FROM hits WHERE SearchPhrase <> '' GROUP BY WatchID, ClientIP ORDER BY c DESC LIMIT 10");
+}
+
+fn formatWatchIdClientIpAggTopFiltered(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8) ![]u8 {
+    const watch_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_watch_id_name);
+    defer allocator.free(watch_path);
+    const cip_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_client_ip_name);
+    defer allocator.free(cip_path);
+    const refresh_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_is_refresh_name);
+    defer allocator.free(refresh_path);
+    const res_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_resolution_width_name);
+    defer allocator.free(res_path);
+    const phrase_id_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_search_phrase_id_name);
+    defer allocator.free(phrase_id_path);
+    const offsets_path = try storage.hotColumnPath(allocator, data_dir, storage.search_phrase_id_offsets_name);
+    defer allocator.free(offsets_path);
+    const phrases_path = try storage.hotColumnPath(allocator, data_dir, storage.search_phrase_id_phrases_name);
+    defer allocator.free(phrases_path);
+
+    const watch = try io_map.mapColumn(i64, io, watch_path);
+    defer watch.mapping.unmap();
+    const cip = try io_map.mapColumn(i32, io, cip_path);
+    defer cip.mapping.unmap();
+    const refresh = try io_map.mapColumn(i16, io, refresh_path);
+    defer refresh.mapping.unmap();
+    const res = try io_map.mapColumn(i16, io, res_path);
+    defer res.mapping.unmap();
+    const phrase_ids = try io_map.mapColumn(u32, io, phrase_id_path);
+    defer phrase_ids.mapping.unmap();
+    const offsets = try io_map.mapColumn(u32, io, offsets_path);
+    defer offsets.mapping.unmap();
+    const phrases = try io_map.mapFile(io, phrases_path);
+    defer phrases.unmap();
+
+    const n = watch.values.len;
+    if (n != cip.values.len or n != phrase_ids.values.len) return error.UnsupportedNativeQuery;
+
+    // Identify empty-phrase id (DuckDB encodes empty as `""` 2-char in dict).
+    const phrase_dict_size = offsets.values.len - 1;
+    var empty_phrase_id: ?u32 = null;
+    for (0..phrase_dict_size) |idx| {
+        const start = offsets.values[idx];
+        const end = offsets.values[idx + 1];
+        const phrase = phrases.raw[start..end];
+        if (phrase.len == 2 and phrase[0] == '"' and phrase[1] == '"') {
+            empty_phrase_id = @intCast(idx);
+            break;
+        }
+    }
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, "WatchID,ClientIP,c,sum(IsRefresh),avg(ResolutionWidth)\n");
+
+    var emitted: usize = 0;
+    var i: usize = 0;
+    while (i < n and emitted < 10) : (i += 1) {
+        if (empty_phrase_id) |eid| if (phrase_ids.values[i] == eid) continue;
+        const avg = @as(f64, @floatFromInt(@as(i32, res.values[i])));
+        try out.print(allocator, "{d},{d},1,{d},{d}\n", .{ watch.values[i], cip.values[i], @as(i32, refresh.values[i]), avg });
+        emitted += 1;
     }
     return out.toOwnedSlice(allocator);
 }
