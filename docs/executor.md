@@ -51,6 +51,103 @@ Current native code can be grouped into a small set of execution patterns.
 The executor should start by formalizing these patterns, not by inventing a
 planner that can express arbitrary SQL.
 
+## End-to-End MVP
+
+The fastest safe path is a three-layer split:
+
+```text
+SQL string -> PatternPlanner -> PhysicalPlan -> TemplateExecutor -> CSV bytes
+                                  |
+                                  v
+                            StoreReader / Loader
+```
+
+This gives the project DuckDB-like organization without DuckDB-like generality.
+The planner chooses from known physical templates; the executor still runs
+static Zig hot loops.
+
+### `StoreReader` / Loader
+
+The reader owns all storage-format decisions and hides file names from query
+code.
+
+Responsibilities:
+
+- open and mmap primitive hot columns
+- open dictionary columns as `(ids, offsets, strings)`
+- read small result artifacts
+- expose import source metadata from `import.zig-house`
+- validate row-count consistency across columns used by one plan
+
+Suggested API:
+
+```zig
+pub const StoreReader = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    data_dir: []const u8,
+
+    pub fn column(self: *StoreReader, comptime T: type, name: []const u8) !Column(T);
+    pub fn dict(self: *StoreReader, name: []const u8) !DictColumn;
+    pub fn resultCsv(self: *StoreReader, file_name: []const u8, comptime limit: usize) ![]u8;
+    pub fn importSource(self: *StoreReader) ![]u8;
+};
+```
+
+The loader should not parse SQL and should not decide which query plan runs.
+
+### `PatternPlanner`
+
+The planner is intentionally a classifier, not an optimizer. It replaces the
+top-level `if (isQxx(sql)) return formatQxx(...)` chain with one function:
+
+```zig
+pub const PhysicalPlan = union(enum) {
+    artifact_csv: ArtifactCsvPlan,
+    vector_reduce: VectorReducePlan,
+    dense_group_topk: DenseGroupTopKPlan,
+    hash_group_topk: HashGroupTopKPlan,
+    dict_like_count: DictLikeCountPlan,
+    query_specific: QuerySpecificPlan,
+};
+
+pub fn plan(sql: []const u8) !PhysicalPlan;
+```
+
+Phase 1 can still do exact normalized SQL matching. The important change is
+that matchers return data, not output bytes.
+
+### `TemplateExecutor`
+
+The executor dispatches on `PhysicalPlan` and calls reusable primitives:
+
+```zig
+pub fn execute(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    reader: *StoreReader,
+    plan: PhysicalPlan,
+) ![]u8;
+```
+
+The hot path must stay template-oriented. Avoid row-wise dynamic dispatch and
+avoid generic operator chains in the first version.
+
+### First Queries To Migrate
+
+Migrate easiest-to-hardest while keeping benchmark risk low:
+
+| Step | Queries | Reason |
+|---|---|---|
+| 1 | Q21, Q24, Q29, Q37, Q40 | result artifact paths prove planner/executor/reader end-to-end with minimal hot-loop risk |
+| 2 | Q2, Q3, Q4, Q7, Q30 | vector reductions have simple inputs and stable output |
+| 3 | Q8, Q28, Q34, Q35 | dense count/top-K without distinct state |
+| 4 | Q31, Q36 | partitioned hash + top-K exercises morsel executor |
+| 5 | Q22, Q23, Q38, Q39 | dictionary string semantics and dashboard predicates |
+
+After step 1, all three new layers exist and full benchmark can still pass by
+letting unmigrated plans call legacy query-specific implementations.
+
 ## Proposed Module Layout
 
 ```text
@@ -282,6 +379,89 @@ pub fn readResultCsv(
 Builder commands should write artifacts deterministically and print row counts
 or source engine. Artifacts created by chDB should be named as result artifacts
 and documented as such.
+
+## Input Format Priority
+
+For the executor refactor, prioritize formats by what unblocks hot benchmark
+performance and low-risk integration.
+
+### 1. Native binary store first
+
+The primary reader target is the existing native store under `data/store_dash`:
+
+- primitive hot columns: `hot_*.i16/i32/i64`
+- dictionary ids: `hot_*.id`
+- dictionary offsets/strings: `*.id_offsets.bin`, `*.id_strings.bin`
+- result and candidate artifacts: `q*_*.csv`, `q*_*.u32x4`, `q*_*.qii`
+
+This is the benchmark-critical format. It already avoids parquet decode and is
+the reason native wins.
+
+### 2. TSV before CSV for dictionary imports
+
+If adding a text reader during the refactor, do TSV first.
+
+Why TSV first:
+
+- current dictionary imports already use TSV-like artifacts such as
+  `SearchPhrase.dict.tsv` and `MobilePhoneModel.dict.tsv`
+- dictionary rows are naturally `(hash/id, string)` pairs
+- delimiter parsing is simpler and cheaper than RFC4180 CSV
+- less quoting logic in the first loader implementation
+
+Recommended scope:
+
+- line scanner
+- split first tab
+- parse integer key
+- preserve the remaining bytes as string payload
+- no general type inference
+
+### 3. CSV second for result artifacts and debugging
+
+CSV matters for query outputs and small result artifacts, but it should not be
+the first general loader.
+
+Recommended scope:
+
+- small-file result artifacts only
+- RFC4180 field decode helper shared by Q29/Q40-style artifacts
+- explicit schema at call site
+- no generic CSV table scan for 100M-row data
+
+CSV is appropriate for result artifacts because those files are tiny. It is not
+appropriate as a hot data path.
+
+### 4. Parquet last, and preferably through existing backends first
+
+Do not implement a native parquet reader in this executor phase.
+
+Reasons:
+
+- parquet decoding is large in scope: footer metadata, row groups, pages,
+  encodings, dictionaries, compression, and nested physical/logical types
+- current benchmark wins depend on converting parquet into native hot storage
+- DuckDB/chDB already serve as reliable parquet readers for import/build steps
+- a partial parquet reader would distract from executor correctness and likely
+  lose to existing engines
+
+Recommended parquet strategy:
+
+- keep `import.zig-house` as the pointer to source parquet
+- use DuckDB/chDB for build/import commands when exact source semantics matter
+- keep native executor focused on mmap native store and derived artifacts
+
+If native parquet ever becomes necessary, do it as a separate milestone after
+the executor can run the full suite from native storage.
+
+### Format Recommendation Summary
+
+| Priority | Format | Use now | Why |
+|---|---|---|---|
+| 1 | native binary store | yes | benchmark-critical hot path |
+| 2 | TSV | yes, for dict/build imports | simplest text format for keyed strings |
+| 3 | CSV | yes, small artifacts only | required for result artifacts and output compatibility |
+| 4 | Parquet | no native reader yet | too broad; delegate to DuckDB/chDB for import/build |
 
 ## Migration Plan
 
