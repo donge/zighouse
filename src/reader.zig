@@ -30,7 +30,11 @@ pub const CsvReader = struct {
         return .{ .allocator = allocator, .io = io, .path = path };
     }
 
-    pub fn rowCount(self: *CsvReader) !u64 {
+    pub const CountOptions = struct {
+        has_header: bool = true,
+    };
+
+    pub fn rowCount(self: *CsvReader, options: CountOptions) !u64 {
         var input = if (std.fs.path.isAbsolute(self.path))
             try std.Io.Dir.openFileAbsolute(self.io, self.path, .{})
         else
@@ -42,6 +46,7 @@ pub const CsvReader = struct {
         var saw_byte = false;
         var last_byte: u8 = 0;
         var prev_cr = false;
+        var in_quotes = false;
 
         while (true) {
             const n = input.readStreaming(self.io, &.{&buf}) catch |err| switch (err) {
@@ -51,10 +56,13 @@ pub const CsvReader = struct {
             if (n == 0) break;
             saw_byte = true;
             for (buf[0..n]) |b| {
-                if (b == '\n') {
+                if (b == '"') {
+                    in_quotes = !in_quotes;
+                    prev_cr = false;
+                } else if (!in_quotes and b == '\n') {
                     if (!prev_cr) lines += 1;
                     prev_cr = false;
-                } else if (b == '\r') {
+                } else if (!in_quotes and b == '\r') {
                     lines += 1;
                     prev_cr = true;
                 } else {
@@ -66,7 +74,7 @@ pub const CsvReader = struct {
 
         if (!saw_byte) return 0;
         if (last_byte != '\n' and last_byte != '\r') lines += 1;
-        return if (lines == 0) 0 else lines - 1;
+        return if (options.has_header and lines > 0) lines - 1 else lines;
     }
 };
 
@@ -76,7 +84,7 @@ test "CsvReader counts data rows after header" {
     defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
 
     var reader = CsvReader.init(std.testing.allocator, std.testing.io, path);
-    try std.testing.expectEqual(@as(u64, 2), try reader.rowCount());
+    try std.testing.expectEqual(@as(u64, 2), try reader.rowCount(.{ .has_header = true }));
 }
 
 test "CsvReader counts CR line endings" {
@@ -85,5 +93,14 @@ test "CsvReader counts CR line endings" {
     defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
 
     var reader = CsvReader.init(std.testing.allocator, std.testing.io, path);
-    try std.testing.expectEqual(@as(u64, 2), try reader.rowCount());
+    try std.testing.expectEqual(@as(u64, 2), try reader.rowCount(.{ .has_header = true }));
+}
+
+test "CsvReader counts no-header rows and ignores quoted newlines" {
+    const path = "/var/folders/g7/4df4jppn3_x6yz0dhx66nf200000gn/T/opencode/zighouse-reader-test-no-header.csv";
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data = "1,\"a\nb\"\n2,c\n" });
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+
+    var reader = CsvReader.init(std.testing.allocator, std.testing.io, path);
+    try std.testing.expectEqual(@as(u64, 2), try reader.rowCount(.{ .has_header = false }));
 }

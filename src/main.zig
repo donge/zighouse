@@ -23,7 +23,7 @@ const usage =
     \\  zighouse build-q29-domain-stats <data_dir>
     \\  zighouse build-q40-result <data_dir>
     \\  zighouse build-q21-count-google <data_dir>
-    \\  zighouse query-csv <csv_path> <sql>
+    \\  zighouse query-csv <csv_path> <sql>  tables: csv (header), csv_no_header
     \\  zighouse query <data_dir> <sql>
     \\  zighouse native-status <data_dir>
     \\  zighouse bench <data_dir> <queries.sql>

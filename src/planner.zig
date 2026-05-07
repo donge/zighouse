@@ -7,7 +7,11 @@ pub const ArtifactCsvPlan = struct {
 
 pub const PhysicalPlan = union(enum) {
     artifact_csv: ArtifactCsvPlan,
-    csv_count: void,
+    csv_count: CsvCountPlan,
+};
+
+pub const CsvCountPlan = struct {
+    has_header: bool,
 };
 
 pub fn plan(sql: []const u8) ?PhysicalPlan {
@@ -20,7 +24,8 @@ pub fn plan(sql: []const u8) ?PhysicalPlan {
 }
 
 pub fn planCsv(sql: []const u8) ?PhysicalPlan {
-    if (normalizedEql(sql, "SELECT COUNT(*) FROM csv")) return .{ .csv_count = {} };
+    if (normalizedEql(sql, "SELECT COUNT(*) FROM csv")) return .{ .csv_count = .{ .has_header = true } };
+    if (normalizedEql(sql, "SELECT COUNT(*) FROM csv_no_header")) return .{ .csv_count = .{ .has_header = false } };
     return null;
 }
 
@@ -75,4 +80,5 @@ test "plans artifact queries" {
 test "plans csv count" {
     try std.testing.expect(planCsv("SELECT COUNT(*) FROM csv") != null);
     try std.testing.expect(planCsv("select   count(*)   from   csv;") != null);
+    try std.testing.expect(planCsv("select count(*) from csv_no_header;") != null);
 }

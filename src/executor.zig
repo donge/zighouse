@@ -11,8 +11,8 @@ pub fn execute(store: *reader.StoreReader, physical: planner.PhysicalPlan) ![]u8
 
 pub fn executeCsv(allocator: std.mem.Allocator, csv: *reader.CsvReader, physical: planner.PhysicalPlan) ![]u8 {
     return switch (physical) {
-        .csv_count => blk: {
-            const count = try csv.rowCount();
+        .csv_count => |p| blk: {
+            const count = try csv.rowCount(.{ .has_header = p.has_header });
             break :blk std.fmt.allocPrint(allocator, "count_star()\n{d}\n", .{count});
         },
         .artifact_csv => error.InvalidPlanInput,
