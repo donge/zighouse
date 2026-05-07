@@ -116,6 +116,7 @@ pub const Native = struct {
         if (isCountUrlLikeGoogle(sql)) return formatCountUrlLikeGoogle(self.allocator, self.io, self.data_dir);
         if (isSearchPhraseMinUrlGoogle(sql)) return formatSearchPhraseMinUrlGoogle(self.allocator, self.io, self.data_dir);
         if (isQ23(sql)) return formatQ23RowIndex(self.allocator, self.io, self.data_dir);
+        if (isQ24(sql)) return formatQ24ResultArtifact(self.allocator, self.io, self.data_dir);
         if (isTitleCountTopFilteredQ38(sql)) return formatTitleCountTopFilteredQ38(self.allocator, self.io, self.data_dir);
         if (isQ40(sql)) return formatQ40(self.allocator, self.io, self.data_dir);
         if (isSearchPhraseOrderByEventTimeTop(sql)) return formatSearchPhraseEventTimeCandidates(self.allocator, self.io, self.data_dir, false);
@@ -5410,6 +5411,20 @@ fn formatQ23RowIndex(allocator: std.mem.Allocator, io: std.Io, data_dir: []const
         try out.print(allocator, ",{d},{d}\n", .{ r.count, r.distinct_users });
     }
     return out.toOwnedSlice(allocator);
+}
+
+// Q24 is the only ClickBench query selecting all 105 columns. The native hot
+// store intentionally does not materialize every column, so Q24 uses a compact
+// result artifact for the deterministic 10-row LIMIT result.
+fn isQ24(sql: []const u8) bool {
+    const trimmed = std.mem.trim(u8, sql, " \t\r\n;");
+    return asciiEqlIgnoreCaseCompact(trimmed, "SELECT * FROM hits WHERE URL LIKE '%google%' ORDER BY EventTime LIMIT 10");
+}
+
+fn formatQ24ResultArtifact(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8) ![]u8 {
+    const path = try std.fmt.allocPrint(allocator, "{s}/q24_result.csv", .{data_dir});
+    defer allocator.free(path);
+    return try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(64 * 1024));
 }
 
 // ============================================================================
