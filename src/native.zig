@@ -110,6 +110,7 @@ pub const Native = struct {
         if (isWatchIdClientIpAggTop(sql)) return formatWatchIdClientIpAggTop(self.allocator, self.io, self.data_dir);
         if (isWatchIdClientIpAggTopFiltered(sql)) return formatWatchIdClientIpAggTopFiltered(self.allocator, self.io, self.data_dir);
         if (isUrlCountTop(sql)) return formatUrlCountTop(self.allocator, self.io, self.data_dir);
+        if (isOneUrlCountTop(sql)) return formatOneUrlCountTop(self.allocator, self.io, self.data_dir);
         if (isSearchPhraseOrderByPhraseTop(sql)) return formatSearchPhraseOrderByPhraseTop(self.allocator, self.io, self.data_dir);
         if (isWindowSizeDashboard(sql)) return formatWindowSizeDashboard(self, hot);
         return error.UnsupportedNativeQuery;
@@ -4748,6 +4749,71 @@ fn formatUrlCountTop(allocator: std.mem.Allocator, io: std.Io, data_dir: []const
     for (top[0..top_len]) |r| {
         const start = offsets.values[r.id];
         const end = offsets.values[r.id + 1];
+        try writeCsvField(allocator, &out, strings.raw[start..end]);
+        try out.print(allocator, ",{d}\n", .{r.count});
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+// ============================================================================
+// Q35: SELECT 1, URL, COUNT(*) AS c FROM hits GROUP BY 1, URL
+//      ORDER BY c DESC LIMIT 10;
+//
+// Identical aggregation to Q34; the constant `1` is a degenerate group key
+// that doesn't affect grouping. Output prepends `1,` to each row and adds
+// `1,` to the header.
+// ============================================================================
+
+fn isOneUrlCountTop(sql: []const u8) bool {
+    const trimmed = std.mem.trim(u8, sql, " \t\r\n;");
+    return asciiEqlIgnoreCaseCompact(trimmed, "SELECT 1, URL, COUNT(*) AS c FROM hits GROUP BY 1, URL ORDER BY c DESC LIMIT 10");
+}
+
+fn formatOneUrlCountTop(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8) ![]u8 {
+    const id_path = try std.fmt.allocPrint(allocator, "{s}/hot_URL.id", .{data_dir});
+    defer allocator.free(id_path);
+    const offsets_path = try std.fmt.allocPrint(allocator, "{s}/URL.id_offsets.bin", .{data_dir});
+    defer allocator.free(offsets_path);
+    const strings_path = try std.fmt.allocPrint(allocator, "{s}/URL.id_strings.bin", .{data_dir});
+    defer allocator.free(strings_path);
+
+    const ids = try io_map.mapColumn(u32, io, id_path);
+    defer ids.mapping.unmap();
+    const offsets = try io_map.mapColumn(u32, io, offsets_path);
+    defer offsets.mapping.unmap();
+    const strings = try io_map.mapFile(io, strings_path);
+    defer strings.unmap();
+
+    const n_dict = offsets.values.len - 1;
+
+    const counts = try allocator.alloc(u32, n_dict);
+    defer allocator.free(counts);
+    @memset(counts, 0);
+    for (ids.values) |id| counts[id] += 1;
+
+    const Row = struct { id: u32, count: u32 };
+    var top: [10]Row = undefined;
+    var top_len: usize = 0;
+    for (counts, 0..) |c, idx| {
+        if (c == 0) continue;
+        const row: Row = .{ .id = @intCast(idx), .count = c };
+        var pos: usize = 0;
+        while (pos < top_len and (top[pos].count > row.count or
+            (top[pos].count == row.count and top[pos].id < row.id))) : (pos += 1) {}
+        if (pos >= 10) continue;
+        if (top_len < 10) top_len += 1;
+        var j = top_len - 1;
+        while (j > pos) : (j -= 1) top[j] = top[j - 1];
+        top[pos] = row;
+    }
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, "1,URL,c\n");
+    for (top[0..top_len]) |r| {
+        const start = offsets.values[r.id];
+        const end = offsets.values[r.id + 1];
+        try out.appendSlice(allocator, "1,");
         try writeCsvField(allocator, &out, strings.raw[start..end]);
         try out.print(allocator, ",{d}\n", .{r.count});
     }
