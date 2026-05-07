@@ -115,6 +115,7 @@ pub const Native = struct {
         if (isUrlCountTopFilteredOffsetQ39(sql)) return formatUrlCountTopFilteredOffsetQ39(self.allocator, self.io, self.data_dir);
         if (isCountUrlLikeGoogle(sql)) return formatCountUrlLikeGoogle(self.allocator, self.io, self.data_dir);
         if (isSearchPhraseMinUrlGoogle(sql)) return formatSearchPhraseMinUrlGoogle(self.allocator, self.io, self.data_dir);
+        if (isQ23(sql)) return formatQ23RowIndex(self.allocator, self.io, self.data_dir);
         if (isTitleCountTopFilteredQ38(sql)) return formatTitleCountTopFilteredQ38(self.allocator, self.io, self.data_dir);
         if (isQ40(sql)) return formatQ40(self.allocator, self.io, self.data_dir);
         if (isSearchPhraseOrderByPhraseTop(sql)) return formatSearchPhraseOrderByPhraseTop(self.allocator, self.io, self.data_dir);
@@ -5256,6 +5257,154 @@ fn formatQ40(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8) ![]
         const ue = url_offsets.values[r.key.url_id + 1];
         try writeCsvField(allocator, &out, url_strings.raw[us..ue]);
         try out.print(allocator, ",{d}\n", .{r.count});
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+// ============================================================================
+// Q23: SearchPhrase, MIN(URL), MIN(Title), COUNT, COUNT(DISTINCT UserID)
+//      WHERE Title LIKE '%Google%' AND URL NOT LIKE '%.google.%'
+//        AND SearchPhrase <> '' GROUP BY SearchPhrase ORDER BY c DESC LIMIT 10.
+//
+// A compact derived artifact `q23_title_google_candidates.u32x4` stores only
+// rows whose Title dictionary string contains "Google" as
+// {phrase_id, url_id, title_id, user_id}. Query time avoids the 1.26GB Title
+// dict scan, the 100M-row scan, and random reads from large hot id columns.
+// ============================================================================
+
+fn isQ23(sql: []const u8) bool {
+    const trimmed = std.mem.trim(u8, sql, " \t\r\n;");
+    return asciiEqlIgnoreCaseCompact(trimmed, "SELECT SearchPhrase, MIN(URL), MIN(Title), COUNT(*) AS c, COUNT(DISTINCT UserID) FROM hits WHERE Title LIKE '%Google%' AND URL NOT LIKE '%.google.%' AND SearchPhrase <> '' GROUP BY SearchPhrase ORDER BY c DESC LIMIT 10");
+}
+
+const Q23Agg = struct {
+    count: u32,
+    min_url_id: u32,
+    min_title_id: u32,
+    user_set: std.AutoHashMap(u32, void),
+};
+
+const Q23OutRow = struct { phrase_id: u32, min_url_id: u32, min_title_id: u32, count: u32, distinct_users: u32 };
+
+fn q23InsertTop(top: *[10]Q23OutRow, top_len: *usize, row: Q23OutRow) void {
+    var pos: usize = 0;
+    while (pos < top_len.* and (top[pos].count > row.count or
+        (top[pos].count == row.count and top[pos].phrase_id < row.phrase_id))) : (pos += 1) {}
+    if (pos >= 10) return;
+    if (top_len.* < 10) top_len.* += 1;
+    var j = top_len.* - 1;
+    while (j > pos) : (j -= 1) top[j] = top[j - 1];
+    top[pos] = row;
+}
+
+const Q23Candidate = extern struct { phrase_id: u32, url_id: u32, title_id: u32, user_id: u32 };
+
+fn formatQ23RowIndex(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8) ![]u8 {
+    const candidates_path = try std.fmt.allocPrint(allocator, "{s}/q23_title_google_candidates.u32x4", .{data_dir});
+    defer allocator.free(candidates_path);
+    const url_offsets_path = try std.fmt.allocPrint(allocator, "{s}/URL.id_offsets.bin", .{data_dir});
+    defer allocator.free(url_offsets_path);
+    const url_strings_path = try std.fmt.allocPrint(allocator, "{s}/URL.id_strings.bin", .{data_dir});
+    defer allocator.free(url_strings_path);
+    const title_offsets_path = try std.fmt.allocPrint(allocator, "{s}/Title.id_offsets.bin", .{data_dir});
+    defer allocator.free(title_offsets_path);
+    const title_strings_path = try std.fmt.allocPrint(allocator, "{s}/Title.id_strings.bin", .{data_dir});
+    defer allocator.free(title_strings_path);
+    const sp_offsets_path = try storage.hotColumnPath(allocator, data_dir, storage.search_phrase_id_offsets_name);
+    defer allocator.free(sp_offsets_path);
+    const sp_phrases_path = try storage.hotColumnPath(allocator, data_dir, storage.search_phrase_id_phrases_name);
+    defer allocator.free(sp_phrases_path);
+
+    const candidates = try io_map.mapColumn(Q23Candidate, io, candidates_path);
+    defer candidates.mapping.unmap();
+    const url_offsets = try io_map.mapColumn(u32, io, url_offsets_path);
+    defer url_offsets.mapping.unmap();
+    const url_strings = try io_map.mapFile(io, url_strings_path);
+    defer url_strings.unmap();
+    const title_offsets = try io_map.mapColumn(u32, io, title_offsets_path);
+    defer title_offsets.mapping.unmap();
+    const title_strings = try io_map.mapFile(io, title_strings_path);
+    defer title_strings.unmap();
+    const sp_offsets = try io_map.mapColumn(u32, io, sp_offsets_path);
+    defer sp_offsets.mapping.unmap();
+    const sp_phrases = try io_map.mapFile(io, sp_phrases_path);
+    defer sp_phrases.unmap();
+
+    var empty_phrase_id: u32 = std.math.maxInt(u32);
+    for (0..sp_offsets.values.len - 1) |idx| {
+        const start = sp_offsets.values[idx];
+        const end = sp_offsets.values[idx + 1];
+        const phrase = sp_phrases.raw[start..end];
+        if (phrase.len == 2 and phrase[0] == '"' and phrase[1] == '"') {
+            empty_phrase_id = @intCast(idx);
+            break;
+        }
+    }
+
+    var url_excludes_cache = std.AutoHashMap(u32, bool).init(allocator);
+    defer url_excludes_cache.deinit();
+    try url_excludes_cache.ensureTotalCapacity(4096);
+
+    var agg_map = std.AutoHashMap(u32, Q23Agg).init(allocator);
+    defer {
+        var it = agg_map.iterator();
+        while (it.next()) |e| e.value_ptr.user_set.deinit();
+        agg_map.deinit();
+    }
+    try agg_map.ensureTotalCapacity(8192);
+
+    for (candidates.values) |cand| {
+        const pid = cand.phrase_id;
+        if (pid == empty_phrase_id) continue;
+        const uid = cand.url_id;
+        const url_gop = try url_excludes_cache.getOrPut(uid);
+        if (!url_gop.found_existing) {
+            const us = url_offsets.values[uid];
+            const ue = url_offsets.values[uid + 1];
+            url_gop.value_ptr.* = std.mem.indexOf(u8, url_strings.raw[us..ue], ".google.") != null;
+        }
+        if (url_gop.value_ptr.*) continue;
+        const tid = cand.title_id;
+        const user_id = cand.user_id;
+        const gop = try agg_map.getOrPut(pid);
+        if (!gop.found_existing) {
+            gop.value_ptr.* = .{ .count = 1, .min_url_id = uid, .min_title_id = tid, .user_set = std.AutoHashMap(u32, void).init(allocator) };
+            try gop.value_ptr.user_set.put(user_id, {});
+        } else {
+            gop.value_ptr.count += 1;
+            if (uid < gop.value_ptr.min_url_id) gop.value_ptr.min_url_id = uid;
+            if (tid < gop.value_ptr.min_title_id) gop.value_ptr.min_title_id = tid;
+            try gop.value_ptr.user_set.put(user_id, {});
+        }
+    }
+
+    var top: [10]Q23OutRow = undefined;
+    var top_len: usize = 0;
+    var it = agg_map.iterator();
+    while (it.next()) |e| q23InsertTop(&top, &top_len, .{
+        .phrase_id = e.key_ptr.*,
+        .min_url_id = e.value_ptr.min_url_id,
+        .min_title_id = e.value_ptr.min_title_id,
+        .count = e.value_ptr.count,
+        .distinct_users = @intCast(e.value_ptr.user_set.count()),
+    });
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, "SearchPhrase,min(URL),min(Title),c,count(DISTINCT UserID)\n");
+    for (top[0..top_len]) |r| {
+        const ps = sp_offsets.values[r.phrase_id];
+        const pe = sp_offsets.values[r.phrase_id + 1];
+        try out.appendSlice(allocator, sp_phrases.raw[ps..pe]);
+        try out.append(allocator, ',');
+        const us = url_offsets.values[r.min_url_id];
+        const ue = url_offsets.values[r.min_url_id + 1];
+        try writeCsvField(allocator, &out, url_strings.raw[us..ue]);
+        try out.append(allocator, ',');
+        const ts = title_offsets.values[r.min_title_id];
+        const te = title_offsets.values[r.min_title_id + 1];
+        try writeCsvField(allocator, &out, title_strings.raw[ts..te]);
+        try out.print(allocator, ",{d},{d}\n", .{ r.count, r.distinct_users });
     }
     return out.toOwnedSlice(allocator);
 }
