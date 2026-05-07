@@ -16,6 +16,7 @@ const usage =
     \\  zighouse import-hot-extra <hits.parquet> <data_dir>
     \\  zighouse convert-hot <data_dir>
     \\  zighouse build-stats <data_dir>
+    \\  zighouse convert-i16-csv <csv_path> <out_path>
     \\  zighouse build-string-column <data_dir> <col>
     \\  zighouse query <data_dir> <sql>
     \\  zighouse native-status <data_dir>
@@ -121,6 +122,11 @@ fn runCommand(init: std.process.Init, allocator: std.mem.Allocator, args: *std.p
         const csv_path = args.next() orelse return error.MissingCsvPath;
         const out_path = args.next() orelse return error.MissingOutputPath;
         try @import("native.zig").convertU64CsvToI64BinaryStreaming(allocator, init.io, csv_path, out_path);
+        try printOut(init.io, "converted {s} -> {s}\n", .{ csv_path, out_path });
+    } else if (std.mem.eql(u8, command, "convert-i16-csv")) {
+        const csv_path = args.next() orelse return error.MissingCsvPath;
+        const out_path = args.next() orelse return error.MissingOutputPath;
+        try @import("native.zig").convertI16CsvToBinaryStreaming(allocator, init.io, csv_path, out_path);
         try printOut(init.io, "converted {s} -> {s}\n", .{ csv_path, out_path });
     } else if (std.mem.eql(u8, command, "build-string-column")) {
         const data_dir = args.next() orelse return error.MissingDataDir;

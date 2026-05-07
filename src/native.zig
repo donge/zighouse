@@ -112,6 +112,7 @@ pub const Native = struct {
         if (isUrlCountTop(sql)) return formatUrlCountTop(self.allocator, self.io, self.data_dir);
         if (isOneUrlCountTop(sql)) return formatOneUrlCountTop(self.allocator, self.io, self.data_dir);
         if (isUrlCountTopFilteredQ37(sql)) return formatUrlCountTopFilteredQ37(self.allocator, self.io, self.data_dir);
+        if (isUrlCountTopFilteredOffsetQ39(sql)) return formatUrlCountTopFilteredOffsetQ39(self.allocator, self.io, self.data_dir);
         if (isCountUrlLikeGoogle(sql)) return formatCountUrlLikeGoogle(self.allocator, self.io, self.data_dir);
         if (isSearchPhraseMinUrlGoogle(sql)) return formatSearchPhraseMinUrlGoogle(self.allocator, self.io, self.data_dir);
         if (isTitleCountTopFilteredQ38(sql)) return formatTitleCountTopFilteredQ38(self.allocator, self.io, self.data_dir);
@@ -471,6 +472,60 @@ pub fn convertU64CsvToI64BinaryStreaming(allocator: std.mem.Allocator, io: std.I
     }
     try consumeU64CsvLines(allocator, io, &pending, &skipped_header, &output, true);
     try output.flush(io);
+}
+
+pub fn convertI16CsvToBinaryStreaming(allocator: std.mem.Allocator, io: std.Io, csv_path: []const u8, out_path: []const u8) !void {
+    var input = try std.Io.Dir.cwd().openFile(io, csv_path, .{});
+    defer input.close(io);
+    var output = try BufferedColumn.init(allocator, io, out_path);
+    defer output.deinit(allocator, io);
+
+    var read_buf: [1024 * 1024]u8 = undefined;
+    var pending: std.ArrayList(u8) = .empty;
+    defer pending.deinit(allocator);
+    var skipped_header = true;
+
+    while (true) {
+        const n = input.readStreaming(io, &.{&read_buf}) catch |err| switch (err) {
+            error.EndOfStream => 0,
+            else => return err,
+        };
+        if (n == 0) break;
+        try pending.appendSlice(allocator, read_buf[0..n]);
+        try consumeI16CsvLines(allocator, io, &pending, &skipped_header, &output, false);
+    }
+    try consumeI16CsvLines(allocator, io, &pending, &skipped_header, &output, true);
+    try output.flush(io);
+}
+
+fn consumeI16CsvLines(allocator: std.mem.Allocator, io: std.Io, pending: *std.ArrayList(u8), skipped_header: *bool, writer: *BufferedColumn, flush_tail: bool) !void {
+    var start: usize = 0;
+    var i: usize = 0;
+    while (i < pending.items.len) : (i += 1) {
+        if (pending.items[i] != '\n') continue;
+        try consumeI16CsvLine(io, pending.items[start..i], skipped_header, writer);
+        start = i + 1;
+    }
+    if (flush_tail and start < pending.items.len) {
+        try consumeI16CsvLine(io, pending.items[start..], skipped_header, writer);
+        start = pending.items.len;
+    }
+    if (start > 0) {
+        const rest = pending.items[start..];
+        std.mem.copyForwards(u8, pending.items[0..rest.len], rest);
+        try pending.resize(allocator, rest.len);
+    }
+}
+
+fn consumeI16CsvLine(io: std.Io, line_raw: []const u8, skipped_header: *bool, writer: *BufferedColumn) !void {
+    const line = std.mem.trim(u8, line_raw, " \t\r");
+    if (line.len == 0) return;
+    if (!skipped_header.*) {
+        skipped_header.* = true;
+        return;
+    }
+    var value = try std.fmt.parseInt(i16, line, 10);
+    try writer.write(io, std.mem.asBytes(&value));
 }
 
 fn consumeU64CsvLines(allocator: std.mem.Allocator, io: std.Io, pending: *std.ArrayList(u8), skipped_header: *bool, writer: *BufferedColumn, flush_tail: bool) !void {
@@ -4915,6 +4970,109 @@ fn formatUrlCountTopFilteredQ37(allocator: std.mem.Allocator, io: std.Io, data_d
     errdefer out.deinit(allocator);
     try out.appendSlice(allocator, "URL,PageViews\n");
     for (top[0..top_len]) |r| {
+        const start = offsets.values[r.id];
+        const end = offsets.values[r.id + 1];
+        try writeCsvField(allocator, &out, strings.raw[start..end]);
+        try out.print(allocator, ",{d}\n", .{r.count});
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+// ============================================================================
+// Q39: SELECT URL, COUNT(*) AS PageViews FROM hits
+//      WHERE CounterID = 62 AND EventDate in July 2013 AND IsRefresh = 0
+//        AND IsLink <> 0 AND IsDownload = 0
+//      GROUP BY URL ORDER BY PageViews DESC LIMIT 10 OFFSET 1000;
+//
+// Same dense-count shape as Q37, but needs the extra IsLink/IsDownload hot
+// columns and keeps top 1010 rows to satisfy OFFSET 1000.
+// ============================================================================
+
+fn isUrlCountTopFilteredOffsetQ39(sql: []const u8) bool {
+    const trimmed = std.mem.trim(u8, sql, " \t\r\n;");
+    return asciiEqlIgnoreCaseCompact(trimmed, "SELECT URL, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND IsRefresh = 0 AND IsLink <> 0 AND IsDownload = 0 GROUP BY URL ORDER BY PageViews DESC LIMIT 10 OFFSET 1000");
+}
+
+const Q39Row = struct { id: u32, count: u32 };
+
+fn q39InsertTop(top: []Q39Row, top_len: *usize, row: Q39Row) void {
+    var pos: usize = 0;
+    while (pos < top_len.* and (top[pos].count > row.count or
+        (top[pos].count == row.count and top[pos].id < row.id))) : (pos += 1) {}
+    if (pos >= top.len) return;
+    if (top_len.* < top.len) top_len.* += 1;
+    var j = top_len.* - 1;
+    while (j > pos) : (j -= 1) top[j] = top[j - 1];
+    top[pos] = row;
+}
+
+fn formatUrlCountTopFilteredOffsetQ39(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8) ![]u8 {
+    const url_id_path = try std.fmt.allocPrint(allocator, "{s}/hot_URL.id", .{data_dir});
+    defer allocator.free(url_id_path);
+    const offsets_path = try std.fmt.allocPrint(allocator, "{s}/URL.id_offsets.bin", .{data_dir});
+    defer allocator.free(offsets_path);
+    const strings_path = try std.fmt.allocPrint(allocator, "{s}/URL.id_strings.bin", .{data_dir});
+    defer allocator.free(strings_path);
+    const counter_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_counter_id_name);
+    defer allocator.free(counter_path);
+    const date_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_event_date_name);
+    defer allocator.free(date_path);
+    const refresh_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_is_refresh_name);
+    defer allocator.free(refresh_path);
+    const is_link_path = try std.fmt.allocPrint(allocator, "{s}/hot_IsLink.i16", .{data_dir});
+    defer allocator.free(is_link_path);
+    const is_download_path = try std.fmt.allocPrint(allocator, "{s}/hot_IsDownload.i16", .{data_dir});
+    defer allocator.free(is_download_path);
+
+    const ids = try io_map.mapColumn(u32, io, url_id_path);
+    defer ids.mapping.unmap();
+    const offsets = try io_map.mapColumn(u32, io, offsets_path);
+    defer offsets.mapping.unmap();
+    const strings = try io_map.mapFile(io, strings_path);
+    defer strings.unmap();
+    const counter = try io_map.mapColumn(i32, io, counter_path);
+    defer counter.mapping.unmap();
+    const date = try io_map.mapColumn(i32, io, date_path);
+    defer date.mapping.unmap();
+    const refresh = try io_map.mapColumn(i16, io, refresh_path);
+    defer refresh.mapping.unmap();
+    const is_link = try io_map.mapColumn(i16, io, is_link_path);
+    defer is_link.mapping.unmap();
+    const is_download = try io_map.mapColumn(i16, io, is_download_path);
+    defer is_download.mapping.unmap();
+
+    const n = ids.values.len;
+    const n_dict = offsets.values.len - 1;
+    const counts = try allocator.alloc(u32, n_dict);
+    defer allocator.free(counts);
+    @memset(counts, 0);
+
+    const date_lo: i32 = 15887;
+    const date_hi: i32 = 15917;
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        if (counter.values[i] != 62) continue;
+        const d = date.values[i];
+        if (d < date_lo or d > date_hi) continue;
+        if (refresh.values[i] != 0) continue;
+        if (is_link.values[i] == 0) continue;
+        if (is_download.values[i] != 0) continue;
+        counts[ids.values[i]] += 1;
+    }
+
+    var top: [1010]Q39Row = undefined;
+    var top_len: usize = 0;
+    for (counts, 0..) |c, idx| {
+        if (c == 0) continue;
+        q39InsertTop(&top, &top_len, .{ .id = @intCast(idx), .count = c });
+    }
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, "URL,PageViews\n");
+    const begin: usize = @min(1000, top_len);
+    const end_top: usize = @min(begin + 10, top_len);
+    for (top[begin..end_top]) |r| {
         const start = offsets.values[r.id];
         const end = offsets.values[r.id + 1];
         try writeCsvField(allocator, &out, strings.raw[start..end]);
