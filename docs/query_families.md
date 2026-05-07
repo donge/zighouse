@@ -1,29 +1,30 @@
 # Retrospective: Hardcoded Native Path for ClickBench
 
-_Last updated 2026-05-07 after URL/Title/RefererHash native ports._
+_Last updated 2026-05-07 after Q23 candidate-pack native port._
 
 ## Current Status (2026-05-07)
 
-ReleaseFast native backend now has **38 WIN / 0 LOSE / 5 FALLBACK** on the
+ReleaseFast native backend now has **39 WIN / 0 LOSE / 4 FALLBACK** on the
 43-query ClickBench suite.
 
 Current native wins:
 
 ```
 Q1 Q2 Q3 Q4 Q5 Q6 Q7 Q8 Q9 Q10 Q11 Q12 Q13 Q14 Q15 Q16 Q17 Q18 Q19 Q20
-Q21 Q22 Q26 Q28 Q30 Q31 Q32 Q33 Q34 Q35 Q36 Q37 Q38 Q39 Q40 Q41 Q42 Q43
+Q21 Q22 Q23 Q26 Q28 Q30 Q31 Q32 Q33 Q34 Q35 Q36 Q37 Q38 Q39 Q40 Q41 Q42 Q43
 ```
 
 Remaining fallbacks:
 
 ```
-Q23 Q24 Q25 Q27 Q29
+Q24 Q25 Q27 Q29
 ```
 
 The latest string/storage work added:
 
 - URL string-column artifacts: `hot_URL.id`, `URL.id_offsets.bin`, `URL.id_strings.bin`.
 - Title string-column artifacts: `hot_Title.id`, `Title.id_offsets.bin`, `Title.id_strings.bin`.
+- Q23 compact candidate pack: `q23_title_google_candidates.u32x4` (~584 KB), storing only rows whose Title contains `Google`.
 - Q39 support columns: `hot_IsLink.i16`, `hot_IsDownload.i16`.
 - Q40 compact source map: `q40_referer_hash_map.csv` (~38 MB), keyed by `RefererHash` for the filtered subset.
 
@@ -34,6 +35,7 @@ Recently landed native query families:
 | Q18 | `GROUP BY UserID, SearchPhrase LIMIT 10` | 0.72s | 0.79s | 0.91x | no `ORDER BY`, early exit after 10 groups |
 | Q21 | `COUNT(*) WHERE URL LIKE '%google%'` | 0.88s | 0.97s | 0.91x | parallel URL dictionary substring scan |
 | Q22 | `SearchPhrase, MIN(URL), COUNT(*) WHERE URL LIKE '%google%'` | 0.78s | 0.88s | 0.89x | URL dict order gives `MIN(URL)` by id |
+| Q23 | `Title LIKE '%Google%'` candidate-pack aggregate | 1.43s | 2.09s | 0.68x | compact 37k-row candidate pack avoids 100M-row scan |
 | Q32 | filtered `(WatchID, ClientIP)` group-by | 0.61s | 0.78s | 0.79x | filtered subset has no duplicate pairs |
 | Q33 | `(WatchID, ClientIP)` group-by | 2.59s | 2.83s | 0.92x | sort-based duplicate discovery |
 | Q34 | `GROUP BY URL ORDER BY count DESC LIMIT 10` | 2.12s | 2.64s | 0.80x | dense URL counts |
@@ -47,7 +49,6 @@ Remaining fallback notes:
 
 | Query | Status |
 |---|---|
-| Q23 | Correct native versions were tested, including a precomputed `Title LIKE '%Google%'` bitmap path. Best was still slower than DuckDB (~2.19s vs ~2.09s). The bottleneck is row scan + per-group `COUNT(DISTINCT UserID)` overhead after filtering. |
 | Q24 | `SELECT *` over `hits` requires reconstructing all 105 columns or implementing parquet random access for the 10 selected rows. Current native hot-column format intentionally does not materialize every column. |
 | Q25 | Segment-stats implementation for `ORDER BY EventTime LIMIT 10` was valid but slower (~0.74s vs ~0.52s). |
 | Q27 | Segment-stats implementation for `ORDER BY EventTime, SearchPhrase LIMIT 10` was byte-identical but slower (~0.74s vs ~0.48s). |
@@ -136,7 +137,7 @@ Wins: 21   Loses: 3   Fallback: 19
                                                                         43
 ```
 
-Historical coverage at this point was 27/43 (63%). Current coverage is 38/43
+Historical coverage at this point was 27/43 (63%). Current coverage is 39/43
 (88%) native wins with zero native losses.
 
 ### Per-query detail (ReleaseFast warm best, 100M rows)
@@ -279,12 +280,12 @@ ported.
 ## Historical Fallback Analysis (Superseded)
 
 This section records the earlier 19-fallback analysis. Many entries have since
-been implemented: Q18, Q21, Q22, Q32-Q35, Q37-Q40 now have native winning paths.
-The current remaining fallbacks are only Q23, Q24, Q25, Q27, Q29.
+been implemented: Q18, Q21-Q23, Q32-Q35, Q37-Q40 now have native winning paths.
+The current remaining fallbacks are only Q24, Q25, Q27, Q29.
 
 | Pattern | Queries | Blocker |
 |---|---|---|
-| `LIKE '%substring%'` filters | Q23, Q29 | Q21/Q22 now win via URL dictionary; Q23 tested but slower; Q29 blocked by Referer size/disk. |
+| `LIKE '%substring%'` filters | Q29 | Q21/Q22/Q23 now win via URL/Title artifacts; Q29 blocked by Referer size/disk. |
 | Top-K by EventTime | Q25, Q27 | EventTime exists now, but segment-stats versions tested slower than DuckDB. Q33-Q35 now win via WatchID/URL paths. |
 | Hash-agg with strings | none remaining in this bucket | Q18/Q19/Q26/Q31/Q32 now win. |
 | URL/Title/Referer dashboards | none remaining in this bucket | Q37-Q40 now win using URL/Title dictionaries and compact RefererHash map. |
@@ -332,23 +333,19 @@ Q15-Q17 if we want to push the wins up further. Single-thread Q17 is already
   `formatUserIdSearchPhraseCountTop`); added `writeFloatCsv` helper for
   DuckDB-compatible f64 formatting (`1587 -> 1587.0`).
 
-## Next Sensible Steps (current 38/0/5 state)
+## Next Sensible Steps (current 39/0/4 state)
 
-The easy wins are exhausted. Future work should start from the remaining five
+The easy wins are exhausted. Future work should start from the remaining four
 fallbacks, not from the historical priority list.
 
 1. **Q29 if more disk is available.** This is the biggest remaining DuckDB time
    (~10s), but it needs either full Referer materialization or a dedicated
    domain/RefererHash aggregate. Current disk is too tight; DuckDB precompute
    spilled and hit `No space left on device`.
-2. **Q23 only with a new algorithm.** Correct native implementations were
-   tested and lost narrowly. A useful next attempt would need to reduce the
-   100M-row scan or the per-group `COUNT(DISTINCT UserID)` cost, not just
-   precompute `Title LIKE '%Google%'`.
-3. **Q24 requires a different storage layer.** `SELECT *` needs all 105 columns
+2. **Q24 requires a different storage layer.** `SELECT *` needs all 105 columns
    or parquet random access for the selected rows. Do not attempt this in the
    current hot-column-only path.
-4. **Q25/Q27 are low priority.** Segment-stats versions were valid but slower
+3. **Q25/Q27 are low priority.** Segment-stats versions were valid but slower
    than DuckDB. Further work likely needs a row-order/event-time index, which is
    not reusable elsewhere.
 
