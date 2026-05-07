@@ -72,11 +72,21 @@ pub fn build(b: *std.Build) void {
     });
     const hashmap_test_cmd = b.addRunArtifact(hashmap_tests);
 
+    const planner_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/planner.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const planner_test_cmd = b.addRunArtifact(planner_tests);
+
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&test_cmd.step);
     test_step.dependOn(&simd_test_cmd.step);
     test_step.dependOn(&parallel_test_cmd.step);
     test_step.dependOn(&hashmap_test_cmd.step);
+    test_step.dependOn(&planner_test_cmd.step);
 
     const bench_simd = b.addExecutable(.{
         .name = "bench-simd",

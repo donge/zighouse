@@ -2,8 +2,11 @@ const std = @import("std");
 const agg = @import("agg.zig");
 const chdb = @import("chdb.zig");
 const duckdb = @import("duckdb.zig");
+const executor = @import("executor.zig");
 const simd = @import("simd.zig");
 const io_map = @import("io_map.zig");
+const planner = @import("planner.zig");
+const reader = @import("reader.zig");
 const storage = @import("storage.zig");
 const hashmap = @import("hashmap.zig");
 const parallel = @import("parallel.zig");
@@ -35,6 +38,13 @@ pub const Native = struct {
     }
 
     pub fn query(self: *Native, sql: []const u8) ![]u8 {
+        if (planner.plan(sql)) |physical| {
+            var store_reader = reader.StoreReader.init(self.allocator, self.io, self.data_dir);
+            if (executor.execute(&store_reader, physical) catch |err| switch (err) {
+                error.FileNotFound => null,
+                else => return err,
+            }) |output| return output;
+        }
         if (isCountStar(sql)) {
             const parquet_path = try storage.readImportSource(self.io, self.allocator, self.data_dir);
             defer self.allocator.free(parquet_path);
