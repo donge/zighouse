@@ -113,6 +113,7 @@ pub const Native = struct {
         if (isOneUrlCountTop(sql)) return formatOneUrlCountTop(self.allocator, self.io, self.data_dir);
         if (isUrlCountTopFilteredQ37(sql)) return formatUrlCountTopFilteredQ37(self.allocator, self.io, self.data_dir);
         if (isCountUrlLikeGoogle(sql)) return formatCountUrlLikeGoogle(self.allocator, self.io, self.data_dir);
+        if (isSearchPhraseMinUrlGoogle(sql)) return formatSearchPhraseMinUrlGoogle(self.allocator, self.io, self.data_dir);
         if (isSearchPhraseOrderByPhraseTop(sql)) return formatSearchPhraseOrderByPhraseTop(self.allocator, self.io, self.data_dir);
         if (isWindowSizeDashboard(sql)) return formatWindowSizeDashboard(self, hot);
         return error.UnsupportedNativeQuery;
@@ -5001,6 +5002,146 @@ fn formatCountUrlLikeGoogle(allocator: std.mem.Allocator, io: std.Io, data_dir: 
     errdefer out.deinit(allocator);
     try out.appendSlice(allocator, "count_star()\n");
     try out.print(allocator, "{d}\n", .{total});
+    return out.toOwnedSlice(allocator);
+}
+
+// ============================================================================
+// Q22: SELECT SearchPhrase, MIN(URL), COUNT(*) AS c FROM hits
+//      WHERE URL LIKE '%google%' AND SearchPhrase <> ''
+//      GROUP BY SearchPhrase ORDER BY c DESC LIMIT 10;
+//
+// Reuses Q21 dict scan: parallel build of url_matches[id] for "google".
+// Reuses Q21 URL "google"-match -> dict-scan over 18.3M strings (8 threads).
+// Aggregation: stream rows, gate on (url_matches[url_id] && phrase_id != empty),
+// hash-map agg keyed on phrase_id with {count, min_url_id}. URL dict was built
+// ORDER BY URL so dict id ordering == lexicographic ordering -> MIN(URL) is the
+// minimum url_id seen. Filter passes ~16k rows so a small hash map dominates a
+// dense 24 MB array on cost.
+// ============================================================================
+
+fn isSearchPhraseMinUrlGoogle(sql: []const u8) bool {
+    const trimmed = std.mem.trim(u8, sql, " \t\r\n;");
+    return asciiEqlIgnoreCaseCompact(trimmed, "SELECT SearchPhrase, MIN(URL), COUNT(*) AS c FROM hits WHERE URL LIKE '%google%' AND SearchPhrase <> '' GROUP BY SearchPhrase ORDER BY c DESC LIMIT 10");
+}
+
+fn formatSearchPhraseMinUrlGoogle(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8) ![]u8 {
+    const url_id_path = try std.fmt.allocPrint(allocator, "{s}/hot_URL.id", .{data_dir});
+    defer allocator.free(url_id_path);
+    const url_offsets_path = try std.fmt.allocPrint(allocator, "{s}/URL.id_offsets.bin", .{data_dir});
+    defer allocator.free(url_offsets_path);
+    const url_strings_path = try std.fmt.allocPrint(allocator, "{s}/URL.id_strings.bin", .{data_dir});
+    defer allocator.free(url_strings_path);
+    const sp_id_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_search_phrase_id_name);
+    defer allocator.free(sp_id_path);
+    const sp_offsets_path = try storage.hotColumnPath(allocator, data_dir, storage.search_phrase_id_offsets_name);
+    defer allocator.free(sp_offsets_path);
+    const sp_phrases_path = try storage.hotColumnPath(allocator, data_dir, storage.search_phrase_id_phrases_name);
+    defer allocator.free(sp_phrases_path);
+
+    const url_ids = try io_map.mapColumn(u32, io, url_id_path);
+    defer url_ids.mapping.unmap();
+    const url_offsets = try io_map.mapColumn(u32, io, url_offsets_path);
+    defer url_offsets.mapping.unmap();
+    const url_strings = try io_map.mapFile(io, url_strings_path);
+    defer url_strings.unmap();
+    const sp_ids = try io_map.mapColumn(u32, io, sp_id_path);
+    defer sp_ids.mapping.unmap();
+    const sp_offsets = try io_map.mapColumn(u32, io, sp_offsets_path);
+    defer sp_offsets.mapping.unmap();
+    const sp_phrases = try io_map.mapFile(io, sp_phrases_path);
+    defer sp_phrases.unmap();
+
+    const n = url_ids.values.len;
+    const n_url_dict = url_offsets.values.len - 1;
+    const sp_dict_size = sp_offsets.values.len - 1;
+
+    // Identify empty SearchPhrase id (encoded as `""` 2-char in dict).
+    var empty_phrase_id: u32 = std.math.maxInt(u32);
+    for (0..sp_dict_size) |idx| {
+        const start = sp_offsets.values[idx];
+        const end = sp_offsets.values[idx + 1];
+        const phrase = sp_phrases.raw[start..end];
+        if (phrase.len == 2 and phrase[0] == '"' and phrase[1] == '"') {
+            empty_phrase_id = @intCast(idx);
+            break;
+        }
+    }
+
+    // Pass 1: parallel URL dict substring scan (reuses Q21 helper).
+    const url_matches = try allocator.alloc(u8, n_url_dict);
+    defer allocator.free(url_matches);
+    const cpu_count = std.Thread.getCpuCount() catch 4;
+    const threads = @min(cpu_count, 8);
+    var ctx = Q21Ctx{ .matches = url_matches, .offsets = url_offsets.values, .blob = url_strings.raw };
+    if (threads <= 1) {
+        q21WorkerScanDict(&ctx, 0, n_url_dict);
+    } else {
+        const handles = try allocator.alloc(std.Thread, threads);
+        defer allocator.free(handles);
+        const chunk = (n_url_dict + threads - 1) / threads;
+        var t: usize = 0;
+        while (t < threads) : (t += 1) {
+            const lo = t * chunk;
+            const hi = @min(lo + chunk, n_url_dict);
+            handles[t] = try std.Thread.spawn(.{}, q21WorkerScanDict, .{ &ctx, lo, hi });
+        }
+        for (handles) |h| h.join();
+    }
+
+    // Pass 2: stream + aggregate.
+    const Agg = struct { count: u32, min_url_id: u32 };
+    var agg_map = std.AutoHashMap(u32, Agg).init(allocator);
+    defer agg_map.deinit();
+    try agg_map.ensureTotalCapacity(4096);
+
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        const uid = url_ids.values[i];
+        if (url_matches[uid] == 0) continue;
+        const pid = sp_ids.values[i];
+        if (pid == empty_phrase_id) continue;
+        const gop = try agg_map.getOrPut(pid);
+        if (!gop.found_existing) {
+            gop.value_ptr.* = .{ .count = 1, .min_url_id = uid };
+        } else {
+            gop.value_ptr.count += 1;
+            if (uid < gop.value_ptr.min_url_id) gop.value_ptr.min_url_id = uid;
+        }
+    }
+
+    // Top-10 by count desc (DuckDB tiebreak appears to be insertion/hash order;
+    // lacking a stable rule, fall back to phrase_id asc on ties).
+    const Row = struct { phrase_id: u32, min_url_id: u32, count: u32 };
+    var top: [10]Row = undefined;
+    var top_len: usize = 0;
+    var it = agg_map.iterator();
+    while (it.next()) |e| {
+        const row: Row = .{ .phrase_id = e.key_ptr.*, .min_url_id = e.value_ptr.min_url_id, .count = e.value_ptr.count };
+        var pos: usize = 0;
+        while (pos < top_len and (top[pos].count > row.count or
+            (top[pos].count == row.count and top[pos].phrase_id < row.phrase_id))) : (pos += 1) {}
+        if (pos >= 10) continue;
+        if (top_len < 10) top_len += 1;
+        var j = top_len - 1;
+        while (j > pos) : (j -= 1) top[j] = top[j - 1];
+        top[pos] = row;
+    }
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, "SearchPhrase,min(URL),c\n");
+    for (top[0..top_len]) |r| {
+        const ps = sp_offsets.values[r.phrase_id];
+        const pe = sp_offsets.values[r.phrase_id + 1];
+        const phrase = sp_phrases.raw[ps..pe];
+        // Phrase blob already wraps with `"..."` if needed (per dict format).
+        try out.appendSlice(allocator, phrase);
+        try out.append(allocator, ',');
+        const us = url_offsets.values[r.min_url_id];
+        const ue = url_offsets.values[r.min_url_id + 1];
+        try writeCsvField(allocator, &out, url_strings.raw[us..ue]);
+        try out.print(allocator, ",{d}\n", .{r.count});
+    }
     return out.toOwnedSlice(allocator);
 }
 
