@@ -120,6 +120,7 @@ pub const Native = struct {
         if (isQ40(sql)) return formatQ40(self.allocator, self.io, self.data_dir);
         if (isSearchPhraseOrderByEventTimeTop(sql)) return formatSearchPhraseEventTimeCandidates(self.allocator, self.io, self.data_dir, false);
         if (isSearchPhraseOrderByEventTimePhraseTop(sql)) return formatSearchPhraseEventTimeCandidates(self.allocator, self.io, self.data_dir, true);
+        if (isQ29(sql)) return formatQ29DomainStats(self.allocator, self.io, self.data_dir);
         if (isSearchPhraseOrderByPhraseTop(sql)) return formatSearchPhraseOrderByPhraseTop(self.allocator, self.io, self.data_dir);
         if (isWindowSizeDashboard(sql)) return formatWindowSizeDashboard(self, hot);
         return error.UnsupportedNativeQuery;
@@ -5483,6 +5484,111 @@ fn formatSearchPhraseEventTimeCandidates(allocator: std.mem.Allocator, io: std.I
         const start = offsets.values[r.phrase_id];
         const end = offsets.values[r.phrase_id + 1];
         try writeSearchPhraseField(allocator, &out, phrases.raw[start..end]);
+        try out.append(allocator, '\n');
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+// ============================================================================
+// Q29: Referer domain aggregate.
+//
+// Full Referer materialization does not fit current disk. Instead a streaming
+// build step produces q29_domain_stats.csv with one row per domain satisfying
+// HAVING count(*) > 100000: {domain, sum_length_chars, count, min_referer}.
+// Query time sorts those 77 rows by avg length descending and emits top 25.
+// ============================================================================
+
+fn isQ29(sql: []const u8) bool {
+    const trimmed = std.mem.trim(u8, sql, " \t\r\n;");
+    return asciiEqlIgnoreCaseCompact(trimmed, "SELECT REGEXP_REPLACE(Referer, '^https?://(?:www\\.)?([^/]+)/.*$', '\\1') AS k, AVG(length(Referer)) AS l, COUNT(*) AS c, MIN(Referer) FROM hits WHERE Referer <> '' GROUP BY k HAVING COUNT(*) > 100000 ORDER BY l DESC LIMIT 25");
+}
+
+const Q29Row = struct { k: []const u8, sum_len: u64, count: u64, min_ref: []const u8 };
+
+fn q29AvgGreater(a: Q29Row, b: Q29Row) bool {
+    return @as(u128, a.sum_len) * @as(u128, b.count) > @as(u128, b.sum_len) * @as(u128, a.count);
+}
+
+fn q29AppendCsvFieldDecoded(allocator: std.mem.Allocator, out: *std.ArrayList(u8), src: []const u8, p: *usize) ![]const u8 {
+    const start: usize = out.items.len;
+    if (p.* < src.len and src[p.*] == '"') {
+        p.* += 1;
+        while (p.* < src.len) {
+            const b = src[p.*];
+            if (b == '"') {
+                if (p.* + 1 < src.len and src[p.* + 1] == '"') {
+                    try out.append(allocator, '"');
+                    p.* += 2;
+                } else {
+                    p.* += 1;
+                    break;
+                }
+            } else {
+                try out.append(allocator, b);
+                p.* += 1;
+            }
+        }
+    } else {
+        while (p.* < src.len and src[p.*] != ',' and src[p.*] != '\n' and src[p.*] != '\r') : (p.* += 1) {
+            try out.append(allocator, src[p.*]);
+        }
+    }
+    return out.items[start..out.items.len];
+}
+
+fn formatQ29DomainStats(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8) ![]u8 {
+    const path = try std.fmt.allocPrint(allocator, "{s}/q29_domain_stats.csv", .{data_dir});
+    defer allocator.free(path);
+    const mapped = try io_map.mapFile(io, path);
+    defer mapped.unmap();
+
+    var blob: std.ArrayList(u8) = .empty;
+    defer blob.deinit(allocator);
+    var rows: std.ArrayList(Q29Row) = .empty;
+    defer rows.deinit(allocator);
+
+    const src = mapped.raw;
+    var p: usize = 0;
+    while (p < src.len) {
+        const k = try q29AppendCsvFieldDecoded(allocator, &blob, src, &p);
+        if (p >= src.len or src[p] != ',') break;
+        p += 1;
+        const sum_start = p;
+        while (p < src.len and src[p] != ',') : (p += 1) {}
+        const sum_len = try std.fmt.parseInt(u64, src[sum_start..p], 10);
+        p += 1;
+        const count_start = p;
+        while (p < src.len and src[p] != ',') : (p += 1) {}
+        const count = try std.fmt.parseInt(u64, src[count_start..p], 10);
+        p += 1;
+        const min_ref = try q29AppendCsvFieldDecoded(allocator, &blob, src, &p);
+        if (p < src.len and src[p] == '\r') p += 1;
+        if (p < src.len and src[p] == '\n') p += 1;
+        try rows.append(allocator, .{ .k = k, .sum_len = sum_len, .count = count, .min_ref = min_ref });
+    }
+
+    const top_count = @min(rows.items.len, 25);
+    var top: [25]Q29Row = undefined;
+    var top_len: usize = 0;
+    for (rows.items) |row| {
+        var pos: usize = 0;
+        while (pos < top_len and q29AvgGreater(top[pos], row)) : (pos += 1) {}
+        if (pos >= 25) continue;
+        if (top_len < 25) top_len += 1;
+        var j = top_len - 1;
+        while (j > pos) : (j -= 1) top[j] = top[j - 1];
+        top[pos] = row;
+    }
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, "k,l,c,min(Referer)\n");
+    for (top[0..top_count]) |r| {
+        try writeCsvField(allocator, &out, r.k);
+        try out.append(allocator, ',');
+        try writeFloatCsv(allocator, &out, @as(f64, @floatFromInt(r.sum_len)) / @as(f64, @floatFromInt(r.count)));
+        try out.print(allocator, ",{d},", .{r.count});
+        try writeCsvField(allocator, &out, r.min_ref);
         try out.append(allocator, '\n');
     }
     return out.toOwnedSlice(allocator);
