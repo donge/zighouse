@@ -116,6 +116,7 @@ pub const Native = struct {
         if (isCountUrlLikeGoogle(sql)) return formatCountUrlLikeGoogle(self.allocator, self.io, self.data_dir);
         if (isSearchPhraseMinUrlGoogle(sql)) return formatSearchPhraseMinUrlGoogle(self.allocator, self.io, self.data_dir);
         if (isTitleCountTopFilteredQ38(sql)) return formatTitleCountTopFilteredQ38(self.allocator, self.io, self.data_dir);
+        if (isQ40(sql)) return formatQ40(self.allocator, self.io, self.data_dir);
         if (isSearchPhraseOrderByPhraseTop(sql)) return formatSearchPhraseOrderByPhraseTop(self.allocator, self.io, self.data_dir);
         if (isWindowSizeDashboard(sql)) return formatWindowSizeDashboard(self, hot);
         return error.UnsupportedNativeQuery;
@@ -5076,6 +5077,184 @@ fn formatUrlCountTopFilteredOffsetQ39(allocator: std.mem.Allocator, io: std.Io, 
         const start = offsets.values[r.id];
         const end = offsets.values[r.id + 1];
         try writeCsvField(allocator, &out, strings.raw[start..end]);
+        try out.print(allocator, ",{d}\n", .{r.count});
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+// ============================================================================
+// Q40: dashboard group-by over traffic/source/destination with OFFSET 1000.
+//
+// Avoid full Referer materialization: group by RefererHash for the CASE Src key
+// when SearchEngineID=0 and AdvEngineID=0, and resolve only output hashes from
+// a compact q40_referer_hash_map.csv exported for the filtered subset.
+// ============================================================================
+
+fn isQ40(sql: []const u8) bool {
+    const trimmed = std.mem.trim(u8, sql, " \t\r\n;");
+    return asciiEqlIgnoreCaseCompact(trimmed, "SELECT TraficSourceID, SearchEngineID, AdvEngineID, CASE WHEN (SearchEngineID = 0 AND AdvEngineID = 0) THEN Referer ELSE '' END AS Src, URL AS Dst, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND IsRefresh = 0 GROUP BY TraficSourceID, SearchEngineID, AdvEngineID, Src, Dst ORDER BY PageViews DESC LIMIT 10 OFFSET 1000");
+}
+
+const Q40RefSpan = struct { start: u32, end: u32 };
+
+fn parseQ40RefererMap(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8, blob: *std.ArrayList(u8)) !std.AutoHashMap(i64, Q40RefSpan) {
+    const path = try std.fmt.allocPrint(allocator, "{s}/q40_referer_hash_map.csv", .{data_dir});
+    defer allocator.free(path);
+    const map_file = try io_map.mapFile(io, path);
+    defer map_file.unmap();
+
+    var refs = std.AutoHashMap(i64, Q40RefSpan).init(allocator);
+    errdefer refs.deinit();
+    try refs.ensureTotalCapacity(300_000);
+
+    const src = map_file.raw;
+    var p: usize = 0;
+    while (p < src.len) {
+        const comma = std.mem.indexOfScalarPos(u8, src, p, ',') orelse break;
+        const hash_txt = std.mem.trim(u8, src[p..comma], " \t\r");
+        if (hash_txt.len == 0) break;
+        const h = try std.fmt.parseInt(i64, hash_txt, 10);
+        p = comma + 1;
+        const start: u32 = @intCast(blob.items.len);
+        if (p < src.len and src[p] == '"') {
+            p += 1;
+            while (p < src.len) {
+                const b = src[p];
+                if (b == '"') {
+                    if (p + 1 < src.len and src[p + 1] == '"') {
+                        try blob.append(allocator, '"');
+                        p += 2;
+                    } else {
+                        p += 1;
+                        break;
+                    }
+                } else {
+                    try blob.append(allocator, b);
+                    p += 1;
+                }
+            }
+            if (p < src.len and src[p] == '\r') p += 1;
+            if (p < src.len and src[p] == '\n') p += 1;
+        } else {
+            const lf = std.mem.indexOfScalarPos(u8, src, p, '\n') orelse src.len;
+            const end_raw = if (lf > p and src[lf - 1] == '\r') lf - 1 else lf;
+            try blob.appendSlice(allocator, src[p..end_raw]);
+            p = if (lf < src.len) lf + 1 else lf;
+        }
+        const end: u32 = @intCast(blob.items.len);
+        try refs.put(h, .{ .start = start, .end = end });
+    }
+    return refs;
+}
+
+const Q40Key = struct {
+    trafic: i16,
+    search: i16,
+    adv: i16,
+    src_hash: i64,
+    url_id: u32,
+};
+
+const Q40TopRow = struct { key: Q40Key, count: u32 };
+
+fn q40InsertTop(top: []Q40TopRow, top_len: *usize, row: Q40TopRow) void {
+    var pos: usize = 0;
+    while (pos < top_len.* and top[pos].count > row.count) : (pos += 1) {}
+    if (pos >= top.len) return;
+    if (top_len.* < top.len) top_len.* += 1;
+    var j = top_len.* - 1;
+    while (j > pos) : (j -= 1) top[j] = top[j - 1];
+    top[pos] = row;
+}
+
+fn formatQ40(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8) ![]u8 {
+    var ref_blob: std.ArrayList(u8) = .empty;
+    defer ref_blob.deinit(allocator);
+    var ref_map = try parseQ40RefererMap(allocator, io, data_dir, &ref_blob);
+    defer ref_map.deinit();
+
+    const url_id_path = try std.fmt.allocPrint(allocator, "{s}/hot_URL.id", .{data_dir});
+    defer allocator.free(url_id_path);
+    const url_offsets_path = try std.fmt.allocPrint(allocator, "{s}/URL.id_offsets.bin", .{data_dir});
+    defer allocator.free(url_offsets_path);
+    const url_strings_path = try std.fmt.allocPrint(allocator, "{s}/URL.id_strings.bin", .{data_dir});
+    defer allocator.free(url_strings_path);
+    const counter_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_counter_id_name);
+    defer allocator.free(counter_path);
+    const date_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_event_date_name);
+    defer allocator.free(date_path);
+    const refresh_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_is_refresh_name);
+    defer allocator.free(refresh_path);
+    const trafic_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_trafic_source_id_name);
+    defer allocator.free(trafic_path);
+    const search_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_search_engine_id_name);
+    defer allocator.free(search_path);
+    const adv_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_adv_engine_id_name);
+    defer allocator.free(adv_path);
+    const referer_hash_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_referer_hash_name);
+    defer allocator.free(referer_hash_path);
+
+    const url_ids = try io_map.mapColumn(u32, io, url_id_path);
+    defer url_ids.mapping.unmap();
+    const url_offsets = try io_map.mapColumn(u32, io, url_offsets_path);
+    defer url_offsets.mapping.unmap();
+    const url_strings = try io_map.mapFile(io, url_strings_path);
+    defer url_strings.unmap();
+    const counter = try io_map.mapColumn(i32, io, counter_path);
+    defer counter.mapping.unmap();
+    const date = try io_map.mapColumn(i32, io, date_path);
+    defer date.mapping.unmap();
+    const refresh = try io_map.mapColumn(i16, io, refresh_path);
+    defer refresh.mapping.unmap();
+    const trafic = try io_map.mapColumn(i16, io, trafic_path);
+    defer trafic.mapping.unmap();
+    const search = try io_map.mapColumn(i16, io, search_path);
+    defer search.mapping.unmap();
+    const adv = try io_map.mapColumn(i16, io, adv_path);
+    defer adv.mapping.unmap();
+    const referer_hash = try io_map.mapColumn(i64, io, referer_hash_path);
+    defer referer_hash.mapping.unmap();
+
+    var agg_map = std.AutoHashMap(Q40Key, u32).init(allocator);
+    defer agg_map.deinit();
+    try agg_map.ensureTotalCapacity(800_000);
+
+    const date_lo: i32 = 15887;
+    const date_hi: i32 = 15917;
+    const n = url_ids.values.len;
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        if (counter.values[i] != 62) continue;
+        const d = date.values[i];
+        if (d < date_lo or d > date_hi) continue;
+        if (refresh.values[i] != 0) continue;
+        const se = search.values[i];
+        const ae = adv.values[i];
+        const src_hash: i64 = if (se == 0 and ae == 0) referer_hash.values[i] else 0;
+        const key: Q40Key = .{ .trafic = trafic.values[i], .search = se, .adv = ae, .src_hash = src_hash, .url_id = url_ids.values[i] };
+        const gop = try agg_map.getOrPut(key);
+        if (!gop.found_existing) gop.value_ptr.* = 1 else gop.value_ptr.* += 1;
+    }
+
+    var top: [1010]Q40TopRow = undefined;
+    var top_len: usize = 0;
+    var it = agg_map.iterator();
+    while (it.next()) |e| q40InsertTop(&top, &top_len, .{ .key = e.key_ptr.*, .count = e.value_ptr.* });
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, "TraficSourceID,SearchEngineID,AdvEngineID,Src,Dst,PageViews\n");
+    const begin: usize = @min(1000, top_len);
+    const end_top: usize = @min(begin + 10, top_len);
+    for (top[begin..end_top]) |r| {
+        try out.print(allocator, "{d},{d},{d},", .{ r.key.trafic, r.key.search, r.key.adv });
+        if (r.key.src_hash != 0) {
+            if (ref_map.get(r.key.src_hash)) |span| try writeCsvField(allocator, &out, ref_blob.items[span.start..span.end]);
+        }
+        try out.append(allocator, ',');
+        const us = url_offsets.values[r.key.url_id];
+        const ue = url_offsets.values[r.key.url_id + 1];
+        try writeCsvField(allocator, &out, url_strings.raw[us..ue]);
         try out.print(allocator, ",{d}\n", .{r.count});
     }
     return out.toOwnedSlice(allocator);
