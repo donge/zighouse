@@ -7,6 +7,7 @@ pub const ArtifactCsvPlan = struct {
 
 pub const PhysicalPlan = union(enum) {
     artifact_csv: ArtifactCsvPlan,
+    csv_count: void,
 };
 
 pub fn plan(sql: []const u8) ?PhysicalPlan {
@@ -15,6 +16,11 @@ pub fn plan(sql: []const u8) ?PhysicalPlan {
     if (isQ29(sql)) return artifact("q29_result.csv", 64 * 1024);
     if (isQ37(sql)) return artifact("q37_result.csv", 64 * 1024);
     if (isQ40(sql)) return artifact("q40_result.csv", 256 * 1024);
+    return null;
+}
+
+pub fn planCsv(sql: []const u8) ?PhysicalPlan {
+    if (normalizedEql(sql, "SELECT COUNT(*) FROM csv")) return .{ .csv_count = {} };
     return null;
 }
 
@@ -64,4 +70,9 @@ fn isQ40(sql: []const u8) bool {
 test "plans artifact queries" {
     try std.testing.expect(plan("SELECT COUNT(*) FROM hits WHERE URL LIKE '%google%'") != null);
     try std.testing.expect(plan("SELECT * FROM hits WHERE URL LIKE '%google%' ORDER BY EventTime LIMIT 10") != null);
+}
+
+test "plans csv count" {
+    try std.testing.expect(planCsv("SELECT COUNT(*) FROM csv") != null);
+    try std.testing.expect(planCsv("select   count(*)   from   csv;") != null);
 }

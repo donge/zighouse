@@ -23,6 +23,7 @@ const usage =
     \\  zighouse build-q29-domain-stats <data_dir>
     \\  zighouse build-q40-result <data_dir>
     \\  zighouse build-q21-count-google <data_dir>
+    \\  zighouse query-csv <csv_path> <sql>
     \\  zighouse query <data_dir> <sql>
     \\  zighouse native-status <data_dir>
     \\  zighouse bench <data_dir> <queries.sql>
@@ -192,6 +193,14 @@ fn runCommand(init: std.process.Init, allocator: std.mem.Allocator, args: *std.p
         var selected = backend.Backend.init(allocator, init.io, data_dir, options);
         defer selected.deinit();
         const output = try selected.query(sql);
+        defer allocator.free(output);
+        try writeOut(init.io, output);
+    } else if (std.mem.eql(u8, command, "query-csv")) {
+        const csv_path = args.next() orelse return error.MissingCsvPath;
+        const sql = args.next() orelse return error.MissingSql;
+        const physical = @import("planner.zig").planCsv(sql) orelse return error.UnsupportedCsvQuery;
+        var csv_reader = @import("reader.zig").CsvReader.init(allocator, init.io, csv_path);
+        const output = try @import("executor.zig").executeCsv(allocator, &csv_reader, physical);
         defer allocator.free(output);
         try writeOut(init.io, output);
     } else if (std.mem.eql(u8, command, "native-status")) {
