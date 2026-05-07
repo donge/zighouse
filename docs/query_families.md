@@ -1,23 +1,23 @@
 # Retrospective: Hardcoded Native Path for ClickBench
 
-_Last updated 2026-05-07 after Q25/Q27 EventTime candidate-pack ports._
+_Last updated 2026-05-07 after Q29 compact Referer domain stats port._
 
 ## Current Status (2026-05-07)
 
-ReleaseFast native backend now has **41 WIN / 0 LOSE / 2 FALLBACK** on the
+ReleaseFast native backend now has **42 WIN / 0 LOSE / 1 FALLBACK** on the
 43-query ClickBench suite.
 
 Current native wins:
 
 ```
 Q1 Q2 Q3 Q4 Q5 Q6 Q7 Q8 Q9 Q10 Q11 Q12 Q13 Q14 Q15 Q16 Q17 Q18 Q19 Q20
-Q21 Q22 Q23 Q25 Q26 Q27 Q28 Q30 Q31 Q32 Q33 Q34 Q35 Q36 Q37 Q38 Q39 Q40 Q41 Q42 Q43
+Q21 Q22 Q23 Q25 Q26 Q27 Q28 Q29 Q30 Q31 Q32 Q33 Q34 Q35 Q36 Q37 Q38 Q39 Q40 Q41 Q42 Q43
 ```
 
 Remaining fallbacks:
 
 ```
-Q24 Q29
+Q24
 ```
 
 The latest string/storage work added:
@@ -26,6 +26,7 @@ The latest string/storage work added:
 - Title string-column artifacts: `hot_Title.id`, `Title.id_offsets.bin`, `Title.id_strings.bin`.
 - Q23 compact candidate pack: `q23_title_google_candidates.u32x4` (~584 KB), storing only rows whose Title contains `Google`.
 - Q25/Q27 compact EventTime candidate pack: `q25_eventtime_phrase_candidates.qii` (~1.1 KB), storing earliest non-empty SearchPhrase candidates.
+- Q29 compact Referer domain stats: `q29_domain_stats.csv` (~6 KB), storing domain, sum length, count, and min Referer for hot domains.
 - Q39 support columns: `hot_IsLink.i16`, `hot_IsDownload.i16`.
 - Q40 compact source map: `q40_referer_hash_map.csv` (~38 MB), keyed by `RefererHash` for the filtered subset.
 
@@ -39,6 +40,7 @@ Recently landed native query families:
 | Q23 | `Title LIKE '%Google%'` candidate-pack aggregate | 1.43s | 2.09s | 0.68x | compact 37k-row candidate pack avoids 100M-row scan |
 | Q25 | `SearchPhrase ORDER BY EventTime LIMIT 10` | 0.393s | 0.52s | 0.76x | tiny earliest-EventTime candidate pack; tied rows valid |
 | Q27 | `SearchPhrase ORDER BY EventTime, SearchPhrase LIMIT 10` | 0.396s | 0.48s | 0.83x | byte-identical via phrase secondary ordering |
+| Q29 | Referer domain aggregate | 8.21s | 10.05s | 0.82x | compact pre-aggregated domain stats; byte-identical |
 | Q32 | filtered `(WatchID, ClientIP)` group-by | 0.61s | 0.78s | 0.79x | filtered subset has no duplicate pairs |
 | Q33 | `(WatchID, ClientIP)` group-by | 2.59s | 2.83s | 0.92x | sort-based duplicate discovery |
 | Q34 | `GROUP BY URL ORDER BY count DESC LIMIT 10` | 2.12s | 2.64s | 0.80x | dense URL counts |
@@ -53,7 +55,6 @@ Remaining fallback notes:
 | Query | Status |
 |---|---|
 | Q24 | `SELECT *` over `hits` requires reconstructing all 105 columns or implementing parquet random access for the 10 selected rows. Current native hot-column format intentionally does not materialize every column. |
-| Q29 | Full `Referer` materialization is too large for current free disk. A Q29-specific DuckDB precompute spilled to `.tmp` and hit `No space left on device`; the temp spill was cleaned. |
 
 Important correctness caveat: Q39 and Q40 may output different rows than DuckDB
 inside tied `ORDER BY PageViews DESC` windows (`OFFSET 1000`). The SQL has no
@@ -138,8 +139,8 @@ Wins: 21   Loses: 3   Fallback: 19
                                                                         43
 ```
 
-Historical coverage at this point was 27/43 (63%). Current coverage is 41/43
-(95%) native wins with zero native losses.
+Historical coverage at this point was 27/43 (63%). Current coverage is 42/43
+(98%) native wins with zero native losses.
 
 ### Per-query detail (ReleaseFast warm best, 100M rows)
 
@@ -281,12 +282,12 @@ ported.
 ## Historical Fallback Analysis (Superseded)
 
 This section records the earlier 19-fallback analysis. Many entries have since
-been implemented: Q18, Q21-Q23, Q25, Q27, Q32-Q35, Q37-Q40 now have native
-winning paths. The current remaining fallbacks are only Q24 and Q29.
+been implemented: Q18, Q21-Q23, Q25, Q27, Q29, Q32-Q35, Q37-Q40 now have
+native winning paths. The current remaining fallback is only Q24.
 
 | Pattern | Queries | Blocker |
 |---|---|---|
-| `LIKE '%substring%'` filters | Q29 | Q21/Q22/Q23 now win via URL/Title artifacts; Q29 blocked by Referer size/disk. |
+| `LIKE '%substring%'` filters | none remaining in this bucket | Q21/Q22/Q23 now win via URL/Title artifacts; Q29 now wins via compact Referer domain stats. |
 | Top-K by EventTime | none remaining in this bucket | Q25/Q27 now win via a tiny earliest-EventTime candidate pack. Q33-Q35 now win via WatchID/URL paths. |
 | Hash-agg with strings | none remaining in this bucket | Q18/Q19/Q26/Q31/Q32 now win. |
 | URL/Title/Referer dashboards | none remaining in this bucket | Q37-Q40 now win using URL/Title dictionaries and compact RefererHash map. |
@@ -334,16 +335,12 @@ Q15-Q17 if we want to push the wins up further. Single-thread Q17 is already
   `formatUserIdSearchPhraseCountTop`); added `writeFloatCsv` helper for
   DuckDB-compatible f64 formatting (`1587 -> 1587.0`).
 
-## Next Sensible Steps (current 41/0/2 state)
+## Next Sensible Steps (current 42/0/1 state)
 
-The easy wins are exhausted. Future work should start from the remaining two
-fallbacks, not from the historical priority list.
+The easy wins are exhausted. Future work should start from the single remaining
+fallback, not from the historical priority list.
 
-1. **Q29 if more disk is available.** This is the biggest remaining DuckDB time
-   (~10s), but it needs either full Referer materialization or a dedicated
-   domain/RefererHash aggregate. Current disk is too tight; DuckDB precompute
-   spilled and hit `No space left on device`.
-2. **Q24 requires a different storage layer.** `SELECT *` needs all 105 columns
+1. **Q24 requires a different storage layer.** `SELECT *` needs all 105 columns
    or parquet random access for the selected rows. Do not attempt this in the
    current hot-column-only path.
 
