@@ -5,6 +5,21 @@ the native executor design target._
 
 ## Current Status (2026-05-07)
 
+Update 2026-05-09: the optimized DuckDB-vector Parquet importer now defaults to
+the `clickbench-hot-minimal` profile without import-time Q24/Q29/Q40 result
+artifacts. Those queries fall back to the source Parquet when native hot-store
+artifacts are absent. Set `ZIGHOUSE_IMPORT_TINY_CACHES=1` (or
+`ZIGHOUSE_REPORT_FAST=1` for `scripts/clickbench-report.sh`) to reproduce the
+older fast-cache ClickBench mode. This keeps the default path closer to a
+general database while preserving an explicit experimental submission profile.
+
+Reusable executor pieces now being extracted from the specialized kernels:
+
+- `agg.insertTop`: generic fixed-capacity ordered TopK insertion.
+- `DenseCountRow` helpers in `native.zig`: shared dense-id count + TopK shape
+  used by URL/Title dictionary group-by queries.
+- `JulyCounterRefreshFilter`: reusable row predicate shape for dashboard scans.
+
 ReleaseFast native backend now has **43 WIN / 0 LOSE / 0 FALLBACK** on the
 43-query ClickBench suite.
 

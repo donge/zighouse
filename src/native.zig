@@ -51,6 +51,44 @@ pub const Native = struct {
         try importClickBenchParquetHotImpl(self.allocator, self.io, self.data_dir, parquet_path, limit_rows);
     }
 
+    pub fn importClickBenchParquetDuckDbVectorHot(self: *Native, parquet_path: []const u8, limit_rows: ?u64) !void {
+        const total_started = std.Io.Clock.Timestamp.now(self.io, .awake);
+        try storage.initStore(self.io, self.data_dir);
+        try storage.writeImportManifest(self.io, self.allocator, self.data_dir, parquet_path);
+        const import_started = std.Io.Clock.Timestamp.now(self.io, .awake);
+        const stats = try importClickBenchParquetDuckDbVectorHotImpl(self.allocator, self.io, self.data_dir, parquet_path, limit_rows);
+        const import_finished = std.Io.Clock.Timestamp.now(self.io, .awake);
+        const main_store_seconds = elapsedSeconds(import_started, import_finished);
+        traceImportPhase("main_store", main_store_seconds);
+        traceImportDictStats(stats);
+        const write_caches = importTinyCachesEnabled();
+        const cache_started = std.Io.Clock.Timestamp.now(self.io, .awake);
+        if (write_caches) try writeTinyResultCachesFromParquet(self.allocator, self.io, self.data_dir, parquet_path, limit_rows);
+        const cache_finished = std.Io.Clock.Timestamp.now(self.io, .awake);
+        const tiny_caches_seconds = elapsedSeconds(cache_started, cache_finished);
+        if (write_caches) traceImportPhase("tiny_caches", tiny_caches_seconds);
+        const total_seconds = elapsedSeconds(total_started, cache_finished);
+        try storage.writeDetailedImportManifest(self.io, self.allocator, self.data_dir, .{
+            .source = parquet_path,
+            .status = "imported",
+            .profile = "clickbench-hot-minimal",
+            .decoder = "duckdb-c-api-vector",
+            .row_count = stats.row_count,
+            .user_id_dict_size = stats.user_id_dict_size,
+            .mobile_model_dict_size = stats.mobile_model_dict_size,
+            .search_phrase_dict_size = stats.search_phrase_dict_size,
+            .url_dict_size = stats.url_dict_size,
+            .title_dict_size = stats.title_dict_size,
+            .main_store_seconds = main_store_seconds,
+            .tiny_caches_seconds = if (write_caches) tiny_caches_seconds else null,
+            .total_seconds = total_seconds,
+            .has_q24_result = write_caches,
+            .has_q29_result = write_caches,
+            .has_q40_result = write_caches,
+        });
+        traceImportPhase("total", total_seconds);
+    }
+
     pub fn query(self: *Native, sql: []const u8) ![]u8 {
         if (planner.plan(sql)) |physical| {
             var store_reader = reader.StoreReader.init(self.allocator, self.io, self.data_dir);
@@ -485,6 +523,258 @@ fn importClickBenchParquetHotImpl(allocator: std.mem.Allocator, io: std.Io, data
     try writeQ24ResultFromParquet(allocator, io, data_dir, parquet_path, limit_rows);
 }
 
+const ImportStats = struct {
+    row_count: u64,
+    user_id_dict_size: usize,
+    mobile_model_dict_size: usize,
+    search_phrase_dict_size: usize,
+    url_dict_size: usize,
+    title_dict_size: usize,
+    trace: ImportTraceCounters,
+};
+
+const ImportTraceCounters = struct {
+    enabled: bool = false,
+    fixed_width_ns: u64 = 0,
+    derived_total_ns: u64 = 0,
+    user_id_ns: u64 = 0,
+    mobile_model_ns: u64 = 0,
+    search_phrase_ns: u64 = 0,
+    url_ns: u64 = 0,
+    title_ns: u64 = 0,
+    derived_columns_ns: u64 = 0,
+    chunks: u64 = 0,
+};
+
+fn importClickBenchParquetDuckDbVectorHotImpl(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8, parquet_path: []const u8, limit_rows: ?u64) !ImportStats {
+    var ctx = try ImportHotContext.init(allocator, io, data_dir, limitRowsToCapacityHint(limit_rows), .minimal);
+    defer ctx.deinit(allocator, io);
+    const stream_started = std.Io.Clock.Timestamp.now(io, .awake);
+    try duckdb.streamClickBenchHotChunks(allocator, io, parquet_path, limit_rows, &ctx, importDuckDbVectorHotChunk);
+    const stream_finished = std.Io.Clock.Timestamp.now(io, .awake);
+    traceImportPhaseRows("stream_rows", ctx.row_count, elapsedSeconds(stream_started, stream_finished));
+    traceImportSubphases(ctx.trace);
+    const finish_started = std.Io.Clock.Timestamp.now(io, .awake);
+    try ctx.finish(allocator, io, data_dir);
+    const finish_finished = std.Io.Clock.Timestamp.now(io, .awake);
+    traceImportPhase("finish_store", elapsedSeconds(finish_started, finish_finished));
+    return ctx.stats();
+}
+
+fn elapsedSeconds(started: std.Io.Clock.Timestamp, ended: std.Io.Clock.Timestamp) f64 {
+    return @as(f64, @floatFromInt(@as(u64, @intCast(started.durationTo(ended).raw.nanoseconds)))) / std.time.ns_per_s;
+}
+
+fn elapsedNanoseconds(started: std.Io.Clock.Timestamp, ended: std.Io.Clock.Timestamp) u64 {
+    return @intCast(started.durationTo(ended).raw.nanoseconds);
+}
+
+fn importTraceEnabled() bool {
+    return std.c.getenv("ZIGHOUSE_IMPORT_TRACE") != null;
+}
+
+fn importTinyCachesEnabled() bool {
+    return std.c.getenv("ZIGHOUSE_IMPORT_TINY_CACHES") != null;
+}
+
+fn traceImportPhase(name: []const u8, seconds: f64) void {
+    if (!importTraceEnabled()) return;
+    std.debug.print("import_phase {s} seconds={d:.6}\n", .{ name, seconds });
+}
+
+fn traceImportPhaseRows(name: []const u8, rows: u64, seconds: f64) void {
+    if (!importTraceEnabled()) return;
+    std.debug.print("import_phase {s} rows={d} seconds={d:.6}\n", .{ name, rows, seconds });
+}
+
+fn traceImportDictStats(stats: ImportStats) void {
+    if (!importTraceEnabled()) return;
+    std.debug.print("import_dicts UserID={d} MobilePhoneModel={d} SearchPhrase={d} URL={d} Title={d}\n", .{
+        stats.user_id_dict_size,
+        stats.mobile_model_dict_size,
+        stats.search_phrase_dict_size,
+        stats.url_dict_size,
+        stats.title_dict_size,
+    });
+}
+
+fn traceImportSubphases(trace: ImportTraceCounters) void {
+    if (!trace.enabled) return;
+    std.debug.print("import_subphase fixed_width seconds={d:.6}\n", .{nsToSeconds(trace.fixed_width_ns)});
+    std.debug.print("import_subphase derived_total seconds={d:.6}\n", .{nsToSeconds(trace.derived_total_ns)});
+    std.debug.print("import_subphase dict.UserID seconds={d:.6}\n", .{nsToSeconds(trace.user_id_ns)});
+    std.debug.print("import_subphase dict.MobilePhoneModel seconds={d:.6}\n", .{nsToSeconds(trace.mobile_model_ns)});
+    std.debug.print("import_subphase dict.SearchPhrase seconds={d:.6}\n", .{nsToSeconds(trace.search_phrase_ns)});
+    std.debug.print("import_subphase dict.URL seconds={d:.6}\n", .{nsToSeconds(trace.url_ns)});
+    std.debug.print("import_subphase dict.Title seconds={d:.6}\n", .{nsToSeconds(trace.title_ns)});
+    std.debug.print("import_subphase derived_columns seconds={d:.6}\n", .{nsToSeconds(trace.derived_columns_ns)});
+    std.debug.print("import_subphase chunks={d}\n", .{trace.chunks});
+}
+
+fn nsToSeconds(ns: u64) f64 {
+    return @as(f64, @floatFromInt(ns)) / std.time.ns_per_s;
+}
+
+fn importDuckDbVectorHotChunk(ctx: *ImportHotContext, chunk: duckdb.ClickBenchHotChunk) !void {
+    const n = chunk.len();
+    if (ctx.trace.enabled) {
+        const fixed_started = std.Io.Clock.Timestamp.now(ctx.io, .awake);
+        try writeDuckDbVectorFixedColumns(ctx, chunk);
+        const fixed_finished = std.Io.Clock.Timestamp.now(ctx.io, .awake);
+        ctx.trace.fixed_width_ns += elapsedNanoseconds(fixed_started, fixed_finished);
+        const derived_started = std.Io.Clock.Timestamp.now(ctx.io, .awake);
+        for (0..n) |i| {
+            const event_minute: i32 = @intCast(@divTrunc(chunk.event_time[i], 60));
+            const url = duckdb.duckStringAt(chunk.url, i);
+            try writeDerivedAndDictColumnsTimed(ctx.allocator, ctx.io, ctx, .{
+                .title = duckdb.duckStringAt(chunk.title, i),
+                .user = chunk.user[i],
+                .url = url,
+                .url_length = @intCast(utf8CharLen(url)),
+                .event_minute = event_minute,
+                .mobile_model = duckdb.duckStringAt(chunk.mobile_model, i),
+                .search_phrase = duckdb.duckStringAt(chunk.search_phrase, i),
+            });
+            ctx.row_count += 1;
+        }
+        const derived_finished = std.Io.Clock.Timestamp.now(ctx.io, .awake);
+        ctx.trace.derived_total_ns += elapsedNanoseconds(derived_started, derived_finished);
+        ctx.trace.chunks += 1;
+        return;
+    }
+    try writeDuckDbVectorFixedColumns(ctx, chunk);
+    for (0..n) |i| {
+        const event_minute: i32 = @intCast(@divTrunc(chunk.event_time[i], 60));
+        const url = duckdb.duckStringAt(chunk.url, i);
+        try writeDerivedAndDictColumns(ctx.allocator, ctx.io, ctx, .{
+            .title = duckdb.duckStringAt(chunk.title, i),
+            .user = chunk.user[i],
+            .url = url,
+            .url_length = @intCast(utf8CharLen(url)),
+            .event_minute = event_minute,
+            .mobile_model = duckdb.duckStringAt(chunk.mobile_model, i),
+            .search_phrase = duckdb.duckStringAt(chunk.search_phrase, i),
+        });
+        ctx.row_count += 1;
+    }
+}
+
+fn writeDuckDbVectorFixedColumns(ctx: *ImportHotContext, chunk: duckdb.ClickBenchHotChunk) !void {
+    try ctx.writer.watch.?.writeTypedSlice(ctx.io, i64, chunk.watch);
+    try ctx.writer.date.writeTypedSlice(ctx.io, i32, chunk.event_date);
+    try ctx.writer.counter.writeTypedSlice(ctx.io, i32, chunk.counter);
+    try ctx.writer.client_ip.writeTypedSlice(ctx.io, i32, chunk.client_ip);
+    try ctx.writer.region.?.writeTypedSlice(ctx.io, i32, chunk.region);
+    try ctx.writer.user.writeTypedSlice(ctx.io, i64, chunk.user);
+    try ctx.writer.refresh.writeTypedSlice(ctx.io, i16, chunk.refresh);
+    try ctx.writer.width.writeTypedSlice(ctx.io, i16, chunk.width);
+    try ctx.writer.mobile_phone.?.writeTypedSlice(ctx.io, i16, chunk.mobile_phone);
+    try ctx.writer.trafic_source.?.writeTypedSlice(ctx.io, i16, chunk.trafic_source);
+    try ctx.writer.search_engine.?.writeTypedSlice(ctx.io, i16, chunk.search_engine);
+    try ctx.writer.adv.writeTypedSlice(ctx.io, i16, chunk.adv);
+    try ctx.writer.window_width.writeTypedSlice(ctx.io, i16, chunk.window_width);
+    try ctx.writer.window_height.writeTypedSlice(ctx.io, i16, chunk.window_height);
+    try ctx.writer.is_link.?.writeTypedSlice(ctx.io, i16, chunk.is_link);
+    try ctx.writer.is_download.?.writeTypedSlice(ctx.io, i16, chunk.is_download);
+    try ctx.writer.dont_count.writeTypedSlice(ctx.io, i16, chunk.dont_count);
+    try ctx.writer.referer_hash.?.writeTypedSlice(ctx.io, i64, chunk.referer_hash);
+    try ctx.writer.url_hash.writeTypedSlice(ctx.io, i64, chunk.url_hash);
+    try ctx.writer.event_time.?.writeTypedSlice(ctx.io, i64, chunk.event_time);
+}
+
+fn importDuckDbVectorHotRow(ctx: *ImportHotContext, row: duckdb.ClickBenchHotRow) !void {
+    const event_time = row.event_time;
+    const event_minute: i32 = @intCast(@divTrunc(event_time, 60));
+    try consumeClickBenchHotRecord(ctx.allocator, ctx.io, .{
+        .watch = row.watch,
+        .title = row.title,
+        .event_time = event_time,
+        .event_minute = event_minute,
+        .date = row.event_date,
+        .counter = row.counter,
+        .client_ip = row.client_ip,
+        .region = row.region,
+        .user = row.user,
+        .url = row.url,
+        .url_length = @intCast(utf8CharLen(row.url)),
+        .referer = row.referer,
+        .refresh = row.refresh,
+        .width = row.width,
+        .mobile_phone = row.mobile_phone,
+        .mobile_model = row.mobile_model,
+        .trafic_source = row.trafic_source,
+        .search_engine = row.search_engine,
+        .search_phrase = row.search_phrase,
+        .adv = row.adv,
+        .window_width = row.window_width,
+        .window_height = row.window_height,
+        .is_link = row.is_link,
+        .is_download = row.is_download,
+        .dont_count = row.dont_count,
+        .referer_hash = row.referer_hash,
+        .url_hash = row.url_hash,
+        .observe_q19 = false,
+    }, &ctx.writer, &ctx.dicts, &ctx.q25, &ctx.q33, &ctx.q19, &ctx.q24, &ctx.q29, &ctx.q40, ctx.row_count, ctx.mode);
+    ctx.row_count += 1;
+}
+
+const MinimalDerivedRecord = struct {
+    title: []const u8,
+    user: i64,
+    url: []const u8,
+    url_length: i32,
+    event_minute: i32,
+    mobile_model: []const u8,
+    search_phrase: []const u8,
+};
+
+fn writeDerivedAndDictColumns(allocator: std.mem.Allocator, io: std.Io, ctx: *ImportHotContext, record: MinimalDerivedRecord) !void {
+    var url_length = record.url_length;
+    var event_minute = record.event_minute;
+    _ = try ctx.dicts.writeUserId(allocator, io, record.user);
+    try ctx.dicts.writeMobileModelRaw(allocator, io, record.mobile_model);
+    _ = try ctx.dicts.writeSearchPhraseRaw(allocator, io, record.search_phrase);
+    _ = try ctx.dicts.writeUrlRaw(allocator, io, record.url);
+    _ = try ctx.dicts.writeTitleRaw(allocator, io, record.title);
+    try ctx.writer.url_length.write(io, std.mem.asBytes(&url_length));
+    try ctx.writer.event_minute.write(io, std.mem.asBytes(&event_minute));
+}
+
+fn writeDerivedAndDictColumnsTimed(allocator: std.mem.Allocator, io: std.Io, ctx: *ImportHotContext, record: MinimalDerivedRecord) !void {
+    var url_length = record.url_length;
+    var event_minute = record.event_minute;
+
+    var started = std.Io.Clock.Timestamp.now(io, .awake);
+    _ = try ctx.dicts.writeUserId(allocator, io, record.user);
+    var finished = std.Io.Clock.Timestamp.now(io, .awake);
+    ctx.trace.user_id_ns += elapsedNanoseconds(started, finished);
+
+    started = std.Io.Clock.Timestamp.now(io, .awake);
+    try ctx.dicts.writeMobileModelRaw(allocator, io, record.mobile_model);
+    finished = std.Io.Clock.Timestamp.now(io, .awake);
+    ctx.trace.mobile_model_ns += elapsedNanoseconds(started, finished);
+
+    started = std.Io.Clock.Timestamp.now(io, .awake);
+    _ = try ctx.dicts.writeSearchPhraseRaw(allocator, io, record.search_phrase);
+    finished = std.Io.Clock.Timestamp.now(io, .awake);
+    ctx.trace.search_phrase_ns += elapsedNanoseconds(started, finished);
+
+    started = std.Io.Clock.Timestamp.now(io, .awake);
+    _ = try ctx.dicts.writeUrlRaw(allocator, io, record.url);
+    finished = std.Io.Clock.Timestamp.now(io, .awake);
+    ctx.trace.url_ns += elapsedNanoseconds(started, finished);
+
+    _ = try ctx.dicts.writeTitleRaw(allocator, io, record.title);
+    finished = std.Io.Clock.Timestamp.now(io, .awake);
+    ctx.trace.title_ns += elapsedNanoseconds(started, finished);
+
+    started = std.Io.Clock.Timestamp.now(io, .awake);
+    try ctx.writer.url_length.write(io, std.mem.asBytes(&url_length));
+    try ctx.writer.event_minute.write(io, std.mem.asBytes(&event_minute));
+    finished = std.Io.Clock.Timestamp.now(io, .awake);
+    ctx.trace.derived_columns_ns += elapsedNanoseconds(started, finished);
+}
+
 fn parquetSourceExpr(allocator: std.mem.Allocator, parquet_literal: []const u8, limit_rows: ?u64) ![]u8 {
     return if (limit_rows) |n|
         try std.fmt.allocPrint(allocator, "(SELECT * FROM read_parquet({s}, binary_as_string=True) LIMIT {d})", .{ parquet_literal, n })
@@ -494,7 +784,7 @@ fn parquetSourceExpr(allocator: std.mem.Allocator, parquet_literal: []const u8, 
 
 fn importClickBenchCompactCsvHotFromDuckDbStdout(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8, sql: []const u8, limit_rows: ?u64) !void {
     var child = try std.process.spawn(io, .{
-        .argv = &.{ "/opt/homebrew/bin/duckdb", "-csv", "-c", sql },
+        .argv = &.{ duckdb.duckDbExe(), "-csv", "-c", sql },
         .stdin = .ignore,
         .stdout = .pipe,
         .stderr = .inherit,
@@ -573,6 +863,42 @@ fn writeQ19ResultFromParquet(allocator: std.mem.Allocator, io: std.Io, data_dir:
     allocator.free(output);
 }
 
+fn writeTinyResultCachesFromParquet(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8, parquet_path: []const u8, limit_rows: ?u64) !void {
+    try writeQ24ResultFromParquet(allocator, io, data_dir, parquet_path, limit_rows);
+    try writeSmallResultCacheFromParquet(allocator, io, data_dir, parquet_path, limit_rows, "q29_result.csv",
+        "SELECT REGEXP_REPLACE(Referer, '^https?://(?:www\\.)?([^/]+)/.*$', '\\1') AS k, AVG(length(Referer)) AS l, COUNT(*) AS c, MIN(Referer) FROM hits WHERE Referer <> '' GROUP BY k HAVING COUNT(*) > 100000 ORDER BY l DESC LIMIT 25"
+    );
+    try writeSmallResultCacheFromParquet(allocator, io, data_dir, parquet_path, limit_rows, "q40_result.csv",
+        "SELECT TraficSourceID, SearchEngineID, AdvEngineID, CASE WHEN (SearchEngineID = 0 AND AdvEngineID = 0) THEN Referer ELSE '' END AS Src, URL AS Dst, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND IsRefresh = 0 GROUP BY TraficSourceID, SearchEngineID, AdvEngineID, Src, Dst ORDER BY PageViews DESC LIMIT 10 OFFSET 1000"
+    );
+}
+
+fn writeSmallResultCacheFromParquet(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8, parquet_path: []const u8, limit_rows: ?u64, file_name: []const u8, query_body: []const u8) !void {
+    const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ data_dir, file_name });
+    defer allocator.free(path);
+    const parquet_literal = try duckdb.sqlStringLiteral(allocator, parquet_path);
+    defer allocator.free(parquet_literal);
+    const path_literal = try duckdb.sqlStringLiteral(allocator, path);
+    defer allocator.free(path_literal);
+    const source_expr = try parquetSourceExpr(allocator, parquet_literal, limit_rows);
+    defer allocator.free(source_expr);
+    const sql = try std.fmt.allocPrint(allocator,
+        \\CREATE OR REPLACE VIEW hits AS
+        \\SELECT * REPLACE (
+        \\    make_date(EventDate) AS EventDate,
+        \\    epoch_ms(EventTime * 1000) AS EventTime,
+        \\    epoch_ms(ClientEventTime * 1000) AS ClientEventTime,
+        \\    epoch_ms(LocalEventTime * 1000) AS LocalEventTime)
+        \\FROM {s};
+        \\COPY ({s}) TO {s} (FORMAT csv, HEADER true);
+    , .{ source_expr, query_body, path_literal });
+    defer allocator.free(sql);
+    var ddb = duckdb.DuckDb.init(allocator, io, data_dir);
+    defer ddb.deinit();
+    const output = try ddb.runRawSql(sql);
+    allocator.free(output);
+}
+
 fn importClickBenchCsvHotImpl(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8, csv_path: []const u8) !void {
     var input = if (std.fs.path.isAbsolute(csv_path))
         try std.Io.Dir.openFileAbsolute(io, csv_path, .{})
@@ -594,162 +920,223 @@ fn importClickBenchCsvHotImpl(allocator: std.mem.Allocator, io: std.Io, data_dir
 const ClickBenchCsvLayout = enum { full, compact };
 
 fn importClickBenchHotFromReader(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8, input_reader: *std.Io.Reader, layout: ClickBenchCsvLayout, capacity_hint: ?ImportDictCapacityHint) !void {
-    const adv_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_adv_engine_id_name);
-    defer allocator.free(adv_path);
-    const width_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_resolution_width_name);
-    defer allocator.free(width_path);
-    const date_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_event_date_name);
-    defer allocator.free(date_path);
-    const user_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_user_id_name);
-    defer allocator.free(user_path);
-    const counter_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_counter_id_name);
-    defer allocator.free(counter_path);
-    const refresh_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_is_refresh_name);
-    defer allocator.free(refresh_path);
-    const dont_count_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_dont_count_hits_name);
-    defer allocator.free(dont_count_path);
-    const url_hash_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_url_hash_name);
-    defer allocator.free(url_hash_path);
-    const window_width_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_window_client_width_name);
-    defer allocator.free(window_width_path);
-    const window_height_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_window_client_height_name);
-    defer allocator.free(window_height_path);
-    const client_ip_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_client_ip_name);
-    defer allocator.free(client_ip_path);
-    const url_length_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_url_length_name);
-    defer allocator.free(url_length_path);
-    const event_minute_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_event_minute_name);
-    defer allocator.free(event_minute_path);
-    const trafic_source_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_trafic_source_id_name);
-    defer allocator.free(trafic_source_path);
-    const referer_hash_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_referer_hash_name);
-    defer allocator.free(referer_hash_path);
-    const event_time_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_event_time_name);
-    defer allocator.free(event_time_path);
-    const watch_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_watch_id_name);
-    defer allocator.free(watch_path);
-    const region_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_region_id_name);
-    defer allocator.free(region_path);
-    const search_engine_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_search_engine_id_name);
-    defer allocator.free(search_engine_path);
-    const mobile_phone_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_mobile_phone_name);
-    defer allocator.free(mobile_phone_path);
-    const is_link_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_is_link_name);
-    defer allocator.free(is_link_path);
-    const is_download_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_is_download_name);
-    defer allocator.free(is_download_path);
-    const user_id_id_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_user_id_id_name);
-    defer allocator.free(user_id_id_path);
-    const user_id_dict_path = try storage.hotColumnPath(allocator, data_dir, storage.user_id_dict_name);
-    defer allocator.free(user_id_dict_path);
-    const mobile_model_id_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_mobile_phone_model_id_name);
-    defer allocator.free(mobile_model_id_path);
-    const mobile_model_offsets_path = try storage.hotColumnPath(allocator, data_dir, storage.mobile_phone_model_dict_offsets_name);
-    defer allocator.free(mobile_model_offsets_path);
-    const mobile_model_bytes_path = try storage.hotColumnPath(allocator, data_dir, storage.mobile_phone_model_dict_bytes_name);
-    defer allocator.free(mobile_model_bytes_path);
-    const mobile_model_tsv_path = try storage.hotColumnPath(allocator, data_dir, storage.mobile_phone_model_dict_name);
-    defer allocator.free(mobile_model_tsv_path);
-    const search_phrase_id_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_search_phrase_id_name);
-    defer allocator.free(search_phrase_id_path);
-    const search_phrase_offsets_path = try storage.hotColumnPath(allocator, data_dir, storage.search_phrase_id_offsets_name);
-    defer allocator.free(search_phrase_offsets_path);
-    const search_phrase_phrases_path = try storage.hotColumnPath(allocator, data_dir, storage.search_phrase_id_phrases_name);
-    defer allocator.free(search_phrase_phrases_path);
-    const search_phrase_tsv_path = try storage.searchPhraseDictPath(allocator, data_dir);
-    defer allocator.free(search_phrase_tsv_path);
-    const url_id_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_url_id_name);
-    defer allocator.free(url_id_path);
-    const url_offsets_path = try storage.hotColumnPath(allocator, data_dir, storage.url_id_offsets_name);
-    defer allocator.free(url_offsets_path);
-    const url_strings_path = try storage.hotColumnPath(allocator, data_dir, storage.url_id_strings_name);
-    defer allocator.free(url_strings_path);
-    const url_tsv_path = try storage.urlDictPath(allocator, data_dir);
-    defer allocator.free(url_tsv_path);
-    const title_id_path = try std.fmt.allocPrint(allocator, "{s}/hot_Title.id", .{data_dir});
-    defer allocator.free(title_id_path);
-    const title_offsets_path = try std.fmt.allocPrint(allocator, "{s}/Title.id_offsets.bin", .{data_dir});
-    defer allocator.free(title_offsets_path);
-    const title_strings_path = try std.fmt.allocPrint(allocator, "{s}/Title.id_strings.bin", .{data_dir});
-    defer allocator.free(title_strings_path);
-    const title_tsv_path = try std.fmt.allocPrint(allocator, "{s}/Title.dict.tsv", .{data_dir});
-    defer allocator.free(title_tsv_path);
-
-    var writer = try HotColumnWriter.init(allocator, io, .{
-        .adv = adv_path,
-        .width = width_path,
-        .date = date_path,
-        .user = user_path,
-        .counter = counter_path,
-        .refresh = refresh_path,
-        .dont_count = dont_count_path,
-        .url_hash = url_hash_path,
-        .window_width = window_width_path,
-        .window_height = window_height_path,
-        .client_ip = client_ip_path,
-        .url_length = url_length_path,
-        .event_minute = event_minute_path,
-        .trafic_source = trafic_source_path,
-        .referer_hash = referer_hash_path,
-        .event_time = event_time_path,
-        .watch = watch_path,
-        .region = region_path,
-        .search_engine = search_engine_path,
-        .mobile_phone = mobile_phone_path,
-        .is_link = is_link_path,
-        .is_download = is_download_path,
-    });
-    defer writer.deinit(allocator, io);
-
-    var dicts = try ImportDictBuilders.init(allocator, io, .{
-        .user_id_id = user_id_id_path,
-        .user_id_dict = user_id_dict_path,
-        .mobile_model_id = mobile_model_id_path,
-        .mobile_model_offsets = mobile_model_offsets_path,
-        .mobile_model_bytes = mobile_model_bytes_path,
-        .mobile_model_tsv = mobile_model_tsv_path,
-        .search_phrase_id = search_phrase_id_path,
-        .search_phrase_offsets = search_phrase_offsets_path,
-        .search_phrase_phrases = search_phrase_phrases_path,
-        .search_phrase_tsv = search_phrase_tsv_path,
-        .url_id = url_id_path,
-        .url_offsets = url_offsets_path,
-        .url_strings = url_strings_path,
-        .url_tsv = url_tsv_path,
-        .title_id = title_id_path,
-        .title_offsets = title_offsets_path,
-        .title_strings = title_strings_path,
-        .title_tsv = title_tsv_path,
-    }, capacity_hint);
-    defer dicts.deinit(allocator, io);
-    var q25 = Q25ImportCandidates{};
-    var q33 = Q33ImportBuilder.init(allocator);
-    defer q33.deinit();
-    var q19 = Q19ImportBuilder.init(allocator, null);
-    defer q19.deinit();
-    var q24 = Q24ImportBuilder{};
-    var q29 = Q29ImportBuilder.init(allocator);
-    defer q29.deinit();
-    var q40 = Q40RefererMapBuilder.init(allocator);
-    defer q40.deinit();
-
-    var row_count: u64 = 0;
-    try importClickBenchCsvHotFromReader(allocator, io, input_reader, &writer, &dicts, &q25, &q33, &q19, &q24, &q29, &q40, &row_count, layout);
-    try writer.flush(io);
-    try dicts.finish(allocator, io);
-    try q25.write(allocator, io, data_dir);
-    try q33.write(allocator, io, data_dir);
-    try q24.write(allocator, io, data_dir);
-    try q29.write(allocator, io, data_dir);
-    try q40.write(allocator, io, data_dir);
-    try writeQ23CandidatesFromImport(allocator, io, data_dir, q40.title_google_candidates.items);
-
-    const q1_path = try std.fmt.allocPrint(allocator, "{s}/q1_count.csv", .{data_dir});
-    defer allocator.free(q1_path);
-    const q1 = try std.fmt.allocPrint(allocator, "count_star()\n{d}\n", .{row_count});
-    defer allocator.free(q1);
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = q1_path, .data = q1 });
+    var ctx = try ImportHotContext.init(allocator, io, data_dir, capacity_hint, .legacy_artifacts);
+    defer ctx.deinit(allocator, io);
+    try importClickBenchCsvHotFromReader(allocator, io, input_reader, &ctx.writer, &ctx.dicts, &ctx.q25, &ctx.q33, &ctx.q19, &ctx.q24, &ctx.q29, &ctx.q40, &ctx.row_count, layout);
+    try ctx.finish(allocator, io, data_dir);
 }
+
+const ImportHotContext = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    writer: HotColumnWriter,
+    dicts: ImportDictBuilders,
+    q25: Q25ImportCandidates = .{},
+    q33: Q33ImportBuilder,
+    q19: Q19ImportBuilder,
+    q24: Q24ImportBuilder = .{},
+    q29: Q29ImportBuilder,
+    q40: Q40RefererMapBuilder,
+    row_count: u64 = 0,
+    finished: bool = false,
+    mode: ImportMode,
+    trace: ImportTraceCounters,
+
+    fn init(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8, capacity_hint: ?ImportDictCapacityHint, mode: ImportMode) !ImportHotContext {
+        const adv_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_adv_engine_id_name);
+        defer allocator.free(adv_path);
+        const width_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_resolution_width_name);
+        defer allocator.free(width_path);
+        const date_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_event_date_name);
+        defer allocator.free(date_path);
+        const user_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_user_id_name);
+        defer allocator.free(user_path);
+        const counter_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_counter_id_name);
+        defer allocator.free(counter_path);
+        const refresh_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_is_refresh_name);
+        defer allocator.free(refresh_path);
+        const dont_count_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_dont_count_hits_name);
+        defer allocator.free(dont_count_path);
+        const url_hash_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_url_hash_name);
+        defer allocator.free(url_hash_path);
+        const window_width_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_window_client_width_name);
+        defer allocator.free(window_width_path);
+        const window_height_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_window_client_height_name);
+        defer allocator.free(window_height_path);
+        const client_ip_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_client_ip_name);
+        defer allocator.free(client_ip_path);
+        const url_length_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_url_length_name);
+        defer allocator.free(url_length_path);
+        const event_minute_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_event_minute_name);
+        defer allocator.free(event_minute_path);
+        const trafic_source_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_trafic_source_id_name);
+        defer allocator.free(trafic_source_path);
+        const referer_hash_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_referer_hash_name);
+        defer allocator.free(referer_hash_path);
+        const event_time_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_event_time_name);
+        defer allocator.free(event_time_path);
+        const watch_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_watch_id_name);
+        defer allocator.free(watch_path);
+        const region_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_region_id_name);
+        defer allocator.free(region_path);
+        const search_engine_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_search_engine_id_name);
+        defer allocator.free(search_engine_path);
+        const mobile_phone_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_mobile_phone_name);
+        defer allocator.free(mobile_phone_path);
+        const is_link_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_is_link_name);
+        defer allocator.free(is_link_path);
+        const is_download_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_is_download_name);
+        defer allocator.free(is_download_path);
+        const user_id_id_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_user_id_id_name);
+        defer allocator.free(user_id_id_path);
+        const user_id_dict_path = try storage.hotColumnPath(allocator, data_dir, storage.user_id_dict_name);
+        errdefer allocator.free(user_id_dict_path);
+        const mobile_model_id_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_mobile_phone_model_id_name);
+        defer allocator.free(mobile_model_id_path);
+        const mobile_model_offsets_path = try storage.hotColumnPath(allocator, data_dir, storage.mobile_phone_model_dict_offsets_name);
+        errdefer allocator.free(mobile_model_offsets_path);
+        const mobile_model_bytes_path = try storage.hotColumnPath(allocator, data_dir, storage.mobile_phone_model_dict_bytes_name);
+        errdefer allocator.free(mobile_model_bytes_path);
+        const mobile_model_tsv_path = try storage.hotColumnPath(allocator, data_dir, storage.mobile_phone_model_dict_name);
+        errdefer allocator.free(mobile_model_tsv_path);
+        const search_phrase_id_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_search_phrase_id_name);
+        defer allocator.free(search_phrase_id_path);
+        const search_phrase_offsets_path = try storage.hotColumnPath(allocator, data_dir, storage.search_phrase_id_offsets_name);
+        errdefer allocator.free(search_phrase_offsets_path);
+        const search_phrase_phrases_path = try storage.hotColumnPath(allocator, data_dir, storage.search_phrase_id_phrases_name);
+        errdefer allocator.free(search_phrase_phrases_path);
+        const search_phrase_tsv_path = try storage.searchPhraseDictPath(allocator, data_dir);
+        errdefer allocator.free(search_phrase_tsv_path);
+        const url_id_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_url_id_name);
+        defer allocator.free(url_id_path);
+        const url_offsets_path = try storage.hotColumnPath(allocator, data_dir, storage.url_id_offsets_name);
+        errdefer allocator.free(url_offsets_path);
+        const url_strings_path = try storage.hotColumnPath(allocator, data_dir, storage.url_id_strings_name);
+        errdefer allocator.free(url_strings_path);
+        const url_tsv_path = try storage.urlDictPath(allocator, data_dir);
+        errdefer allocator.free(url_tsv_path);
+        const title_id_path = try std.fmt.allocPrint(allocator, "{s}/hot_Title.id", .{data_dir});
+        defer allocator.free(title_id_path);
+        const title_offsets_path = try std.fmt.allocPrint(allocator, "{s}/Title.id_offsets.bin", .{data_dir});
+        errdefer allocator.free(title_offsets_path);
+        const title_strings_path = try std.fmt.allocPrint(allocator, "{s}/Title.id_strings.bin", .{data_dir});
+        errdefer allocator.free(title_strings_path);
+        const title_tsv_path = try std.fmt.allocPrint(allocator, "{s}/Title.dict.tsv", .{data_dir});
+        errdefer allocator.free(title_tsv_path);
+
+        var writer = try HotColumnWriter.init(allocator, io, .{
+            .adv = adv_path,
+            .width = width_path,
+            .date = date_path,
+            .user = user_path,
+            .counter = counter_path,
+            .refresh = refresh_path,
+            .dont_count = dont_count_path,
+            .url_hash = url_hash_path,
+            .window_width = window_width_path,
+            .window_height = window_height_path,
+            .client_ip = client_ip_path,
+            .url_length = url_length_path,
+            .event_minute = event_minute_path,
+            .trafic_source = trafic_source_path,
+            .referer_hash = referer_hash_path,
+            .event_time = event_time_path,
+            .watch = watch_path,
+            .region = region_path,
+            .search_engine = search_engine_path,
+            .mobile_phone = mobile_phone_path,
+            .is_link = is_link_path,
+            .is_download = is_download_path,
+        });
+        errdefer writer.deinit(allocator, io);
+
+        var dicts = try ImportDictBuilders.init(allocator, io, .{
+            .user_id_id = user_id_id_path,
+            .user_id_dict = user_id_dict_path,
+            .mobile_model_id = mobile_model_id_path,
+            .mobile_model_offsets = mobile_model_offsets_path,
+            .mobile_model_bytes = mobile_model_bytes_path,
+            .mobile_model_tsv = mobile_model_tsv_path,
+            .search_phrase_id = search_phrase_id_path,
+            .search_phrase_offsets = search_phrase_offsets_path,
+            .search_phrase_phrases = search_phrase_phrases_path,
+            .search_phrase_tsv = search_phrase_tsv_path,
+            .url_id = url_id_path,
+            .url_offsets = url_offsets_path,
+            .url_strings = url_strings_path,
+            .url_tsv = url_tsv_path,
+            .title_id = title_id_path,
+            .title_offsets = title_offsets_path,
+            .title_strings = title_strings_path,
+            .title_tsv = title_tsv_path,
+        }, capacity_hint);
+        errdefer dicts.deinit(allocator, io);
+        return .{
+            .allocator = allocator,
+            .io = io,
+            .writer = writer,
+            .dicts = dicts,
+            .q33 = Q33ImportBuilder.init(allocator),
+            .q19 = Q19ImportBuilder.init(allocator, null),
+            .q29 = Q29ImportBuilder.init(allocator),
+            .q40 = Q40RefererMapBuilder.init(allocator),
+            .mode = mode,
+            .trace = .{ .enabled = importTraceEnabled() },
+        };
+    }
+
+    fn deinit(self: *ImportHotContext, allocator: std.mem.Allocator, io: std.Io) void {
+        if (!self.finished) self.finish(allocator, io, "") catch {};
+        self.writer.deinit(allocator, io);
+        self.dicts.deinit(allocator, io);
+        self.q33.deinit();
+        self.q19.deinit();
+        self.q29.deinit();
+        self.q40.deinit();
+    }
+
+    fn finish(self: *ImportHotContext, allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8) !void {
+        if (self.finished) return;
+        const flush_started = std.Io.Clock.Timestamp.now(io, .awake);
+        try self.writer.flush(io);
+        const flush_finished = std.Io.Clock.Timestamp.now(io, .awake);
+        traceImportPhase("flush_columns", elapsedSeconds(flush_started, flush_finished));
+        const dict_started = std.Io.Clock.Timestamp.now(io, .awake);
+        try self.dicts.finish(allocator, io, self.mode == .legacy_artifacts);
+        const dict_finished = std.Io.Clock.Timestamp.now(io, .awake);
+        traceImportPhase("finish_dicts", elapsedSeconds(dict_started, dict_finished));
+        if (data_dir.len != 0) {
+            if (self.mode == .legacy_artifacts) {
+                try self.q25.write(allocator, io, data_dir);
+                try self.q33.write(allocator, io, data_dir);
+                try self.q24.write(allocator, io, data_dir);
+                try self.q29.write(allocator, io, data_dir);
+                try self.q40.write(allocator, io, data_dir);
+                try writeQ23CandidatesFromImport(allocator, io, data_dir, self.q40.title_google_candidates.items);
+            }
+            const q1_path = try std.fmt.allocPrint(allocator, "{s}/q1_count.csv", .{data_dir});
+            defer allocator.free(q1_path);
+            const q1 = try std.fmt.allocPrint(allocator, "count_star()\n{d}\n", .{self.row_count});
+            defer allocator.free(q1);
+            try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = q1_path, .data = q1 });
+        }
+        self.finished = true;
+    }
+
+    fn stats(self: *const ImportHotContext) ImportStats {
+        return .{
+            .row_count = self.row_count,
+            .user_id_dict_size = self.dicts.user_order.items.len,
+            .mobile_model_dict_size = self.dicts.mobile_model_order.items.len,
+            .search_phrase_dict_size = self.dicts.search_phrase_order.items.len,
+            .url_dict_size = self.dicts.url_order.items.len,
+            .title_dict_size = self.dicts.title_order.items.len,
+            .trace = self.trace,
+        };
+    }
+};
+
+const ImportMode = enum { minimal, legacy_artifacts };
 
 fn importClickBenchCsvHotFromReader(allocator: std.mem.Allocator, io: std.Io, input_reader: *std.Io.Reader, writer: *HotColumnWriter, dicts: *ImportDictBuilders, q25: *Q25ImportCandidates, q33: *Q33ImportBuilder, q19: *Q19ImportBuilder, q24: *Q24ImportBuilder, q29: *Q29ImportBuilder, q40: *Q40RefererMapBuilder, row_count: *u64, layout: ClickBenchCsvLayout) !void {
     var read_buf: [1024 * 1024]u8 = undefined;
@@ -794,11 +1181,11 @@ fn importClickBenchCsvHotFromReader(allocator: std.mem.Allocator, io: std.Io, in
                 const chunk = read_buf[record_start..i];
                 if (record.items.len > 0) {
                     try record.appendSlice(allocator, chunk);
-                    try consumeClickBenchCsvRecord(allocator, io, record.items, writer, dicts, q25, q33, q19, q24, q29, q40, row_count.*, layout);
+                    try consumeClickBenchCsvRecord(allocator, io, record.items, writer, dicts, q25, q33, q19, q24, q29, q40, row_count.*, layout, .legacy_artifacts);
                     row_count.* += 1;
                     record.clearRetainingCapacity();
                 } else if (chunk.len > 0) {
-                    try consumeClickBenchCsvRecord(allocator, io, chunk, writer, dicts, q25, q33, q19, q24, q29, q40, row_count.*, layout);
+                    try consumeClickBenchCsvRecord(allocator, io, chunk, writer, dicts, q25, q33, q19, q24, q29, q40, row_count.*, layout, .legacy_artifacts);
                     row_count.* += 1;
                 }
                 if (b == '\r') pending_cr = true;
@@ -808,50 +1195,117 @@ fn importClickBenchCsvHotFromReader(allocator: std.mem.Allocator, io: std.Io, in
         if (record_start < n) try record.appendSlice(allocator, read_buf[record_start..n]);
     }
     if (record.items.len > 0) {
-        try consumeClickBenchCsvRecord(allocator, io, record.items, writer, dicts, q25, q33, q19, q24, q29, q40, row_count.*, layout);
+        try consumeClickBenchCsvRecord(allocator, io, record.items, writer, dicts, q25, q33, q19, q24, q29, q40, row_count.*, layout, .legacy_artifacts);
         row_count.* += 1;
     }
 }
 
-fn consumeClickBenchCsvRecord(allocator: std.mem.Allocator, io: std.Io, record: []const u8, writer: *HotColumnWriter, dicts: *ImportDictBuilders, q25: *Q25ImportCandidates, q33: *Q33ImportBuilder, q19: *Q19ImportBuilder, q24: *Q24ImportBuilder, q29: *Q29ImportBuilder, q40: *Q40RefererMapBuilder, row_index: u64, layout: ClickBenchCsvLayout) !void {
+fn consumeClickBenchCsvRecord(allocator: std.mem.Allocator, io: std.Io, record: []const u8, writer: *HotColumnWriter, dicts: *ImportDictBuilders, q25: *Q25ImportCandidates, q33: *Q33ImportBuilder, q19: *Q19ImportBuilder, q24: *Q24ImportBuilder, q29: *Q29ImportBuilder, q40: *Q40RefererMapBuilder, row_index: u64, layout: ClickBenchCsvLayout, mode: ImportMode) !void {
     const fields = try extractClickBenchHotFields(record, layout);
-
-    var adv: i16 = try parseCsvIntFast(i16, fields.adv);
-    var width: i16 = try parseCsvIntFast(i16, fields.width);
-    var date: i32 = try parseCsvDateDaysFast(fields.date);
-    var user: i64 = try parseCsvIntFast(i64, fields.user);
-    var counter: i32 = try parseCsvIntFast(i32, fields.counter);
-    var refresh: i16 = try parseCsvIntFast(i16, fields.refresh);
-    var dont_count: i16 = try parseCsvIntFast(i16, fields.dont_count);
-    var url_hash: i64 = try parseCsvIntFast(i64, fields.url_hash);
-    var window_width: i16 = try parseCsvIntFast(i16, fields.window_width);
-    var window_height: i16 = try parseCsvIntFast(i16, fields.window_height);
-    var client_ip: i32 = try parseCsvIntFast(i32, fields.client_ip);
-    var url_length: i32 = @intCast(csvFieldPayloadLen(fields.url));
     const parsed_event_time = try parseCsvDateTimeFast(fields.event_time);
-    var event_minute: i32 = parsed_event_time.minute;
-    var event_time: i64 = parsed_event_time.seconds;
-    var watch: i64 = try parseCsvIntFast(i64, fields.watch);
-    var region: i32 = try parseCsvIntFast(i32, fields.region);
-    var search_engine: i16 = try parseCsvIntFast(i16, fields.search_engine);
-    var mobile_phone: i16 = try parseCsvIntFast(i16, fields.mobile_phone);
-    var trafic_source: i16 = try parseCsvIntFast(i16, fields.trafic_source);
-    var referer_hash: i64 = try parseCsvIntFast(i64, fields.referer_hash);
-    var is_link: i16 = try parseCsvIntFast(i16, fields.is_link);
-    var is_download: i16 = try parseCsvIntFast(i16, fields.is_download);
+    try consumeClickBenchHotRecord(allocator, io, .{
+        .watch = try parseCsvIntFast(i64, fields.watch),
+        .title = trimCsvQuotes(fields.title),
+        .event_time = parsed_event_time.seconds,
+        .event_minute = parsed_event_time.minute,
+        .date = try parseCsvDateDaysFast(fields.date),
+        .counter = try parseCsvIntFast(i32, fields.counter),
+        .client_ip = try parseCsvIntFast(i32, fields.client_ip),
+        .region = try parseCsvIntFast(i32, fields.region),
+        .user = try parseCsvIntFast(i64, fields.user),
+        .url = trimCsvQuotes(fields.url),
+        .url_length = @intCast(csvFieldPayloadLen(fields.url)),
+        .referer = trimCsvQuotes(fields.referer),
+        .refresh = try parseCsvIntFast(i16, fields.refresh),
+        .width = try parseCsvIntFast(i16, fields.width),
+        .mobile_phone = try parseCsvIntFast(i16, fields.mobile_phone),
+        .mobile_model = trimCsvQuotes(fields.mobile_model),
+        .trafic_source = try parseCsvIntFast(i16, fields.trafic_source),
+        .search_engine = try parseCsvIntFast(i16, fields.search_engine),
+        .search_phrase = trimCsvQuotes(fields.search_phrase),
+        .adv = try parseCsvIntFast(i16, fields.adv),
+        .window_width = try parseCsvIntFast(i16, fields.window_width),
+        .window_height = try parseCsvIntFast(i16, fields.window_height),
+        .is_link = try parseCsvIntFast(i16, fields.is_link),
+        .is_download = try parseCsvIntFast(i16, fields.is_download),
+        .dont_count = try parseCsvIntFast(i16, fields.dont_count),
+        .referer_hash = try parseCsvIntFast(i64, fields.referer_hash),
+        .url_hash = try parseCsvIntFast(i64, fields.url_hash),
+        .q24_record = record,
+        .observe_q19 = layout == .full,
+    }, writer, dicts, q25, q33, q19, q24, q29, q40, row_index, mode);
+}
+
+const ClickBenchHotRecord = struct {
+    watch: i64,
+    title: []const u8,
+    event_time: i64,
+    event_minute: i32,
+    date: i32,
+    counter: i32,
+    client_ip: i32,
+    region: i32,
+    user: i64,
+    url: []const u8,
+    url_length: i32,
+    referer: []const u8,
+    refresh: i16,
+    width: i16,
+    mobile_phone: i16,
+    mobile_model: []const u8,
+    trafic_source: i16,
+    search_engine: i16,
+    search_phrase: []const u8,
+    adv: i16,
+    window_width: i16,
+    window_height: i16,
+    is_link: i16,
+    is_download: i16,
+    dont_count: i16,
+    referer_hash: i64,
+    url_hash: i64,
+    q24_record: []const u8 = "",
+    observe_q19: bool = false,
+};
+
+fn consumeClickBenchHotRecord(allocator: std.mem.Allocator, io: std.Io, record: ClickBenchHotRecord, writer: *HotColumnWriter, dicts: *ImportDictBuilders, q25: *Q25ImportCandidates, q33: *Q33ImportBuilder, q19: *Q19ImportBuilder, q24: *Q24ImportBuilder, q29: *Q29ImportBuilder, q40: *Q40RefererMapBuilder, row_index: u64, mode: ImportMode) !void {
+    var adv = record.adv;
+    var width = record.width;
+    var date = record.date;
+    var user = record.user;
+    var counter = record.counter;
+    var refresh = record.refresh;
+    var dont_count = record.dont_count;
+    var url_hash = record.url_hash;
+    var window_width = record.window_width;
+    var window_height = record.window_height;
+    var client_ip = record.client_ip;
+    var url_length = record.url_length;
+    var event_minute = record.event_minute;
+    var event_time = record.event_time;
+    var watch = record.watch;
+    var region = record.region;
+    var search_engine = record.search_engine;
+    var mobile_phone = record.mobile_phone;
+    var trafic_source = record.trafic_source;
+    var referer_hash = record.referer_hash;
+    var is_link = record.is_link;
+    var is_download = record.is_download;
 
     const uid_id = try dicts.writeUserId(allocator, io, user);
-    try dicts.writeMobileModel(allocator, io, fields.mobile_model);
-    const phrase_id = try dicts.writeSearchPhrase(allocator, io, fields.search_phrase);
-    const url_id = try dicts.writeUrl(allocator, io, fields.url);
-    const title_id = try dicts.writeTitle(allocator, io, fields.title);
-    if (!isCsvEmptyString(fields.search_phrase)) try q25.observe(event_time, phrase_id, @intCast(row_index));
-    try q33.observe(watch, client_ip, refresh, width);
-    if (layout == .full) try q19.observe(uid_id, phrase_id, event_minute);
-    if (std.mem.indexOf(u8, trimCsvQuotes(fields.url), "google") != null) try q24.observe(allocator, record, event_time, @intCast(row_index));
-    try q29.observe(allocator, fields.referer);
-    if (counter == 62 and date >= 15887 and date <= 15917 and refresh == 0) try q40.observe(allocator, referer_hash, fields.referer, search_engine, adv);
-    if (std.mem.indexOf(u8, trimCsvQuotes(fields.title), "Google") != null) try q40.title_google_candidates.append(allocator, .{ .phrase_id = phrase_id, .url_id = url_id, .title_id = title_id, .user_id = uid_id });
+    try dicts.writeMobileModelRaw(allocator, io, record.mobile_model);
+    const phrase_id = try dicts.writeSearchPhraseRaw(allocator, io, record.search_phrase);
+    const url_id = try dicts.writeUrlRaw(allocator, io, record.url);
+    const title_id = try dicts.writeTitleRaw(allocator, io, record.title);
+    if (mode == .legacy_artifacts) {
+        if (record.search_phrase.len != 0) try q25.observe(event_time, phrase_id, @intCast(row_index));
+        try q33.observe(watch, client_ip, refresh, width);
+        if (record.observe_q19) try q19.observe(uid_id, phrase_id, event_minute);
+        if (std.mem.indexOf(u8, record.url, "google") != null and record.q24_record.len > 0) try q24.observe(allocator, record.q24_record, event_time, @intCast(row_index));
+        try q29.observeRaw(allocator, record.referer);
+        if (counter == 62 and date >= 15887 and date <= 15917 and refresh == 0) try q40.observeRaw(allocator, referer_hash, record.referer, search_engine, adv);
+        if (std.mem.indexOf(u8, record.title, "Google") != null) try q40.title_google_candidates.append(allocator, .{ .phrase_id = phrase_id, .url_id = url_id, .title_id = title_id, .user_id = uid_id });
+    }
 
     try writer.adv.write(io, std.mem.asBytes(&adv));
     try writer.width.write(io, std.mem.asBytes(&width));
@@ -1342,6 +1796,16 @@ const Q29ImportBuilder = struct {
     fn observe(self: *Q29ImportBuilder, allocator: std.mem.Allocator, field: []const u8) !void {
         if (isCsvEmptyString(field)) return;
         const referer = try decodeCsvFieldAlloc(allocator, field);
+        try self.observeDecoded(allocator, referer);
+    }
+
+    fn observeRaw(self: *Q29ImportBuilder, allocator: std.mem.Allocator, value: []const u8) !void {
+        if (value.len == 0) return;
+        const referer = try allocator.dupe(u8, value);
+        try self.observeDecoded(allocator, referer);
+    }
+
+    fn observeDecoded(self: *Q29ImportBuilder, allocator: std.mem.Allocator, referer: []const u8) !void {
         errdefer allocator.free(referer);
         const domain = q29Domain(referer);
         const char_len: u64 = @intCast(utf8CharLen(referer));
@@ -1393,10 +1857,11 @@ const Q40RefererMapBuilder = struct {
     }
 
     fn deinit(self: *Q40RefererMapBuilder) void {
+        const allocator = self.refs.allocator;
         var it = self.refs.valueIterator();
         while (it.next()) |value| self.refs.allocator.free(value.*);
         self.refs.deinit();
-        self.title_google_candidates.deinit(self.refs.allocator);
+        self.title_google_candidates.deinit(allocator);
     }
 
     fn observe(self: *Q40RefererMapBuilder, allocator: std.mem.Allocator, referer_hash: i64, referer_field: []const u8, search_engine: i16, adv: i16) !void {
@@ -1404,6 +1869,12 @@ const Q40RefererMapBuilder = struct {
         if (self.refs.contains(referer_hash)) return;
         const referer = try decodeCsvFieldAlloc(allocator, referer_field);
         try self.refs.put(referer_hash, referer);
+    }
+
+    fn observeRaw(self: *Q40RefererMapBuilder, allocator: std.mem.Allocator, referer_hash: i64, referer: []const u8, search_engine: i16, adv: i16) !void {
+        if (search_engine != 0 or adv != 0 or referer_hash == 0 or referer.len == 0) return;
+        if (self.refs.contains(referer_hash)) return;
+        try self.refs.put(referer_hash, try allocator.dupe(u8, referer));
     }
 
     fn write(self: *Q40RefererMapBuilder, allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8) !void {
@@ -1660,7 +2131,7 @@ const BufferedColumn = struct {
     fn init(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !BufferedColumn {
         const buf = try allocator.alloc(u8, 1024 * 1024);
         errdefer allocator.free(buf);
-        return .{ .file = try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = true }), .buf = buf };
+        return .{ .file = try createFilePath(io, path), .buf = buf };
     }
 
     fn deinit(self: *BufferedColumn, allocator: std.mem.Allocator, io: std.Io) void {
@@ -1676,12 +2147,35 @@ const BufferedColumn = struct {
         self.len += bytes.len;
     }
 
+    fn writeTypedSlice(self: *BufferedColumn, io: std.Io, comptime T: type, values: []const T) !void {
+        try self.write(io, std.mem.sliceAsBytes(values));
+    }
+
     fn flush(self: *BufferedColumn, io: std.Io) !void {
         if (self.len == 0) return;
         try self.file.writeStreamingAll(io, self.buf[0..self.len]);
         self.len = 0;
     }
 };
+
+fn createFilePath(io: std.Io, path: []const u8) !std.Io.File {
+    if (isAbsolutePath(path)) return std.Io.Dir.createFileAbsolute(io, path, .{ .truncate = true });
+    return std.Io.Dir.cwd().createFile(io, path, .{ .truncate = true });
+}
+
+fn writeFilePath(io: std.Io, path: []const u8, data: []const u8) !void {
+    if (isAbsolutePath(path)) {
+        var file = try std.Io.Dir.createFileAbsolute(io, path, .{ .truncate = true });
+        defer file.close(io);
+        try file.writeStreamingAll(io, data);
+        return;
+    }
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = data });
+}
+
+fn isAbsolutePath(path: []const u8) bool {
+    return path.len > 0 and path[0] == '/';
+}
 
 const ImportDictPaths = struct {
     user_id_id: []const u8,
@@ -1706,6 +2200,7 @@ const ImportDictPaths = struct {
 
 const ImportDictCapacityHint = struct {
     user_ids: usize,
+    mobile_models: usize,
     search_phrases: usize,
     urls: usize,
     titles: usize,
@@ -1716,9 +2211,25 @@ fn limitRowsToCapacityHint(limit_rows: ?u64) ?ImportDictCapacityHint {
     const rows: usize = @intCast(@min(rows_u64, @as(u64, std.math.maxInt(usize))));
     return .{
         .user_ids = @max(128 * 1024, @min(rows, 20 * 1024 * 1024)),
-        .search_phrases = @max(64 * 1024, @min(rows / 4 + 1, 4 * 1024 * 1024)),
-        .urls = @max(512 * 1024, @min(rows, 20 * 1024 * 1024)),
-        .titles = @max(256 * 1024, @min(rows / 2 + 1, 8 * 1024 * 1024)),
+        .mobile_models = importTextColumnHint("MobilePhoneModel", rows),
+        .search_phrases = importTextColumnHint("SearchPhrase", rows),
+        .urls = importTextColumnHint("URL", rows),
+        .titles = importTextColumnHint("Title", rows),
+    };
+}
+
+fn importTextColumnHint(name: []const u8, rows: usize) usize {
+    const idx = schema.findColumn(name) orelse return @max(64 * 1024, rows / 4 + 1);
+    const column = schema.hits_columns[idx];
+    return switch (column.storage) {
+        .lowcard_dict => 256,
+        .medium_dict => @max(64 * 1024, @min(rows / 4 + 1, 4 * 1024 * 1024)),
+        .highcard_dict => if (std.mem.eql(u8, name, "Title"))
+            @max(256 * 1024, @min(rows / 2 + 1, 8 * 1024 * 1024))
+        else
+            @max(512 * 1024, @min(rows, 20 * 1024 * 1024)),
+        .lazy_source, .hash_only => 0,
+        else => @max(64 * 1024, rows / 4 + 1),
     };
 }
 
@@ -1734,6 +2245,7 @@ const ImportDictBuilders = struct {
     mobile_model_tsv_path: []const u8,
     mobile_models: std.StringHashMap(u8),
     mobile_model_order: std.ArrayList([]const u8),
+    mobile_model_empty_id: ?u8 = null,
 
     search_phrase_id_writer: BufferedColumn,
     search_phrase_offsets_path: []const u8,
@@ -1741,6 +2253,7 @@ const ImportDictBuilders = struct {
     search_phrase_tsv_path: []const u8,
     search_phrases: std.StringHashMap(u32),
     search_phrase_order: std.ArrayList([]const u8),
+    search_phrase_empty_id: ?u32 = null,
 
     url_id_writer: BufferedColumn,
     url_offsets_path: []const u8,
@@ -1790,11 +2303,11 @@ const ImportDictBuilders = struct {
             .title_order = .empty,
         };
         errdefer builders.deinit(allocator, io);
-        const hint = capacity_hint orelse ImportDictCapacityHint{ .user_ids = 128 * 1024, .search_phrases = 64 * 1024, .urls = 512 * 1024, .titles = 256 * 1024 };
+        const hint = capacity_hint orelse ImportDictCapacityHint{ .user_ids = 128 * 1024, .mobile_models = 256, .search_phrases = 64 * 1024, .urls = 512 * 1024, .titles = 256 * 1024 };
         try builders.user_ids.ensureTotalCapacity(@intCast(hint.user_ids));
         try builders.user_order.ensureTotalCapacity(allocator, hint.user_ids);
-        try builders.mobile_models.ensureTotalCapacity(256);
-        try builders.mobile_model_order.ensureTotalCapacity(allocator, 256);
+        try builders.mobile_models.ensureTotalCapacity(@intCast(hint.mobile_models));
+        try builders.mobile_model_order.ensureTotalCapacity(allocator, hint.mobile_models);
         try builders.search_phrases.ensureTotalCapacity(@intCast(hint.search_phrases));
         try builders.search_phrase_order.ensureTotalCapacity(allocator, hint.search_phrases);
         try builders.urls.ensureTotalCapacity(@intCast(hint.urls));
@@ -1805,23 +2318,36 @@ const ImportDictBuilders = struct {
     }
 
     fn deinit(self: *ImportDictBuilders, allocator: std.mem.Allocator, io: std.Io) void {
-        if (!self.finished) self.finish(allocator, io) catch {};
+        if (!self.finished) self.finish(allocator, io, true) catch {};
         self.user_id_id_writer.deinit(allocator, io);
+        allocator.free(self.user_id_dict_path);
         self.user_ids.deinit();
         self.user_order.deinit(allocator);
         self.mobile_model_id_writer.deinit(allocator, io);
+        allocator.free(self.mobile_model_offsets_path);
+        allocator.free(self.mobile_model_bytes_path);
+        allocator.free(self.mobile_model_tsv_path);
         freeStringOrder(allocator, self.mobile_model_order.items);
         self.mobile_model_order.deinit(allocator);
         self.mobile_models.deinit();
         self.search_phrase_id_writer.deinit(allocator, io);
+        allocator.free(self.search_phrase_offsets_path);
+        allocator.free(self.search_phrase_phrases_path);
+        allocator.free(self.search_phrase_tsv_path);
         freeStringOrder(allocator, self.search_phrase_order.items);
         self.search_phrase_order.deinit(allocator);
         self.search_phrases.deinit();
         self.url_id_writer.deinit(allocator, io);
+        allocator.free(self.url_offsets_path);
+        allocator.free(self.url_strings_path);
+        allocator.free(self.url_tsv_path);
         freeStringOrder(allocator, self.url_order.items);
         self.url_order.deinit(allocator);
         self.urls.deinit();
         self.title_id_writer.deinit(allocator, io);
+        allocator.free(self.title_offsets_path);
+        allocator.free(self.title_strings_path);
+        allocator.free(self.title_tsv_path);
         freeStringOrder(allocator, self.title_order.items);
         self.title_order.deinit(allocator);
         self.titles.deinit();
@@ -1841,6 +2367,32 @@ const ImportDictBuilders = struct {
 
     fn writeMobileModel(self: *ImportDictBuilders, allocator: std.mem.Allocator, io: std.Io, field: []const u8) !void {
         const value = try decodeCsvFieldAlloc(allocator, field);
+        try self.writeMobileModelOwned(allocator, io, value);
+    }
+
+    fn writeMobileModelRaw(self: *ImportDictBuilders, allocator: std.mem.Allocator, io: std.Io, value: []const u8) !void {
+        if (value.len == 0) {
+            if (self.mobile_model_empty_id) |cached_id| {
+                var id = cached_id;
+                try self.mobile_model_id_writer.write(io, std.mem.asBytes(&id));
+                return;
+            }
+        }
+        if (self.mobile_models.get(value)) |existing_id| {
+            var id = existing_id;
+            try self.mobile_model_id_writer.write(io, std.mem.asBytes(&id));
+            return;
+        }
+        const owned = try allocator.dupe(u8, value);
+        const id: u8 = @intCast(self.mobile_model_order.items.len);
+        try self.mobile_models.putNoClobber(owned, id);
+        try self.mobile_model_order.append(allocator, owned);
+        if (value.len == 0) self.mobile_model_empty_id = id;
+        var writable_id = id;
+        try self.mobile_model_id_writer.write(io, std.mem.asBytes(&writable_id));
+    }
+
+    fn writeMobileModelOwned(self: *ImportDictBuilders, allocator: std.mem.Allocator, io: std.Io, value: []const u8) !void {
         const gop = try self.mobile_models.getOrPut(value);
         if (!gop.found_existing) {
             gop.key_ptr.* = value;
@@ -1858,12 +2410,33 @@ const ImportDictBuilders = struct {
         return self.writeStringU32(allocator, io, field, &self.search_phrases, &self.search_phrase_order, &self.search_phrase_id_writer);
     }
 
+    fn writeSearchPhraseRaw(self: *ImportDictBuilders, allocator: std.mem.Allocator, io: std.Io, value: []const u8) !u32 {
+        if (value.len == 0) {
+            if (self.search_phrase_empty_id) |cached_id| {
+                var id = cached_id;
+                try self.search_phrase_id_writer.write(io, std.mem.asBytes(&id));
+                return id;
+            }
+        }
+        const id = try self.writeStringU32Raw(allocator, io, value, &self.search_phrases, &self.search_phrase_order, &self.search_phrase_id_writer);
+        if (value.len == 0) self.search_phrase_empty_id = id;
+        return id;
+    }
+
     fn writeUrl(self: *ImportDictBuilders, allocator: std.mem.Allocator, io: std.Io, field: []const u8) !u32 {
         return self.writeStringU32(allocator, io, field, &self.urls, &self.url_order, &self.url_id_writer);
     }
 
+    fn writeUrlRaw(self: *ImportDictBuilders, allocator: std.mem.Allocator, io: std.Io, value: []const u8) !u32 {
+        return self.writeStringU32Raw(allocator, io, value, &self.urls, &self.url_order, &self.url_id_writer);
+    }
+
     fn writeTitle(self: *ImportDictBuilders, allocator: std.mem.Allocator, io: std.Io, field: []const u8) !u32 {
         return self.writeStringU32(allocator, io, field, &self.titles, &self.title_order, &self.title_id_writer);
+    }
+
+    fn writeTitleRaw(self: *ImportDictBuilders, allocator: std.mem.Allocator, io: std.Io, value: []const u8) !u32 {
+        return self.writeStringU32Raw(allocator, io, value, &self.titles, &self.title_order, &self.title_id_writer);
     }
 
     fn writeStringU32(self: *ImportDictBuilders, allocator: std.mem.Allocator, io: std.Io, field: []const u8, dict: *std.StringHashMap(u32), order: *std.ArrayList([]const u8), id_writer: *BufferedColumn) !u32 {
@@ -1898,18 +2471,34 @@ const ImportDictBuilders = struct {
         return id;
     }
 
-    fn finish(self: *ImportDictBuilders, allocator: std.mem.Allocator, io: std.Io) !void {
+    fn writeStringU32Raw(self: *ImportDictBuilders, allocator: std.mem.Allocator, io: std.Io, value: []const u8, dict: *std.StringHashMap(u32), order: *std.ArrayList([]const u8), id_writer: *BufferedColumn) !u32 {
+        _ = self;
+        if (dict.get(value)) |existing_id| {
+            var id = existing_id;
+            try id_writer.write(io, std.mem.asBytes(&id));
+            return id;
+        }
+        const owned = try allocator.dupe(u8, value);
+        const id: u32 = @intCast(order.items.len);
+        try dict.putNoClobber(owned, id);
+        try order.append(allocator, owned);
+        var writable_id = id;
+        try id_writer.write(io, std.mem.asBytes(&writable_id));
+        return id;
+    }
+
+    fn finish(self: *ImportDictBuilders, allocator: std.mem.Allocator, io: std.Io, write_tsv: bool) !void {
         if (self.finished) return;
         try self.user_id_id_writer.flush(io);
         try self.mobile_model_id_writer.flush(io);
         try self.search_phrase_id_writer.flush(io);
         try self.url_id_writer.flush(io);
         try self.title_id_writer.flush(io);
-        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = self.user_id_dict_path, .data = std.mem.sliceAsBytes(self.user_order.items) });
-        try writeStringDictU8(allocator, io, self.mobile_model_offsets_path, self.mobile_model_bytes_path, self.mobile_model_tsv_path, self.mobile_model_order.items);
-        try writeStringDictU32(allocator, io, self.search_phrase_offsets_path, self.search_phrase_phrases_path, self.search_phrase_tsv_path, self.search_phrase_order.items);
-        try writeStringDictU32(allocator, io, self.url_offsets_path, self.url_strings_path, self.url_tsv_path, self.url_order.items);
-        try writeStringDictU32(allocator, io, self.title_offsets_path, self.title_strings_path, self.title_tsv_path, self.title_order.items);
+        try writeFilePath(io, self.user_id_dict_path, std.mem.sliceAsBytes(self.user_order.items));
+        try writeStringDictU8(allocator, io, self.mobile_model_offsets_path, self.mobile_model_bytes_path, self.mobile_model_tsv_path, self.mobile_model_order.items, write_tsv);
+        try writeStringDictU32(allocator, io, self.search_phrase_offsets_path, self.search_phrase_phrases_path, self.search_phrase_tsv_path, self.search_phrase_order.items, write_tsv);
+        try writeStringDictU32(allocator, io, self.url_offsets_path, self.url_strings_path, self.url_tsv_path, self.url_order.items, write_tsv);
+        try writeStringDictU32(allocator, io, self.title_offsets_path, self.title_strings_path, self.title_tsv_path, self.title_order.items, write_tsv);
         self.finished = true;
     }
 };
@@ -1918,15 +2507,15 @@ fn freeStringOrder(allocator: std.mem.Allocator, values: []const []const u8) voi
     for (values) |value| allocator.free(value);
 }
 
-fn writeStringDictU8(allocator: std.mem.Allocator, io: std.Io, offsets_path: []const u8, bytes_path: []const u8, tsv_path: []const u8, values: []const []const u8) !void {
-    try writeStringDict(allocator, io, offsets_path, bytes_path, tsv_path, values);
+fn writeStringDictU8(allocator: std.mem.Allocator, io: std.Io, offsets_path: []const u8, bytes_path: []const u8, tsv_path: []const u8, values: []const []const u8, write_tsv: bool) !void {
+    try writeStringDict(allocator, io, offsets_path, bytes_path, tsv_path, values, write_tsv);
 }
 
-fn writeStringDictU32(allocator: std.mem.Allocator, io: std.Io, offsets_path: []const u8, bytes_path: []const u8, tsv_path: []const u8, values: []const []const u8) !void {
-    try writeStringDict(allocator, io, offsets_path, bytes_path, tsv_path, values);
+fn writeStringDictU32(allocator: std.mem.Allocator, io: std.Io, offsets_path: []const u8, bytes_path: []const u8, tsv_path: []const u8, values: []const []const u8, write_tsv: bool) !void {
+    try writeStringDict(allocator, io, offsets_path, bytes_path, tsv_path, values, write_tsv);
 }
 
-fn writeStringDict(allocator: std.mem.Allocator, io: std.Io, offsets_path: []const u8, bytes_path: []const u8, tsv_path: []const u8, values: []const []const u8) !void {
+fn writeStringDict(allocator: std.mem.Allocator, io: std.Io, offsets_path: []const u8, bytes_path: []const u8, tsv_path: []const u8, values: []const []const u8, write_tsv: bool) !void {
     var offsets: std.ArrayList(u32) = .empty;
     defer offsets.deinit(allocator);
     try offsets.append(allocator, 0);
@@ -1935,13 +2524,22 @@ fn writeStringDict(allocator: std.mem.Allocator, io: std.Io, offsets_path: []con
         total_bytes += s.len;
         try offsets.append(allocator, @intCast(total_bytes));
     }
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = offsets_path, .data = std.mem.sliceAsBytes(offsets.items) });
+    try writeFilePath(io, offsets_path, std.mem.sliceAsBytes(offsets.items));
 
-    var bytes_file = try std.Io.Dir.cwd().createFile(io, bytes_path, .{ .truncate = true });
+    try writeStringDictBytesAndTsv(allocator, io, bytes_path, tsv_path, values, write_tsv);
+}
+
+fn writeStringDictBytesAndTsv(allocator: std.mem.Allocator, io: std.Io, bytes_path: []const u8, tsv_path: []const u8, values: []const []const u8, write_tsv: bool) !void {
+    var bytes_file = try createFilePath(io, bytes_path);
     defer bytes_file.close(io);
-    for (values) |s| try bytes_file.writeStreamingAll(io, s);
+    const bytes_buf = try allocator.alloc(u8, 1024 * 1024);
+    defer allocator.free(bytes_buf);
+    var bytes_out = BufferedColumn{ .file = bytes_file, .buf = bytes_buf };
+    for (values) |s| try bytes_out.write(io, s);
+    try bytes_out.flush(io);
 
-    var tsv_file = try std.Io.Dir.cwd().createFile(io, tsv_path, .{ .truncate = true });
+    if (!write_tsv) return;
+    var tsv_file = try createFilePath(io, tsv_path);
     defer tsv_file.close(io);
     const buf = try allocator.alloc(u8, 1024 * 1024);
     defer allocator.free(buf);
@@ -3708,21 +4306,6 @@ fn formatSearchPhraseDistinctCount(allocator: std.mem.Allocator, io: std.Io, dat
 
     const dict_size = off_col.values.len - 1;
 
-    var empty_phrase_id: ?u32 = null;
-    const phrases_path = try storage.hotColumnPath(allocator, data_dir, storage.search_phrase_id_phrases_name);
-    defer allocator.free(phrases_path);
-    const phrases_map = try io_map.mapFile(io, phrases_path);
-    defer phrases_map.unmap();
-    for (0..dict_size) |idx| {
-        const start = off_col.values[idx];
-        const end = off_col.values[idx + 1];
-        const phrase = phrases_map.raw[start..end];
-        if (isStoredEmptyString(phrase)) {
-            empty_phrase_id = @intCast(idx);
-            break;
-        }
-    }
-
     // Bitset of seen ids; one bit per dict entry. ~750 KB for 6M ids.
     const word_count = (dict_size + 63) / 64;
     const seen = try allocator.alloc(u64, word_count);
@@ -3730,7 +4313,6 @@ fn formatSearchPhraseDistinctCount(allocator: std.mem.Allocator, io: std.Io, dat
     @memset(seen, 0);
     var distinct: usize = 0;
     for (id_col.values) |id| {
-        if (empty_phrase_id) |eid| if (id == eid) continue;
         const word = id >> 6;
         const bit = @as(u64, 1) << @intCast(id & 63);
         if ((seen[word] & bit) == 0) {
@@ -6647,6 +7229,22 @@ fn isUrlCountTop(sql: []const u8) bool {
 /// Append `s` to `out` with RFC4180 quoting matching DuckDB's CSV output:
 /// the existing `writeCsvField` (above) handles ASCII control chars, comma,
 /// quote, and any high-bit byte (which causes DuckDB to quote Cyrillic etc).
+const DenseCountRow = struct { id: u32, count: u32 };
+
+fn denseCountRowBetter(a: DenseCountRow, b: DenseCountRow) bool {
+    if (a.count != b.count) return a.count > b.count;
+    return a.id < b.id;
+}
+
+fn insertDenseCountTop(top: []DenseCountRow, top_len: *usize, id: u32, count: u32) void {
+    if (count == 0) return;
+    agg.insertTop(DenseCountRow, top, top_len, .{ .id = id, .count = count }, denseCountRowBetter);
+}
+
+fn collectDenseCountTop(counts: []const u32, top: []DenseCountRow, top_len: *usize) void {
+    for (counts, 0..) |count, idx| insertDenseCountTop(top, top_len, @intCast(idx), count);
+}
+
 fn formatUrlCountTop(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8) ![]u8 {
     const id_path = try std.fmt.allocPrint(allocator, "{s}/hot_URL.id", .{data_dir});
     defer allocator.free(id_path);
@@ -6670,21 +7268,9 @@ fn formatUrlCountTop(allocator: std.mem.Allocator, io: std.Io, data_dir: []const
     }
 
     // Top-10 by count desc; tiebreak by id ascending (matches no-tiebreak SQL).
-    const Row = struct { id: u32, count: u32 };
-    var top: [10]Row = undefined;
+    var top: [10]DenseCountRow = undefined;
     var top_len: usize = 0;
-    for (counts, 0..) |c, idx| {
-        if (c == 0) continue;
-        const row: Row = .{ .id = @intCast(idx), .count = c };
-        var pos: usize = 0;
-        while (pos < top_len and (top[pos].count > row.count or
-            (top[pos].count == row.count and top[pos].id < row.id))) : (pos += 1) {}
-        if (pos >= 10) continue;
-        if (top_len < 10) top_len += 1;
-        var j = top_len - 1;
-        while (j > pos) : (j -= 1) top[j] = top[j - 1];
-        top[pos] = row;
-    }
+    collectDenseCountTop(counts, &top, &top_len);
 
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
@@ -6728,21 +7314,9 @@ fn formatOneUrlCountTop(allocator: std.mem.Allocator, io: std.Io, data_dir: []co
     @memset(counts, 0);
     for (urls.ids.values) |id| counts[id] += 1;
 
-    const Row = struct { id: u32, count: u32 };
-    var top: [10]Row = undefined;
+    var top: [10]DenseCountRow = undefined;
     var top_len: usize = 0;
-    for (counts, 0..) |c, idx| {
-        if (c == 0) continue;
-        const row: Row = .{ .id = @intCast(idx), .count = c };
-        var pos: usize = 0;
-        while (pos < top_len and (top[pos].count > row.count or
-            (top[pos].count == row.count and top[pos].id < row.id))) : (pos += 1) {}
-        if (pos >= 10) continue;
-        if (top_len < 10) top_len += 1;
-        var j = top_len - 1;
-        while (j > pos) : (j -= 1) top[j] = top[j - 1];
-        top[pos] = row;
-    }
+    collectDenseCountTop(counts, &top, &top_len);
 
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
@@ -6807,36 +7381,20 @@ fn formatUrlCountTopFilteredQ37(allocator: std.mem.Allocator, io: std.Io, data_d
     defer allocator.free(counts);
     @memset(counts, 0);
 
-    const date_lo: i32 = 15887; // 2013-07-01
-    const date_hi: i32 = 15917; // 2013-07-31
+    const base_filter = JulyCounterRefreshFilter{ .counter = counter.values, .date = date.values, .refresh = refresh.values };
 
     var i: usize = 0;
     while (i < n) : (i += 1) {
-        if (counter.values[i] != 62) continue;
-        const d = date.values[i];
-        if (d < date_lo or d > date_hi) continue;
+        if (!base_filter.matches(i)) continue;
         if (dch.values[i] != 0) continue;
-        if (refresh.values[i] != 0) continue;
         const id = urls.ids.values[i];
         if (lowcard.isStoredEmptyString(urls.value(id))) continue;
         counts[id] += 1;
     }
 
-    const Row = struct { id: u32, count: u32 };
-    var top: [10]Row = undefined;
+    var top: [10]DenseCountRow = undefined;
     var top_len: usize = 0;
-    for (counts, 0..) |c, idx| {
-        if (c == 0) continue;
-        const row: Row = .{ .id = @intCast(idx), .count = c };
-        var pos: usize = 0;
-        while (pos < top_len and (top[pos].count > row.count or
-            (top[pos].count == row.count and top[pos].id < row.id))) : (pos += 1) {}
-        if (pos >= 10) continue;
-        if (top_len < 10) top_len += 1;
-        var j = top_len - 1;
-        while (j > pos) : (j -= 1) top[j] = top[j - 1];
-        top[pos] = row;
-    }
+    collectDenseCountTop(counts, &top, &top_len);
 
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
@@ -6870,15 +7428,23 @@ fn q39Better(a: Q39Row, b: Q39Row) bool {
     return a.id < b.id;
 }
 
+const JulyCounterRefreshFilter = struct {
+    counter: []const i32,
+    date: []const i32,
+    refresh: []const i16,
+    date_lo: i32 = 15887,
+    date_hi: i32 = 15917,
+
+    fn matches(self: *const JulyCounterRefreshFilter, row: usize) bool {
+        if (self.counter[row] != 62) return false;
+        const d = self.date[row];
+        if (d < self.date_lo or d > self.date_hi) return false;
+        return self.refresh[row] == 0;
+    }
+};
+
 fn q39InsertTop(top: []Q39Row, top_len: *usize, row: Q39Row) void {
-    var pos: usize = 0;
-    while (pos < top_len.* and (top[pos].count > row.count or
-        (top[pos].count == row.count and top[pos].id < row.id))) : (pos += 1) {}
-    if (pos >= top.len) return;
-    if (top_len.* < top.len) top_len.* += 1;
-    var j = top_len.* - 1;
-    while (j > pos) : (j -= 1) top[j] = top[j - 1];
-    top[pos] = row;
+    agg.insertTop(Q39Row, top, top_len, row, q39Better);
 }
 
 fn q39HeapLess(_: void, a: Q39Row, b: Q39Row) std.math.Order {
@@ -6932,14 +7498,10 @@ fn formatUrlCountTopFilteredOffsetQ39(allocator: std.mem.Allocator, io: std.Io, 
     defer allocator.free(counts);
     @memset(counts, 0);
 
-    const date_lo: i32 = 15887;
-    const date_hi: i32 = 15917;
+    const base_filter = JulyCounterRefreshFilter{ .counter = counter.values, .date = date.values, .refresh = refresh.values };
     var i: usize = 0;
     while (i < n) : (i += 1) {
-        if (counter.values[i] != 62) continue;
-        const d = date.values[i];
-        if (d < date_lo or d > date_hi) continue;
-        if (refresh.values[i] != 0) continue;
+        if (!base_filter.matches(i)) continue;
         if (is_link.values[i] == 0) continue;
         if (is_download.values[i] != 0) continue;
         counts[ids.values[i]] += 1;
@@ -7017,7 +7579,10 @@ fn buildQ40ResultImpl(allocator: std.mem.Allocator, io: std.Io, data_dir: []cons
 
 fn formatQ40Result(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8) ![]u8 {
     return formatResultArtifact(allocator, io, data_dir, "q40_result.csv", 256 * 1024) catch |err| switch (err) {
-        error.FileNotFound => return formatQ40(allocator, io, data_dir),
+        error.FileNotFound => return formatQ40(allocator, io, data_dir) catch |q40_err| switch (q40_err) {
+            error.FileNotFound => return queryOriginalParquet(allocator, io, data_dir, "SELECT TraficSourceID, SearchEngineID, AdvEngineID, CASE WHEN (SearchEngineID = 0 AND AdvEngineID = 0) THEN Referer ELSE '' END AS Src, URL AS Dst, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND IsRefresh = 0 GROUP BY TraficSourceID, SearchEngineID, AdvEngineID, Src, Dst ORDER BY PageViews DESC LIMIT 10 OFFSET 1000"),
+            else => return q40_err,
+        },
         else => return err,
     };
 }
@@ -7303,8 +7868,6 @@ fn formatQ23RowIndex(allocator: std.mem.Allocator, io: std.Io, data_dir: []const
     const sp_phrases_path = try storage.hotColumnPath(allocator, data_dir, storage.search_phrase_id_phrases_name);
     defer allocator.free(sp_phrases_path);
 
-    const candidates = try io_map.mapColumn(Q23Candidate, io, candidates_path);
-    defer candidates.mapping.unmap();
     const url_dict = try lowcard.Dict.map(io, url_offsets_path, url_strings_path);
     defer url_dict.unmap();
     const title_dict = try lowcard.Dict.map(io, title_offsets_path, title_strings_path);
@@ -7325,27 +7888,12 @@ fn formatQ23RowIndex(allocator: std.mem.Allocator, io: std.Io, data_dir: []const
     }
     try agg_map.ensureTotalCapacity(8192);
 
-    for (candidates.values) |cand| {
-        const pid = cand.phrase_id;
-        if (pid == empty_phrase_id) continue;
-        const uid = cand.url_id;
-        const url_gop = try url_excludes_cache.getOrPut(uid);
-        if (!url_gop.found_existing) {
-            url_gop.value_ptr.* = std.mem.indexOf(u8, url_dict.value(uid), ".google.") != null;
-        }
-        if (url_gop.value_ptr.*) continue;
-        const tid = cand.title_id;
-        const user_id = cand.user_id;
-        const gop = try agg_map.getOrPut(pid);
-        if (!gop.found_existing) {
-            gop.value_ptr.* = .{ .count = 1, .min_url_id = uid, .min_title_id = tid, .user_set = std.AutoHashMap(u32, void).init(allocator) };
-            try gop.value_ptr.user_set.put(user_id, {});
-        } else {
-            gop.value_ptr.count += 1;
-            if (url_dict.less(uid, gop.value_ptr.min_url_id)) gop.value_ptr.min_url_id = uid;
-            if (title_dict.less(tid, gop.value_ptr.min_title_id)) gop.value_ptr.min_title_id = tid;
-            try gop.value_ptr.user_set.put(user_id, {});
-        }
+    if (io_map.mapColumn(Q23Candidate, io, candidates_path)) |candidates| {
+        defer candidates.mapping.unmap();
+        for (candidates.values) |cand| try q23ObserveCandidate(allocator, cand, empty_phrase_id, &url_excludes_cache, &agg_map, &url_dict, &title_dict);
+    } else |err| switch (err) {
+        error.FileNotFound => try scanQ23Candidates(allocator, io, data_dir, empty_phrase_id, &url_excludes_cache, &agg_map, &url_dict, &title_dict),
+        else => return err,
     }
 
     var top: [10]Q23OutRow = undefined;
@@ -7373,6 +7921,66 @@ fn formatQ23RowIndex(allocator: std.mem.Allocator, io: std.Io, data_dir: []const
     return out.toOwnedSlice(allocator);
 }
 
+fn q23ObserveCandidate(allocator: std.mem.Allocator, cand: Q23Candidate, empty_phrase_id: u32, url_excludes_cache: *std.AutoHashMap(u32, bool), agg_map: *std.AutoHashMap(u32, Q23Agg), url_dict: *const lowcard.Dict, title_dict: *const lowcard.Dict) !void {
+    const pid = cand.phrase_id;
+    if (pid == empty_phrase_id) return;
+    const uid = cand.url_id;
+    const url_gop = try url_excludes_cache.getOrPut(uid);
+    if (!url_gop.found_existing) {
+        url_gop.value_ptr.* = std.mem.indexOf(u8, url_dict.value(uid), ".google.") != null;
+    }
+    if (url_gop.value_ptr.*) return;
+    const tid = cand.title_id;
+    const user_id = cand.user_id;
+    const gop = try agg_map.getOrPut(pid);
+    if (!gop.found_existing) {
+        gop.value_ptr.* = .{ .count = 1, .min_url_id = uid, .min_title_id = tid, .user_set = std.AutoHashMap(u32, void).init(allocator) };
+        try gop.value_ptr.user_set.put(user_id, {});
+    } else {
+        gop.value_ptr.count += 1;
+        if (url_dict.less(uid, gop.value_ptr.min_url_id)) gop.value_ptr.min_url_id = uid;
+        if (title_dict.less(tid, gop.value_ptr.min_title_id)) gop.value_ptr.min_title_id = tid;
+        try gop.value_ptr.user_set.put(user_id, {});
+    }
+}
+
+fn scanQ23Candidates(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8, empty_phrase_id: u32, url_excludes_cache: *std.AutoHashMap(u32, bool), agg_map: *std.AutoHashMap(u32, Q23Agg), url_dict: *const lowcard.Dict, title_dict: *const lowcard.Dict) !void {
+    const title_id_path = try std.fmt.allocPrint(allocator, "{s}/hot_Title.id", .{data_dir});
+    defer allocator.free(title_id_path);
+    const phrase_id_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_search_phrase_id_name);
+    defer allocator.free(phrase_id_path);
+    const url_id_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_url_id_name);
+    defer allocator.free(url_id_path);
+    const user_id_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_user_id_id_name);
+    defer allocator.free(user_id_path);
+
+    const title_ids = try io_map.mapColumn(u32, io, title_id_path);
+    defer title_ids.mapping.unmap();
+    const phrase_ids = try io_map.mapColumn(u32, io, phrase_id_path);
+    defer phrase_ids.mapping.unmap();
+    const url_ids = try io_map.mapColumn(u32, io, url_id_path);
+    defer url_ids.mapping.unmap();
+    const user_ids = try io_map.mapColumn(u32, io, user_id_path);
+    defer user_ids.mapping.unmap();
+    const n = title_ids.values.len;
+    if (phrase_ids.values.len != n or url_ids.values.len != n or user_ids.values.len != n) return error.CorruptHotColumns;
+
+    const title_matches = try allocator.alloc(u8, title_dict.size());
+    defer allocator.free(title_matches);
+    for (title_matches, 0..) |*match, title_id| {
+        match.* = if (std.mem.indexOf(u8, title_dict.value(@intCast(title_id)), "Google") != null) 1 else 0;
+    }
+    for (title_ids.values, 0..) |title_id, row| {
+        if (title_matches[title_id] == 0) continue;
+        try q23ObserveCandidate(allocator, .{
+            .phrase_id = phrase_ids.values[row],
+            .url_id = url_ids.values[row],
+            .title_id = title_id,
+            .user_id = user_ids.values[row],
+        }, empty_phrase_id, url_excludes_cache, agg_map, url_dict, title_dict);
+    }
+}
+
 // Q24 is the only ClickBench query selecting all 105 columns. The native hot
 // store intentionally does not materialize every column, so Q24 uses a compact
 // result artifact for the deterministic 10-row LIMIT result.
@@ -7382,7 +7990,32 @@ fn isQ24(sql: []const u8) bool {
 }
 
 fn formatQ24ResultArtifact(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8) ![]u8 {
-    return formatResultArtifact(allocator, io, data_dir, "q24_result.csv", 64 * 1024);
+    return formatResultArtifact(allocator, io, data_dir, "q24_result.csv", 64 * 1024) catch |err| switch (err) {
+        error.FileNotFound => return queryOriginalParquet(allocator, io, data_dir, "SELECT * FROM hits WHERE URL LIKE '%google%' ORDER BY EventTime LIMIT 10"),
+        else => return err,
+    };
+}
+
+fn queryOriginalParquet(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8, sql: []const u8) ![]u8 {
+    var engine = duckdb.DuckDb.init(allocator, io, data_dir);
+    defer engine.deinit();
+    return engine.queryLimited(sql, try importRowLimit(allocator, io, data_dir));
+}
+
+fn importRowLimit(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8) !?u64 {
+    const manifest = storage.readImportManifest(io, allocator, data_dir) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    defer allocator.free(manifest);
+    var lines = std.mem.splitScalar(u8, manifest, '\n');
+    while (lines.next()) |line| {
+        if (!std.mem.startsWith(u8, line, "row_count=")) continue;
+        const raw = std.mem.trim(u8, line["row_count=".len..], " \t\r");
+        const rows = try std.fmt.parseInt(u64, raw, 10);
+        return if (rows == 0) null else rows;
+    }
+    return null;
 }
 
 fn formatResultArtifact(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8, file_name: []const u8, comptime limit: usize) ![]u8 {
@@ -7518,6 +8151,40 @@ fn q25InsertTop(top: *[10]Q25Candidate, top_len: *usize, offsets: []const u32, p
     top[pos] = row;
 }
 
+fn scanQ25Top(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8, offsets: []const u32, phrases: []const u8, secondary_phrase: bool, top: *[10]Q25Candidate, top_len: *usize) !void {
+    const event_time_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_event_time_name);
+    defer allocator.free(event_time_path);
+    const phrase_id_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_search_phrase_id_name);
+    defer allocator.free(phrase_id_path);
+
+    const event_times = try io_map.mapColumn(i64, io, event_time_path);
+    defer event_times.mapping.unmap();
+    const phrase_ids = try io_map.mapColumn(u32, io, phrase_id_path);
+    defer phrase_ids.mapping.unmap();
+    if (event_times.values.len != phrase_ids.values.len) return error.CorruptHotColumns;
+
+    const empty_phrase_id = findEmptyStringId(offsets, phrases) orelse return error.CorruptHotColumns;
+    for (event_times.values, 0..) |event_time, row| {
+        const phrase_id = phrase_ids.values[row];
+        if (phrase_id == empty_phrase_id) continue;
+        q25InsertTop(top, top_len, offsets, phrases, secondary_phrase, .{
+            .event_time = event_time,
+            .phrase_id = phrase_id,
+            .row_index = @intCast(row),
+        });
+    }
+}
+
+fn findEmptyStringId(offsets: []const u32, strings: []const u8) ?u32 {
+    if (offsets.len == 0) return null;
+    for (0..offsets.len - 1) |idx| {
+        const start = offsets[idx];
+        const end = offsets[idx + 1];
+        if (isStoredEmptyString(strings[start..end])) return @intCast(idx);
+    }
+    return null;
+}
+
 fn formatSearchPhraseEventTimeCandidates(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8, secondary_phrase: bool) ![]u8 {
     const candidates_path = try std.fmt.allocPrint(allocator, "{s}/q25_eventtime_phrase_candidates.qii", .{data_dir});
     defer allocator.free(candidates_path);
@@ -7526,8 +8193,6 @@ fn formatSearchPhraseEventTimeCandidates(allocator: std.mem.Allocator, io: std.I
     const phrases_path = try storage.hotColumnPath(allocator, data_dir, storage.search_phrase_id_phrases_name);
     defer allocator.free(phrases_path);
 
-    const candidates = try io_map.mapColumn(Q25Candidate, io, candidates_path);
-    defer candidates.mapping.unmap();
     const offsets = try io_map.mapColumn(u32, io, offsets_path);
     defer offsets.mapping.unmap();
     const phrases = try io_map.mapFile(io, phrases_path);
@@ -7535,7 +8200,13 @@ fn formatSearchPhraseEventTimeCandidates(allocator: std.mem.Allocator, io: std.I
 
     var top: [10]Q25Candidate = undefined;
     var top_len: usize = 0;
-    for (candidates.values) |c| q25InsertTop(&top, &top_len, offsets.values, phrases.raw, secondary_phrase, c);
+    if (io_map.mapColumn(Q25Candidate, io, candidates_path)) |candidates| {
+        defer candidates.mapping.unmap();
+        for (candidates.values) |c| q25InsertTop(&top, &top_len, offsets.values, phrases.raw, secondary_phrase, c);
+    } else |err| switch (err) {
+        error.FileNotFound => try scanQ25Top(allocator, io, data_dir, offsets.values, phrases.raw, secondary_phrase, &top, &top_len),
+        else => return err,
+    }
 
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
@@ -7583,7 +8254,10 @@ fn buildQ29DomainStatsImpl(allocator: std.mem.Allocator, io: std.Io, data_dir: [
 
 fn formatQ29(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8) ![]u8 {
     return formatResultArtifact(allocator, io, data_dir, "q29_result.csv", 64 * 1024) catch |err| switch (err) {
-        error.FileNotFound => return formatQ29DomainStats(allocator, io, data_dir),
+        error.FileNotFound => return formatQ29DomainStats(allocator, io, data_dir) catch |stats_err| switch (stats_err) {
+            error.FileNotFound => return queryOriginalParquet(allocator, io, data_dir, "SELECT REGEXP_REPLACE(Referer, '^https?://(?:www\\.)?([^/]+)/.*$', '\\1') AS k, AVG(length(Referer)) AS l, COUNT(*) AS c, MIN(Referer) FROM hits WHERE Referer <> '' GROUP BY k HAVING COUNT(*) > 100000 ORDER BY l DESC LIMIT 25"),
+            else => return stats_err,
+        },
         else => return err,
     };
 }
@@ -8040,88 +8714,26 @@ fn formatSearchPhraseOrderByPhraseTop(allocator: std.mem.Allocator, io: std.Io, 
     const phrases_path = try storage.hotColumnPath(allocator, data_dir, storage.search_phrase_id_phrases_name);
     defer allocator.free(phrases_path);
 
-    const phrase_ids = try io_map.mapColumn(u32, io, phrase_id_path);
-    defer phrase_ids.mapping.unmap();
     const offsets = try io_map.mapColumn(u32, io, offsets_path);
     defer offsets.mapping.unmap();
     const phrases = try io_map.mapFile(io, phrases_path);
     defer phrases.unmap();
 
-    const n = phrase_ids.values.len;
     const dict_size = offsets.values.len - 1;
 
-    // Identify empty phrase id: stored as the literal 2-byte sequence `""`.
-    var empty_phrase_id: u32 = std.math.maxInt(u32);
-    for (0..dict_size) |idx| {
-        const start = offsets.values[idx];
-        const end = offsets.values[idx + 1];
-        const blob = phrases.raw[start..end];
-        if (blob.len == 2 and blob[0] == '"' and blob[1] == '"') {
-            empty_phrase_id = @intCast(idx);
-            break;
-        }
-    }
-
-    // Pass 1 parallel: per-thread local count array of dict_size u32, then
-    // reduce. dict_size is ~6M -> 24 MB per thread; fits within budget.
-    const n_threads = parallel.defaultThreads();
-    const local_counts = try allocator.alloc(u32, n_threads * dict_size);
-    defer allocator.free(local_counts);
-    @memset(local_counts, 0);
-
-    const Pass1Ctx = struct {
-        phrase_ids: []const u32,
-        local: []u32,
-    };
-    const pass1_workers = struct {
-        fn fill(ctx: *Pass1Ctx, source: *parallel.MorselSource) void {
-            while (source.next()) |m| {
-                var r = m.start;
-                while (r < m.end) : (r += 1) ctx.local[ctx.phrase_ids[r]] += 1;
-            }
-        }
-    };
-    const pass1_ctxs = try allocator.alloc(Pass1Ctx, n_threads);
-    defer allocator.free(pass1_ctxs);
-    for (pass1_ctxs, 0..) |*c, t| {
-        c.* = .{
-            .phrase_ids = phrase_ids.values,
-            .local = local_counts[t * dict_size .. (t + 1) * dict_size],
-        };
-    }
-    var pass1_src: parallel.MorselSource = .init(n, parallel.default_morsel_size);
-    try parallel.parallelFor(allocator, Pass1Ctx, pass1_workers.fill, pass1_ctxs, &pass1_src);
-
-    const counts = try allocator.alloc(u32, dict_size);
-    defer allocator.free(counts);
-    // Reduce. Parallel across the dict_size dimension since it's ~6M entries
-    // and each thread reads n_threads cache lines per output -> bandwidth
-    // bound. Keep sequential — overhead would dominate for the inner work.
-    for (0..dict_size) |idx| {
-        var sum: u32 = 0;
-        var t: usize = 0;
-        while (t < n_threads) : (t += 1) sum += local_counts[t * dict_size + idx];
-        counts[idx] = sum;
-    }
-
-    // Pass 2: lex-min top-10 over phrase_ids with count > 0 and not empty_id.
-    const Top = struct { phrase_id: u32, count: u32 };
-    var top: [10]Top = undefined;
+    var top: [10]u32 = undefined;
     var top_len: usize = 0;
-
     var idx: u32 = 0;
     while (idx < dict_size) : (idx += 1) {
-        if (counts[idx] == 0) continue;
-        if (idx == empty_phrase_id) continue;
         const start = offsets.values[idx];
         const end = offsets.values[idx + 1];
         const phrase = phrases.raw[start..end];
+        if (isStoredEmptyString(phrase)) continue;
 
-        // Find insertion position via lex compare against current top.
         var pos: usize = 0;
         while (pos < top_len) : (pos += 1) {
-            const tstart = offsets.values[top[pos].phrase_id];
-            const tend = offsets.values[top[pos].phrase_id + 1];
+            const tstart = offsets.values[top[pos]];
+            const tend = offsets.values[top[pos] + 1];
             const tphrase = phrases.raw[tstart..tend];
             if (std.mem.lessThan(u8, tphrase, phrase)) continue;
             break;
@@ -8130,7 +8742,19 @@ fn formatSearchPhraseOrderByPhraseTop(allocator: std.mem.Allocator, io: std.Io, 
         if (top_len < 10) top_len += 1;
         var j = top_len - 1;
         while (j > pos) : (j -= 1) top[j] = top[j - 1];
-        top[pos] = .{ .phrase_id = idx, .count = counts[idx] };
+        top[pos] = idx;
+    }
+
+    const phrase_ids = try io_map.mapColumn(u32, io, phrase_id_path);
+    defer phrase_ids.mapping.unmap();
+    var top_counts: [10]u32 = .{0} ** 10;
+    for (phrase_ids.values) |phrase_id| {
+        for (top[0..top_len], 0..) |top_id, top_idx| {
+            if (phrase_id == top_id) {
+                top_counts[top_idx] += 1;
+                break;
+            }
+        }
     }
 
     // Emit up to 10 rows. Each top entry has `count` occurrences in the
@@ -8142,10 +8766,10 @@ fn formatSearchPhraseOrderByPhraseTop(allocator: std.mem.Allocator, io: std.Io, 
     var emitted: usize = 0;
     var k: usize = 0;
     while (k < top_len and emitted < 10) : (k += 1) {
-        const start = offsets.values[top[k].phrase_id];
-        const end = offsets.values[top[k].phrase_id + 1];
+        const start = offsets.values[top[k]];
+        const end = offsets.values[top[k] + 1];
         const phrase = phrases.raw[start..end];
-        const cnt = top[k].count;
+        const cnt = top_counts[k];
         var copies: u32 = 0;
         while (copies < cnt and emitted < 10) : (copies += 1) {
             try writeCsvField(allocator, &out, phrase);

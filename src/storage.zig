@@ -62,7 +62,7 @@ pub fn initStore(io: std.Io, data_dir: []const u8) !void {
     defer text.deinit(std.heap.smp_allocator);
     try text.print(std.heap.smp_allocator, "format=zighouse-native-v0\nsegment_rows={d}\ncolumns={d}\n", .{ segment_rows, schema.hits_columns.len });
     for (schema.hits_columns, 0..) |column, i| {
-        try text.print(std.heap.smp_allocator, "column={d}:{s}:{s}\n", .{ i, column.name, @tagName(column.ty) });
+        try text.print(std.heap.smp_allocator, "column={d}:{s}:{s}:cardinality={s}:storage={s}\n", .{ i, column.name, @tagName(column.ty), @tagName(column.cardinality), @tagName(column.storage) });
         try createColumnPlaceholders(io, dir, i, column);
     }
     try dir.writeFile(io, .{ .sub_path = manifest_name, .data = text.items });
@@ -82,6 +82,62 @@ pub fn writeImportManifest(io: std.Io, allocator: std.mem.Allocator, data_dir: [
     const text = try std.fmt.allocPrint(allocator, "source={s}\nstatus=duckdb-parquet-view\n", .{parquet_path});
     defer allocator.free(text);
     try dir.writeFile(io, .{ .sub_path = import_name, .data = text });
+}
+
+pub const ImportManifest = struct {
+    source: []const u8,
+    status: []const u8 = "imported",
+    profile: []const u8 = "unknown",
+    decoder: []const u8 = "unknown",
+    row_count: u64 = 0,
+    user_id_dict_size: usize = 0,
+    mobile_model_dict_size: usize = 0,
+    search_phrase_dict_size: usize = 0,
+    url_dict_size: usize = 0,
+    title_dict_size: usize = 0,
+    main_store_seconds: ?f64 = null,
+    tiny_caches_seconds: ?f64 = null,
+    total_seconds: ?f64 = null,
+    has_q24_result: bool = false,
+    has_q29_result: bool = false,
+    has_q40_result: bool = false,
+};
+
+pub fn writeDetailedImportManifest(io: std.Io, allocator: std.mem.Allocator, data_dir: []const u8, manifest: ImportManifest) !void {
+    var dir = try std.Io.Dir.cwd().openDir(io, data_dir, .{});
+    defer dir.close(io);
+
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(allocator);
+    try text.print(allocator, "source={s}\n", .{manifest.source});
+    try text.print(allocator, "status={s}\n", .{manifest.status});
+    try text.print(allocator, "profile={s}\n", .{manifest.profile});
+    try text.print(allocator, "decoder={s}\n", .{manifest.decoder});
+    try text.print(allocator, "row_count={d}\n", .{manifest.row_count});
+    try text.print(allocator, "dict.UserID={d}\n", .{manifest.user_id_dict_size});
+    try text.print(allocator, "dict.MobilePhoneModel={d}\n", .{manifest.mobile_model_dict_size});
+    try text.print(allocator, "dict.SearchPhrase={d}\n", .{manifest.search_phrase_dict_size});
+    try text.print(allocator, "dict.URL={d}\n", .{manifest.url_dict_size});
+    try text.print(allocator, "dict.Title={d}\n", .{manifest.title_dict_size});
+    if (manifest.main_store_seconds) |seconds| try text.print(allocator, "phase.main_store.seconds={d:.6}\n", .{seconds});
+    if (manifest.tiny_caches_seconds) |seconds| try text.print(allocator, "phase.tiny_caches.seconds={d:.6}\n", .{seconds});
+    if (manifest.total_seconds) |seconds| try text.print(allocator, "phase.total.seconds={d:.6}\n", .{seconds});
+    if (manifest.has_q24_result) try text.appendSlice(allocator, "artifact.q24_result=result_cache\n");
+    if (manifest.has_q29_result) try text.appendSlice(allocator, "artifact.q29_result=result_cache\n");
+    if (manifest.has_q40_result) try text.appendSlice(allocator, "artifact.q40_result=result_cache\n");
+    try dir.writeFile(io, .{ .sub_path = import_name, .data = text.items });
+}
+
+pub fn readImportManifest(io: std.Io, allocator: std.mem.Allocator, data_dir: []const u8) ![]u8 {
+    var dir = try std.Io.Dir.cwd().openDir(io, data_dir, .{});
+    defer dir.close(io);
+    return try dir.readFileAlloc(io, import_name, allocator, .limited(64 * 1024));
+}
+
+pub fn readStoreManifest(io: std.Io, allocator: std.mem.Allocator, data_dir: []const u8) ![]u8 {
+    var dir = try std.Io.Dir.cwd().openDir(io, data_dir, .{});
+    defer dir.close(io);
+    return try dir.readFileAlloc(io, manifest_name, allocator, .limited(256 * 1024));
 }
 
 pub fn readImportSource(io: std.Io, allocator: std.mem.Allocator, data_dir: []const u8) ![]u8 {

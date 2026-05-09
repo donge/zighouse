@@ -144,18 +144,22 @@ pub const UserCount = struct {
 };
 
 pub fn insertTop10(top: *[10]UserCount, top_len: *usize, row: UserCount) void {
-    var pos: usize = 0;
-    while (pos < top_len.* and before(top[pos], row)) : (pos += 1) {}
-    if (pos >= 10) return;
-    if (top_len.* < 10) top_len.* += 1;
-    var i = top_len.* - 1;
-    while (i > pos) : (i -= 1) top[i] = top[i - 1];
-    top[pos] = row;
+    insertTop(UserCount, top, top_len, row, before);
 }
 
 fn before(a: UserCount, b: UserCount) bool {
     if (a.count == b.count) return a.user_id < b.user_id;
     return a.count > b.count;
+}
+
+pub fn insertTop(comptime T: type, top: []T, top_len: *usize, row: T, comptime better: fn (T, T) bool) void {
+    var pos: usize = 0;
+    while (pos < top_len.* and better(top[pos], row)) : (pos += 1) {}
+    if (pos >= top.len) return;
+    if (top_len.* < top.len) top_len.* += 1;
+    var i = top_len.* - 1;
+    while (i > pos) : (i -= 1) top[i] = top[i - 1];
+    top[pos] = row;
 }
 
 pub fn hashI64(value: i64) usize {
@@ -176,6 +180,27 @@ test "i64 count table aggregates" {
     try table.add(allocator, 2);
     try table.add(allocator, 1);
     try std.testing.expectEqual(@as(usize, 2), table.len);
+}
+
+test "generic insertTop keeps best rows" {
+    const Row = struct { id: u32, count: u32 };
+    const better = struct {
+        fn f(a: Row, b: Row) bool {
+            if (a.count != b.count) return a.count > b.count;
+            return a.id < b.id;
+        }
+    }.f;
+
+    var top: [3]Row = undefined;
+    var top_len: usize = 0;
+    insertTop(Row, &top, &top_len, .{ .id = 3, .count = 1 }, better);
+    insertTop(Row, &top, &top_len, .{ .id = 2, .count = 3 }, better);
+    insertTop(Row, &top, &top_len, .{ .id = 1, .count = 3 }, better);
+    insertTop(Row, &top, &top_len, .{ .id = 4, .count = 2 }, better);
+    try std.testing.expectEqual(@as(usize, 3), top_len);
+    try std.testing.expectEqual(Row{ .id = 1, .count = 3 }, top[0]);
+    try std.testing.expectEqual(Row{ .id = 2, .count = 3 }, top[1]);
+    try std.testing.expectEqual(Row{ .id = 4, .count = 2 }, top[2]);
 }
 
 const empty_u64_key: u64 = std.math.maxInt(u64);

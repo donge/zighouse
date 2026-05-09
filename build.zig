@@ -24,6 +24,14 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    const duckdb_prefix = b.option([]const u8, "duckdb-prefix", "DuckDB installation prefix") orelse "/opt/homebrew/opt/duckdb";
+    const duckdb_include = b.fmt("{s}/include", .{duckdb_prefix});
+    const duckdb_lib = b.fmt("{s}/lib", .{duckdb_prefix});
+    exe.root_module.addIncludePath(.{ .cwd_relative = duckdb_include });
+    exe.root_module.addLibraryPath(.{ .cwd_relative = duckdb_lib });
+    exe.root_module.addRPath(.{ .cwd_relative = duckdb_lib });
+    exe.root_module.linkSystemLibrary("duckdb", .{});
+    exe.root_module.link_libc = true;
 
     b.installArtifact(exe);
 
@@ -99,6 +107,15 @@ pub fn build(b: *std.Build) void {
     });
     const lowcard_test_cmd = b.addRunArtifact(lowcard_tests);
 
+    const parquet_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/parquet.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const parquet_test_cmd = b.addRunArtifact(parquet_tests);
+
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&test_cmd.step);
     test_step.dependOn(&simd_test_cmd.step);
@@ -107,6 +124,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&planner_test_cmd.step);
     test_step.dependOn(&reader_test_cmd.step);
     test_step.dependOn(&lowcard_test_cmd.step);
+    test_step.dependOn(&parquet_test_cmd.step);
 
     const bench_simd = b.addExecutable(.{
         .name = "bench-simd",
