@@ -14,6 +14,7 @@ const usage =
     \\  zighouse import <hits.parquet> <data_dir>
     \\  zighouse import-hot <hits.parquet> <data_dir>
     \\  zighouse import-clickbench-csv-hot <hits.csv> <data_dir>
+    \\  zighouse import-clickbench-parquet-hot <hits.parquet> <data_dir> [limit_rows]
     \\  zighouse import-hot-extra <hits.parquet> <data_dir>
     \\  zighouse convert-hot <data_dir>
     \\  zighouse build-stats <data_dir>
@@ -102,6 +103,14 @@ fn runCommand(init: std.process.Init, allocator: std.mem.Allocator, args: *std.p
         defer native_backend.deinit();
         try native_backend.importClickBenchCsvHot(csv_path);
         try printOut(init.io, "imported ClickBench CSV hot columns {s} -> {s}\n", .{ csv_path, data_dir });
+    } else if (std.mem.eql(u8, command, "import-clickbench-parquet-hot")) {
+        const parquet_path = args.next() orelse return error.MissingParquetPath;
+        const data_dir = args.next() orelse return error.MissingDataDir;
+        const limit_rows = if (args.next()) |raw| try std.fmt.parseInt(u64, raw, 10) else null;
+        var native_backend = @import("native.zig").Native.init(allocator, init.io, data_dir);
+        defer native_backend.deinit();
+        try native_backend.importClickBenchParquetHot(parquet_path, limit_rows);
+        try printOut(init.io, "imported ClickBench Parquet hot columns {s} -> {s}\n", .{ parquet_path, data_dir });
     } else if (std.mem.eql(u8, command, "import-hot-extra")) {
         const parquet_path = args.next() orelse return error.MissingParquetPath;
         const data_dir = args.next() orelse return error.MissingDataDir;
