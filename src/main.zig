@@ -33,6 +33,7 @@ const usage =
     \\  zighouse build-q29-domain-stats <data_dir>
     \\  zighouse build-q40-result <data_dir>
     \\  zighouse build-q21-count-google <data_dir>
+    \\  zighouse build-referer-sidecars <data_dir>
     \\  zighouse query-csv <csv_path> <sql>  tables: csv (header), csv_no_header
     \\  zighouse query <data_dir> <sql>
     \\  zighouse compare-duckdb-native <data_dir> <queries.sql> [first] [limit]
@@ -256,6 +257,11 @@ fn runCommand(init: std.process.Init, allocator: std.mem.Allocator, args: *std.p
         var native_backend = @import("native.zig").Native.init(allocator, init.io, data_dir);
         defer native_backend.deinit();
         try native_backend.buildQ21CountGoogle();
+    } else if (std.mem.eql(u8, command, "build-referer-sidecars")) {
+        const data_dir = args.next() orelse return error.MissingDataDir;
+        var native_backend = @import("native.zig").Native.init(allocator, init.io, data_dir);
+        defer native_backend.deinit();
+        try native_backend.buildRefererSidecars();
     } else if (std.mem.eql(u8, command, "convert-user-id-id")) {
         const data_dir = args.next() orelse return error.MissingDataDir;
         var native_backend = @import("native.zig").Native.init(allocator, init.io, data_dir);

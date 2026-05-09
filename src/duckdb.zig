@@ -356,6 +356,7 @@ pub const ClickBenchHotChunk = struct {
     region: []const i32,
     user: []const i64,
     url: []const DuckString,
+    referer: ?[]const DuckString = null,
     refresh: []const i16,
     width: []const i16,
     mobile_phone: []const i16,
@@ -393,7 +394,7 @@ pub fn streamClickBenchHotRows(allocator: std.mem.Allocator, io: std.Io, parquet
                     .region = chunk.region[i],
                     .user = chunk.user[i],
                     .url = duckStringAt(chunk.url, i),
-                    .referer = "",
+                    .referer = if (chunk.referer) |referers| duckStringAt(referers, i) else "",
                     .refresh = chunk.refresh[i],
                     .width = chunk.width[i],
                     .mobile_phone = chunk.mobile_phone[i],
@@ -422,6 +423,8 @@ pub fn streamClickBenchHotChunks(allocator: std.mem.Allocator, io: std.Io, parqu
     defer allocator.free(parquet_literal);
     const limit_clause = if (limit_rows) |n| try std.fmt.allocPrint(allocator, "\nLIMIT {d}", .{n}) else try allocator.dupe(u8, "");
     defer allocator.free(limit_clause);
+    const include_referer = std.c.getenv("ZIGHOUSE_IMPORT_REFERER") != null;
+    const referer_select = if (include_referer) ",\n       COALESCE(CAST(Referer AS VARCHAR), '') AS Referer" else "";
     const sql_text = try std.fmt.allocPrint(allocator,
         \\SELECT CAST(WatchID AS BIGINT) AS WatchID,
         \\       CAST(Title AS VARCHAR) AS Title,
@@ -431,7 +434,7 @@ pub fn streamClickBenchHotChunks(allocator: std.mem.Allocator, io: std.Io, parqu
         \\       CAST(ClientIP AS INTEGER) AS ClientIP,
         \\       CAST(RegionID AS INTEGER) AS RegionID,
         \\       CAST(UserID AS BIGINT) AS UserID,
-        \\       CAST(URL AS VARCHAR) AS URL,
+        \\       CAST(URL AS VARCHAR) AS URL{s},
         \\       CAST(IsRefresh AS SMALLINT) AS IsRefresh,
         \\       CAST(ResolutionWidth AS SMALLINT) AS ResolutionWidth,
         \\       CAST(MobilePhone AS SMALLINT) AS MobilePhone,
@@ -448,7 +451,7 @@ pub fn streamClickBenchHotChunks(allocator: std.mem.Allocator, io: std.Io, parqu
         \\       CAST(RefererHash AS BIGINT) AS RefererHash,
         \\       CAST(URLHash AS BIGINT) AS URLHash
         \\FROM read_parquet({s}, binary_as_string=True){s}
-    , .{ parquet_literal, limit_clause });
+    , .{ referer_select, parquet_literal, limit_clause });
     defer allocator.free(sql_text);
     const sql = try allocator.dupeZ(u8, sql_text);
     defer allocator.free(sql);
@@ -511,21 +514,23 @@ pub fn streamClickBenchHotChunks(allocator: std.mem.Allocator, io: std.Io, parqu
         const region: [*]const i32 = @ptrCast(@alignCast(vectorData(chunk, 6)));
         const user: [*]const i64 = @ptrCast(@alignCast(vectorData(chunk, 7)));
         const url: [*]DuckString = @ptrCast(@alignCast(vectorData(chunk, 8)));
-        const refresh: [*]const i16 = @ptrCast(@alignCast(vectorData(chunk, 9)));
-        const width: [*]const i16 = @ptrCast(@alignCast(vectorData(chunk, 10)));
-        const mobile_phone: [*]const i16 = @ptrCast(@alignCast(vectorData(chunk, 11)));
-        const mobile_model: [*]DuckString = @ptrCast(@alignCast(vectorData(chunk, 12)));
-        const trafic_source: [*]const i16 = @ptrCast(@alignCast(vectorData(chunk, 13)));
-        const search_engine: [*]const i16 = @ptrCast(@alignCast(vectorData(chunk, 14)));
-        const search_phrase: [*]DuckString = @ptrCast(@alignCast(vectorData(chunk, 15)));
-        const adv: [*]const i16 = @ptrCast(@alignCast(vectorData(chunk, 16)));
-        const window_width: [*]const i16 = @ptrCast(@alignCast(vectorData(chunk, 17)));
-        const window_height: [*]const i16 = @ptrCast(@alignCast(vectorData(chunk, 18)));
-        const is_link: [*]const i16 = @ptrCast(@alignCast(vectorData(chunk, 19)));
-        const is_download: [*]const i16 = @ptrCast(@alignCast(vectorData(chunk, 20)));
-        const dont_count: [*]const i16 = @ptrCast(@alignCast(vectorData(chunk, 21)));
-        const referer_hash: [*]const i64 = @ptrCast(@alignCast(vectorData(chunk, 22)));
-        const url_hash: [*]const i64 = @ptrCast(@alignCast(vectorData(chunk, 23)));
+        const referer_col: ?[*]DuckString = if (include_referer) @ptrCast(@alignCast(vectorData(chunk, 9))) else null;
+        const base: usize = if (include_referer) 1 else 0;
+        const refresh: [*]const i16 = @ptrCast(@alignCast(vectorData(chunk, 9 + base)));
+        const width: [*]const i16 = @ptrCast(@alignCast(vectorData(chunk, 10 + base)));
+        const mobile_phone: [*]const i16 = @ptrCast(@alignCast(vectorData(chunk, 11 + base)));
+        const mobile_model: [*]DuckString = @ptrCast(@alignCast(vectorData(chunk, 12 + base)));
+        const trafic_source: [*]const i16 = @ptrCast(@alignCast(vectorData(chunk, 13 + base)));
+        const search_engine: [*]const i16 = @ptrCast(@alignCast(vectorData(chunk, 14 + base)));
+        const search_phrase: [*]DuckString = @ptrCast(@alignCast(vectorData(chunk, 15 + base)));
+        const adv: [*]const i16 = @ptrCast(@alignCast(vectorData(chunk, 16 + base)));
+        const window_width: [*]const i16 = @ptrCast(@alignCast(vectorData(chunk, 17 + base)));
+        const window_height: [*]const i16 = @ptrCast(@alignCast(vectorData(chunk, 18 + base)));
+        const is_link: [*]const i16 = @ptrCast(@alignCast(vectorData(chunk, 19 + base)));
+        const is_download: [*]const i16 = @ptrCast(@alignCast(vectorData(chunk, 20 + base)));
+        const dont_count: [*]const i16 = @ptrCast(@alignCast(vectorData(chunk, 21 + base)));
+        const referer_hash: [*]const i64 = @ptrCast(@alignCast(vectorData(chunk, 22 + base)));
+        const url_hash: [*]const i64 = @ptrCast(@alignCast(vectorData(chunk, 23 + base)));
         try callback(context, ClickBenchHotChunk{
             .watch = watch[0..n],
             .title = title[0..n],
@@ -536,6 +541,7 @@ pub fn streamClickBenchHotChunks(allocator: std.mem.Allocator, io: std.Io, parqu
             .region = region[0..n],
             .user = user[0..n],
             .url = url[0..n],
+            .referer = if (referer_col) |col| col[0..n] else null,
             .refresh = refresh[0..n],
             .width = width[0..n],
             .mobile_phone = mobile_phone[0..n],

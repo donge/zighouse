@@ -18,6 +18,8 @@ Environment:
   ZIGHOUSE_IMPORT_TRACE Set to 1 to include import phase timings
   ZIGHOUSE_REPORT_FAST  Set to 1 to include Q24/Q29/Q40 tiny result artifacts
   ZIGHOUSE_REPORT_FAIR  Set to 1 to reject query-specific artifacts and run native with ZIGHOUSE_FAIR=1
+  ZIGHOUSE_IMPORT_REFERER
+                         Set to 1 to import generic Referer dictionary/sidecars for fair Q29/Q40 native paths
   ZIGHOUSE_REPORT_REUSE_STORE
                          Set to 1 to skip import and benchmark an existing store
 
@@ -129,7 +131,11 @@ REPORT="$REPORT_DIR/report.md"
   echo "- Store is a ClickBench-oriented hot-column profile, not a general-purpose full-column store."
   if [[ -n "${ZIGHOUSE_REPORT_FAIR:-}" ]]; then
     echo "- Fair mode: query-specific result/candidate artifacts are rejected and native reads ignore them."
-    echo "- Fair mode: Q29/Q40 use the original Parquet because the current hot store only keeps RefererHash, not generic Referer strings."
+    if [[ -e "$STORE_DIR/Referer.domain_id.u32" && -e "$STORE_DIR/hot_Referer.id" ]]; then
+      echo "- Fair mode: Q29/Q40 use generic Referer dictionary/sidecars from the store."
+    else
+      echo "- Fair mode: Q29/Q40 use the original Parquet when generic Referer dictionary/sidecars are absent."
+    fi
   fi
   if [[ -n "${ZIGHOUSE_REPORT_FAST:-}" ]]; then
     echo "- Q24/Q29/Q40 use import-time tiny result artifacts recorded in the store."
@@ -175,6 +181,9 @@ while [[ $run -le $RUNS ]]; do
     fi
     if [[ -n "${ZIGHOUSE_REPORT_FAST:-}" ]]; then
       import_env+=(ZIGHOUSE_IMPORT_TINY_CACHES=1)
+    fi
+    if [[ -n "${ZIGHOUSE_IMPORT_REFERER:-}" ]]; then
+      import_env+=(ZIGHOUSE_IMPORT_REFERER="$ZIGHOUSE_IMPORT_REFERER")
     fi
     run_cmd "$IMPORT_LOG" "${import_env[@]}" "$ZIGHOUSE" import-clickbench-parquet-duckdb-vector-hot "$PARQUET_PATH" "$STORE_DIR"
   else
