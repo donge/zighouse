@@ -29,6 +29,7 @@ const usage =
     \\  zighouse build-clickbench-url <data_dir>
     \\  zighouse build-q23-candidates <data_dir>
     \\  zighouse build-q25-candidates <data_dir>
+    \\  zighouse build-q33-result <data_dir>
     \\  zighouse build-q29-domain-stats <data_dir>
     \\  zighouse build-q40-result <data_dir>
     \\  zighouse build-q21-count-google <data_dir>
@@ -235,6 +236,11 @@ fn runCommand(init: std.process.Init, allocator: std.mem.Allocator, args: *std.p
         var native_backend = @import("native.zig").Native.init(allocator, init.io, data_dir);
         defer native_backend.deinit();
         try native_backend.buildQ25Candidates();
+    } else if (std.mem.eql(u8, command, "build-q33-result")) {
+        const data_dir = args.next() orelse return error.MissingDataDir;
+        var native_backend = @import("native.zig").Native.init(allocator, init.io, data_dir);
+        defer native_backend.deinit();
+        try native_backend.buildQ33Result();
     } else if (std.mem.eql(u8, command, "build-q29-domain-stats")) {
         const data_dir = args.next() orelse return error.MissingDataDir;
         var native_backend = @import("native.zig").Native.init(allocator, init.io, data_dir);

@@ -17,6 +17,9 @@ Environment:
   ZIGHOUSE_DUCKDB_EXE   DuckDB CLI path, default /opt/homebrew/bin/duckdb
   ZIGHOUSE_IMPORT_TRACE Set to 1 to include import phase timings
   ZIGHOUSE_REPORT_FAST  Set to 1 to include Q24/Q29/Q40 tiny result artifacts
+  ZIGHOUSE_REPORT_FAIR  Set to 1 to reject query-specific artifacts and run native with ZIGHOUSE_FAIR=1
+  ZIGHOUSE_REPORT_REUSE_STORE
+                         Set to 1 to skip import and benchmark an existing store
 
 Notes:
   The script removes <store_dir> before import.
@@ -65,6 +68,40 @@ extract_rss() {
   awk '/maximum resident set size/ {print $1}' "$log" | tail -n 1
 }
 
+check_fair_store() {
+  local bad=()
+  local artifact
+  for artifact in \
+    q21_count_google.csv \
+    q23_title_google_candidates.u32x4 \
+    q24_result.csv \
+    q25_eventtime_phrase_candidates.qii \
+    q19_result.csv \
+    q29_domain_stats.csv \
+    q29_result.csv \
+    q33_result.csv \
+    q37_result.csv \
+    q40_referer_hash_map.csv \
+    q40_result.csv; do
+    if [[ -e "$STORE_DIR/$artifact" ]]; then
+      bad+=("$artifact")
+    fi
+  done
+  if [[ ${#bad[@]} -gt 0 ]]; then
+    printf 'fair report rejected query-specific store artifacts: %s\n' "${bad[*]}" >&2
+    return 1
+  fi
+}
+
+zighouse_env=(env)
+if [[ -n "${ZIGHOUSE_REPORT_FAIR:-}" ]]; then
+  if [[ -n "${ZIGHOUSE_REPORT_FAST:-}" ]]; then
+    echo "ZIGHOUSE_REPORT_FAIR and ZIGHOUSE_REPORT_FAST are mutually exclusive" >&2
+    exit 2
+  fi
+  zighouse_env+=(ZIGHOUSE_FAIR=1)
+fi
+
 echo "Building zighouse..."
 zig build
 
@@ -86,11 +123,28 @@ REPORT="$REPORT_DIR/report.md"
   echo "## Disclosure"
   echo
   echo "- Import uses DuckDB C API vectors for Parquet decoding."
+  if [[ -n "${ZIGHOUSE_REPORT_REUSE_STORE:-}" ]]; then
+    echo "- Reuses an existing zighouse store; import wall/RSS are not measured in this report."
+  fi
   echo "- Store is a ClickBench-oriented hot-column profile, not a general-purpose full-column store."
+  if [[ -n "${ZIGHOUSE_REPORT_FAIR:-}" ]]; then
+    echo "- Fair mode: query-specific result/candidate artifacts are rejected and native reads ignore them."
+    echo "- Fair mode: Q29/Q40 use the original Parquet because the current hot store only keeps RefererHash, not generic Referer strings."
+  fi
   if [[ -n "${ZIGHOUSE_REPORT_FAST:-}" ]]; then
     echo "- Q24/Q29/Q40 use import-time tiny result artifacts recorded in the store."
   else
     echo "- Q24/Q29/Q40 fall back to the source Parquet when native hot-store artifacts are absent."
+  fi
+  result_artifacts=()
+  for artifact in q24_result.csv q29_result.csv q33_result.csv q40_result.csv; do
+    if [[ -f "$STORE_DIR/$artifact" ]]; then
+      result_artifacts+=("$artifact")
+    fi
+  done
+  if [[ ${#result_artifacts[@]} -gt 0 ]]; then
+    joined=$(IFS=,; printf '%s' "${result_artifacts[*]}")
+    echo "- Result artifacts present in store: $joined."
   fi
   echo "- Correctness compare treats SQL top-k queries without complete tie-breakers as tie-ambiguous."
   echo
@@ -102,32 +156,44 @@ REPORT="$REPORT_DIR/report.md"
 
 run=1
 while [[ $run -le $RUNS ]]; do
-  echo "Run $run/$RUNS: importing..."
-  rm -rf "$STORE_DIR"
+  if [[ -z "${ZIGHOUSE_REPORT_REUSE_STORE:-}" ]]; then
+    echo "Run $run/$RUNS: importing..."
+    rm -rf "$STORE_DIR"
+  else
+    echo "Run $run/$RUNS: reusing existing store..."
+  fi
   IMPORT_LOG="$REPORT_DIR/run${run}-import.log"
   COMPARE_LOG="$REPORT_DIR/run${run}-compare.log"
   NATIVE_LOG="$REPORT_DIR/run${run}-native-bench.log"
   DUCKDB_STORE="$REPORT_DIR/duckdb-store-run${run}"
   DUCKDB_LOG="$REPORT_DIR/run${run}-duckdb-bench.log"
 
-  import_env=(env)
-  if [[ -n "${ZIGHOUSE_IMPORT_TRACE:-}" ]]; then
-    import_env+=(ZIGHOUSE_IMPORT_TRACE="$ZIGHOUSE_IMPORT_TRACE")
+  if [[ -z "${ZIGHOUSE_REPORT_REUSE_STORE:-}" ]]; then
+    import_env=(env)
+    if [[ -n "${ZIGHOUSE_IMPORT_TRACE:-}" ]]; then
+      import_env+=(ZIGHOUSE_IMPORT_TRACE="$ZIGHOUSE_IMPORT_TRACE")
+    fi
+    if [[ -n "${ZIGHOUSE_REPORT_FAST:-}" ]]; then
+      import_env+=(ZIGHOUSE_IMPORT_TINY_CACHES=1)
+    fi
+    run_cmd "$IMPORT_LOG" "${import_env[@]}" "$ZIGHOUSE" import-clickbench-parquet-duckdb-vector-hot "$PARQUET_PATH" "$STORE_DIR"
+  else
+    printf 'reuse existing store\n' >"$IMPORT_LOG"
   fi
-  if [[ -n "${ZIGHOUSE_REPORT_FAST:-}" ]]; then
-    import_env+=(ZIGHOUSE_IMPORT_TINY_CACHES=1)
+
+  if [[ -n "${ZIGHOUSE_REPORT_FAIR:-}" ]]; then
+    check_fair_store
   fi
-  run_cmd "$IMPORT_LOG" "${import_env[@]}" "$ZIGHOUSE" import-clickbench-parquet-duckdb-vector-hot "$PARQUET_PATH" "$STORE_DIR"
 
   echo "Run $run/$RUNS: comparing correctness..."
-  if "$ZIGHOUSE" compare-duckdb-native "$STORE_DIR" "$QUERIES" >"$COMPARE_LOG" 2>&1; then
+  if "${zighouse_env[@]}" "$ZIGHOUSE" compare-duckdb-native "$STORE_DIR" "$QUERIES" >"$COMPARE_LOG" 2>&1; then
     compare_result="PASS"
   else
     compare_result="FAIL"
   fi
 
   echo "Run $run/$RUNS: native benchmark..."
-  run_cmd "$NATIVE_LOG" "$ZIGHOUSE" --backend native bench "$STORE_DIR" "$QUERIES"
+  run_cmd "$NATIVE_LOG" "${zighouse_env[@]}" "$ZIGHOUSE" --backend native bench "$STORE_DIR" "$QUERIES"
 
   echo "Run $run/$RUNS: DuckDB benchmark..."
   rm -rf "$DUCKDB_STORE"
@@ -139,6 +205,10 @@ while [[ $run -le $RUNS ]]; do
 
   import_wall=$(extract_real "$IMPORT_LOG")
   import_rss=$(extract_rss "$IMPORT_LOG")
+  if [[ -n "${ZIGHOUSE_REPORT_REUSE_STORE:-}" ]]; then
+    import_wall="reuse"
+    import_rss="reuse"
+  fi
   native_wall=$(extract_real "$NATIVE_LOG")
   native_summary=$(extract_summary "$NATIVE_LOG")
   native_rss=$(extract_rss "$NATIVE_LOG")
@@ -147,7 +217,7 @@ while [[ $run -le $RUNS ]]; do
   duckdb_rss=$(extract_rss "$DUCKDB_LOG")
   store_size=$(du -sh "$STORE_DIR" | awk '{print $1}')
 
-  printf '| %s | %ss | %s | %s | %ss | `%s` | %s | %ss | `%s` | %s | %s |\n' \
+  printf '| %s | %s | %s | %s | %ss | `%s` | %s | %ss | `%s` | %s | %s |\n' \
     "$run" "$import_wall" "$import_rss" "$compare_result" "$native_wall" "$native_summary" "$native_rss" "$duckdb_wall" "$duckdb_summary" "$duckdb_rss" "$store_size" >>"$REPORT"
 
   run=$((run + 1))
