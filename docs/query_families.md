@@ -1,7 +1,7 @@
 # Retrospective: Hardcoded Native Path for ClickBench
 
-_Last updated 2026-05-09 after adding fair-mode reporting and generic Referer
-sidecars for Q29/Q40._
+_Last updated 2026-05-10 after adding fair Q24 late materialization and generic
+Referer sidecars for Q29/Q40._
 
 ## Current Status (2026-05-09)
 
@@ -18,24 +18,23 @@ Update 2026-05-09: benchmark reporting now has two explicit modes:
 Fair mode can optionally import generic Referer dictionary/sidecar files with
 `ZIGHOUSE_IMPORT_REFERER=1`. These are not query answers: Q29 uses domain/length
 sidecars derived from the full Referer dictionary, and Q40 uses the Referer and
-URL dictionaries for late materialization.
+URL dictionaries for late materialization. Q24 uses native URL/EventTime TopN to
+select row ids, then asks DuckDB to materialize those selected Parquet rows via
+`file_row_number`; this avoids `q24_result.csv` without writing a full row cache.
 
 Latest fair query-only report on the 100M `hits.parquet` store with generic
 Referer sidecars:
 
 | Scope | Native warm best | DuckDB direct Parquet warm best | Notes |
 |---|---:|---:|---|
-| Full Q1-Q43 | 63.53s | 68.16s | Q24 source-Parquet fallback dominates native time. |
-| Excluding Q24 | 31.69s | 73.02s | Shows the current hot-store native paths without the all-column query. |
-| Q29 only | 5.22s | 17.50s | Generic Referer sidecars, no result artifact. |
-| Q40 only | 0.38s | 0.30s | Generic Referer/URL dictionary path. |
+| Full Q1-Q43 | 10.91s | 41.73s | Q24 no longer falls back to full source-Parquet execution. |
+| Q24 only | 0.20s | n/a | Native TopN + DuckDB `file_row_number` late materialization. |
+| Q29 only | 1.67s | n/a | Generic Referer sidecars, no result artifact. |
+| Q40 only | 0.19s | n/a | Generic Referer/URL dictionary path. |
 
-Q24 remains the main fair-mode gap. It is `SELECT * ... ORDER BY EventTime LIMIT
-10`, the only ClickBench query that needs all 105 source columns. The current
-store is a ClickBench hot-column profile, not a full-column store, so fair mode
-must fall back to the source Parquet. A fair native Q24 path requires generic
-full-column storage plus row-id late materialization, not another compact result
-artifact.
+Q24 is still not pure native: all-column Parquet row materialization is delegated
+to DuckDB. It is no longer a query-specific artifact or full source-Parquet
+fallback, but a future native Parquet row decoder would remove this dependency.
 
 Reusable executor pieces now being extracted from the specialized kernels:
 
@@ -45,8 +44,9 @@ Reusable executor pieces now being extracted from the specialized kernels:
 - `JulyCounterRefreshFilter`: reusable row predicate shape for dashboard scans.
 
 Under the legacy fast-cache profile, ReleaseFast native backend has **43 WIN / 0
-LOSE / 0 FALLBACK** on the 43-query ClickBench suite. Under fair mode, Q24 is a
-known source-Parquet fallback until the store can reconstruct all 105 columns.
+LOSE / 0 FALLBACK** on the 43-query ClickBench suite. Under fair mode, Q24/Q29/Q40
+now avoid query-specific result artifacts; Q24 still discloses DuckDB Parquet row
+materialization for the selected rows.
 
 The next engineering milestone is not another per-query hardcoded path. It is
 to extract the shared vectorized, morsel-scan, group-by, top-K, dictionary, and
@@ -59,10 +59,10 @@ Q1 Q2 Q3 Q4 Q5 Q6 Q7 Q8 Q9 Q10 Q11 Q12 Q13 Q14 Q15 Q16 Q17 Q18 Q19 Q20
 Q21 Q22 Q23 Q24 Q25 Q26 Q27 Q28 Q29 Q30 Q31 Q32 Q33 Q34 Q35 Q36 Q37 Q38 Q39 Q40 Q41 Q42 Q43
 ```
 
-Remaining fair-mode fallback:
+Remaining fair-mode source-Parquet fallbacks:
 
 ```
-Q24
+none when generic Referer sidecars are present
 ```
 
 The latest string/storage work added:
@@ -102,9 +102,9 @@ Recently landed native query families in the legacy fast-cache profile:
 | Q39 | filtered URL group-by `OFFSET 1000` | 0.077s | 0.087s | 0.88x | top-1010 buffer; tied rows at offset boundary |
 | Q40 | traffic/source/destination dashboard | 0.000012s | 0.184s | 0.00x | fast-cache result artifact; fair mode uses Referer/URL dictionaries |
 
-Remaining fallback notes: in fair mode, Q24 falls back to source Parquet because
-it requires all 105 columns. In legacy fast-cache mode, `q24_result.csv` remains
-available as an explicitly disclosed query-specific artifact.
+Remaining fallback notes: in fair mode, Q29/Q40 fall back to source Parquet if
+generic Referer sidecars are absent. In legacy fast-cache mode, `q24_result.csv`
+remains available as an explicitly disclosed query-specific artifact.
 
 Important correctness caveat: Q39 and Q40 may output different rows than DuckDB
 inside tied `ORDER BY PageViews DESC` windows (`OFFSET 1000`). The SQL has no
@@ -388,16 +388,15 @@ Q15-Q17 if we want to push the wins up further. Single-thread Q17 is already
 ## Next Sensible Steps
 
 The legacy fast-cache profile has native winning paths for all 43 ClickBench
-queries. Fair mode has one important coverage gap: Q24 still needs the original
-Parquet because the current store cannot reconstruct all 105 columns.
+queries. Fair mode now avoids the major Q24 source-Parquet fallback, but Q24
+still delegates selected-row Parquet materialization to DuckDB.
 
-1. **Add generic full-column storage and row-id materialization for Q24.** This
-   is the fair replacement for `q24_result.csv`: use existing URL/EventTime hot
-   paths to find the first 10 row ids, then materialize every selected column
-   from general column files.
+1. **Replace DuckDB-selected-row materialization with native Parquet row decode.**
+   Q24 already uses native URL/EventTime TopN; the remaining dependency is
+   reading all 105 columns for those row ids from Parquet.
 2. **Keep moving query-specific artifacts behind explicit fast-cache switches.**
-   Q29/Q40 now have fair generic Referer paths; Q24 is the remaining major
-   artifact/fallback split.
+   Q24/Q29/Q40 now have fair non-result paths; the legacy tiny artifacts should
+   remain opt-in only.
 3. **Consolidate string-sidecar builders.** Referer, URL, Title, and SearchPhrase
    now share similar dictionary/sidecar mechanics that can be made less bespoke.
 
