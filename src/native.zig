@@ -1308,9 +1308,9 @@ const ImportHotContext = struct {
             .row_count = self.row_count,
             .user_id_dict_size = self.dicts.user_order.items.len,
             .mobile_model_dict_size = self.dicts.mobile_model_order.items.len,
-            .search_phrase_dict_size = self.dicts.search_phrase_order.items.len,
-            .url_dict_size = self.dicts.url_order.items.len,
-            .title_dict_size = self.dicts.title_order.items.len,
+            .search_phrase_dict_size = self.dicts.search_phrase_blob.len(),
+            .url_dict_size = self.dicts.url_blob.len(),
+            .title_dict_size = self.dicts.title_blob.len(),
             .trace = self.trace,
         };
     }
@@ -2594,6 +2594,12 @@ const ImportStringBlob = struct {
         return self;
     }
 
+    fn resetCapacity(self: *ImportStringBlob, allocator: std.mem.Allocator, capacity_hint: usize) !void {
+        self.offsets.clearRetainingCapacity();
+        try self.offsets.ensureTotalCapacity(allocator, capacity_hint + 1);
+        try self.offsets.append(allocator, 0);
+    }
+
     fn deinit(self: *ImportStringBlob, allocator: std.mem.Allocator) void {
         for (self.chunks.items) |chunk| allocator.free(chunk);
         self.chunks.deinit(allocator);
@@ -2659,7 +2665,7 @@ const ImportDictBuilders = struct {
     search_phrase_phrases_path: []const u8,
     search_phrase_tsv_path: []const u8,
     search_phrases: std.StringHashMap(u32),
-    search_phrase_order: std.ArrayList([]const u8),
+    search_phrase_blob: ImportStringBlob,
     search_phrase_empty_id: ?u32 = null,
 
     url_id_writer: BufferedColumn,
@@ -2667,7 +2673,7 @@ const ImportDictBuilders = struct {
     url_strings_path: []const u8,
     url_tsv_path: []const u8,
     urls: std.StringHashMap(u32),
-    url_order: std.ArrayList([]const u8),
+    url_blob: ImportStringBlob,
 
     referer_id_writer: ?BufferedColumn = null,
     referer_offsets_path: ?[]const u8 = null,
@@ -2685,7 +2691,7 @@ const ImportDictBuilders = struct {
     title_strings_path: []const u8,
     title_tsv_path: []const u8,
     titles: std.StringHashMap(u32),
-    title_order: std.ArrayList([]const u8),
+    title_blob: ImportStringBlob,
 
     finished: bool = false,
 
@@ -2706,13 +2712,13 @@ const ImportDictBuilders = struct {
             .search_phrase_phrases_path = paths.search_phrase_phrases,
             .search_phrase_tsv_path = paths.search_phrase_tsv,
             .search_phrases = std.StringHashMap(u32).init(allocator),
-            .search_phrase_order = .empty,
+            .search_phrase_blob = try ImportStringBlob.init(allocator, 0),
             .url_id_writer = try .init(allocator, io, paths.url_id),
             .url_offsets_path = paths.url_offsets,
             .url_strings_path = paths.url_strings,
             .url_tsv_path = paths.url_tsv,
             .urls = std.StringHashMap(u32).init(allocator),
-            .url_order = .empty,
+            .url_blob = try ImportStringBlob.init(allocator, 0),
             .referer_id_writer = if (paths.referer_id) |path| try .init(allocator, io, path) else null,
             .referer_offsets_path = paths.referer_offsets,
             .referer_strings_path = paths.referer_strings,
@@ -2728,7 +2734,7 @@ const ImportDictBuilders = struct {
             .title_strings_path = paths.title_strings,
             .title_tsv_path = paths.title_tsv,
             .titles = std.StringHashMap(u32).init(allocator),
-            .title_order = .empty,
+            .title_blob = try ImportStringBlob.init(allocator, 0),
         };
         errdefer builders.deinit(allocator, io);
         const hint = capacity_hint orelse ImportDictCapacityHint{ .user_ids = 128 * 1024, .mobile_models = 256, .search_phrases = 64 * 1024, .urls = 512 * 1024, .referers = if (importRefererEnabled()) 512 * 1024 else 0, .titles = 256 * 1024 };
@@ -2737,9 +2743,9 @@ const ImportDictBuilders = struct {
         try builders.mobile_models.ensureTotalCapacity(@intCast(hint.mobile_models));
         try builders.mobile_model_order.ensureTotalCapacity(allocator, hint.mobile_models);
         try builders.search_phrases.ensureTotalCapacity(@intCast(hint.search_phrases));
-        try builders.search_phrase_order.ensureTotalCapacity(allocator, hint.search_phrases);
+        try builders.search_phrase_blob.resetCapacity(allocator, hint.search_phrases);
         try builders.urls.ensureTotalCapacity(@intCast(hint.urls));
-        try builders.url_order.ensureTotalCapacity(allocator, hint.urls);
+        try builders.url_blob.resetCapacity(allocator, hint.urls);
         if (paths.referer_id != null) {
             try builders.referers.ensureTotalCapacity(@intCast(hint.referers));
             builders.referer_blob.offsets.clearRetainingCapacity();
@@ -2750,7 +2756,7 @@ const ImportDictBuilders = struct {
             try builders.referer_domains.ensureTotalCapacity(1024);
         }
         try builders.titles.ensureTotalCapacity(@intCast(hint.titles));
-        try builders.title_order.ensureTotalCapacity(allocator, hint.titles);
+        try builders.title_blob.resetCapacity(allocator, hint.titles);
         return builders;
     }
 
@@ -2771,15 +2777,13 @@ const ImportDictBuilders = struct {
         allocator.free(self.search_phrase_offsets_path);
         allocator.free(self.search_phrase_phrases_path);
         allocator.free(self.search_phrase_tsv_path);
-        freeStringOrder(allocator, self.search_phrase_order.items);
-        self.search_phrase_order.deinit(allocator);
+        self.search_phrase_blob.deinit(allocator);
         self.search_phrases.deinit();
         self.url_id_writer.deinit(allocator, io);
         allocator.free(self.url_offsets_path);
         allocator.free(self.url_strings_path);
         allocator.free(self.url_tsv_path);
-        freeStringOrder(allocator, self.url_order.items);
-        self.url_order.deinit(allocator);
+        self.url_blob.deinit(allocator);
         self.urls.deinit();
         if (self.referer_id_writer) |*w| w.deinit(allocator, io);
         if (self.referer_offsets_path) |path| allocator.free(path);
@@ -2795,8 +2799,7 @@ const ImportDictBuilders = struct {
         allocator.free(self.title_offsets_path);
         allocator.free(self.title_strings_path);
         allocator.free(self.title_tsv_path);
-        freeStringOrder(allocator, self.title_order.items);
-        self.title_order.deinit(allocator);
+        self.title_blob.deinit(allocator);
         self.titles.deinit();
     }
 
@@ -2854,7 +2857,7 @@ const ImportDictBuilders = struct {
     }
 
     fn writeSearchPhrase(self: *ImportDictBuilders, allocator: std.mem.Allocator, io: std.Io, field: []const u8) !u32 {
-        return self.writeStringU32(allocator, io, field, &self.search_phrases, &self.search_phrase_order, &self.search_phrase_id_writer);
+        return self.writeStringU32Blob(allocator, io, field, &self.search_phrases, &self.search_phrase_blob, &self.search_phrase_id_writer);
     }
 
     fn writeSearchPhraseRaw(self: *ImportDictBuilders, allocator: std.mem.Allocator, io: std.Io, value: []const u8) !u32 {
@@ -2865,17 +2868,17 @@ const ImportDictBuilders = struct {
                 return id;
             }
         }
-        const id = try self.writeStringU32Raw(allocator, io, value, &self.search_phrases, &self.search_phrase_order, &self.search_phrase_id_writer);
+        const id = try self.writeStringU32BlobRaw(allocator, io, value, &self.search_phrases, &self.search_phrase_blob, &self.search_phrase_id_writer);
         if (value.len == 0) self.search_phrase_empty_id = id;
         return id;
     }
 
     fn writeUrl(self: *ImportDictBuilders, allocator: std.mem.Allocator, io: std.Io, field: []const u8) !u32 {
-        return self.writeStringU32(allocator, io, field, &self.urls, &self.url_order, &self.url_id_writer);
+        return self.writeStringU32Blob(allocator, io, field, &self.urls, &self.url_blob, &self.url_id_writer);
     }
 
     fn writeUrlRaw(self: *ImportDictBuilders, allocator: std.mem.Allocator, io: std.Io, value: []const u8) !u32 {
-        return self.writeStringU32Raw(allocator, io, value, &self.urls, &self.url_order, &self.url_id_writer);
+        return self.writeStringU32BlobRaw(allocator, io, value, &self.urls, &self.url_blob, &self.url_id_writer);
     }
 
     fn writeRefererRaw(self: *ImportDictBuilders, allocator: std.mem.Allocator, io: std.Io, value: []const u8) !?u32 {
@@ -2928,11 +2931,27 @@ const ImportDictBuilders = struct {
     }
 
     fn writeTitle(self: *ImportDictBuilders, allocator: std.mem.Allocator, io: std.Io, field: []const u8) !u32 {
-        return self.writeStringU32(allocator, io, field, &self.titles, &self.title_order, &self.title_id_writer);
+        return self.writeStringU32Blob(allocator, io, field, &self.titles, &self.title_blob, &self.title_id_writer);
     }
 
     fn writeTitleRaw(self: *ImportDictBuilders, allocator: std.mem.Allocator, io: std.Io, value: []const u8) !u32 {
-        return self.writeStringU32Raw(allocator, io, value, &self.titles, &self.title_order, &self.title_id_writer);
+        return self.writeStringU32BlobRaw(allocator, io, value, &self.titles, &self.title_blob, &self.title_id_writer);
+    }
+
+    fn writeStringU32Blob(self: *ImportDictBuilders, allocator: std.mem.Allocator, io: std.Io, field: []const u8, dict: *std.StringHashMap(u32), blob: *ImportStringBlob, id_writer: *BufferedColumn) !u32 {
+        _ = self;
+        if (field.len < 2 or field[0] != '"' or field[field.len - 1] != '"') {
+            return writeStringU32BlobRawImpl(allocator, io, field, dict, blob, id_writer);
+        }
+
+        const value = try decodeCsvFieldAlloc(allocator, field);
+        defer allocator.free(value);
+        return writeStringU32BlobRawImpl(allocator, io, value, dict, blob, id_writer);
+    }
+
+    fn writeStringU32BlobRaw(self: *ImportDictBuilders, allocator: std.mem.Allocator, io: std.Io, value: []const u8, dict: *std.StringHashMap(u32), blob: *ImportStringBlob, id_writer: *BufferedColumn) !u32 {
+        _ = self;
+        return writeStringU32BlobRawImpl(allocator, io, value, dict, blob, id_writer);
     }
 
     fn writeStringU32(self: *ImportDictBuilders, allocator: std.mem.Allocator, io: std.Io, field: []const u8, dict: *std.StringHashMap(u32), order: *std.ArrayList([]const u8), id_writer: *BufferedColumn) !u32 {
@@ -3003,25 +3022,28 @@ const ImportDictBuilders = struct {
         traceImportPhase("finish_dict.MobilePhoneModel", elapsedSeconds(started, finished));
 
         started = std.Io.Clock.Timestamp.now(io, .awake);
-        try writeStringDictU32(allocator, io, self.search_phrase_offsets_path, self.search_phrase_phrases_path, self.search_phrase_tsv_path, self.search_phrase_order.items, write_tsv);
+        try self.search_phrase_blob.write(allocator, io, self.search_phrase_offsets_path, self.search_phrase_phrases_path);
+        if (write_tsv) try writeStringBlobTsv(allocator, io, self.search_phrase_tsv_path, &self.search_phrase_blob);
         finished = std.Io.Clock.Timestamp.now(io, .awake);
         traceImportPhase("finish_dict.SearchPhrase", elapsedSeconds(started, finished));
 
         started = std.Io.Clock.Timestamp.now(io, .awake);
-        try writeStringDictU32(allocator, io, self.url_offsets_path, self.url_strings_path, self.url_tsv_path, self.url_order.items, write_tsv);
+        try self.url_blob.write(allocator, io, self.url_offsets_path, self.url_strings_path);
+        if (write_tsv) try writeStringBlobTsv(allocator, io, self.url_tsv_path, &self.url_blob);
         finished = std.Io.Clock.Timestamp.now(io, .awake);
         traceImportPhase("finish_dict.URL", elapsedSeconds(started, finished));
 
         if (self.referer_offsets_path) |offsets_path| {
             started = std.Io.Clock.Timestamp.now(io, .awake);
             try self.referer_blob.write(allocator, io, offsets_path, self.referer_strings_path.?);
-            if (write_tsv) try writeRefererTsvFromBlob(allocator, io, self.referer_tsv_path.?, &self.referer_blob);
+            if (write_tsv) try writeStringBlobTsv(allocator, io, self.referer_tsv_path.?, &self.referer_blob);
             finished = std.Io.Clock.Timestamp.now(io, .awake);
             traceImportPhase("finish_dict.Referer", elapsedSeconds(started, finished));
         }
 
         started = std.Io.Clock.Timestamp.now(io, .awake);
-        try writeStringDictU32(allocator, io, self.title_offsets_path, self.title_strings_path, self.title_tsv_path, self.title_order.items, write_tsv);
+        try self.title_blob.write(allocator, io, self.title_offsets_path, self.title_strings_path);
+        if (write_tsv) try writeStringBlobTsv(allocator, io, self.title_tsv_path, &self.title_blob);
         finished = std.Io.Clock.Timestamp.now(io, .awake);
         traceImportPhase("finish_dict.Title", elapsedSeconds(started, finished));
         self.finished = true;
@@ -3080,7 +3102,21 @@ fn writeStringDictBytesAndTsv(allocator: std.mem.Allocator, io: std.Io, bytes_pa
     try out.flush(io);
 }
 
-fn writeRefererTsvFromBlob(allocator: std.mem.Allocator, io: std.Io, tsv_path: []const u8, blob: *const ImportStringBlob) !void {
+fn writeStringU32BlobRawImpl(allocator: std.mem.Allocator, io: std.Io, value: []const u8, dict: *std.StringHashMap(u32), blob: *ImportStringBlob, id_writer: *BufferedColumn) !u32 {
+    if (dict.get(value)) |existing_id| {
+        var id = existing_id;
+        try id_writer.write(io, std.mem.asBytes(&id));
+        return id;
+    }
+    const id: u32 = @intCast(blob.len());
+    const owned = try blob.append(allocator, value);
+    try dict.putNoClobber(owned, id);
+    var writable_id = id;
+    try id_writer.write(io, std.mem.asBytes(&writable_id));
+    return id;
+}
+
+fn writeStringBlobTsv(allocator: std.mem.Allocator, io: std.Io, tsv_path: []const u8, blob: *const ImportStringBlob) !void {
     var tsv_file = try createFilePath(io, tsv_path);
     defer tsv_file.close(io);
     const buf = try allocator.alloc(u8, 1024 * 1024);
