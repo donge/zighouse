@@ -358,6 +358,7 @@ pub const ClickBenchHotRow = struct {
     dont_count: i16,
     referer_hash: i64,
     url_hash: i64,
+    title_hash: i64,
 };
 
 pub const DuckString = c.duckdb_string_t;
@@ -388,6 +389,7 @@ pub const ClickBenchHotChunk = struct {
     dont_count: []const i16,
     referer_hash: []const i64,
     url_hash: []const i64,
+    title_hash: []const i64,
 
     pub fn len(self: ClickBenchHotChunk) usize {
         return self.watch.len;
@@ -426,6 +428,7 @@ pub fn streamClickBenchHotRows(allocator: std.mem.Allocator, io: std.Io, parquet
                     .dont_count = chunk.dont_count[i],
                     .referer_hash = chunk.referer_hash[i],
                     .url_hash = chunk.url_hash[i],
+                    .title_hash = chunk.title_hash[i],
                 });
             }
         }
@@ -465,7 +468,8 @@ pub fn streamClickBenchHotChunks(allocator: std.mem.Allocator, io: std.Io, parqu
         \\       CAST(IsDownload AS SMALLINT) AS IsDownload,
         \\       CAST(DontCountHits AS SMALLINT) AS DontCountHits,
         \\       CAST(RefererHash AS BIGINT) AS RefererHash,
-        \\       CAST(URLHash AS BIGINT) AS URLHash
+        \\       CAST(URLHash AS BIGINT) AS URLHash,
+        \\       CAST(hash(CAST(Title AS VARCHAR)) & 9223372036854775807 AS BIGINT) AS TitleHash
         \\FROM read_parquet({s}, binary_as_string=True){s}
     , .{ referer_select, parquet_literal, limit_clause });
     defer allocator.free(sql_text);
@@ -547,6 +551,7 @@ pub fn streamClickBenchHotChunks(allocator: std.mem.Allocator, io: std.Io, parqu
         const dont_count: [*]const i16 = @ptrCast(@alignCast(vectorData(chunk, 21 + base)));
         const referer_hash: [*]const i64 = @ptrCast(@alignCast(vectorData(chunk, 22 + base)));
         const url_hash: [*]const i64 = @ptrCast(@alignCast(vectorData(chunk, 23 + base)));
+        const title_hash: [*]const i64 = @ptrCast(@alignCast(vectorData(chunk, 24 + base)));
         try callback(context, ClickBenchHotChunk{
             .watch = watch[0..n],
             .title = title[0..n],
@@ -573,6 +578,7 @@ pub fn streamClickBenchHotChunks(allocator: std.mem.Allocator, io: std.Io, parqu
             .dont_count = dont_count[0..n],
             .referer_hash = referer_hash[0..n],
             .url_hash = url_hash[0..n],
+            .title_hash = title_hash[0..n],
         });
         c.duckdb_destroy_data_chunk(&chunk);
     }
