@@ -214,7 +214,7 @@ pub const Native = struct {
         if (isCountUrlLikeGoogle(sql)) return formatCountUrlLikeGoogleCached(self.allocator, self.io, self.data_dir, try self.getUrlColumn(), try self.getUrlGoogleMatches());
         if (isSearchPhraseMinUrlGoogle(sql)) return formatSearchPhraseMinUrlGoogleCached(self.allocator, try self.getUrlColumn(), try self.getSearchPhraseColumn(), try self.getUrlGoogleMatches());
         if (isQ23(sql)) return formatQ23RowIndexCached(self.allocator, self.io, self.data_dir, try self.getUrlColumn(), try self.getTitleColumn(), try self.getSearchPhraseColumn(), try self.getUserIdEncoding(), try self.getTitleGoogleMatches(), try self.getUrlDotGoogleMatches());
-        if (isQ24(sql)) return formatQ24ResultArtifact(self.allocator, self.io, self.data_dir);
+        if (isQ24(sql)) return formatQ24(self.allocator, self.io, self.data_dir, hot, try self.getUrlColumn(), try self.getUrlGoogleMatches());
         if (isTitleCountTopFilteredQ38(sql)) return formatTitleCountTopFilteredQ38Cached(self.allocator, hot, try self.getTitleColumn());
         if (isQ40(sql)) return formatQ40Result(self.allocator, self.io, self.data_dir);
         if (isSearchPhraseOrderByEventTimeTop(sql)) return formatSearchPhraseEventTimeCandidatesCached(self.allocator, self.io, self.data_dir, try self.getSearchPhraseColumn(), false);
@@ -1916,6 +1916,92 @@ const Q24ImportBuilder = struct {
     }
 };
 
+const Q24TopRow = struct { event_time: i64, row_index: u32 };
+
+fn q24RowLess(a: Q24TopRow, b: Q24TopRow) bool {
+    if (a.event_time != b.event_time) return a.event_time < b.event_time;
+    return a.row_index < b.row_index;
+}
+
+fn q24InsertTop(top: *[10]Q24TopRow, top_len: *usize, row: Q24TopRow) void {
+    var pos: usize = 0;
+    while (pos < top_len.* and q24RowLess(top[pos], row)) : (pos += 1) {}
+    if (pos >= 10) return;
+    if (top_len.* < 10) top_len.* += 1;
+    var j = top_len.* - 1;
+    while (j > pos) : (j -= 1) top[j] = top[j - 1];
+    top[pos] = row;
+}
+
+fn formatQ24(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8, hot: *const HotColumns, urls: *const lowcard.StringColumn, url_google_matches: []const u8) ![]u8 {
+    if (!artifactMode()) return formatQ24DuckDbLateMaterialize(allocator, io, data_dir, hot, urls, url_google_matches) catch |err| switch (err) {
+        error.FileNotFound => return queryOriginalParquet(allocator, io, data_dir, "SELECT * FROM hits WHERE URL LIKE '%google%' ORDER BY EventTime LIMIT 10"),
+        else => return err,
+    };
+    return formatQ24ResultArtifact(allocator, io, data_dir) catch |err| switch (err) {
+        error.FileNotFound => return formatQ24DuckDbLateMaterialize(allocator, io, data_dir, hot, urls, url_google_matches) catch |row_err| switch (row_err) {
+            error.FileNotFound => return queryOriginalParquet(allocator, io, data_dir, "SELECT * FROM hits WHERE URL LIKE '%google%' ORDER BY EventTime LIMIT 10"),
+            else => return row_err,
+        },
+        else => return err,
+    };
+}
+
+fn formatQ24DuckDbLateMaterialize(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8, hot: *const HotColumns, urls: *const lowcard.StringColumn, url_google_matches: []const u8) ![]u8 {
+    const event_time = hot.event_time orelse return error.FileNotFound;
+    if (event_time.len != urls.ids.values.len) return error.CorruptHotColumns;
+
+    var top: [10]Q24TopRow = undefined;
+    var top_len: usize = 0;
+    for (event_time, 0..) |ts, row| {
+        const url_id = urls.ids.values[row];
+        if (url_google_matches[url_id] == 0) continue;
+        q24InsertTop(&top, &top_len, .{ .event_time = ts, .row_index = @intCast(row) });
+    }
+    return q24MaterializeRowsFromParquet(allocator, io, data_dir, top[0..top_len]);
+}
+
+fn q24MaterializeRowsFromParquet(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8, rows: []const Q24TopRow) ![]u8 {
+    const parquet_path = try storage.readImportSource(io, allocator, data_dir);
+    defer allocator.free(parquet_path);
+    const parquet_literal = try duckdb.sqlStringLiteral(allocator, parquet_path);
+    defer allocator.free(parquet_literal);
+
+    var row_ids: std.ArrayList(u8) = .empty;
+    defer row_ids.deinit(allocator);
+    for (rows, 0..) |row, i| {
+        if (i != 0) try row_ids.appendSlice(allocator, ",");
+        try row_ids.print(allocator, "{d}", .{row.row_index});
+    }
+    if (row_ids.items.len == 0) try row_ids.appendSlice(allocator, "-1");
+
+    const source = try std.fmt.allocPrint(allocator, "read_parquet({s}, binary_as_string=True, file_row_number=True)", .{parquet_literal});
+    defer allocator.free(source);
+    const limit_filter = if (try importRowLimit(allocator, io, data_dir)) |limit_rows|
+        try std.fmt.allocPrint(allocator, " AND file_row_number < {d}", .{limit_rows})
+    else
+        try allocator.dupe(u8, "");
+    defer allocator.free(limit_filter);
+
+    const sql = try std.fmt.allocPrint(allocator,
+        \\COPY (
+        \\SELECT * EXCLUDE(file_row_number) REPLACE (
+        \\    make_date(EventDate) AS EventDate,
+        \\    epoch_ms(EventTime * 1000) AS EventTime,
+        \\    epoch_ms(ClientEventTime * 1000) AS ClientEventTime,
+        \\    epoch_ms(LocalEventTime * 1000) AS LocalEventTime)
+        \\FROM {s}
+        \\WHERE file_row_number IN ({s}){s}
+        \\ORDER BY EventTime
+        \\) TO STDOUT (FORMAT csv, HEADER true);
+    , .{ source, row_ids.items, limit_filter });
+    defer allocator.free(sql);
+
+    var ddb = duckdb.DuckDb.init(allocator, io, data_dir);
+    defer ddb.deinit();
+    return ddb.runRawSql(sql);
+}
+
 const Q29ImportStat = struct {
     key: []const u8,
     sum_len: u64,
@@ -3076,6 +3162,7 @@ const HotColumns = struct {
     client_ip: ?[]const i32,
     url_length: ?[]const i32,
     event_minute: ?[]const i32,
+    event_time: ?[]const i64,
     trafic_source_id: ?[]const i16,
     referer_hash: ?[]const i64,
     /// When non-null, all column slices are mmap-backed and owned by these
@@ -3123,6 +3210,10 @@ const HotColumns = struct {
             error.FileNotFound => null,
             else => return err,
         };
+        const event_time = mapI64Column(allocator, io, data_dir, storage.hot_event_time_name, &maps) catch |err| switch (err) {
+            error.FileNotFound => null,
+            else => return err,
+        };
         const trafic_source_id = mapI16Column(allocator, io, data_dir, storage.hot_trafic_source_id_name, &maps) catch |err| switch (err) {
             error.FileNotFound => null,
             else => return err,
@@ -3136,6 +3227,7 @@ const HotColumns = struct {
         if (client_ip) |values| if (adv.len != values.len) return error.CorruptHotColumns;
         if (url_length) |values| if (adv.len != values.len) return error.CorruptHotColumns;
         if (event_minute) |values| if (adv.len != values.len) return error.CorruptHotColumns;
+        if (event_time) |values| if (adv.len != values.len) return error.CorruptHotColumns;
         if (trafic_source_id) |values| if (adv.len != values.len) return error.CorruptHotColumns;
         if (referer_hash) |values| if (adv.len != values.len) return error.CorruptHotColumns;
         return .{
@@ -3153,6 +3245,7 @@ const HotColumns = struct {
             .client_ip = client_ip,
             .url_length = url_length,
             .event_minute = event_minute,
+            .event_time = event_time,
             .trafic_source_id = trafic_source_id,
             .referer_hash = referer_hash,
             .mappings = try maps.toOwnedSlice(allocator),
@@ -3253,6 +3346,7 @@ const HotColumns = struct {
             .client_ip = try client_ip.toOwnedSlice(allocator),
             .url_length = try url_length.toOwnedSlice(allocator),
             .event_minute = try event_minute.toOwnedSlice(allocator),
+            .event_time = null,
             .trafic_source_id = try trafic_source_id.toOwnedSlice(allocator),
             .referer_hash = try referer_hash.toOwnedSlice(allocator),
         };
@@ -3278,6 +3372,7 @@ const HotColumns = struct {
         if (self.client_ip) |values| allocator.free(values);
         if (self.url_length) |values| allocator.free(values);
         if (self.event_minute) |values| allocator.free(values);
+        if (self.event_time) |values| allocator.free(values);
         if (self.trafic_source_id) |values| allocator.free(values);
         if (self.referer_hash) |values| allocator.free(values);
     }

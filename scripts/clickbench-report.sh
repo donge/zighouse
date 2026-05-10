@@ -131,6 +131,7 @@ REPORT="$REPORT_DIR/report.md"
   echo "- Store is a ClickBench-oriented hot-column profile, not a general-purpose full-column store."
   if [[ -n "${ZIGHOUSE_REPORT_FAIR:-}" ]]; then
     echo "- Fair mode: query-specific result/candidate artifacts are rejected and native reads ignore them."
+    echo "- Fair mode: Q24 uses native URL/EventTime TopN and DuckDB file_row_number Parquet late materialization for the selected rows."
     if [[ -e "$STORE_DIR/Referer.domain_id.u32" && -e "$STORE_DIR/hot_Referer.id" ]]; then
       echo "- Fair mode: Q29/Q40 use generic Referer dictionary/sidecars from the store."
     else
@@ -139,6 +140,8 @@ REPORT="$REPORT_DIR/report.md"
   fi
   if [[ -n "${ZIGHOUSE_REPORT_FAST:-}" ]]; then
     echo "- Q24/Q29/Q40 use import-time tiny result artifacts recorded in the store."
+  elif [[ -n "${ZIGHOUSE_REPORT_FAIR:-}" ]]; then
+    echo "- Q29/Q40 fall back to the source Parquet when required generic Referer files are absent."
   else
     echo "- Q24/Q29/Q40 fall back to the source Parquet when native hot-store artifacts are absent."
   fi
