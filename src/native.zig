@@ -2580,6 +2580,66 @@ fn importTextColumnHint(name: []const u8, rows: usize) usize {
     };
 }
 
+const ImportStringBlob = struct {
+    offsets: std.ArrayList(u32) = .empty,
+    chunks: std.ArrayList([]u8) = .empty,
+    chunk_lens: std.ArrayList(usize) = .empty,
+    total_bytes: usize = 0,
+
+    fn init(allocator: std.mem.Allocator, capacity_hint: usize) !ImportStringBlob {
+        var self = ImportStringBlob{};
+        errdefer self.deinit(allocator);
+        try self.offsets.ensureTotalCapacity(allocator, capacity_hint + 1);
+        try self.offsets.append(allocator, 0);
+        return self;
+    }
+
+    fn deinit(self: *ImportStringBlob, allocator: std.mem.Allocator) void {
+        for (self.chunks.items) |chunk| allocator.free(chunk);
+        self.chunks.deinit(allocator);
+        self.chunk_lens.deinit(allocator);
+        self.offsets.deinit(allocator);
+    }
+
+    fn len(self: *const ImportStringBlob) usize {
+        return self.offsets.items.len - 1;
+    }
+
+    fn append(self: *ImportStringBlob, allocator: std.mem.Allocator, value: []const u8) ![]const u8 {
+        try self.ensureWritable(allocator, value.len);
+        const chunk_idx = self.chunks.items.len - 1;
+        const start = self.chunk_lens.items[chunk_idx];
+        @memcpy(self.chunks.items[chunk_idx][start..][0..value.len], value);
+        self.chunk_lens.items[chunk_idx] = start + value.len;
+        self.total_bytes += value.len;
+        try self.offsets.append(allocator, @intCast(self.total_bytes));
+        return self.chunks.items[chunk_idx][start .. start + value.len];
+    }
+
+    fn write(self: *const ImportStringBlob, allocator: std.mem.Allocator, io: std.Io, offsets_path: []const u8, strings_path: []const u8) !void {
+        try writeFilePath(io, offsets_path, std.mem.sliceAsBytes(self.offsets.items));
+        var strings_file = try createFilePath(io, strings_path);
+        defer strings_file.close(io);
+        const buf = try allocator.alloc(u8, 1024 * 1024);
+        defer allocator.free(buf);
+        var out = BufferedColumn{ .file = strings_file, .buf = buf };
+        for (self.chunks.items, self.chunk_lens.items) |chunk, used| try out.write(io, chunk[0..used]);
+        try out.flush(io);
+    }
+
+    fn ensureWritable(self: *ImportStringBlob, allocator: std.mem.Allocator, value_len: usize) !void {
+        if (self.chunks.items.len != 0) {
+            const idx = self.chunks.items.len - 1;
+            if (self.chunk_lens.items[idx] + value_len <= self.chunks.items[idx].len) return;
+        }
+        const cap = @max(@max(value_len, 64 * 1024), 8 * 1024 * 1024);
+        const chunk = try allocator.alloc(u8, cap);
+        errdefer allocator.free(chunk);
+        try self.chunks.append(allocator, chunk);
+        try self.chunk_lens.append(allocator, 0);
+    }
+};
+
 const ImportDictBuilders = struct {
     user_id_id_writer: BufferedColumn,
     user_id_dict_path: []const u8,
@@ -2614,7 +2674,7 @@ const ImportDictBuilders = struct {
     referer_strings_path: ?[]const u8 = null,
     referer_tsv_path: ?[]const u8 = null,
     referers: std.StringHashMap(u32),
-    referer_order: std.ArrayList([]const u8),
+    referer_blob: ImportStringBlob,
     referer_domain_ids: std.ArrayList(u32),
     referer_utf8_lens: std.ArrayList(u32),
     referer_domains: std.StringHashMap(u32),
@@ -2658,7 +2718,7 @@ const ImportDictBuilders = struct {
             .referer_strings_path = paths.referer_strings,
             .referer_tsv_path = paths.referer_tsv,
             .referers = std.StringHashMap(u32).init(allocator),
-            .referer_order = .empty,
+            .referer_blob = try ImportStringBlob.init(allocator, 0),
             .referer_domain_ids = .empty,
             .referer_utf8_lens = .empty,
             .referer_domains = std.StringHashMap(u32).init(allocator),
@@ -2682,7 +2742,9 @@ const ImportDictBuilders = struct {
         try builders.url_order.ensureTotalCapacity(allocator, hint.urls);
         if (paths.referer_id != null) {
             try builders.referers.ensureTotalCapacity(@intCast(hint.referers));
-            try builders.referer_order.ensureTotalCapacity(allocator, hint.referers);
+            builders.referer_blob.offsets.clearRetainingCapacity();
+            try builders.referer_blob.offsets.ensureTotalCapacity(allocator, hint.referers + 1);
+            try builders.referer_blob.offsets.append(allocator, 0);
             try builders.referer_domain_ids.ensureTotalCapacity(allocator, hint.referers);
             try builders.referer_utf8_lens.ensureTotalCapacity(allocator, hint.referers);
             try builders.referer_domains.ensureTotalCapacity(1024);
@@ -2723,8 +2785,7 @@ const ImportDictBuilders = struct {
         if (self.referer_offsets_path) |path| allocator.free(path);
         if (self.referer_strings_path) |path| allocator.free(path);
         if (self.referer_tsv_path) |path| allocator.free(path);
-        freeStringOrder(allocator, self.referer_order.items);
-        self.referer_order.deinit(allocator);
+        self.referer_blob.deinit(allocator);
         self.referers.deinit();
         self.referer_domain_ids.deinit(allocator);
         self.referer_utf8_lens.deinit(allocator);
@@ -2824,10 +2885,9 @@ const ImportDictBuilders = struct {
                 try writer.write(io, std.mem.asBytes(&id));
                 return id;
             }
-            const owned = try allocator.dupe(u8, value);
-            const id: u32 = @intCast(self.referer_order.items.len);
+            const id: u32 = @intCast(self.referer_blob.len());
+            const owned = try self.referer_blob.append(allocator, value);
             try self.referers.putNoClobber(owned, id);
-            try self.referer_order.append(allocator, owned);
             try self.addRefererSidecarEntry(allocator, owned);
             var writable_id = id;
             try writer.write(io, std.mem.asBytes(&writable_id));
@@ -2954,7 +3014,8 @@ const ImportDictBuilders = struct {
 
         if (self.referer_offsets_path) |offsets_path| {
             started = std.Io.Clock.Timestamp.now(io, .awake);
-            try writeStringDictU32(allocator, io, offsets_path, self.referer_strings_path.?, self.referer_tsv_path.?, self.referer_order.items, write_tsv);
+            try self.referer_blob.write(allocator, io, offsets_path, self.referer_strings_path.?);
+            if (write_tsv) try writeRefererTsvFromBlob(allocator, io, self.referer_tsv_path.?, &self.referer_blob);
             finished = std.Io.Clock.Timestamp.now(io, .awake);
             traceImportPhase("finish_dict.Referer", elapsedSeconds(started, finished));
         }
@@ -3014,6 +3075,33 @@ fn writeStringDictBytesAndTsv(allocator: std.mem.Allocator, io: std.Io, bytes_pa
         const prefix = try std.fmt.bufPrint(&prefix_buf, "{d}\t", .{idx});
         try out.write(io, prefix);
         try out.write(io, s);
+        try out.write(io, "\n");
+    }
+    try out.flush(io);
+}
+
+fn writeRefererTsvFromBlob(allocator: std.mem.Allocator, io: std.Io, tsv_path: []const u8, blob: *const ImportStringBlob) !void {
+    var tsv_file = try createFilePath(io, tsv_path);
+    defer tsv_file.close(io);
+    const buf = try allocator.alloc(u8, 1024 * 1024);
+    defer allocator.free(buf);
+    var out = BufferedColumn{ .file = tsv_file, .buf = buf };
+    var idx: usize = 0;
+    var chunk_idx: usize = 0;
+    var chunk_base: usize = 0;
+    while (idx + 1 < blob.offsets.items.len) : (idx += 1) {
+        const start = blob.offsets.items[idx];
+        const end = blob.offsets.items[idx + 1];
+        while (chunk_idx + 1 < blob.chunks.items.len and start >= chunk_base + blob.chunk_lens.items[chunk_idx]) {
+            chunk_base += blob.chunk_lens.items[chunk_idx];
+            chunk_idx += 1;
+        }
+        const local_start = start - chunk_base;
+        const local_end = end - chunk_base;
+        var prefix_buf: [32]u8 = undefined;
+        const prefix = try std.fmt.bufPrint(&prefix_buf, "{d}\t", .{idx});
+        try out.write(io, prefix);
+        try out.write(io, blob.chunks.items[chunk_idx][local_start..local_end]);
         try out.write(io, "\n");
     }
     try out.flush(io);
