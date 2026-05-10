@@ -45,7 +45,7 @@ pub const DuckDb = struct {
     pub fn query(self: *DuckDb, sql: []const u8) ![]u8 {
         const parquet_path = try storage.readImportSource(self.io, self.allocator, self.data_dir);
         defer self.allocator.free(parquet_path);
-        const wrapped = try wrapSql(self.allocator, parquet_path, null, sql);
+        const wrapped = try wrapSql(self.allocator, parquet_path, try importRowLimit(self.allocator, self.io, self.data_dir), sql);
         defer self.allocator.free(wrapped);
         return self.runDuckDb(&.{ duckDbExe(), "-csv", "-c", wrapped });
     }
@@ -97,6 +97,22 @@ pub const DuckDb = struct {
         try std.Io.File.stdout().writeStreamingAll(self.io, bytes);
     }
 };
+
+fn importRowLimit(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8) !?u64 {
+    const manifest = storage.readImportManifest(io, allocator, data_dir) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    defer allocator.free(manifest);
+    var lines = std.mem.splitScalar(u8, manifest, '\n');
+    while (lines.next()) |line| {
+        if (!std.mem.startsWith(u8, line, "row_count=")) continue;
+        const raw = std.mem.trim(u8, line["row_count=".len..], " \t\r");
+        const rows = try std.fmt.parseInt(u64, raw, 10);
+        return if (rows == 0) null else rows;
+    }
+    return null;
+}
 
 fn wrapSql(allocator: std.mem.Allocator, parquet_path: []const u8, limit_rows: ?u64, sql: []const u8) ![]u8 {
     const escaped_path = try sqlStringLiteral(allocator, parquet_path);
