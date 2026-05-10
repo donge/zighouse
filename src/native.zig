@@ -83,21 +83,29 @@ pub const Native = struct {
 
     pub fn importClickBenchParquetDuckDbVectorHot(self: *Native, parquet_path: []const u8, limit_rows: ?u64) !void {
         const total_started = std.Io.Clock.Timestamp.now(self.io, .awake);
+        const total_wall_started = wallNow();
         try storage.initStore(self.io, self.data_dir);
         try storage.writeImportManifest(self.io, self.allocator, self.data_dir, parquet_path);
         const import_started = std.Io.Clock.Timestamp.now(self.io, .awake);
+        const import_wall_started = wallNow();
         const stats = try importClickBenchParquetDuckDbVectorHotImpl(self.allocator, self.io, self.data_dir, parquet_path, limit_rows);
         const import_finished = std.Io.Clock.Timestamp.now(self.io, .awake);
+        const import_wall_finished = wallNow();
         const main_store_seconds = elapsedSeconds(import_started, import_finished);
+        traceImportWallPhase("main_store", elapsedWallSeconds(import_wall_started, import_wall_finished));
         traceImportPhase("main_store", main_store_seconds);
         traceImportDictStats(stats);
         const write_caches = importTinyCachesEnabled();
         const cache_started = std.Io.Clock.Timestamp.now(self.io, .awake);
+        const cache_wall_started = wallNow();
         if (write_caches) try writeTinyResultCachesFromParquet(self.allocator, self.io, self.data_dir, parquet_path, limit_rows);
         const cache_finished = std.Io.Clock.Timestamp.now(self.io, .awake);
+        const cache_wall_finished = wallNow();
         const tiny_caches_seconds = elapsedSeconds(cache_started, cache_finished);
         if (write_caches) traceImportPhase("tiny_caches", tiny_caches_seconds);
+        if (write_caches) traceImportWallPhase("tiny_caches", elapsedWallSeconds(cache_wall_started, cache_wall_finished));
         const total_seconds = elapsedSeconds(total_started, cache_finished);
+        traceImportWallPhase("total", elapsedWallSeconds(total_wall_started, cache_wall_finished));
         try storage.writeDetailedImportManifest(self.io, self.allocator, self.data_dir, .{
             .source = parquet_path,
             .status = "imported",
@@ -685,6 +693,18 @@ fn elapsedSeconds(started: std.Io.Clock.Timestamp, ended: std.Io.Clock.Timestamp
     return @as(f64, @floatFromInt(@as(u64, @intCast(started.durationTo(ended).raw.nanoseconds)))) / std.time.ns_per_s;
 }
 
+fn wallNow() i128 {
+    var ts: std.posix.timespec = undefined;
+    switch (std.posix.errno(std.posix.system.clock_gettime(.REALTIME, &ts))) {
+        .SUCCESS => return @as(i128, ts.sec) * std.time.ns_per_s + ts.nsec,
+        else => return 0,
+    }
+}
+
+fn elapsedWallSeconds(started: i128, ended: i128) f64 {
+    return @as(f64, @floatFromInt(ended - started)) / std.time.ns_per_s;
+}
+
 fn elapsedNanoseconds(started: std.Io.Clock.Timestamp, ended: std.Io.Clock.Timestamp) u64 {
     return @intCast(started.durationTo(ended).raw.nanoseconds);
 }
@@ -704,6 +724,11 @@ fn importRefererEnabled() bool {
 fn traceImportPhase(name: []const u8, seconds: f64) void {
     if (!importTraceEnabled()) return;
     std.debug.print("import_phase {s} seconds={d:.6}\n", .{ name, seconds });
+}
+
+fn traceImportWallPhase(name: []const u8, seconds: f64) void {
+    if (!importTraceEnabled()) return;
+    std.debug.print("import_wall_phase {s} seconds={d:.6}\n", .{ name, seconds });
 }
 
 fn traceImportPhaseRows(name: []const u8, rows: u64, seconds: f64) void {

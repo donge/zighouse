@@ -59,6 +59,8 @@ const usage =
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
+    const main_started = wallNow();
+    defer traceMainWall("process", main_started);
 
     var args = try std.process.Args.Iterator.initAllocator(init.minimal.args, allocator);
     defer args.deinit();
@@ -77,9 +79,30 @@ pub fn main(init: std.process.Init) !void {
             continue;
         }
         const command = maybe_arg;
+        const command_started = wallNow();
         try runCommand(init, allocator, &args, command, options);
+        traceMainWall(command, command_started);
         return;
     }
+}
+
+fn importTraceEnabled() bool {
+    return std.c.getenv("ZIGHOUSE_IMPORT_TRACE") != null;
+}
+
+fn wallNow() i128 {
+    var ts: std.posix.timespec = undefined;
+    switch (std.posix.errno(std.posix.system.clock_gettime(.REALTIME, &ts))) {
+        .SUCCESS => return @as(i128, ts.sec) * std.time.ns_per_s + ts.nsec,
+        else => return 0,
+    }
+}
+
+fn traceMainWall(name: []const u8, started: i128) void {
+    if (!importTraceEnabled()) return;
+    const ended = wallNow();
+    const seconds = @as(f64, @floatFromInt(ended - started)) / std.time.ns_per_s;
+    std.debug.print("import_wall_phase main.{s} seconds={d:.6}\n", .{ name, seconds });
 }
 
 fn runCommand(init: std.process.Init, allocator: std.mem.Allocator, args: *std.process.Args.Iterator, command: []const u8, options: backend.Options) !void {
