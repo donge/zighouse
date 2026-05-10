@@ -7,6 +7,7 @@ const schema = @import("schema.zig");
 const simd = @import("simd.zig");
 const io_map = @import("io_map.zig");
 const lowcard = @import("lowcard.zig");
+const parquet = @import("parquet.zig");
 const planner = @import("planner.zig");
 const reader = @import("reader.zig");
 const storage = @import("storage.zig");
@@ -665,7 +666,8 @@ const ImportTraceCounters = struct {
 };
 
 fn importClickBenchParquetDuckDbVectorHotImpl(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8, parquet_path: []const u8, limit_rows: ?u64) !ImportStats {
-    var ctx = try ImportHotContext.init(allocator, io, data_dir, limitRowsToCapacityHint(limit_rows), .minimal);
+    const hint_rows = limit_rows orelse parquet.rowCountPath(allocator, io, parquet_path) catch null;
+    var ctx = try ImportHotContext.init(allocator, io, data_dir, limitRowsToCapacityHint(hint_rows), .minimal);
     defer ctx.deinit(allocator, io);
     const stream_started = std.Io.Clock.Timestamp.now(io, .awake);
     try duckdb.streamClickBenchHotChunks(allocator, io, parquet_path, limit_rows, &ctx, importDuckDbVectorHotChunk);
@@ -1070,6 +1072,7 @@ const ImportHotContext = struct {
     q40: Q40RefererMapBuilder,
     row_count: u64 = 0,
     finished: bool = false,
+    skip_deep_deinit: bool = false,
     mode: ImportMode,
     trace: ImportTraceCounters,
 
@@ -1232,6 +1235,7 @@ const ImportHotContext = struct {
     fn deinit(self: *ImportHotContext, allocator: std.mem.Allocator, io: std.Io) void {
         if (!self.finished) self.finish(allocator, io, "") catch {};
         self.writer.deinit(allocator, io);
+        if (self.skip_deep_deinit) return;
         self.dicts.deinit(allocator, io);
         self.q33.deinit();
         self.q19.deinit();
@@ -1247,7 +1251,12 @@ const ImportHotContext = struct {
         traceImportPhase("flush_columns", elapsedSeconds(flush_started, flush_finished));
         const dict_started = std.Io.Clock.Timestamp.now(io, .awake);
         try self.dicts.finish(allocator, io, self.mode == .legacy_artifacts);
-        if (self.dicts.referer_offsets_path != null and data_dir.len != 0) try writeRefererSidecars(allocator, io, data_dir);
+        if (self.dicts.referer_offsets_path != null and data_dir.len != 0) {
+            const sidecar_started = std.Io.Clock.Timestamp.now(io, .awake);
+            try self.dicts.writeRefererSidecars(allocator, io, data_dir);
+            const sidecar_finished = std.Io.Clock.Timestamp.now(io, .awake);
+            traceImportPhase("finish_referer_sidecars", elapsedSeconds(sidecar_started, sidecar_finished));
+        }
         const dict_finished = std.Io.Clock.Timestamp.now(io, .awake);
         traceImportPhase("finish_dicts", elapsedSeconds(dict_started, dict_finished));
         if (data_dir.len != 0) {
@@ -1266,6 +1275,7 @@ const ImportHotContext = struct {
             try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = q1_path, .data = q1 });
         }
         self.finished = true;
+        self.skip_deep_deinit = true;
     }
 
     fn stats(self: *const ImportHotContext) ImportStats {
@@ -2580,6 +2590,10 @@ const ImportDictBuilders = struct {
     referer_tsv_path: ?[]const u8 = null,
     referers: std.StringHashMap(u32),
     referer_order: std.ArrayList([]const u8),
+    referer_domain_ids: std.ArrayList(u32),
+    referer_utf8_lens: std.ArrayList(u32),
+    referer_domains: std.StringHashMap(u32),
+    referer_domain_order: std.ArrayList([]const u8),
 
     title_id_writer: BufferedColumn,
     title_offsets_path: []const u8,
@@ -2620,6 +2634,10 @@ const ImportDictBuilders = struct {
             .referer_tsv_path = paths.referer_tsv,
             .referers = std.StringHashMap(u32).init(allocator),
             .referer_order = .empty,
+            .referer_domain_ids = .empty,
+            .referer_utf8_lens = .empty,
+            .referer_domains = std.StringHashMap(u32).init(allocator),
+            .referer_domain_order = .empty,
             .title_id_writer = try .init(allocator, io, paths.title_id),
             .title_offsets_path = paths.title_offsets,
             .title_strings_path = paths.title_strings,
@@ -2640,6 +2658,9 @@ const ImportDictBuilders = struct {
         if (paths.referer_id != null) {
             try builders.referers.ensureTotalCapacity(@intCast(hint.referers));
             try builders.referer_order.ensureTotalCapacity(allocator, hint.referers);
+            try builders.referer_domain_ids.ensureTotalCapacity(allocator, hint.referers);
+            try builders.referer_utf8_lens.ensureTotalCapacity(allocator, hint.referers);
+            try builders.referer_domains.ensureTotalCapacity(1024);
         }
         try builders.titles.ensureTotalCapacity(@intCast(hint.titles));
         try builders.title_order.ensureTotalCapacity(allocator, hint.titles);
@@ -2680,6 +2701,10 @@ const ImportDictBuilders = struct {
         freeStringOrder(allocator, self.referer_order.items);
         self.referer_order.deinit(allocator);
         self.referers.deinit();
+        self.referer_domain_ids.deinit(allocator);
+        self.referer_utf8_lens.deinit(allocator);
+        self.referer_domains.deinit();
+        self.referer_domain_order.deinit(allocator);
         self.title_id_writer.deinit(allocator, io);
         allocator.free(self.title_offsets_path);
         allocator.free(self.title_strings_path);
@@ -2769,9 +2794,52 @@ const ImportDictBuilders = struct {
 
     fn writeRefererRaw(self: *ImportDictBuilders, allocator: std.mem.Allocator, io: std.Io, value: []const u8) !?u32 {
         if (self.referer_id_writer) |*writer| {
-            return try self.writeStringU32Raw(allocator, io, value, &self.referers, &self.referer_order, writer);
+            if (self.referers.get(value)) |existing_id| {
+                var id = existing_id;
+                try writer.write(io, std.mem.asBytes(&id));
+                return id;
+            }
+            const owned = try allocator.dupe(u8, value);
+            const id: u32 = @intCast(self.referer_order.items.len);
+            try self.referers.putNoClobber(owned, id);
+            try self.referer_order.append(allocator, owned);
+            try self.addRefererSidecarEntry(allocator, owned);
+            var writable_id = id;
+            try writer.write(io, std.mem.asBytes(&writable_id));
+            return id;
         }
         return null;
+    }
+
+    fn addRefererSidecarEntry(self: *ImportDictBuilders, allocator: std.mem.Allocator, referer: []const u8) !void {
+        try self.referer_utf8_lens.append(allocator, @intCast(utf8CharLen(referer)));
+        if (referer.len == 0) {
+            try self.referer_domain_ids.append(allocator, std.math.maxInt(u32));
+            return;
+        }
+        const domain = q29Domain(referer);
+        const gop = try self.referer_domains.getOrPut(domain);
+        if (!gop.found_existing) {
+            const id: u32 = @intCast(self.referer_domain_order.items.len);
+            gop.value_ptr.* = id;
+            try self.referer_domain_order.append(allocator, domain);
+        }
+        try self.referer_domain_ids.append(allocator, gop.value_ptr.*);
+    }
+
+    fn writeRefererSidecars(self: *ImportDictBuilders, allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8) !void {
+        const domain_id_path = try storage.hotColumnPath(allocator, data_dir, storage.referer_domain_id_name);
+        defer allocator.free(domain_id_path);
+        const utf8_len_path = try storage.hotColumnPath(allocator, data_dir, storage.referer_utf8_len_name);
+        defer allocator.free(utf8_len_path);
+        const domain_offsets_path = try storage.hotColumnPath(allocator, data_dir, storage.referer_domain_offsets_name);
+        defer allocator.free(domain_offsets_path);
+        const domain_strings_path = try storage.hotColumnPath(allocator, data_dir, storage.referer_domain_strings_name);
+        defer allocator.free(domain_strings_path);
+
+        try writeFilePath(io, domain_id_path, std.mem.sliceAsBytes(self.referer_domain_ids.items));
+        try writeFilePath(io, utf8_len_path, std.mem.sliceAsBytes(self.referer_utf8_lens.items));
+        try writeStringDictU32(allocator, io, domain_offsets_path, domain_strings_path, "", self.referer_domain_order.items, false);
     }
 
     fn writeTitle(self: *ImportDictBuilders, allocator: std.mem.Allocator, io: std.Io, field: []const u8) !u32 {
@@ -2838,14 +2906,38 @@ const ImportDictBuilders = struct {
         try self.url_id_writer.flush(io);
         if (self.referer_id_writer) |*w| try w.flush(io);
         try self.title_id_writer.flush(io);
+
+        var started = std.Io.Clock.Timestamp.now(io, .awake);
         try writeFilePath(io, self.user_id_dict_path, std.mem.sliceAsBytes(self.user_order.items));
+        var finished = std.Io.Clock.Timestamp.now(io, .awake);
+        traceImportPhase("finish_dict.UserID", elapsedSeconds(started, finished));
+
+        started = std.Io.Clock.Timestamp.now(io, .awake);
         try writeStringDictU8(allocator, io, self.mobile_model_offsets_path, self.mobile_model_bytes_path, self.mobile_model_tsv_path, self.mobile_model_order.items, write_tsv);
+        finished = std.Io.Clock.Timestamp.now(io, .awake);
+        traceImportPhase("finish_dict.MobilePhoneModel", elapsedSeconds(started, finished));
+
+        started = std.Io.Clock.Timestamp.now(io, .awake);
         try writeStringDictU32(allocator, io, self.search_phrase_offsets_path, self.search_phrase_phrases_path, self.search_phrase_tsv_path, self.search_phrase_order.items, write_tsv);
+        finished = std.Io.Clock.Timestamp.now(io, .awake);
+        traceImportPhase("finish_dict.SearchPhrase", elapsedSeconds(started, finished));
+
+        started = std.Io.Clock.Timestamp.now(io, .awake);
         try writeStringDictU32(allocator, io, self.url_offsets_path, self.url_strings_path, self.url_tsv_path, self.url_order.items, write_tsv);
+        finished = std.Io.Clock.Timestamp.now(io, .awake);
+        traceImportPhase("finish_dict.URL", elapsedSeconds(started, finished));
+
         if (self.referer_offsets_path) |offsets_path| {
+            started = std.Io.Clock.Timestamp.now(io, .awake);
             try writeStringDictU32(allocator, io, offsets_path, self.referer_strings_path.?, self.referer_tsv_path.?, self.referer_order.items, write_tsv);
+            finished = std.Io.Clock.Timestamp.now(io, .awake);
+            traceImportPhase("finish_dict.Referer", elapsedSeconds(started, finished));
         }
+
+        started = std.Io.Clock.Timestamp.now(io, .awake);
         try writeStringDictU32(allocator, io, self.title_offsets_path, self.title_strings_path, self.title_tsv_path, self.title_order.items, write_tsv);
+        finished = std.Io.Clock.Timestamp.now(io, .awake);
+        traceImportPhase("finish_dict.Title", elapsedSeconds(started, finished));
         self.finished = true;
     }
 };
@@ -2865,6 +2957,7 @@ fn writeStringDictU32(allocator: std.mem.Allocator, io: std.Io, offsets_path: []
 fn writeStringDict(allocator: std.mem.Allocator, io: std.Io, offsets_path: []const u8, bytes_path: []const u8, tsv_path: []const u8, values: []const []const u8, write_tsv: bool) !void {
     var offsets: std.ArrayList(u32) = .empty;
     defer offsets.deinit(allocator);
+    try offsets.ensureTotalCapacity(allocator, values.len + 1);
     try offsets.append(allocator, 0);
     var total_bytes: usize = 0;
     for (values) |s| {
@@ -2900,7 +2993,6 @@ fn writeStringDictBytesAndTsv(allocator: std.mem.Allocator, io: std.Io, bytes_pa
     }
     try out.flush(io);
 }
-
 const HotColumnWriter = struct {
     adv: BufferedColumn,
     width: BufferedColumn,

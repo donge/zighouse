@@ -49,6 +49,37 @@ pub const Metadata = struct {
     row_groups: []const RowGroup = &.{},
 };
 
+pub fn rowCountPath(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !u64 {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    var file = if (std.fs.path.isAbsolute(path))
+        try std.Io.Dir.openFileAbsolute(io, path, .{})
+    else
+        try std.Io.Dir.cwd().openFile(io, path, .{});
+    defer file.close(io);
+
+    const stat = try file.stat(io);
+    if (stat.size < 12) return error.InvalidParquetFile;
+
+    var trailer: [8]u8 = undefined;
+    const trailer_n = try file.readPositionalAll(io, &trailer, stat.size - 8);
+    if (trailer_n != trailer.len) return error.InvalidParquetFile;
+    if (!std.mem.eql(u8, trailer[4..8], "PAR1")) return error.InvalidParquetFile;
+    const footer_len = std.mem.readInt(u32, trailer[0..4], .little);
+    if (@as(u64, footer_len) + 8 > stat.size) return error.InvalidParquetFile;
+
+    const footer = try arena.allocator().alloc(u8, footer_len);
+    const footer_offset = stat.size - 8 - footer_len;
+    const footer_n = try file.readPositionalAll(io, footer, footer_offset);
+    if (footer_n != footer.len) return error.InvalidParquetFile;
+
+    var parser = CompactParser{ .allocator = arena.allocator(), .buf = footer };
+    const meta = try parser.readFileMetaData();
+    if (meta.num_rows < 0) return error.InvalidParquetFile;
+    return @intCast(meta.num_rows);
+}
+
 pub fn inspectPath(allocator: std.mem.Allocator, io: std.Io, path: []const u8) ![]u8 {
     var file = if (std.fs.path.isAbsolute(path))
         try std.Io.Dir.openFileAbsolute(io, path, .{})
