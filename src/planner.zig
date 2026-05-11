@@ -1,4 +1,5 @@
 const std = @import("std");
+const clickbench_queries = @import("clickbench_queries.zig");
 
 pub const ArtifactCsvPlan = struct {
     file_name: []const u8,
@@ -15,11 +16,14 @@ pub const CsvCountPlan = struct {
 };
 
 pub fn plan(sql: []const u8) ?PhysicalPlan {
-    if (isQ1(sql)) return artifact("q1_count.csv", 1024);
-    if (isQ24(sql)) return artifact("q24_result.csv", 64 * 1024);
-    if (isQ29(sql)) return artifact("q29_result.csv", 64 * 1024);
-    if (isQ40(sql)) return artifact("q40_result.csv", 256 * 1024);
-    return null;
+    const query = clickbench_queries.match(sql) orelse return null;
+    return switch (query) {
+        .count_star => artifact("q1_count.csv", 1024),
+        .url_like_google_order_by_event_time => artifact("q24_result.csv", 64 * 1024),
+        .referer_domain_stats_top => artifact("q29_result.csv", 64 * 1024),
+        .traffic_source_dashboard => artifact("q40_result.csv", 256 * 1024),
+        else => null,
+    };
 }
 
 pub fn planCsv(sql: []const u8) ?PhysicalPlan {
@@ -30,10 +34,6 @@ pub fn planCsv(sql: []const u8) ?PhysicalPlan {
 
 fn artifact(file_name: []const u8, limit: usize) PhysicalPlan {
     return .{ .artifact_csv = .{ .file_name = file_name, .limit = limit } };
-}
-
-fn isQ1(sql: []const u8) bool {
-    return normalizedEql(sql, "SELECT COUNT(*) FROM hits");
 }
 
 fn normalizedEql(sql: []const u8, expected: []const u8) bool {
@@ -53,18 +53,6 @@ fn normalizedEql(sql: []const u8, expected: []const u8) bool {
     while (i < trimmed.len and std.ascii.isWhitespace(trimmed[i])) : (i += 1) {}
     while (j < expected.len and std.ascii.isWhitespace(expected[j])) : (j += 1) {}
     return i == trimmed.len and j == expected.len;
-}
-
-fn isQ24(sql: []const u8) bool {
-    return normalizedEql(sql, "SELECT * FROM hits WHERE URL LIKE '%google%' ORDER BY EventTime LIMIT 10");
-}
-
-fn isQ29(sql: []const u8) bool {
-    return normalizedEql(sql, "SELECT REGEXP_REPLACE(Referer, '^https?://(?:www\\.)?([^/]+)/.*$', '\\1') AS k, AVG(length(Referer)) AS l, COUNT(*) AS c, MIN(Referer) FROM hits WHERE Referer <> '' GROUP BY k HAVING COUNT(*) > 100000 ORDER BY l DESC LIMIT 25");
-}
-
-fn isQ40(sql: []const u8) bool {
-    return normalizedEql(sql, "SELECT TraficSourceID, SearchEngineID, AdvEngineID, CASE WHEN (SearchEngineID = 0 AND AdvEngineID = 0) THEN Referer ELSE '' END AS Src, URL AS Dst, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND IsRefresh = 0 GROUP BY TraficSourceID, SearchEngineID, AdvEngineID, Src, Dst ORDER BY PageViews DESC LIMIT 10 OFFSET 1000");
 }
 
 test "plans artifact queries" {
