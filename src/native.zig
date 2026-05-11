@@ -1,6 +1,7 @@
 const std = @import("std");
 const agg = @import("agg.zig");
 const chdb = @import("chdb.zig");
+const clickbench_queries = @import("clickbench_queries.zig");
 const build_options = @import("build_options");
 const duckdb = if (build_options.duckdb) @import("duckdb.zig") else @import("duckdb_stub.zig");
 const executor = @import("executor.zig");
@@ -192,6 +193,7 @@ pub const Native = struct {
     }
 
     pub fn query(self: *Native, sql: []const u8) ![]u8 {
+        const clickbench_query = clickbench_queries.match(sql);
         if (planner.plan(sql)) |physical| {
             var store_reader = reader.StoreReader.init(self.allocator, self.io, self.data_dir);
             if (executor.execute(&store_reader, physical) catch |err| switch (err) {
@@ -199,90 +201,92 @@ pub const Native = struct {
                 else => return err,
             }) |output| return output;
         }
-        if (isCountStar(sql)) {
-            const parquet_path = try storage.readImportSource(self.io, self.allocator, self.data_dir);
-            defer self.allocator.free(parquet_path);
-            return self.countStarFromDuckDbMetadata(parquet_path);
-        }
-        if (isCountDistinctUserId(sql)) {
-            if (!self.experimental) return error.UnsupportedNativeQuery;
-            return formatUserIdDistinctCountCached(self.allocator, try self.getUserIdEncoding());
-        }
-        if (isCountDistinctSearchPhrase(sql)) {
-            if (!self.experimental) return error.UnsupportedNativeQuery;
-            return formatSearchPhraseDistinctCountCached(self.allocator, try self.getSearchPhraseColumn());
-        }
-        if (isRegionDistinctUserIdTop(sql)) {
-            if (!self.experimental) return error.UnsupportedNativeQuery;
-            return formatRegionDistinctUserIdTop(self.allocator, self.io, self.data_dir);
-        }
-        if (isRegionStatsDistinctUserIdTop(sql)) {
-            if (!self.experimental) return error.UnsupportedNativeQuery;
-            return formatRegionStatsDistinctUserIdTop(self.allocator, self.io, self.data_dir);
-        }
-        if (isMobilePhoneModelDistinctUserIdTop(sql)) {
-            if (!self.experimental) return error.UnsupportedNativeQuery;
-            return formatMobilePhoneModelDistinctUserIdTop(self.allocator, self.io, self.data_dir);
-        }
-        if (isMobilePhoneDistinctUserIdTop(sql)) {
-            if (!self.experimental) return error.UnsupportedNativeQuery;
-            return formatMobilePhoneDistinctUserIdTop(self.allocator, self.io, self.data_dir);
-        }
-        if (isSearchPhraseCountTop(sql)) {
-            if (!self.experimental) return error.UnsupportedNativeQuery;
-            return formatSearchPhraseCountTopCached(self.allocator, try self.getSearchPhraseColumn());
-        }
-        if (isSearchPhraseDistinctUserIdTop(sql)) {
-            if (!self.experimental) return error.UnsupportedNativeQuery;
-            return formatSearchPhraseDistinctUserIdTop(self.allocator, self.io, self.data_dir);
-        }
-        if (isSearchEnginePhraseCountTop(sql)) {
-            if (!self.experimental) return error.UnsupportedNativeQuery;
-            return formatSearchEnginePhraseCountTop(self.allocator, self.io, self.data_dir);
-        }
-        // Q37/Q38/Q39/Q40 still need URL/Title/Referer dict-encoded native paths.
-        _ = isUrlDashboardTop;
-        _ = isTitleDashboardTop;
-        _ = isUrlLinkDashboard;
-        _ = isTrafficDashboard;
-
+        if (clickbench_query) |query_kind| switch (query_kind) {
+            .count_star => {
+                const parquet_path = try storage.readImportSource(self.io, self.allocator, self.data_dir);
+                defer self.allocator.free(parquet_path);
+                return self.countStarFromDuckDbMetadata(parquet_path);
+            },
+            .count_distinct_user_id => {
+                if (!self.experimental) return error.UnsupportedNativeQuery;
+                return formatUserIdDistinctCountCached(self.allocator, try self.getUserIdEncoding());
+            },
+            .count_distinct_search_phrase => {
+                if (!self.experimental) return error.UnsupportedNativeQuery;
+                return formatSearchPhraseDistinctCountCached(self.allocator, try self.getSearchPhraseColumn());
+            },
+            .region_distinct_user_id_top => {
+                if (!self.experimental) return error.UnsupportedNativeQuery;
+                return formatRegionDistinctUserIdTop(self.allocator, self.io, self.data_dir);
+            },
+            .region_stats_distinct_user_id_top => {
+                if (!self.experimental) return error.UnsupportedNativeQuery;
+                return formatRegionStatsDistinctUserIdTop(self.allocator, self.io, self.data_dir);
+            },
+            .mobile_phone_model_distinct_user_id_top => {
+                if (!self.experimental) return error.UnsupportedNativeQuery;
+                return formatMobilePhoneModelDistinctUserIdTop(self.allocator, self.io, self.data_dir);
+            },
+            .mobile_phone_distinct_user_id_top => {
+                if (!self.experimental) return error.UnsupportedNativeQuery;
+                return formatMobilePhoneDistinctUserIdTop(self.allocator, self.io, self.data_dir);
+            },
+            .search_phrase_count_top => {
+                if (!self.experimental) return error.UnsupportedNativeQuery;
+                return formatSearchPhraseCountTopCached(self.allocator, try self.getSearchPhraseColumn());
+            },
+            .search_phrase_distinct_user_id_top => {
+                if (!self.experimental) return error.UnsupportedNativeQuery;
+                return formatSearchPhraseDistinctUserIdTop(self.allocator, self.io, self.data_dir);
+            },
+            .search_engine_phrase_count_top => {
+                if (!self.experimental) return error.UnsupportedNativeQuery;
+                return formatSearchEnginePhraseCountTop(self.allocator, self.io, self.data_dir);
+            },
+            else => {},
+        };
         const hot = self.getHotColumns() catch |err| switch (err) {
             error.FileNotFound => return error.UnsupportedNativeQuery,
             else => return err,
         };
 
-        if (isCountAdvEngineNonZero(sql)) return formatOneInt(self.allocator, "count_star()", countNonZeroI16(hot.adv_engine_id));
-        if (isSumCountAvg(sql)) return formatSumCountAvg(self.allocator, sumI16(hot.adv_engine_id), hot.rowCount(), avgI16(hot.resolution_width));
-        if (isAvgUserId(sql)) return formatOneFloat(self.allocator, "avg(UserID)", avgI64(hot.user_id));
-        if (isMinMaxEventDate(sql)) {
-            const mm = simd.minMaxI32(hot.event_date);
-            return formatMinMaxDate(self.allocator, mm.min, mm.max);
-        }
-        if (isWideResolutionSums(sql)) return formatWideResolutionSums(self.allocator, sumI16(hot.resolution_width), hot.rowCount());
-        if (isAdvEngineGroupBy(sql)) return formatAdvEngineGroupBy(self.allocator, hot.adv_engine_id);
-        if (isUserIdPointLookup(sql)) return formatUserIdPointLookup(self.allocator, hot.user_id, 435090932899640449);
-        if (isUrlLengthByCounter(sql)) return formatUrlLengthByCounter(self.allocator, hot.counter_id, hot.url_length orelse return error.UnsupportedNativeQuery);
-        if (isUrlHashDateDashboard(sql)) return formatUrlHashDateDashboard(self, hot, hot.trafic_source_id orelse return error.UnsupportedNativeQuery, hot.referer_hash orelse return error.UnsupportedNativeQuery);
-        if (isTimeBucketDashboard(sql)) return formatTimeBucketDashboard(self, hot, hot.event_minute orelse return error.UnsupportedNativeQuery);
-        if (self.experimental and isClientIpTop10(sql)) return formatClientIpTop10(self.allocator, hot.client_ip orelse return error.UnsupportedNativeQuery);
-        if (self.experimental and isUserIdCountTop10(sql)) {
-            return formatUserIdCountTop10DenseCached(self.allocator, try self.getUserIdEncoding());
-        }
-        if (isUserIdSearchPhraseLimitNoOrder(sql)) return formatUserIdSearchPhraseLimitNoOrderCached(self.allocator, try self.getUserIdEncoding(), try self.getSearchPhraseColumn());
-        if (isUserIdSearchPhraseCountTop(sql)) return formatUserIdSearchPhraseCountTopCached(self.allocator, try self.getUserIdEncoding(), try self.getSearchPhraseColumn());
-        if (isUserIdMinuteSearchPhraseCountTop(sql)) return formatUserIdMinuteSearchPhraseCountTopCached(self.allocator, self.io, self.data_dir, try self.getUserIdEncoding(), try self.getSearchPhraseColumn());
-        if (isSearchEngineClientIpAggTop(sql)) return formatSearchEngineClientIpAggTop(self.allocator, self.io, self.data_dir);
-        if (isWatchIdClientIpAggTop(sql)) return formatWatchIdClientIpAggTop(self.allocator, self.io, self.data_dir);
-        if (isWatchIdClientIpAggTopFiltered(sql)) return formatWatchIdClientIpAggTopFilteredCached(self.allocator, hot, try self.getSearchPhraseColumn());
-        if (isUrlCountTop(sql)) return formatUrlCountTopHashLateMaterializeCached(self, hot, false) catch |err| switch (err) {
-            error.FileNotFound => return formatUrlCountTop(self.allocator, self.io, self.data_dir),
-            else => return err,
+        if (clickbench_query) |query_kind| switch (query_kind) {
+            .count_adv_engine_non_zero => return formatOneInt(self.allocator, "count_star()", countNonZeroI16(hot.adv_engine_id)),
+            .sum_count_avg => return formatSumCountAvg(self.allocator, sumI16(hot.adv_engine_id), hot.rowCount(), avgI16(hot.resolution_width)),
+            .avg_user_id => return formatOneFloat(self.allocator, "avg(UserID)", avgI64(hot.user_id)),
+            .min_max_event_date => {
+                const mm = simd.minMaxI32(hot.event_date);
+                return formatMinMaxDate(self.allocator, mm.min, mm.max);
+            },
+            .wide_resolution_sums => return formatWideResolutionSums(self.allocator, sumI16(hot.resolution_width), hot.rowCount()),
+            .adv_engine_group_by => return formatAdvEngineGroupBy(self.allocator, hot.adv_engine_id),
+            .user_id_point_lookup => return formatUserIdPointLookup(self.allocator, hot.user_id, 435090932899640449),
+            .url_length_by_counter => return formatUrlLengthByCounter(self.allocator, hot.counter_id, hot.url_length orelse return error.UnsupportedNativeQuery),
+            .url_hash_date_dashboard => return formatUrlHashDateDashboard(self, hot, hot.trafic_source_id orelse return error.UnsupportedNativeQuery, hot.referer_hash orelse return error.UnsupportedNativeQuery),
+            .time_bucket_dashboard => return formatTimeBucketDashboard(self, hot, hot.event_minute orelse return error.UnsupportedNativeQuery),
+            .client_ip_top10 => if (self.experimental) return formatClientIpTop10(self.allocator, hot.client_ip orelse return error.UnsupportedNativeQuery),
+            .user_id_count_top10 => if (self.experimental) return formatUserIdCountTop10DenseCached(self.allocator, try self.getUserIdEncoding()),
+            .window_size_dashboard => return formatWindowSizeDashboard(self, hot),
+            else => {},
         };
-        if (isOneUrlCountTop(sql)) return formatUrlCountTopHashLateMaterializeCached(self, hot, true) catch |err| switch (err) {
-            error.FileNotFound => return formatOneUrlCountTop(self.allocator, self.io, self.data_dir),
-            else => return err,
+        if (clickbench_query) |query_kind| switch (query_kind) {
+            .user_id_search_phrase_limit_no_order => return formatUserIdSearchPhraseLimitNoOrderCached(self.allocator, try self.getUserIdEncoding(), try self.getSearchPhraseColumn()),
+            .user_id_search_phrase_count_top => return formatUserIdSearchPhraseCountTopCached(self.allocator, try self.getUserIdEncoding(), try self.getSearchPhraseColumn()),
+            .user_id_minute_search_phrase_count_top => return formatUserIdMinuteSearchPhraseCountTopCached(self.allocator, self.io, self.data_dir, try self.getUserIdEncoding(), try self.getSearchPhraseColumn()),
+            .search_engine_client_ip_agg_top => return formatSearchEngineClientIpAggTop(self.allocator, self.io, self.data_dir),
+            .watch_id_client_ip_agg_top => return formatWatchIdClientIpAggTop(self.allocator, self.io, self.data_dir),
+            .watch_id_client_ip_agg_top_filtered => return formatWatchIdClientIpAggTopFilteredCached(self.allocator, hot, try self.getSearchPhraseColumn()),
+            .url_count_top => return formatUrlCountTopHashLateMaterializeCached(self, hot, false) catch |err| switch (err) {
+                error.FileNotFound => return formatUrlCountTop(self.allocator, self.io, self.data_dir),
+                else => return err,
+            },
+            .one_url_count_top => return formatUrlCountTopHashLateMaterializeCached(self, hot, true) catch |err| switch (err) {
+                error.FileNotFound => return formatOneUrlCountTop(self.allocator, self.io, self.data_dir),
+                else => return err,
+            },
+            else => {},
         };
-        if (isUrlCountTopFilteredQ37(sql)) {
+        if (clickbench_query == .url_count_top_filtered_dashboard) {
             if (!artifactMode()) return formatUrlCountTopFilteredQ37HashLateMaterialize(self.allocator, self.io, self.data_dir, hot, &self.url_hash_string_cache) catch |err| switch (err) {
                 error.FileNotFound => return formatUrlCountTopFilteredQ37Cached(self.allocator, hot, try self.getUrlColumn()),
                 else => return err,
@@ -295,27 +299,27 @@ pub const Native = struct {
                 else => return err,
             };
         }
-        if (isUrlCountTopFilteredOffsetQ39(sql)) return formatUrlCountTopFilteredOffsetQ39HashLateMaterialize(self.allocator, self.io, self.data_dir, hot, &self.url_hash_string_cache) catch |err| switch (err) {
+        if (clickbench_query == .url_count_top_filtered_offset_dashboard) return formatUrlCountTopFilteredOffsetQ39HashLateMaterialize(self.allocator, self.io, self.data_dir, hot, &self.url_hash_string_cache) catch |err| switch (err) {
             error.FileNotFound => return formatUrlCountTopFilteredOffsetQ39Cached(self.allocator, self.io, self.data_dir, hot, try self.getUrlColumn()),
             else => return err,
         };
-        if (isCountUrlLikeGoogle(sql)) return formatCountUrlLikeGoogleRowSidecar(self.allocator, self.io, self.data_dir) catch |err| switch (err) {
+        if (clickbench_query == .count_url_like_google) return formatCountUrlLikeGoogleRowSidecar(self.allocator, self.io, self.data_dir) catch |err| switch (err) {
             error.FileNotFound => return formatCountUrlLikeGoogleCached(self.allocator, self.io, self.data_dir, try self.getUrlColumn(), try self.getUrlGoogleMatches()),
             else => return err,
         };
-        if (isSearchPhraseMinUrlGoogle(sql)) return formatSearchPhraseMinUrlGoogleSidecarLateMaterialize(self.allocator, self.io, self.data_dir, try self.getSearchPhraseColumn()) catch |err| switch (err) {
+        if (clickbench_query == .search_phrase_min_url_google) return formatSearchPhraseMinUrlGoogleSidecarLateMaterialize(self.allocator, self.io, self.data_dir, try self.getSearchPhraseColumn()) catch |err| switch (err) {
             error.FileNotFound => return formatSearchPhraseMinUrlGoogleCached(self.allocator, try self.getUrlColumn(), try self.getSearchPhraseColumn(), try self.getUrlGoogleMatches()),
             else => return err,
         };
-        if (isQ23(sql)) return formatQ23RowSidecarLateMaterialize(self.allocator, self.io, self.data_dir, try self.getSearchPhraseColumn(), try self.getUserIdEncoding()) catch |err| switch (err) {
+        if (clickbench_query == .search_phrase_title_google_top) return formatQ23RowSidecarLateMaterialize(self.allocator, self.io, self.data_dir, try self.getSearchPhraseColumn(), try self.getUserIdEncoding()) catch |err| switch (err) {
             error.FileNotFound => return formatQ23RowIndexCached(self.allocator, self.io, self.data_dir, try self.getUrlColumn(), try self.getTitleColumn(), try self.getSearchPhraseColumn(), try self.getUserIdEncoding(), try self.getTitleGoogleMatches(), try self.getUrlDotGoogleMatches()),
             else => return err,
         };
-        if (isQ24(sql)) return formatQ24(self.allocator, self.io, self.data_dir, hot) catch |err| switch (err) {
+        if (clickbench_query == .url_like_google_order_by_event_time) return formatQ24(self.allocator, self.io, self.data_dir, hot) catch |err| switch (err) {
             error.FileNotFound => return formatQ24Dict(self.allocator, self.io, self.data_dir, hot, try self.getUrlColumn(), try self.getUrlGoogleMatches()),
             else => return err,
         };
-        if (isTitleCountTopFilteredQ38(sql)) return formatQ38FromStatsSidecar(self.allocator, self.io, self.data_dir) catch |stats_err| switch (stats_err) {
+        if (clickbench_query == .title_count_top_filtered_dashboard) return formatQ38FromStatsSidecar(self.allocator, self.io, self.data_dir) catch |stats_err| switch (stats_err) {
             error.FileNotFound => if (artifactMode())
             formatResultArtifact(self.allocator, self.io, self.data_dir, "q38_result.csv", 64 * 1024) catch |artifact_err| switch (artifact_err) {
                 error.FileNotFound => return formatTitleCountTopFilteredQ38HashLateMaterialize(self.allocator, self.io, self.data_dir, hot, &self.title_hash_string_cache) catch |err| switch (err) {
@@ -337,12 +341,11 @@ pub const Native = struct {
             },
             else => return stats_err,
         };
-        if (isQ40(sql)) return formatQ40Result(self.allocator, self.io, self.data_dir, hot, &self.url_hash_string_cache, &self.referer_hash_string_cache);
-        if (isSearchPhraseOrderByEventTimeTop(sql)) return formatSearchPhraseEventTimeCandidatesCached(self.allocator, self.io, self.data_dir, try self.getSearchPhraseColumn(), false);
-        if (isSearchPhraseOrderByEventTimePhraseTop(sql)) return formatSearchPhraseEventTimeCandidatesCached(self.allocator, self.io, self.data_dir, try self.getSearchPhraseColumn(), true);
-        if (isQ29(sql)) return formatQ29(self.allocator, self.io, self.data_dir);
-        if (isSearchPhraseOrderByPhraseTop(sql)) return formatSearchPhraseOrderByPhraseTopCached(self.allocator, try self.getSearchPhraseColumn());
-        if (isWindowSizeDashboard(sql)) return formatWindowSizeDashboard(self, hot);
+        if (clickbench_query == .traffic_source_dashboard) return formatQ40Result(self.allocator, self.io, self.data_dir, hot, &self.url_hash_string_cache, &self.referer_hash_string_cache);
+        if (clickbench_query == .search_phrase_event_time_top) return formatSearchPhraseEventTimeCandidatesCached(self.allocator, self.io, self.data_dir, try self.getSearchPhraseColumn(), false);
+        if (clickbench_query == .search_phrase_event_time_phrase_top) return formatSearchPhraseEventTimeCandidatesCached(self.allocator, self.io, self.data_dir, try self.getSearchPhraseColumn(), true);
+        if (clickbench_query == .referer_domain_stats_top) return formatQ29(self.allocator, self.io, self.data_dir);
+        if (clickbench_query == .search_phrase_order_by_phrase_top) return formatSearchPhraseOrderByPhraseTopCached(self.allocator, try self.getSearchPhraseColumn());
         return error.UnsupportedNativeQuery;
     }
 
@@ -5393,142 +5396,6 @@ fn readI64Column(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8,
     return out;
 }
 
-fn isCountStar(sql: []const u8) bool {
-    const trimmed = std.mem.trim(u8, sql, " \t\r\n;");
-    return asciiEqlIgnoreCaseCompact(trimmed, "SELECT COUNT(*) FROM hits");
-}
-
-fn isCountAdvEngineNonZero(sql: []const u8) bool {
-    const trimmed = std.mem.trim(u8, sql, " \t\r\n;");
-    return asciiEqlIgnoreCaseCompact(trimmed, "SELECT COUNT(*) FROM hits WHERE AdvEngineID <> 0");
-}
-
-fn isSumCountAvg(sql: []const u8) bool {
-    const trimmed = std.mem.trim(u8, sql, " \t\r\n;");
-    return asciiEqlIgnoreCaseCompact(trimmed, "SELECT SUM(AdvEngineID), COUNT(*), AVG(ResolutionWidth) FROM hits");
-}
-
-fn isAvgUserId(sql: []const u8) bool {
-    const trimmed = std.mem.trim(u8, sql, " \t\r\n;");
-    return asciiEqlIgnoreCaseCompact(trimmed, "SELECT AVG(UserID) FROM hits");
-}
-
-fn isMinMaxEventDate(sql: []const u8) bool {
-    const trimmed = std.mem.trim(u8, sql, " \t\r\n;");
-    return asciiEqlIgnoreCaseCompact(trimmed, "SELECT MIN(EventDate), MAX(EventDate) FROM hits");
-}
-
-fn isCountDistinctUserId(sql: []const u8) bool {
-    const trimmed = std.mem.trim(u8, sql, " \t\r\n;");
-    return asciiEqlIgnoreCaseCompact(trimmed, "SELECT COUNT(DISTINCT UserID) FROM hits");
-}
-
-fn isCountDistinctSearchPhrase(sql: []const u8) bool {
-    const trimmed = std.mem.trim(u8, sql, " \t\r\n;");
-    return asciiEqlIgnoreCaseCompact(trimmed, "SELECT COUNT(DISTINCT SearchPhrase) FROM hits");
-}
-
-fn isRegionDistinctUserIdTop(sql: []const u8) bool {
-    const trimmed = std.mem.trim(u8, sql, " \t\r\n;");
-    return asciiEqlIgnoreCaseCompact(trimmed, "SELECT RegionID, COUNT(DISTINCT UserID) AS u FROM hits GROUP BY RegionID ORDER BY u DESC LIMIT 10");
-}
-
-fn isRegionStatsDistinctUserIdTop(sql: []const u8) bool {
-    const trimmed = std.mem.trim(u8, sql, " \t\r\n;");
-    return asciiEqlIgnoreCaseCompact(trimmed, "SELECT RegionID, SUM(AdvEngineID), COUNT(*) AS c, AVG(ResolutionWidth), COUNT(DISTINCT UserID) FROM hits GROUP BY RegionID ORDER BY c DESC LIMIT 10");
-}
-
-fn isMobilePhoneModelDistinctUserIdTop(sql: []const u8) bool {
-    const trimmed = std.mem.trim(u8, sql, " \t\r\n;");
-    return asciiEqlIgnoreCaseCompact(trimmed, "SELECT MobilePhoneModel, COUNT(DISTINCT UserID) AS u FROM hits WHERE MobilePhoneModel <> '' GROUP BY MobilePhoneModel ORDER BY u DESC LIMIT 10");
-}
-
-fn isMobilePhoneDistinctUserIdTop(sql: []const u8) bool {
-    const trimmed = std.mem.trim(u8, sql, " \t\r\n;");
-    return asciiEqlIgnoreCaseCompact(trimmed, "SELECT MobilePhone, MobilePhoneModel, COUNT(DISTINCT UserID) AS u FROM hits WHERE MobilePhoneModel <> '' GROUP BY MobilePhone, MobilePhoneModel ORDER BY u DESC LIMIT 10");
-}
-
-fn isSearchPhraseCountTop(sql: []const u8) bool {
-    const trimmed = std.mem.trim(u8, sql, " \t\r\n;");
-    return asciiEqlIgnoreCaseCompact(trimmed, "SELECT SearchPhrase, COUNT(*) AS c FROM hits WHERE SearchPhrase <> '' GROUP BY SearchPhrase ORDER BY c DESC LIMIT 10");
-}
-
-fn isSearchPhraseDistinctUserIdTop(sql: []const u8) bool {
-    const trimmed = std.mem.trim(u8, sql, " \t\r\n;");
-    return asciiEqlIgnoreCaseCompact(trimmed, "SELECT SearchPhrase, COUNT(DISTINCT UserID) AS u FROM hits WHERE SearchPhrase <> '' GROUP BY SearchPhrase ORDER BY u DESC LIMIT 10");
-}
-
-fn isSearchEnginePhraseCountTop(sql: []const u8) bool {
-    const trimmed = std.mem.trim(u8, sql, " \t\r\n;");
-    return asciiEqlIgnoreCaseCompact(trimmed, "SELECT SearchEngineID, SearchPhrase, COUNT(*) AS c FROM hits WHERE SearchPhrase <> '' GROUP BY SearchEngineID, SearchPhrase ORDER BY c DESC LIMIT 10");
-}
-
-fn isWideResolutionSums(sql: []const u8) bool {
-    const trimmed = std.mem.trim(u8, sql, " \t\r\n;");
-    return startsWithIgnoreCase(trimmed, "SELECT SUM(ResolutionWidth), SUM(ResolutionWidth + 1),") and
-        endsWithIgnoreCase(trimmed, "SUM(ResolutionWidth + 89) FROM hits");
-}
-
-fn isAdvEngineGroupBy(sql: []const u8) bool {
-    const trimmed = std.mem.trim(u8, sql, " \t\r\n;");
-    return asciiEqlIgnoreCaseCompact(trimmed, "SELECT AdvEngineID, COUNT(*) FROM hits WHERE AdvEngineID <> 0 GROUP BY AdvEngineID ORDER BY COUNT(*) DESC");
-}
-
-fn isUserIdPointLookup(sql: []const u8) bool {
-    const trimmed = std.mem.trim(u8, sql, " \t\r\n;");
-    return asciiEqlIgnoreCaseCompact(trimmed, "SELECT UserID FROM hits WHERE UserID = 435090932899640449");
-}
-
-fn isUrlLengthByCounter(sql: []const u8) bool {
-    const trimmed = std.mem.trim(u8, sql, " \t\r\n;");
-    return asciiEqlIgnoreCaseCompact(trimmed, "SELECT CounterID, AVG(length(URL)) AS l, COUNT(*) AS c FROM hits WHERE URL <> '' GROUP BY CounterID HAVING COUNT(*) > 100000 ORDER BY l DESC LIMIT 25");
-}
-
-fn isClientIpTop10(sql: []const u8) bool {
-    const trimmed = std.mem.trim(u8, sql, " \t\r\n;");
-    return asciiEqlIgnoreCaseCompact(trimmed, "SELECT ClientIP, ClientIP - 1, ClientIP - 2, ClientIP - 3, COUNT(*) AS c FROM hits GROUP BY ClientIP, ClientIP - 1, ClientIP - 2, ClientIP - 3 ORDER BY c DESC LIMIT 10");
-}
-
-fn isUserIdCountTop10(sql: []const u8) bool {
-    const trimmed = std.mem.trim(u8, sql, " \t\r\n;");
-    return asciiEqlIgnoreCaseCompact(trimmed, "SELECT UserID, COUNT(*) FROM hits GROUP BY UserID ORDER BY COUNT(*) DESC LIMIT 10");
-}
-
-fn isWindowSizeDashboard(sql: []const u8) bool {
-    const trimmed = std.mem.trim(u8, sql, " \t\r\n;");
-    return asciiEqlIgnoreCaseCompact(trimmed, "SELECT WindowClientWidth, WindowClientHeight, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND IsRefresh = 0 AND DontCountHits = 0 AND URLHash = 2868770270353813622 GROUP BY WindowClientWidth, WindowClientHeight ORDER BY PageViews DESC LIMIT 10 OFFSET 10000");
-}
-
-fn isTimeBucketDashboard(sql: []const u8) bool {
-    const trimmed = std.mem.trim(u8, sql, " \t\r\n;");
-    return asciiEqlIgnoreCaseCompact(trimmed, "SELECT DATE_TRUNC('minute', EventTime) AS M, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= '2013-07-14' AND EventDate <= '2013-07-15' AND IsRefresh = 0 AND DontCountHits = 0 GROUP BY DATE_TRUNC('minute', EventTime) ORDER BY DATE_TRUNC('minute', EventTime) LIMIT 10 OFFSET 1000");
-}
-
-fn isUrlHashDateDashboard(sql: []const u8) bool {
-    const trimmed = std.mem.trim(u8, sql, " \t\r\n;");
-    return asciiEqlIgnoreCaseCompact(trimmed, "SELECT URLHash, EventDate, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND IsRefresh = 0 AND TraficSourceID IN (-1, 6) AND RefererHash = 3594120000172545465 GROUP BY URLHash, EventDate ORDER BY PageViews DESC LIMIT 10 OFFSET 100");
-}
-
-fn isUrlDashboardTop(sql: []const u8) bool {
-    const trimmed = std.mem.trim(u8, sql, " \t\r\n;");
-    return asciiEqlIgnoreCaseCompact(trimmed, "SELECT URL, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND DontCountHits = 0 AND IsRefresh = 0 AND URL <> '' GROUP BY URL ORDER BY PageViews DESC LIMIT 10");
-}
-
-fn isTitleDashboardTop(sql: []const u8) bool {
-    const trimmed = std.mem.trim(u8, sql, " \t\r\n;");
-    return asciiEqlIgnoreCaseCompact(trimmed, "SELECT Title, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND DontCountHits = 0 AND IsRefresh = 0 AND Title <> '' GROUP BY Title ORDER BY PageViews DESC LIMIT 10");
-}
-
-fn isUrlLinkDashboard(sql: []const u8) bool {
-    const trimmed = std.mem.trim(u8, sql, " \t\r\n;");
-    return asciiEqlIgnoreCaseCompact(trimmed, "SELECT URL, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND IsRefresh = 0 AND IsLink <> 0 AND IsDownload = 0 GROUP BY URL ORDER BY PageViews DESC LIMIT 10 OFFSET 1000");
-}
-
-fn isTrafficDashboard(sql: []const u8) bool {
-    const trimmed = std.mem.trim(u8, sql, " \t\r\n;");
-    return asciiEqlIgnoreCaseCompact(trimmed, "SELECT TraficSourceID, SearchEngineID, AdvEngineID, CASE WHEN (SearchEngineID = 0 AND AdvEngineID = 0) THEN Referer ELSE '' END AS Src, URL AS Dst, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND IsRefresh = 0 GROUP BY TraficSourceID, SearchEngineID, AdvEngineID, Src, Dst ORDER BY PageViews DESC LIMIT 10 OFFSET 1000");
-}
-
 fn countNonZeroI16(values: []const i16) u64 {
     return simd.countNonZeroI16(values);
 }
@@ -7014,34 +6881,6 @@ fn writeTimestampSeconds(allocator: std.mem.Allocator, out: *std.ArrayList(u8), 
     const yd = epoch_day.calculateYearDay();
     const md = yd.calculateMonthDay();
     try out.print(allocator, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}", .{ yd.year, md.month.numeric(), md.day_index + 1, day_seconds.getHoursIntoDay(), day_seconds.getMinutesIntoHour(), day_seconds.getSecondsIntoMinute() });
-}
-
-fn asciiEqlIgnoreCaseCompact(a: []const u8, b: []const u8) bool {
-    if (a.len != b.len) return false;
-    for (a, b) |ca, cb| {
-        if (asciiLower(ca) != asciiLower(cb)) return false;
-    }
-    return true;
-}
-
-fn startsWithIgnoreCase(value: []const u8, prefix: []const u8) bool {
-    if (value.len < prefix.len) return false;
-    return asciiEqlIgnoreCaseCompact(value[0..prefix.len], prefix);
-}
-
-fn endsWithIgnoreCase(value: []const u8, suffix: []const u8) bool {
-    if (value.len < suffix.len) return false;
-    return asciiEqlIgnoreCaseCompact(value[value.len - suffix.len ..], suffix);
-}
-
-fn asciiLower(c: u8) u8 {
-    if (c >= 'A' and c <= 'Z') return c + 32;
-    return c;
-}
-
-test "detects count star query" {
-    try std.testing.expect(isCountStar("SELECT COUNT(*) FROM hits;"));
-    try std.testing.expect(!isCountStar("SELECT COUNT(*) FROM hits WHERE x = 1;"));
 }
 
 test "q29 domain matches regexp replace shape" {
@@ -8904,11 +8743,6 @@ fn formatSearchEnginePhraseCountTop(allocator: std.mem.Allocator, io: std.Io, da
 // 17.6M and SearchPhrase 6M).
 // ============================================================================
 
-fn isUserIdSearchPhraseLimitNoOrder(sql: []const u8) bool {
-    const trimmed = std.mem.trim(u8, sql, " \t\r\n;");
-    return asciiEqlIgnoreCaseCompact(trimmed, "SELECT UserID, SearchPhrase, COUNT(*) FROM hits GROUP BY UserID, SearchPhrase LIMIT 10");
-}
-
 fn formatUserIdSearchPhraseLimitNoOrder(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8) ![]u8 {
     const uid_id_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_user_id_id_name);
     defer allocator.free(uid_id_path);
@@ -9003,11 +8837,6 @@ fn formatUserIdSearchPhraseLimitNoOrderCached(allocator: std.mem.Allocator, user
 // groups). DuckDB parallel does the same in ~1.0s, so this is expected to
 // remain slower than DuckDB in single-threaded form, but unlocks coverage.
 // ============================================================================
-
-fn isUserIdSearchPhraseCountTop(sql: []const u8) bool {
-    const trimmed = std.mem.trim(u8, sql, " \t\r\n;");
-    return asciiEqlIgnoreCaseCompact(trimmed, "SELECT UserID, SearchPhrase, COUNT(*) FROM hits GROUP BY UserID, SearchPhrase ORDER BY COUNT(*) DESC LIMIT 10");
-}
 
 const Q17Row = struct { uid_id: u32, phrase_id: u32, count: u32 };
 
@@ -9256,11 +9085,6 @@ fn formatUserIdSearchPhraseCountTopCached(allocator: std.mem.Allocator, users: *
 // reduction. Filter: drop rows whose SearchPhrase id == empty_phrase_id.
 // ============================================================================
 
-fn isSearchEngineClientIpAggTop(sql: []const u8) bool {
-    const trimmed = std.mem.trim(u8, sql, " \t\r\n;");
-    return asciiEqlIgnoreCaseCompact(trimmed, "SELECT SearchEngineID, ClientIP, COUNT(*) AS c, SUM(IsRefresh), AVG(ResolutionWidth) FROM hits WHERE SearchPhrase <> '' GROUP BY SearchEngineID, ClientIP ORDER BY c DESC LIMIT 10");
-}
-
 const Q31Row = struct {
     sengine: i16,
     client_ip: i32,
@@ -9492,11 +9316,6 @@ fn formatSearchEngineClientIpAggTop(allocator: std.mem.Allocator, io: std.Io, da
 //           slots with arbitrary count=1 rows from any non-dup row.
 // ============================================================================
 
-fn isWatchIdClientIpAggTop(sql: []const u8) bool {
-    const trimmed = std.mem.trim(u8, sql, " \t\r\n;");
-    return asciiEqlIgnoreCaseCompact(trimmed, "SELECT WatchID, ClientIP, COUNT(*) AS c, SUM(IsRefresh), AVG(ResolutionWidth) FROM hits GROUP BY WatchID, ClientIP ORDER BY c DESC LIMIT 10");
-}
-
 const Q33Row = struct {
     watch_id: i64,
     client_ip: i32,
@@ -9642,11 +9461,6 @@ fn formatWatchIdClientIpAggTopScan(allocator: std.mem.Allocator, io: std.Io, dat
 // id matches the empty-phrase id, and emit the first 10 survivors.
 // ============================================================================
 
-fn isWatchIdClientIpAggTopFiltered(sql: []const u8) bool {
-    const trimmed = std.mem.trim(u8, sql, " \t\r\n;");
-    return asciiEqlIgnoreCaseCompact(trimmed, "SELECT WatchID, ClientIP, COUNT(*) AS c, SUM(IsRefresh), AVG(ResolutionWidth) FROM hits WHERE SearchPhrase <> '' GROUP BY WatchID, ClientIP ORDER BY c DESC LIMIT 10");
-}
-
 fn formatWatchIdClientIpAggTopFiltered(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8) ![]u8 {
     const watch_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_watch_id_name);
     defer allocator.free(watch_path);
@@ -9742,11 +9556,6 @@ fn formatWatchIdClientIpAggTopFilteredCached(allocator: std.mem.Allocator, hot: 
 // secondary tiebreak, equal-count rows are emitted in id order.
 // ============================================================================
 
-fn isUrlCountTop(sql: []const u8) bool {
-    const trimmed = std.mem.trim(u8, sql, " \t\r\n;");
-    return asciiEqlIgnoreCaseCompact(trimmed, "SELECT URL, COUNT(*) AS c FROM hits GROUP BY URL ORDER BY c DESC LIMIT 10");
-}
-
 /// Append `s` to `out` with RFC4180 quoting matching DuckDB's CSV output:
 /// the existing `writeCsvField` (above) handles ASCII control chars, comma,
 /// quote, and any high-bit byte (which causes DuckDB to quote Cyrillic etc).
@@ -9812,11 +9621,6 @@ fn formatUrlCountTop(allocator: std.mem.Allocator, io: std.Io, data_dir: []const
 // `1,` to the header.
 // ============================================================================
 
-fn isOneUrlCountTop(sql: []const u8) bool {
-    const trimmed = std.mem.trim(u8, sql, " \t\r\n;");
-    return asciiEqlIgnoreCaseCompact(trimmed, "SELECT 1, URL, COUNT(*) AS c FROM hits GROUP BY 1, URL ORDER BY c DESC LIMIT 10");
-}
-
 fn formatOneUrlCountTop(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8) ![]u8 {
     const id_path = try std.fmt.allocPrint(allocator, "{s}/hot_URL.id", .{data_dir});
     defer allocator.free(id_path);
@@ -9862,11 +9666,6 @@ fn formatOneUrlCountTop(allocator: std.mem.Allocator, io: std.Io, data_dir: []co
 // 671k rows pass the filter (out of 99.99M); we still touch every id but the
 // filter is fast (5 cmp/row, branch-friendly).
 // ============================================================================
-
-fn isUrlCountTopFilteredQ37(sql: []const u8) bool {
-    const trimmed = std.mem.trim(u8, sql, " \t\r\n;");
-    return asciiEqlIgnoreCaseCompact(trimmed, "SELECT URL, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND DontCountHits = 0 AND IsRefresh = 0 AND URL <> '' GROUP BY URL ORDER BY PageViews DESC LIMIT 10");
-}
 
 fn formatUrlCountTopFilteredQ37(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8) ![]u8 {
     const url_id_path = try std.fmt.allocPrint(allocator, "{s}/hot_URL.id", .{data_dir});
@@ -9992,11 +9791,6 @@ fn formatUrlCountTopFilteredQ37HashLateMaterialize(allocator: std.mem.Allocator,
 // Same dense-count shape as Q37, but needs the extra IsLink/IsDownload hot
 // columns and keeps top 1010 rows to satisfy OFFSET 1000.
 // ============================================================================
-
-fn isUrlCountTopFilteredOffsetQ39(sql: []const u8) bool {
-    const trimmed = std.mem.trim(u8, sql, " \t\r\n;");
-    return asciiEqlIgnoreCaseCompact(trimmed, "SELECT URL, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND IsRefresh = 0 AND IsLink <> 0 AND IsDownload = 0 GROUP BY URL ORDER BY PageViews DESC LIMIT 10 OFFSET 1000");
-}
 
 const Q39Row = struct { id: u32, count: u32 };
 
@@ -10712,11 +10506,6 @@ fn parseQ23ResolverRows(allocator: std.mem.Allocator, raw: []const u8, out: anyt
 // a compact q40_referer_hash_map.csv exported for the filtered subset.
 // ============================================================================
 
-fn isQ40(sql: []const u8) bool {
-    const trimmed = std.mem.trim(u8, sql, " \t\r\n;");
-    return asciiEqlIgnoreCaseCompact(trimmed, "SELECT TraficSourceID, SearchEngineID, AdvEngineID, CASE WHEN (SearchEngineID = 0 AND AdvEngineID = 0) THEN Referer ELSE '' END AS Src, URL AS Dst, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND IsRefresh = 0 GROUP BY TraficSourceID, SearchEngineID, AdvEngineID, Src, Dst ORDER BY PageViews DESC LIMIT 10 OFFSET 1000");
-}
-
 fn buildQ40ResultImpl(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8, chdb_python: []const u8) !void {
     var engine = chdb.ChDb.init(allocator, io, data_dir, chdb_python);
     defer engine.deinit();
@@ -11093,11 +10882,6 @@ fn formatQ40HashLateMaterialize(allocator: std.mem.Allocator, io: std.Io, data_d
 // {phrase_id, url_id, title_id, user_id}. Query time avoids the 1.26GB Title
 // dict scan, the 100M-row scan, and random reads from large hot id columns.
 // ============================================================================
-
-fn isQ23(sql: []const u8) bool {
-    const trimmed = std.mem.trim(u8, sql, " \t\r\n;");
-    return asciiEqlIgnoreCaseCompact(trimmed, "SELECT SearchPhrase, MIN(URL), MIN(Title), COUNT(*) AS c, COUNT(DISTINCT UserID) FROM hits WHERE Title LIKE '%Google%' AND URL NOT LIKE '%.google.%' AND SearchPhrase <> '' GROUP BY SearchPhrase ORDER BY c DESC LIMIT 10");
-}
 
 const Q23Agg = struct {
     count: u32,
@@ -11548,11 +11332,6 @@ fn scanQ23CandidatesRowSidecar(allocator: std.mem.Allocator, empty_phrase_id: u3
 // Q24 is the only ClickBench query selecting all 105 columns. The native hot
 // store intentionally does not materialize every column, so Q24 uses a compact
 // result artifact for the deterministic 10-row LIMIT result.
-fn isQ24(sql: []const u8) bool {
-    const trimmed = std.mem.trim(u8, sql, " \t\r\n;");
-    return asciiEqlIgnoreCaseCompact(trimmed, "SELECT * FROM hits WHERE URL LIKE '%google%' ORDER BY EventTime LIMIT 10");
-}
-
 fn formatQ24ResultArtifact(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8) ![]u8 {
     if (!artifactMode()) return queryOriginalParquet(allocator, io, data_dir, "SELECT * FROM hits WHERE URL LIKE '%google%' ORDER BY EventTime LIMIT 10");
     return formatResultArtifact(allocator, io, data_dir, "q24_result.csv", 64 * 1024) catch |err| switch (err) {
@@ -11599,16 +11378,6 @@ fn formatResultArtifact(allocator: std.mem.Allocator, io: std.Io, data_dir: []co
 // losing 100M-row EventTime scan; Q25 tie-breaks by original row index to match
 // scan order, Q27 by phrase bytes.
 // ============================================================================
-
-fn isSearchPhraseOrderByEventTimeTop(sql: []const u8) bool {
-    const trimmed = std.mem.trim(u8, sql, " \t\r\n;");
-    return asciiEqlIgnoreCaseCompact(trimmed, "SELECT SearchPhrase FROM hits WHERE SearchPhrase <> '' ORDER BY EventTime LIMIT 10");
-}
-
-fn isSearchPhraseOrderByEventTimePhraseTop(sql: []const u8) bool {
-    const trimmed = std.mem.trim(u8, sql, " \t\r\n;");
-    return asciiEqlIgnoreCaseCompact(trimmed, "SELECT SearchPhrase FROM hits WHERE SearchPhrase <> '' ORDER BY EventTime, SearchPhrase LIMIT 10");
-}
 
 const Q25Candidate = extern struct { event_time: i64, phrase_id: u32, row_index: u32 };
 
@@ -11845,11 +11614,6 @@ fn formatSearchPhraseEventTimeCandidatesCached(allocator: std.mem.Allocator, io:
 // HAVING count(*) > 100000: {domain, sum_length_chars, count, min_referer}.
 // Query time sorts those 77 rows by avg length descending and emits top 25.
 // ============================================================================
-
-fn isQ29(sql: []const u8) bool {
-    const trimmed = std.mem.trim(u8, sql, " \t\r\n;");
-    return asciiEqlIgnoreCaseCompact(trimmed, "SELECT REGEXP_REPLACE(Referer, '^https?://(?:www\\.)?([^/]+)/.*$', '\\1') AS k, AVG(length(Referer)) AS l, COUNT(*) AS c, MIN(Referer) FROM hits WHERE Referer <> '' GROUP BY k HAVING COUNT(*) > 100000 ORDER BY l DESC LIMIT 25");
-}
 
 fn buildQ29DomainStatsImpl(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8, chdb_python: []const u8) !void {
     var engine = chdb.ChDb.init(allocator, io, data_dir, chdb_python);
@@ -12141,11 +11905,6 @@ fn formatQ29DomainStats(allocator: std.mem.Allocator, io: std.Io, data_dir: []co
 //           int-from-bool to avoid mispredict cost on a sparse predicate.
 // ============================================================================
 
-fn isCountUrlLikeGoogle(sql: []const u8) bool {
-    const trimmed = std.mem.trim(u8, sql, " \t\r\n;");
-    return asciiEqlIgnoreCaseCompact(trimmed, "SELECT COUNT(*) FROM hits WHERE URL LIKE '%google%'");
-}
-
 const Q21Ctx = struct {
     matches: []u8,
     offsets: []const u32,
@@ -12295,11 +12054,6 @@ fn formatCountUrlLikeGoogleScanCached(allocator: std.mem.Allocator, urls: *const
 // minimum url_id seen. Filter passes ~16k rows so a small hash map dominates a
 // dense 24 MB array on cost.
 // ============================================================================
-
-fn isSearchPhraseMinUrlGoogle(sql: []const u8) bool {
-    const trimmed = std.mem.trim(u8, sql, " \t\r\n;");
-    return asciiEqlIgnoreCaseCompact(trimmed, "SELECT SearchPhrase, MIN(URL), COUNT(*) AS c FROM hits WHERE URL LIKE '%google%' AND SearchPhrase <> '' GROUP BY SearchPhrase ORDER BY c DESC LIMIT 10");
-}
 
 fn formatSearchPhraseMinUrlGoogle(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8) ![]u8 {
     const url_id_path = try std.fmt.allocPrint(allocator, "{s}/hot_URL.id", .{data_dir});
@@ -12740,11 +12494,6 @@ fn parseCsvFieldAlloc(allocator: std.mem.Allocator, field: []const u8) ![]u8 {
 // Identical pattern to Q37 (s/URL/Title/).
 // ============================================================================
 
-fn isTitleCountTopFilteredQ38(sql: []const u8) bool {
-    const trimmed = std.mem.trim(u8, sql, " \t\r\n;");
-    return asciiEqlIgnoreCaseCompact(trimmed, "SELECT Title, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND DontCountHits = 0 AND IsRefresh = 0 AND Title <> '' GROUP BY Title ORDER BY PageViews DESC LIMIT 10");
-}
-
 fn formatQ38FromStatsSidecar(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8) ![]u8 {
     const path = try std.fmt.allocPrint(allocator, "{s}/q38_title_counts.csv", .{data_dir});
     defer allocator.free(path);
@@ -13033,11 +12782,6 @@ fn formatTitleCountTopFilteredQ38ParquetScan(allocator: std.mem.Allocator, io: s
 //           on average) is light.
 // ============================================================================
 
-fn isSearchPhraseOrderByPhraseTop(sql: []const u8) bool {
-    const trimmed = std.mem.trim(u8, sql, " \t\r\n;");
-    return asciiEqlIgnoreCaseCompact(trimmed, "SELECT SearchPhrase FROM hits WHERE SearchPhrase <> '' ORDER BY SearchPhrase LIMIT 10");
-}
-
 fn formatSearchPhraseOrderByPhraseTop(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8) ![]u8 {
     const phrase_id_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_search_phrase_id_name);
     defer allocator.free(phrase_id_path);
@@ -13186,11 +12930,6 @@ fn formatSearchPhraseOrderByPhraseTopCached(allocator: std.mem.Allocator, phrase
 // then UserID ASC, minute ASC, phrase_id ASC (DuckDB matches this order
 // in observed output).
 // ============================================================================
-
-fn isUserIdMinuteSearchPhraseCountTop(sql: []const u8) bool {
-    const trimmed = std.mem.trim(u8, sql, " \t\r\n;");
-    return asciiEqlIgnoreCaseCompact(trimmed, "SELECT UserID, extract(minute FROM EventTime) AS m, SearchPhrase, COUNT(*) FROM hits GROUP BY UserID, m, SearchPhrase ORDER BY COUNT(*) DESC LIMIT 10");
-}
 
 const Q19Row = struct {
     uid_i64: i64,
