@@ -15,6 +15,10 @@ pub fn build(b: *std.Build) void {
         "optimize",
         "Prioritize performance, safety, or binary size (default: ReleaseFast)",
     ) orelse .ReleaseFast;
+    const enable_duckdb = b.option(bool, "duckdb", "Link DuckDB and enable DuckDB-backed commands") orelse true;
+    const install_bench_tools = b.option(bool, "bench-tools", "Install benchmark helper executables") orelse true;
+    const options = b.addOptions();
+    options.addOption(bool, "duckdb", enable_duckdb);
 
     const exe = b.addExecutable(.{
         .name = "zighouse",
@@ -24,14 +28,17 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
-    const duckdb_prefix = b.option([]const u8, "duckdb-prefix", "DuckDB installation prefix") orelse "/opt/homebrew/opt/duckdb";
-    const duckdb_include = b.fmt("{s}/include", .{duckdb_prefix});
-    const duckdb_lib = b.fmt("{s}/lib", .{duckdb_prefix});
-    exe.root_module.addIncludePath(.{ .cwd_relative = duckdb_include });
-    exe.root_module.addLibraryPath(.{ .cwd_relative = duckdb_lib });
-    exe.root_module.addRPath(.{ .cwd_relative = duckdb_lib });
-    exe.root_module.linkSystemLibrary("duckdb", .{});
+    exe.root_module.addOptions("build_options", options);
     exe.root_module.link_libc = true;
+    if (enable_duckdb) {
+        const duckdb_prefix = b.option([]const u8, "duckdb-prefix", "DuckDB installation prefix") orelse "/opt/homebrew/opt/duckdb";
+        const duckdb_include = b.fmt("{s}/include", .{duckdb_prefix});
+        const duckdb_lib = b.fmt("{s}/lib", .{duckdb_prefix});
+        exe.root_module.addIncludePath(.{ .cwd_relative = duckdb_include });
+        exe.root_module.addLibraryPath(.{ .cwd_relative = duckdb_lib });
+        exe.root_module.addRPath(.{ .cwd_relative = duckdb_lib });
+        exe.root_module.linkSystemLibrary("duckdb", .{});
+    }
 
     b.installArtifact(exe);
 
@@ -51,6 +58,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    unit_tests.root_module.addOptions("build_options", options);
     const test_cmd = b.addRunArtifact(unit_tests);
 
     const simd_tests = b.addTest(.{
@@ -126,6 +134,8 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&lowcard_test_cmd.step);
     test_step.dependOn(&parquet_test_cmd.step);
 
+    if (!install_bench_tools) return;
+
     const bench_simd = b.addExecutable(.{
         .name = "bench-simd",
         .root_module = b.createModule(.{
@@ -164,6 +174,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    bench_mmap.root_module.link_libc = true;
     b.installArtifact(bench_mmap);
     const bench_mmap_run = b.addRunArtifact(bench_mmap);
     bench_mmap_run.step.dependOn(b.getInstallStep());
@@ -179,6 +190,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    bench_hashmap.root_module.link_libc = true;
     b.installArtifact(bench_hashmap);
     const bench_hashmap_run = b.addRunArtifact(bench_hashmap);
     bench_hashmap_run.step.dependOn(b.getInstallStep());

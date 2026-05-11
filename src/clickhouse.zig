@@ -1,6 +1,7 @@
 const std = @import("std");
+const build_options = @import("build_options");
 const chdb = @import("chdb.zig");
-const duckdb = @import("duckdb.zig");
+const duckdb = if (build_options.duckdb) @import("duckdb.zig") else @import("duckdb_stub.zig");
 
 pub const default_container = "sw_asdb";
 pub const default_database = "default";

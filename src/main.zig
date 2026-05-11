@@ -1,6 +1,7 @@
 const std = @import("std");
+const build_options = @import("build_options");
 const backend = @import("backend.zig");
-const duckdb = @import("duckdb.zig");
+const duckdb = if (build_options.duckdb) @import("duckdb.zig") else @import("duckdb_stub.zig");
 const parquet = @import("parquet.zig");
 const schema = @import("schema.zig");
 const storage = @import("storage.zig");
@@ -16,8 +17,17 @@ const usage =
     \\  zighouse import-hot <hits.parquet> <data_dir>
     \\  zighouse import-clickbench-csv-hot <hits.csv> <data_dir>
     \\  zighouse import-clickbench-parquet-hot <hits.parquet> <data_dir> [limit_rows]
+    \\  zighouse import-clickbench-parquet-native-hot <hits.parquet> <data_dir> [limit_rows]
     \\  zighouse import-clickbench-parquet-duckdb-vector-hot <hits.parquet> <data_dir> [limit_rows]
+    \\  zighouse import-clickbench-parquet-duckdb-csv-hot <hits.parquet> <data_dir> [limit_rows]
+    \\  zighouse import-clickbench-parquet-duckdb-vector-fixed-hot <hits.parquet> <data_dir> [limit_rows]
+    \\  zighouse import-clickbench-parquet-native-fixed-hot <hits.parquet> <data_dir> [limit_rows]
     \\  zighouse parquet-inspect <hits.parquet>
+    \\  zighouse parquet-page-inspect <hits.parquet> <row_group> <column> [max_pages]
+    \\  zighouse parquet-decode-fixed <hits.parquet> <row_group> <column> [limit_values]
+    \\  zighouse parquet-decode-byte-array <hits.parquet> <row_group> <column> [limit_values]
+    \\  zighouse parquet-scan-fixed <hits.parquet> <column> [limit_rows]
+    \\  zighouse parquet-scan-byte-array <hits.parquet> <column> [limit_rows]
     \\  zighouse duckdb-vector-smoke <hits.parquet> [limit_rows]
     \\  zighouse import-hot-extra <hits.parquet> <data_dir>
     \\  zighouse convert-hot <data_dir>
@@ -36,6 +46,7 @@ const usage =
     \\  zighouse build-referer-sidecars <data_dir>
     \\  zighouse query-csv <csv_path> <sql>  tables: csv (header), csv_no_header
     \\  zighouse query <data_dir> <sql>
+    \\  zighouse query-timed <data_dir> <sql>
     \\  zighouse compare-duckdb-native <data_dir> <queries.sql> [first] [limit]
     \\  zighouse store-info <data_dir>
     \\  zighouse native-status <data_dir>
@@ -144,6 +155,22 @@ fn runCommand(init: std.process.Init, allocator: std.mem.Allocator, args: *std.p
         defer native_backend.deinit();
         try native_backend.importClickBenchParquetHot(parquet_path, limit_rows);
         try printOut(init.io, "imported ClickBench Parquet hot columns {s} -> {s}\n", .{ parquet_path, data_dir });
+    } else if (std.mem.eql(u8, command, "import-clickbench-parquet-native-hot")) {
+        const parquet_path = args.next() orelse return error.MissingParquetPath;
+        const data_dir = args.next() orelse return error.MissingDataDir;
+        const limit_rows = if (args.next()) |raw| try std.fmt.parseInt(u64, raw, 10) else null;
+        var native_backend = @import("native.zig").Native.init(allocator, init.io, data_dir);
+        defer native_backend.deinit();
+        try native_backend.importClickBenchParquetNativeHot(parquet_path, limit_rows);
+        try printOut(init.io, "imported ClickBench Parquet hot columns via native decoder {s} -> {s}\n", .{ parquet_path, data_dir });
+    } else if (std.mem.eql(u8, command, "import-clickbench-parquet-duckdb-csv-hot")) {
+        const parquet_path = args.next() orelse return error.MissingParquetPath;
+        const data_dir = args.next() orelse return error.MissingDataDir;
+        const limit_rows = if (args.next()) |raw| try std.fmt.parseInt(u64, raw, 10) else null;
+        var native_backend = @import("native.zig").Native.init(allocator, init.io, data_dir);
+        defer native_backend.deinit();
+        try native_backend.importClickBenchParquetHotDuckDbCsv(parquet_path, limit_rows);
+        try printOut(init.io, "imported ClickBench Parquet hot columns via DuckDB CSV {s} -> {s}\n", .{ parquet_path, data_dir });
     } else if (std.mem.eql(u8, command, "import-clickbench-parquet-duckdb-vector-hot")) {
         const parquet_path = args.next() orelse return error.MissingParquetPath;
         const data_dir = args.next() orelse return error.MissingDataDir;
@@ -152,9 +179,63 @@ fn runCommand(init: std.process.Init, allocator: std.mem.Allocator, args: *std.p
         defer native_backend.deinit();
         try native_backend.importClickBenchParquetDuckDbVectorHot(parquet_path, limit_rows);
         try printOut(init.io, "imported ClickBench Parquet hot columns via DuckDB vectors {s} -> {s}\n", .{ parquet_path, data_dir });
+    } else if (std.mem.eql(u8, command, "import-clickbench-parquet-duckdb-vector-fixed-hot")) {
+        const parquet_path = args.next() orelse return error.MissingParquetPath;
+        const data_dir = args.next() orelse return error.MissingDataDir;
+        const limit_rows = if (args.next()) |raw| try std.fmt.parseInt(u64, raw, 10) else null;
+        var native_backend = @import("native.zig").Native.init(allocator, init.io, data_dir);
+        defer native_backend.deinit();
+        try native_backend.importClickBenchParquetDuckDbVectorFixedHot(parquet_path, limit_rows);
+        try printOut(init.io, "imported ClickBench Parquet fixed hot columns via DuckDB vectors {s} -> {s}\n", .{ parquet_path, data_dir });
+    } else if (std.mem.eql(u8, command, "import-clickbench-parquet-native-fixed-hot")) {
+        const parquet_path = args.next() orelse return error.MissingParquetPath;
+        const data_dir = args.next() orelse return error.MissingDataDir;
+        const limit_rows = if (args.next()) |raw| try std.fmt.parseInt(u64, raw, 10) else null;
+        var native_backend = @import("native.zig").Native.init(allocator, init.io, data_dir);
+        defer native_backend.deinit();
+        try native_backend.importClickBenchParquetNativeFixedHot(parquet_path, limit_rows);
+        try printOut(init.io, "imported ClickBench Parquet hot columns via native decoder {s} -> {s}\n", .{ parquet_path, data_dir });
     } else if (std.mem.eql(u8, command, "parquet-inspect")) {
         const parquet_path = args.next() orelse return error.MissingParquetPath;
         const output = try parquet.inspectPath(allocator, init.io, parquet_path);
+        defer allocator.free(output);
+        try writeOut(init.io, output);
+    } else if (std.mem.eql(u8, command, "parquet-page-inspect")) {
+        const parquet_path = args.next() orelse return error.MissingParquetPath;
+        const row_group = try std.fmt.parseInt(usize, args.next() orelse return error.MissingRowGroup, 10);
+        const column = try std.fmt.parseInt(usize, args.next() orelse return error.MissingColumn, 10);
+        const max_pages = if (args.next()) |raw| try std.fmt.parseInt(usize, raw, 10) else 16;
+        const output = try parquet.inspectPageHeadersPath(allocator, init.io, parquet_path, row_group, column, max_pages);
+        defer allocator.free(output);
+        try writeOut(init.io, output);
+    } else if (std.mem.eql(u8, command, "parquet-decode-fixed")) {
+        const parquet_path = args.next() orelse return error.MissingParquetPath;
+        const row_group = try std.fmt.parseInt(usize, args.next() orelse return error.MissingRowGroup, 10);
+        const column = try std.fmt.parseInt(usize, args.next() orelse return error.MissingColumn, 10);
+        const limit_values = if (args.next()) |raw| try std.fmt.parseInt(usize, raw, 10) else 32;
+        const output = try parquet.decodeFixedDictionaryPath(allocator, init.io, parquet_path, row_group, column, limit_values);
+        defer allocator.free(output);
+        try writeOut(init.io, output);
+    } else if (std.mem.eql(u8, command, "parquet-decode-byte-array")) {
+        const parquet_path = args.next() orelse return error.MissingParquetPath;
+        const row_group = try std.fmt.parseInt(usize, args.next() orelse return error.MissingRowGroup, 10);
+        const column = try std.fmt.parseInt(usize, args.next() orelse return error.MissingColumn, 10);
+        const limit_values = if (args.next()) |raw| try std.fmt.parseInt(usize, raw, 10) else 32;
+        const output = try parquet.decodeByteArrayPath(allocator, init.io, parquet_path, row_group, column, limit_values);
+        defer allocator.free(output);
+        try writeOut(init.io, output);
+    } else if (std.mem.eql(u8, command, "parquet-scan-fixed")) {
+        const parquet_path = args.next() orelse return error.MissingParquetPath;
+        const column = try std.fmt.parseInt(usize, args.next() orelse return error.MissingColumn, 10);
+        const limit_rows = if (args.next()) |raw| try std.fmt.parseInt(usize, raw, 10) else null;
+        const output = try parquet.scanFixedColumnPath(allocator, init.io, parquet_path, column, limit_rows);
+        defer allocator.free(output);
+        try writeOut(init.io, output);
+    } else if (std.mem.eql(u8, command, "parquet-scan-byte-array")) {
+        const parquet_path = args.next() orelse return error.MissingParquetPath;
+        const column = try std.fmt.parseInt(usize, args.next() orelse return error.MissingColumn, 10);
+        const limit_rows = if (args.next()) |raw| try std.fmt.parseInt(usize, raw, 10) else null;
+        const output = try parquet.scanByteArrayPath(allocator, init.io, parquet_path, column, limit_rows);
         defer allocator.free(output);
         try writeOut(init.io, output);
     } else if (std.mem.eql(u8, command, "duckdb-vector-smoke")) {
@@ -311,6 +392,19 @@ fn runCommand(init: std.process.Init, allocator: std.mem.Allocator, args: *std.p
         const output = try selected.query(sql);
         defer allocator.free(output);
         try writeOut(init.io, output);
+    } else if (std.mem.eql(u8, command, "query-timed")) {
+        const data_dir = args.next() orelse return error.MissingDataDir;
+        const sql = args.next() orelse return error.MissingSql;
+        try storage.ensureStore(init.io, data_dir);
+        var selected = backend.Backend.init(allocator, init.io, data_dir, options);
+        defer selected.deinit();
+        const started = std.Io.Clock.Timestamp.now(init.io, .awake);
+        const output = try selected.query(sql);
+        const ended = std.Io.Clock.Timestamp.now(init.io, .awake);
+        defer allocator.free(output);
+        try writeOut(init.io, output);
+        const elapsed_ns: u64 = @intCast(started.durationTo(ended).raw.nanoseconds);
+        try printErr(init.io, "{d:.6}\n", .{@as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_s});
     } else if (std.mem.eql(u8, command, "query-csv")) {
         const csv_path = args.next() orelse return error.MissingCsvPath;
         const sql = args.next() orelse return error.MissingSql;

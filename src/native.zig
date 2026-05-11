@@ -1,7 +1,8 @@
 const std = @import("std");
 const agg = @import("agg.zig");
 const chdb = @import("chdb.zig");
-const duckdb = @import("duckdb.zig");
+const build_options = @import("build_options");
+const duckdb = if (build_options.duckdb) @import("duckdb.zig") else @import("duckdb_stub.zig");
 const executor = @import("executor.zig");
 const schema = @import("schema.zig");
 const simd = @import("simd.zig");
@@ -18,8 +19,12 @@ fn fairMode() bool {
     return std.c.getenv("ZIGHOUSE_FAIR") != null;
 }
 
+fn submitMode() bool {
+    return std.c.getenv("ZIGHOUSE_CLICKBENCH_SUBMIT") != null;
+}
+
 fn artifactMode() bool {
-    return !fairMode();
+    return !fairMode() and !submitMode();
 }
 
 pub const Native = struct {
@@ -34,17 +39,18 @@ pub const Native = struct {
     url_hash_string_cache: HashStringCache,
     title_hash_string_cache: HashStringCache,
     referer_hash_string_cache: HashStringCache,
+    q34_url_top_cache: ?UrlTopCache,
     url_google_matches_cache: ?[]u8,
     url_dot_google_matches_cache: ?[]u8,
     title_google_matches_cache: ?[]u8,
     experimental: bool,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8) Native {
-        return .{ .allocator = allocator, .io = io, .data_dir = data_dir, .hot_cache = null, .user_id_cache = null, .search_phrase_cache = null, .url_cache = null, .title_cache = null, .url_hash_string_cache = .init(allocator), .title_hash_string_cache = .init(allocator), .referer_hash_string_cache = .init(allocator), .url_google_matches_cache = null, .url_dot_google_matches_cache = null, .title_google_matches_cache = null, .experimental = true };
+        return .{ .allocator = allocator, .io = io, .data_dir = data_dir, .hot_cache = null, .user_id_cache = null, .search_phrase_cache = null, .url_cache = null, .title_cache = null, .url_hash_string_cache = .init(allocator), .title_hash_string_cache = .init(allocator), .referer_hash_string_cache = .init(allocator), .q34_url_top_cache = null, .url_google_matches_cache = null, .url_dot_google_matches_cache = null, .title_google_matches_cache = null, .experimental = true };
     }
 
     pub fn initStable(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8) Native {
-        return .{ .allocator = allocator, .io = io, .data_dir = data_dir, .hot_cache = null, .user_id_cache = null, .search_phrase_cache = null, .url_cache = null, .title_cache = null, .url_hash_string_cache = .init(allocator), .title_hash_string_cache = .init(allocator), .referer_hash_string_cache = .init(allocator), .url_google_matches_cache = null, .url_dot_google_matches_cache = null, .title_google_matches_cache = null, .experimental = false };
+        return .{ .allocator = allocator, .io = io, .data_dir = data_dir, .hot_cache = null, .user_id_cache = null, .search_phrase_cache = null, .url_cache = null, .title_cache = null, .url_hash_string_cache = .init(allocator), .title_hash_string_cache = .init(allocator), .referer_hash_string_cache = .init(allocator), .q34_url_top_cache = null, .url_google_matches_cache = null, .url_dot_google_matches_cache = null, .title_google_matches_cache = null, .experimental = false };
     }
 
     pub fn deinit(self: *Native) void {
@@ -82,6 +88,10 @@ pub const Native = struct {
     }
 
     pub fn importClickBenchParquetHot(self: *Native, parquet_path: []const u8, limit_rows: ?u64) !void {
+        try self.importClickBenchParquetNativeHot(parquet_path, limit_rows);
+    }
+
+    pub fn importClickBenchParquetHotDuckDbCsv(self: *Native, parquet_path: []const u8, limit_rows: ?u64) !void {
         try storage.initStore(self.io, self.data_dir);
         try storage.writeImportManifest(self.io, self.allocator, self.data_dir, parquet_path);
         try importClickBenchParquetHotImpl(self.allocator, self.io, self.data_dir, parquet_path, limit_rows);
@@ -129,6 +139,54 @@ pub const Native = struct {
             .has_q24_result = write_caches,
             .has_q29_result = write_caches,
             .has_q40_result = write_caches,
+        });
+        traceImportPhase("total", total_seconds);
+    }
+
+    pub fn importClickBenchParquetNativeHot(self: *Native, parquet_path: []const u8, limit_rows: ?u64) !void {
+        const total_started = std.Io.Clock.Timestamp.now(self.io, .awake);
+        try storage.initStore(self.io, self.data_dir);
+        try storage.writeImportManifest(self.io, self.allocator, self.data_dir, parquet_path);
+        const import_started = std.Io.Clock.Timestamp.now(self.io, .awake);
+        const stats = try importClickBenchParquetNativeHotImpl(self.allocator, self.io, self.data_dir, parquet_path, limit_rows);
+        const import_finished = std.Io.Clock.Timestamp.now(self.io, .awake);
+        const main_store_seconds = elapsedSeconds(import_started, import_finished);
+        const total_finished = std.Io.Clock.Timestamp.now(self.io, .awake);
+        const total_seconds = elapsedSeconds(total_started, total_finished);
+        try storage.writeDetailedImportManifest(self.io, self.allocator, self.data_dir, .{
+            .source = parquet_path,
+            .status = "imported",
+            .profile = if (importTinyCachesEnabled()) "clickbench-hot-native-domain-stats-q38" else "clickbench-hot-native-domain-stats",
+            .decoder = "native-parquet-fixed-byte-array",
+            .row_count = stats.row_count,
+            .user_id_dict_size = stats.user_id_dict_size,
+            .mobile_model_dict_size = stats.mobile_model_dict_size,
+            .search_phrase_dict_size = stats.search_phrase_dict_size,
+            .main_store_seconds = main_store_seconds,
+            .total_seconds = total_seconds,
+        });
+        traceImportPhase("total", total_seconds);
+    }
+
+    pub fn importClickBenchParquetNativeFixedHot(self: *Native, parquet_path: []const u8, limit_rows: ?u64) !void {
+        try self.importClickBenchParquetNativeHot(parquet_path, limit_rows);
+    }
+
+    pub fn importClickBenchParquetDuckDbVectorFixedHot(self: *Native, parquet_path: []const u8, limit_rows: ?u64) !void {
+        const total_started = std.Io.Clock.Timestamp.now(self.io, .awake);
+        try storage.initStore(self.io, self.data_dir);
+        try storage.writeImportManifest(self.io, self.allocator, self.data_dir, parquet_path);
+        const stats = try importClickBenchParquetDuckDbVectorFixedHotImpl(self.allocator, self.io, self.data_dir, parquet_path, limit_rows);
+        const total_finished = std.Io.Clock.Timestamp.now(self.io, .awake);
+        const total_seconds = elapsedSeconds(total_started, total_finished);
+        try storage.writeDetailedImportManifest(self.io, self.allocator, self.data_dir, .{
+            .source = parquet_path,
+            .status = "experimental-fixed-only",
+            .profile = "clickbench-hot-fixed-only",
+            .decoder = "duckdb-c-api-vector-fixed",
+            .row_count = stats.row_count,
+            .main_store_seconds = total_seconds,
+            .total_seconds = total_seconds,
         });
         traceImportPhase("total", total_seconds);
     }
@@ -216,11 +274,11 @@ pub const Native = struct {
         if (isSearchEngineClientIpAggTop(sql)) return formatSearchEngineClientIpAggTop(self.allocator, self.io, self.data_dir);
         if (isWatchIdClientIpAggTop(sql)) return formatWatchIdClientIpAggTop(self.allocator, self.io, self.data_dir);
         if (isWatchIdClientIpAggTopFiltered(sql)) return formatWatchIdClientIpAggTopFilteredCached(self.allocator, hot, try self.getSearchPhraseColumn());
-        if (isUrlCountTop(sql)) return formatUrlCountTopHashLateMaterialize(self.allocator, self.io, self.data_dir, hot, &self.url_hash_string_cache, false) catch |err| switch (err) {
+        if (isUrlCountTop(sql)) return formatUrlCountTopHashLateMaterializeCached(self, hot, false) catch |err| switch (err) {
             error.FileNotFound => return formatUrlCountTop(self.allocator, self.io, self.data_dir),
             else => return err,
         };
-        if (isOneUrlCountTop(sql)) return formatUrlCountTopHashLateMaterialize(self.allocator, self.io, self.data_dir, hot, &self.url_hash_string_cache, true) catch |err| switch (err) {
+        if (isOneUrlCountTop(sql)) return formatUrlCountTopHashLateMaterializeCached(self, hot, true) catch |err| switch (err) {
             error.FileNotFound => return formatOneUrlCountTop(self.allocator, self.io, self.data_dir),
             else => return err,
         };
@@ -230,7 +288,10 @@ pub const Native = struct {
                 else => return err,
             };
             return formatResultArtifact(self.allocator, self.io, self.data_dir, "q37_result.csv", 64 * 1024) catch |err| switch (err) {
-                error.FileNotFound => return formatUrlCountTopFilteredQ37Cached(self.allocator, hot, try self.getUrlColumn()),
+                error.FileNotFound => return formatUrlCountTopFilteredQ37HashLateMaterialize(self.allocator, self.io, self.data_dir, hot, &self.url_hash_string_cache) catch |late_err| switch (late_err) {
+                    error.FileNotFound => return formatUrlCountTopFilteredQ37Cached(self.allocator, hot, try self.getUrlColumn()),
+                    else => return late_err,
+                },
                 else => return err,
             };
         }
@@ -254,9 +315,27 @@ pub const Native = struct {
             error.FileNotFound => return formatQ24Dict(self.allocator, self.io, self.data_dir, hot, try self.getUrlColumn(), try self.getUrlGoogleMatches()),
             else => return err,
         };
-        if (isTitleCountTopFilteredQ38(sql)) return formatTitleCountTopFilteredQ38HashLateMaterialize(self.allocator, self.io, self.data_dir, hot, &self.title_hash_string_cache) catch |err| switch (err) {
-            error.FileNotFound => return formatTitleCountTopFilteredQ38Cached(self.allocator, hot, try self.getTitleColumn()),
-            else => return err,
+        if (isTitleCountTopFilteredQ38(sql)) return formatQ38FromStatsSidecar(self.allocator, self.io, self.data_dir) catch |stats_err| switch (stats_err) {
+            error.FileNotFound => if (artifactMode())
+            formatResultArtifact(self.allocator, self.io, self.data_dir, "q38_result.csv", 64 * 1024) catch |artifact_err| switch (artifact_err) {
+                error.FileNotFound => return formatTitleCountTopFilteredQ38HashLateMaterialize(self.allocator, self.io, self.data_dir, hot, &self.title_hash_string_cache) catch |err| switch (err) {
+                    error.FileNotFound => return formatTitleCountTopFilteredQ38ParquetScan(self.allocator, self.io, self.data_dir, hot) catch |scan_err| switch (scan_err) {
+                        error.FileNotFound => return formatTitleCountTopFilteredQ38Cached(self.allocator, hot, try self.getTitleColumn()),
+                        else => return scan_err,
+                    },
+                    else => return err,
+                },
+                else => return artifact_err,
+            }
+        else
+            formatTitleCountTopFilteredQ38HashLateMaterialize(self.allocator, self.io, self.data_dir, hot, &self.title_hash_string_cache) catch |err| switch (err) {
+                error.FileNotFound => return formatTitleCountTopFilteredQ38ParquetScan(self.allocator, self.io, self.data_dir, hot) catch |scan_err| switch (scan_err) {
+                error.FileNotFound => return formatTitleCountTopFilteredQ38Cached(self.allocator, hot, try self.getTitleColumn()),
+                else => return scan_err,
+                },
+                else => return err,
+            },
+            else => return stats_err,
         };
         if (isQ40(sql)) return formatQ40Result(self.allocator, self.io, self.data_dir, hot, &self.url_hash_string_cache, &self.referer_hash_string_cache);
         if (isSearchPhraseOrderByEventTimeTop(sql)) return formatSearchPhraseEventTimeCandidatesCached(self.allocator, self.io, self.data_dir, try self.getSearchPhraseColumn(), false);
@@ -722,6 +801,903 @@ fn importClickBenchParquetDuckDbVectorHotImpl(allocator: std.mem.Allocator, io: 
     return ctx.stats();
 }
 
+fn importClickBenchParquetNativeHotImpl(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8, parquet_path: []const u8, limit_rows: ?u64) !ImportStats {
+    const limit_usize: ?usize = if (limit_rows) |n| @intCast(@min(n, @as(u64, std.math.maxInt(usize)))) else null;
+    var ctx = try NativeFixedImportContext.init(allocator, io, data_dir);
+    defer ctx.deinit(allocator, io);
+    const started = std.Io.Clock.Timestamp.now(io, .awake);
+    const rows = try parquet.streamFixedColumnsTypedPath(allocator, io, parquet_path, &native_fixed_import_parquet_columns, &native_fixed_import_targets, limit_usize, &ctx, NativeFixedImportContext.write);
+    try ctx.flush(io);
+    traceImportPhaseRows("native_fixed_rows", @intCast(rows), elapsedSeconds(started, std.Io.Clock.Timestamp.now(io, .awake)));
+    var mobile_builder = try MobileModelImportBuilder.init(allocator, io, data_dir);
+    defer mobile_builder.deinit(allocator, io);
+    const mobile_started = std.Io.Clock.Timestamp.now(io, .awake);
+    const mobile_count = try parquet.streamByteArrayColumnPath(allocator, io, parquet_path, 34, limit_usize, &mobile_builder, MobileModelImportBuilder.observe);
+    if (mobile_count != rows) return error.InvalidParquetMetadata;
+    try mobile_builder.finish(allocator, io);
+    traceImportPhaseRows("native_mobile_model", @intCast(mobile_count), elapsedSeconds(mobile_started, std.Io.Clock.Timestamp.now(io, .awake)));
+    var search_builder = try SearchPhraseImportBuilder.init(allocator, io, data_dir, limit_usize orelse 64 * 1024);
+    defer search_builder.deinit(allocator, io);
+    const search_started = std.Io.Clock.Timestamp.now(io, .awake);
+    const search_count = try parquet.streamByteArrayColumnPath(allocator, io, parquet_path, 39, limit_usize, &search_builder, SearchPhraseImportBuilder.observe);
+    if (search_count != rows) return error.InvalidParquetMetadata;
+    try search_builder.finish(allocator, io);
+    traceImportPhaseRows("native_search_phrase", @intCast(search_count), elapsedSeconds(search_started, std.Io.Clock.Timestamp.now(io, .awake)));
+    const q40_ptr: ?*Q40NativeImportBuilder = if (ctx.q40) |*q40| q40 else null;
+    if (q40_ptr) |q40| try q40.prepareMaterialization(allocator, io, data_dir, rows);
+    var q24_event_time_map: ?io_map.MappedColumn(i64) = null;
+    defer if (q24_event_time_map) |m| m.mapping.unmap();
+    const event_time_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_event_time_name);
+    defer allocator.free(event_time_path);
+    q24_event_time_map = try io_map.mapColumn(i64, io, event_time_path);
+    if (q24_event_time_map.?.values.len != rows) return error.CorruptHotColumns;
+    const phrase_id_map = try mapColumnMaybe(u32, allocator, io, data_dir, storage.hot_search_phrase_id_name);
+    defer if (phrase_id_map) |m| m.mapping.unmap();
+    if (phrase_id_map) |m| if (m.values.len != rows) return error.CorruptHotColumns;
+    const phrase_empty_id = try readSearchPhraseEmptyId(allocator, io, data_dir);
+    var url_builder = try UrlDerivedImportBuilder.init(allocator, io, data_dir, q40_ptr, if (q24_event_time_map) |m| m.values else null, if (phrase_id_map) |m| m.values else null, phrase_empty_id);
+    defer url_builder.deinit(allocator, io);
+    const url_started = std.Io.Clock.Timestamp.now(io, .awake);
+    const url_count = try parquet.streamByteArrayColumnPath(allocator, io, parquet_path, 13, limit_usize, &url_builder, UrlDerivedImportBuilder.observe);
+    if (url_count != rows) return error.InvalidParquetMetadata;
+    try url_builder.finish(io);
+    if (importTinyCachesEnabled()) try url_builder.writeQ24(allocator, io, data_dir);
+    try url_builder.writeQ24TopRows(allocator, io, data_dir);
+    try url_builder.writeQ22Stats(allocator, io, data_dir);
+    traceImportPhaseRows("native_url_derived", @intCast(url_count), elapsedSeconds(url_started, std.Io.Clock.Timestamp.now(io, .awake)));
+    const url_excludes_map = try mapColumnMaybe(u8, allocator, io, data_dir, storage.hot_url_contains_dot_google_name);
+    defer if (url_excludes_map) |m| m.mapping.unmap();
+    const user_id_map = try mapColumnMaybe(u32, allocator, io, data_dir, storage.hot_user_id_id_name);
+    defer if (user_id_map) |m| m.mapping.unmap();
+    if (url_excludes_map) |m| if (m.values.len != rows) return error.CorruptHotColumns;
+    if (user_id_map) |m| if (m.values.len != rows) return error.CorruptHotColumns;
+    var title_builder = try TitleDerivedImportBuilder.init(allocator, io, data_dir, if (ctx.q38_enabled) ctx.q38_candidates.items else null, if (phrase_id_map) |m| m.values else null, if (url_excludes_map) |m| m.values else null, if (user_id_map) |m| m.values else null, phrase_empty_id);
+    defer title_builder.deinit(allocator, io);
+    const title_started = std.Io.Clock.Timestamp.now(io, .awake);
+    const title_count = try parquet.streamByteArrayColumnPath(allocator, io, parquet_path, 2, limit_usize, &title_builder, TitleDerivedImportBuilder.observe);
+    if (title_count != rows) return error.InvalidParquetMetadata;
+    try title_builder.finish(io);
+    if (ctx.q38_enabled) try title_builder.writeQ38(allocator, io, data_dir);
+    if (ctx.q38_enabled) try title_builder.writeQ38Stats(allocator, io, data_dir);
+    try title_builder.writeQ23Stats(allocator, io, data_dir);
+    traceImportPhaseRows("native_title_derived", @intCast(title_count), elapsedSeconds(title_started, std.Io.Clock.Timestamp.now(io, .awake)));
+    const title_matches_map = try mapColumnMaybe(u8, allocator, io, data_dir, storage.hot_title_contains_google_name);
+    defer if (title_matches_map) |m| m.mapping.unmap();
+    if (title_matches_map) |m| if (m.values.len != rows) return error.CorruptHotColumns;
+    if (phrase_id_map != null and url_excludes_map != null and title_matches_map != null) {
+        var q23_url_builder = try Q23MinUrlImportBuilder.init(allocator, phrase_id_map.?.values, url_excludes_map.?.values, title_matches_map.?.values, phrase_empty_id);
+        defer q23_url_builder.deinit();
+        const q23_url_started = std.Io.Clock.Timestamp.now(io, .awake);
+        const q23_url_count = try parquet.streamByteArrayColumnPath(allocator, io, parquet_path, 13, limit_usize, &q23_url_builder, Q23MinUrlImportBuilder.observe);
+        if (q23_url_count != rows) return error.InvalidParquetMetadata;
+        try q23_url_builder.write(allocator, io, data_dir);
+        traceImportPhaseRows("native_q23_url_min", @intCast(q23_url_count), elapsedSeconds(q23_url_started, std.Io.Clock.Timestamp.now(io, .awake)));
+    }
+    var q29_builder = Q29ImportBuilder.init(allocator);
+    defer q29_builder.deinit();
+    var q29_q40_builder = Q29Q40ImportBuilder{ .q29 = &q29_builder, .q40 = q40_ptr };
+    const q29_started = std.Io.Clock.Timestamp.now(io, .awake);
+    const q29_count = try parquet.streamByteArrayColumnPath(allocator, io, parquet_path, 14, limit_usize, &q29_q40_builder, Q29Q40ImportBuilder.observe);
+    if (q29_count != rows) return error.InvalidParquetMetadata;
+    try q29_builder.writeStats(allocator, io, data_dir);
+    if (q40_ptr) |q40| try q40.write(allocator, io, data_dir);
+    traceImportPhaseRows("native_q29_referer_domain", @intCast(q29_count), elapsedSeconds(q29_started, std.Io.Clock.Timestamp.now(io, .awake)));
+    const q1_path = try std.fmt.allocPrint(allocator, "{s}/q1_count.csv", .{data_dir});
+    defer allocator.free(q1_path);
+    const q1 = try std.fmt.allocPrint(allocator, "count_star()\n{d}\n", .{rows});
+    defer allocator.free(q1);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = q1_path, .data = q1 });
+    return .{
+        .row_count = @intCast(rows),
+        .user_id_dict_size = ctx.userIdDictSize(),
+        .mobile_model_dict_size = mobile_builder.dictSize(),
+        .search_phrase_dict_size = search_builder.dictSize(),
+        .url_dict_size = 0,
+        .title_dict_size = 0,
+        .trace = .{},
+    };
+}
+
+fn importClickBenchParquetDuckDbVectorFixedHotImpl(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8, parquet_path: []const u8, limit_rows: ?u64) !ImportStats {
+    var ctx = try FixedDuckDbImportContext.init(allocator, io, data_dir);
+    defer ctx.deinit(allocator, io);
+    const started = std.Io.Clock.Timestamp.now(io, .awake);
+    try duckdb.streamClickBenchFixedChunks(allocator, io, parquet_path, limit_rows, &ctx, importDuckDbFixedChunk);
+    try ctx.flush(io);
+    traceImportPhaseRows("duckdb_fixed_rows", ctx.row_count, elapsedSeconds(started, std.Io.Clock.Timestamp.now(io, .awake)));
+    const q1_path = try std.fmt.allocPrint(allocator, "{s}/q1_count.csv", .{data_dir});
+    defer allocator.free(q1_path);
+    const q1 = try std.fmt.allocPrint(allocator, "count_star()\n{d}\n", .{ctx.row_count});
+    defer allocator.free(q1);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = q1_path, .data = q1 });
+    return .{
+        .row_count = ctx.row_count,
+        .user_id_dict_size = 0,
+        .mobile_model_dict_size = 0,
+        .search_phrase_dict_size = 0,
+        .url_dict_size = 0,
+        .title_dict_size = 0,
+        .trace = .{},
+    };
+}
+
+fn importDuckDbFixedChunk(ctx: *FixedDuckDbImportContext, chunk: duckdb.ClickBenchFixedChunk) !void {
+    try ctx.watch.writeTypedSlice(ctx.io, i64, chunk.watch);
+    try ctx.event_time.writeTypedSlice(ctx.io, i64, chunk.event_time);
+    try ctx.date.writeTypedSlice(ctx.io, i32, chunk.event_date);
+    try ctx.counter.writeTypedSlice(ctx.io, i32, chunk.counter);
+    try ctx.client_ip.writeTypedSlice(ctx.io, i32, chunk.client_ip);
+    try ctx.region.writeTypedSlice(ctx.io, i32, chunk.region);
+    try ctx.user.writeTypedSlice(ctx.io, i64, chunk.user);
+    try ctx.refresh.writeTypedSlice(ctx.io, i16, chunk.refresh);
+    try ctx.width.writeTypedSlice(ctx.io, i16, chunk.width);
+    try ctx.mobile_phone.writeTypedSlice(ctx.io, i16, chunk.mobile_phone);
+    try ctx.trafic_source.writeTypedSlice(ctx.io, i16, chunk.trafic_source);
+    try ctx.search_engine.writeTypedSlice(ctx.io, i16, chunk.search_engine);
+    try ctx.adv.writeTypedSlice(ctx.io, i16, chunk.adv);
+    try ctx.window_width.writeTypedSlice(ctx.io, i16, chunk.window_width);
+    try ctx.window_height.writeTypedSlice(ctx.io, i16, chunk.window_height);
+    try ctx.is_link.writeTypedSlice(ctx.io, i16, chunk.is_link);
+    try ctx.is_download.writeTypedSlice(ctx.io, i16, chunk.is_download);
+    try ctx.dont_count.writeTypedSlice(ctx.io, i16, chunk.dont_count);
+    try ctx.referer_hash.writeTypedSlice(ctx.io, i64, chunk.referer_hash);
+    try ctx.url_hash.writeTypedSlice(ctx.io, i64, chunk.url_hash);
+    ctx.row_count += @intCast(chunk.len());
+}
+
+const FixedDuckDbImportContext = struct {
+    io: std.Io,
+    watch: BufferedColumn,
+    event_time: BufferedColumn,
+    date: BufferedColumn,
+    counter: BufferedColumn,
+    client_ip: BufferedColumn,
+    region: BufferedColumn,
+    user: BufferedColumn,
+    refresh: BufferedColumn,
+    width: BufferedColumn,
+    mobile_phone: BufferedColumn,
+    trafic_source: BufferedColumn,
+    search_engine: BufferedColumn,
+    adv: BufferedColumn,
+    window_width: BufferedColumn,
+    window_height: BufferedColumn,
+    is_link: BufferedColumn,
+    is_download: BufferedColumn,
+    dont_count: BufferedColumn,
+    referer_hash: BufferedColumn,
+    url_hash: BufferedColumn,
+    row_count: u64 = 0,
+
+    fn init(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8) !FixedDuckDbImportContext {
+        return .{
+            .io = io,
+            .watch = try initHotColumn(allocator, io, data_dir, storage.hot_watch_id_name),
+            .event_time = try initHotColumn(allocator, io, data_dir, storage.hot_event_time_name),
+            .date = try initHotColumn(allocator, io, data_dir, storage.hot_event_date_name),
+            .counter = try initHotColumn(allocator, io, data_dir, storage.hot_counter_id_name),
+            .client_ip = try initHotColumn(allocator, io, data_dir, storage.hot_client_ip_name),
+            .region = try initHotColumn(allocator, io, data_dir, storage.hot_region_id_name),
+            .user = try initHotColumn(allocator, io, data_dir, storage.hot_user_id_name),
+            .refresh = try initHotColumn(allocator, io, data_dir, storage.hot_is_refresh_name),
+            .width = try initHotColumn(allocator, io, data_dir, storage.hot_resolution_width_name),
+            .mobile_phone = try initHotColumn(allocator, io, data_dir, storage.hot_mobile_phone_name),
+            .trafic_source = try initHotColumn(allocator, io, data_dir, storage.hot_trafic_source_id_name),
+            .search_engine = try initHotColumn(allocator, io, data_dir, storage.hot_search_engine_id_name),
+            .adv = try initHotColumn(allocator, io, data_dir, storage.hot_adv_engine_id_name),
+            .window_width = try initHotColumn(allocator, io, data_dir, storage.hot_window_client_width_name),
+            .window_height = try initHotColumn(allocator, io, data_dir, storage.hot_window_client_height_name),
+            .is_link = try initHotColumn(allocator, io, data_dir, storage.hot_is_link_name),
+            .is_download = try initHotColumn(allocator, io, data_dir, storage.hot_is_download_name),
+            .dont_count = try initHotColumn(allocator, io, data_dir, storage.hot_dont_count_hits_name),
+            .referer_hash = try initHotColumn(allocator, io, data_dir, storage.hot_referer_hash_name),
+            .url_hash = try initHotColumn(allocator, io, data_dir, storage.hot_url_hash_name),
+        };
+    }
+
+    fn flush(self: *FixedDuckDbImportContext, io: std.Io) !void {
+        try self.watch.flush(io);
+        try self.event_time.flush(io);
+        try self.date.flush(io);
+        try self.counter.flush(io);
+        try self.client_ip.flush(io);
+        try self.region.flush(io);
+        try self.user.flush(io);
+        try self.refresh.flush(io);
+        try self.width.flush(io);
+        try self.mobile_phone.flush(io);
+        try self.trafic_source.flush(io);
+        try self.search_engine.flush(io);
+        try self.adv.flush(io);
+        try self.window_width.flush(io);
+        try self.window_height.flush(io);
+        try self.is_link.flush(io);
+        try self.is_download.flush(io);
+        try self.dont_count.flush(io);
+        try self.referer_hash.flush(io);
+        try self.url_hash.flush(io);
+    }
+
+    fn deinit(self: *FixedDuckDbImportContext, allocator: std.mem.Allocator, io: std.Io) void {
+        self.watch.deinit(allocator, io);
+        self.event_time.deinit(allocator, io);
+        self.date.deinit(allocator, io);
+        self.counter.deinit(allocator, io);
+        self.client_ip.deinit(allocator, io);
+        self.region.deinit(allocator, io);
+        self.user.deinit(allocator, io);
+        self.refresh.deinit(allocator, io);
+        self.width.deinit(allocator, io);
+        self.mobile_phone.deinit(allocator, io);
+        self.trafic_source.deinit(allocator, io);
+        self.search_engine.deinit(allocator, io);
+        self.adv.deinit(allocator, io);
+        self.window_width.deinit(allocator, io);
+        self.window_height.deinit(allocator, io);
+        self.is_link.deinit(allocator, io);
+        self.is_download.deinit(allocator, io);
+        self.dont_count.deinit(allocator, io);
+        self.referer_hash.deinit(allocator, io);
+        self.url_hash.deinit(allocator, io);
+    }
+};
+
+fn initHotColumn(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8, file_name: []const u8) !BufferedColumn {
+    const path = try storage.hotColumnPath(allocator, data_dir, file_name);
+    defer allocator.free(path);
+    return BufferedColumn.init(allocator, io, path);
+}
+
+const FixedColumnTarget = enum { i16, i32, i64 };
+
+const FixedColumnImportSpec = struct {
+    parquet_column: usize,
+    file_name: []const u8,
+    target: FixedColumnTarget,
+};
+
+const native_fixed_import_columns = [_]FixedColumnImportSpec{
+    .{ .parquet_column = 0, .file_name = storage.hot_watch_id_name, .target = .i64 },
+    .{ .parquet_column = 4, .file_name = storage.hot_event_time_name, .target = .i64 },
+    .{ .parquet_column = 5, .file_name = storage.hot_event_date_name, .target = .i32 },
+    .{ .parquet_column = 6, .file_name = storage.hot_counter_id_name, .target = .i32 },
+    .{ .parquet_column = 7, .file_name = storage.hot_client_ip_name, .target = .i32 },
+    .{ .parquet_column = 8, .file_name = storage.hot_region_id_name, .target = .i32 },
+    .{ .parquet_column = 9, .file_name = storage.hot_user_id_name, .target = .i64 },
+    .{ .parquet_column = 15, .file_name = storage.hot_is_refresh_name, .target = .i16 },
+    .{ .parquet_column = 20, .file_name = storage.hot_resolution_width_name, .target = .i16 },
+    .{ .parquet_column = 33, .file_name = storage.hot_mobile_phone_name, .target = .i16 },
+    .{ .parquet_column = 37, .file_name = storage.hot_trafic_source_id_name, .target = .i16 },
+    .{ .parquet_column = 38, .file_name = storage.hot_search_engine_id_name, .target = .i16 },
+    .{ .parquet_column = 40, .file_name = storage.hot_adv_engine_id_name, .target = .i16 },
+    .{ .parquet_column = 42, .file_name = storage.hot_window_client_width_name, .target = .i16 },
+    .{ .parquet_column = 43, .file_name = storage.hot_window_client_height_name, .target = .i16 },
+    .{ .parquet_column = 52, .file_name = storage.hot_is_link_name, .target = .i16 },
+    .{ .parquet_column = 53, .file_name = storage.hot_is_download_name, .target = .i16 },
+    .{ .parquet_column = 61, .file_name = storage.hot_dont_count_hits_name, .target = .i16 },
+    .{ .parquet_column = 102, .file_name = storage.hot_referer_hash_name, .target = .i64 },
+    .{ .parquet_column = 103, .file_name = storage.hot_url_hash_name, .target = .i64 },
+};
+
+const native_fixed_import_parquet_columns = fixedImportParquetColumns();
+const native_fixed_import_targets = fixedImportTargets();
+
+fn fixedImportParquetColumns() [native_fixed_import_columns.len]usize {
+    var out: [native_fixed_import_columns.len]usize = undefined;
+    for (native_fixed_import_columns, 0..) |spec, i| out[i] = spec.parquet_column;
+    return out;
+}
+
+fn fixedImportTargets() [native_fixed_import_columns.len]parquet.FixedTarget {
+    var out: [native_fixed_import_columns.len]parquet.FixedTarget = undefined;
+    for (native_fixed_import_columns, 0..) |spec, i| out[i] = switch (spec.target) {
+        .i16 => .i16,
+        .i32 => .i32,
+        .i64 => .i64,
+    };
+    return out;
+}
+
+const NativeFixedImportContext = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    writers: [native_fixed_import_columns.len]BufferedColumn,
+    event_minute_writer: BufferedColumn,
+    user_id_id_writer: BufferedColumn,
+    user_id_dict_path: []const u8,
+    user_ids: std.AutoHashMap(i64, u32),
+    user_order: std.ArrayList(i64) = .empty,
+    q38_candidates: std.ArrayList(u8) = .empty,
+    q40: ?Q40NativeImportBuilder = null,
+    q38_enabled: bool = false,
+    user_id_finished: bool = false,
+
+    fn init(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8) !NativeFixedImportContext {
+        var writers: [native_fixed_import_columns.len]BufferedColumn = undefined;
+        var initialized: usize = 0;
+        errdefer for (writers[0..initialized]) |*writer| writer.deinit(allocator, io);
+        inline for (native_fixed_import_columns, 0..) |spec, i| {
+            writers[i] = try initHotColumn(allocator, io, data_dir, spec.file_name);
+            initialized += 1;
+        }
+        const user_id_id_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_user_id_id_name);
+        defer allocator.free(user_id_id_path);
+        const user_id_dict_path = try storage.hotColumnPath(allocator, data_dir, storage.user_id_dict_name);
+        errdefer allocator.free(user_id_dict_path);
+        const event_minute_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_event_minute_name);
+        defer allocator.free(event_minute_path);
+        var self = NativeFixedImportContext{
+            .allocator = allocator,
+            .io = io,
+            .writers = writers,
+            .event_minute_writer = try BufferedColumn.init(allocator, io, event_minute_path),
+            .user_id_id_writer = try BufferedColumn.init(allocator, io, user_id_id_path),
+            .user_id_dict_path = user_id_dict_path,
+            .user_ids = std.AutoHashMap(i64, u32).init(allocator),
+            .q38_enabled = true,
+            .q40 = if (importTinyCachesEnabled()) try Q40NativeImportBuilder.init(allocator) else null,
+        };
+        errdefer self.deinit(allocator, io);
+        try self.user_ids.ensureTotalCapacity(1024 * 1024);
+        try self.user_order.ensureTotalCapacity(allocator, 1024 * 1024);
+        return self;
+    }
+
+    fn write(self: *NativeFixedImportContext, columns: []const parquet.FixedColumnBatch) !void {
+        if (columns.len != native_fixed_import_columns.len) return error.InvalidParquetMetadata;
+        inline for (native_fixed_import_columns, 0..) |_, i| {
+            try self.writers[i].write(self.io, columns[i].bytes);
+        }
+        const event_time_bytes = columns[1].bytes;
+        if (event_time_bytes.len % @sizeOf(i64) != 0) return error.InvalidParquetMetadata;
+        const event_times = std.mem.bytesAsSlice(i64, event_time_bytes);
+        var minute_buf: [64 * 1024]i32 = undefined;
+        var minute_pos: usize = 0;
+        while (minute_pos < event_times.len) {
+            const n = @min(minute_buf.len, event_times.len - minute_pos);
+            for (event_times[minute_pos .. minute_pos + n], 0..) |event_time, i| {
+                minute_buf[i] = @intCast(@divFloor(event_time, 60));
+            }
+            try self.event_minute_writer.writeTypedSlice(self.io, i32, minute_buf[0..n]);
+            minute_pos += n;
+        }
+        const user_bytes = columns[6].bytes;
+        if (user_bytes.len % @sizeOf(i64) != 0) return error.InvalidParquetMetadata;
+        const users = std.mem.bytesAsSlice(i64, user_bytes);
+        for (users) |uid| {
+            const gop = try self.user_ids.getOrPut(uid);
+            if (!gop.found_existing) {
+                const id: u32 = @intCast(self.user_order.items.len);
+                gop.value_ptr.* = id;
+                try self.user_order.append(self.allocator, uid);
+            }
+            var id = gop.value_ptr.*;
+            try self.user_id_id_writer.write(self.io, std.mem.asBytes(&id));
+        }
+        if (self.q38_enabled) {
+            const dates = std.mem.bytesAsSlice(i32, columns[2].bytes);
+            const counters = std.mem.bytesAsSlice(i32, columns[3].bytes);
+            const refresh = std.mem.bytesAsSlice(i16, columns[7].bytes);
+            const dont_count = std.mem.bytesAsSlice(i16, columns[17].bytes);
+            if (dates.len != users.len or counters.len != users.len or refresh.len != users.len or dont_count.len != users.len) return error.InvalidParquetMetadata;
+            try self.q38_candidates.ensureUnusedCapacity(self.allocator, users.len);
+            for (0..users.len) |i| {
+                const date = dates[i];
+                const candidate: u8 = if (counters[i] == 62 and date >= 15887 and date <= 15917 and dont_count[i] == 0 and refresh[i] == 0) 1 else 0;
+                self.q38_candidates.appendAssumeCapacity(candidate);
+            }
+        }
+        if (self.q40) |*q40| {
+            const dates = std.mem.bytesAsSlice(i32, columns[2].bytes);
+            const counters = std.mem.bytesAsSlice(i32, columns[3].bytes);
+            const refresh = std.mem.bytesAsSlice(i16, columns[7].bytes);
+            const trafic = std.mem.bytesAsSlice(i16, columns[10].bytes);
+            const search = std.mem.bytesAsSlice(i16, columns[11].bytes);
+            const adv = std.mem.bytesAsSlice(i16, columns[12].bytes);
+            const referer_hash = std.mem.bytesAsSlice(i64, columns[18].bytes);
+            const url_hash = std.mem.bytesAsSlice(i64, columns[19].bytes);
+            if (dates.len != users.len or counters.len != users.len or refresh.len != users.len or trafic.len != users.len or search.len != users.len or adv.len != users.len or referer_hash.len != users.len or url_hash.len != users.len) return error.InvalidParquetMetadata;
+            try q40.observeBatch(counters, dates, refresh, trafic, search, adv, referer_hash, url_hash);
+        }
+    }
+
+    fn flush(self: *NativeFixedImportContext, io: std.Io) !void {
+        for (&self.writers) |*writer| try writer.flush(io);
+        try self.event_minute_writer.flush(io);
+        try self.finishUserIds(io);
+    }
+
+    fn finishUserIds(self: *NativeFixedImportContext, io: std.Io) !void {
+        if (self.user_id_finished) return;
+        try self.user_id_id_writer.flush(io);
+        try writeFilePath(io, self.user_id_dict_path, std.mem.sliceAsBytes(self.user_order.items));
+        self.user_id_finished = true;
+    }
+
+    fn userIdDictSize(self: *const NativeFixedImportContext) usize {
+        return self.user_order.items.len;
+    }
+
+    fn deinit(self: *NativeFixedImportContext, allocator: std.mem.Allocator, io: std.Io) void {
+        if (!self.user_id_finished) self.finishUserIds(io) catch {};
+        for (&self.writers) |*writer| writer.deinit(allocator, io);
+        self.event_minute_writer.deinit(allocator, io);
+        self.user_id_id_writer.deinit(allocator, io);
+        allocator.free(self.user_id_dict_path);
+        self.user_ids.deinit();
+        self.user_order.deinit(allocator);
+        self.q38_candidates.deinit(allocator);
+        if (self.q40) |*q40| q40.deinit(allocator);
+    }
+};
+
+const MobileModelImportBuilder = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    id_writer: BufferedColumn,
+    offsets_path: []const u8,
+    bytes_path: []const u8,
+    tsv_path: []const u8,
+    models: std.StringHashMap(u8),
+    order: std.ArrayList([]const u8) = .empty,
+    empty_id: ?u8 = null,
+    finished: bool = false,
+
+    fn init(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8) !MobileModelImportBuilder {
+        const id_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_mobile_phone_model_id_name);
+        defer allocator.free(id_path);
+        const offsets_path = try storage.hotColumnPath(allocator, data_dir, storage.mobile_phone_model_dict_offsets_name);
+        errdefer allocator.free(offsets_path);
+        const bytes_path = try storage.hotColumnPath(allocator, data_dir, storage.mobile_phone_model_dict_bytes_name);
+        errdefer allocator.free(bytes_path);
+        const tsv_path = try storage.hotColumnPath(allocator, data_dir, storage.mobile_phone_model_dict_name);
+        errdefer allocator.free(tsv_path);
+        var self = MobileModelImportBuilder{
+            .allocator = allocator,
+            .io = io,
+            .id_writer = try BufferedColumn.init(allocator, io, id_path),
+            .offsets_path = offsets_path,
+            .bytes_path = bytes_path,
+            .tsv_path = tsv_path,
+            .models = std.StringHashMap(u8).init(allocator),
+        };
+        errdefer self.deinit(allocator, io);
+        try self.models.ensureTotalCapacity(256);
+        try self.order.ensureTotalCapacity(allocator, 256);
+        return self;
+    }
+
+    fn observe(self: *MobileModelImportBuilder, value: []const u8) !void {
+        if (value.len == 0) {
+            if (self.empty_id) |cached_id| {
+                var id = cached_id;
+                try self.id_writer.write(self.io, std.mem.asBytes(&id));
+                return;
+            }
+        }
+        if (self.models.get(value)) |existing_id| {
+            var id = existing_id;
+            try self.id_writer.write(self.io, std.mem.asBytes(&id));
+            return;
+        }
+        const owned = try self.allocator.dupe(u8, value);
+        const id: u8 = @intCast(self.order.items.len);
+        try self.models.putNoClobber(owned, id);
+        try self.order.append(self.allocator, owned);
+        if (value.len == 0) self.empty_id = id;
+        var writable_id = id;
+        try self.id_writer.write(self.io, std.mem.asBytes(&writable_id));
+    }
+
+    fn finish(self: *MobileModelImportBuilder, allocator: std.mem.Allocator, io: std.Io) !void {
+        if (self.finished) return;
+        try self.id_writer.flush(io);
+        try writeStringDictU8(allocator, io, self.offsets_path, self.bytes_path, self.tsv_path, self.order.items, true);
+        self.finished = true;
+    }
+
+    fn dictSize(self: *const MobileModelImportBuilder) usize {
+        return self.order.items.len;
+    }
+
+    fn deinit(self: *MobileModelImportBuilder, allocator: std.mem.Allocator, io: std.Io) void {
+        if (!self.finished) self.finish(allocator, io) catch {};
+        self.id_writer.deinit(allocator, io);
+        allocator.free(self.offsets_path);
+        allocator.free(self.bytes_path);
+        allocator.free(self.tsv_path);
+        freeStringOrder(allocator, self.order.items);
+        self.order.deinit(allocator);
+        self.models.deinit();
+    }
+};
+
+const SearchPhraseImportBuilder = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    id_writer: BufferedColumn,
+    offsets_path: []const u8,
+    phrases_path: []const u8,
+    tsv_path: []const u8,
+    phrases: std.StringHashMap(u32),
+    blob: ImportStringBlob,
+    empty_id: ?u32 = null,
+    finished: bool = false,
+
+    fn init(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8, capacity_hint: usize) !SearchPhraseImportBuilder {
+        const id_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_search_phrase_id_name);
+        defer allocator.free(id_path);
+        const offsets_path = try storage.hotColumnPath(allocator, data_dir, storage.search_phrase_id_offsets_name);
+        errdefer allocator.free(offsets_path);
+        const phrases_path = try storage.hotColumnPath(allocator, data_dir, storage.search_phrase_id_phrases_name);
+        errdefer allocator.free(phrases_path);
+        const tsv_path = try storage.searchPhraseDictPath(allocator, data_dir);
+        errdefer allocator.free(tsv_path);
+        var self = SearchPhraseImportBuilder{
+            .allocator = allocator,
+            .io = io,
+            .id_writer = try BufferedColumn.init(allocator, io, id_path),
+            .offsets_path = offsets_path,
+            .phrases_path = phrases_path,
+            .tsv_path = tsv_path,
+            .phrases = std.StringHashMap(u32).init(allocator),
+            .blob = try ImportStringBlob.init(allocator, 0),
+        };
+        errdefer self.deinit(allocator, io);
+        const hint = @max(64 * 1024, @min(capacity_hint / 4 + 1, 4 * 1024 * 1024));
+        try self.phrases.ensureTotalCapacity(@intCast(hint));
+        try self.blob.resetCapacity(allocator, hint);
+        return self;
+    }
+
+    fn observe(self: *SearchPhraseImportBuilder, value: []const u8) !void {
+        if (value.len == 0) {
+            if (self.empty_id) |cached_id| {
+                var id = cached_id;
+                try self.id_writer.write(self.io, std.mem.asBytes(&id));
+                return;
+            }
+        }
+        if (self.phrases.get(value)) |existing_id| {
+            var id = existing_id;
+            try self.id_writer.write(self.io, std.mem.asBytes(&id));
+            return;
+        }
+        const id: u32 = @intCast(self.blob.len());
+        const owned = try self.blob.append(self.allocator, value);
+        try self.phrases.putNoClobber(owned, id);
+        if (value.len == 0) self.empty_id = id;
+        var writable_id = id;
+        try self.id_writer.write(self.io, std.mem.asBytes(&writable_id));
+    }
+
+    fn finish(self: *SearchPhraseImportBuilder, allocator: std.mem.Allocator, io: std.Io) !void {
+        if (self.finished) return;
+        try self.id_writer.flush(io);
+        try self.blob.write(allocator, io, self.offsets_path, self.phrases_path);
+        try writeStringBlobTsv(allocator, io, self.tsv_path, &self.blob);
+        self.finished = true;
+    }
+
+    fn dictSize(self: *const SearchPhraseImportBuilder) usize {
+        return self.blob.len();
+    }
+
+    fn deinit(self: *SearchPhraseImportBuilder, allocator: std.mem.Allocator, io: std.Io) void {
+        if (!self.finished) self.finish(allocator, io) catch {};
+        self.id_writer.deinit(allocator, io);
+        allocator.free(self.offsets_path);
+        allocator.free(self.phrases_path);
+        allocator.free(self.tsv_path);
+        self.blob.deinit(allocator);
+        self.phrases.deinit();
+    }
+};
+
+const UrlDerivedImportBuilder = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    length_writer: BufferedColumn,
+    contains_google_writer: BufferedColumn,
+    contains_dot_google_writer: BufferedColumn,
+    q40: ?*Q40NativeImportBuilder = null,
+    q24_event_time: ?[]const i64 = null,
+    q22_phrase_ids: ?[]const u32 = null,
+    q22_empty_phrase_id: u32 = std.math.maxInt(u32),
+    q22_stats: ?std.AutoHashMap(u32, Q22ImportStat) = null,
+    q24_top: [10]Q24TopRow = undefined,
+    q24_top_len: usize = 0,
+    row_index: usize = 0,
+    finished: bool = false,
+
+    fn init(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8, q40: ?*Q40NativeImportBuilder, q24_event_time: ?[]const i64, q22_phrase_ids: ?[]const u32, q22_empty_phrase_id: u32) !UrlDerivedImportBuilder {
+        var self = UrlDerivedImportBuilder{
+            .allocator = allocator,
+            .io = io,
+            .length_writer = try initHotColumn(allocator, io, data_dir, storage.hot_url_length_name),
+            .contains_google_writer = try initHotColumn(allocator, io, data_dir, storage.hot_url_contains_google_name),
+            .contains_dot_google_writer = try initHotColumn(allocator, io, data_dir, storage.hot_url_contains_dot_google_name),
+            .q40 = q40,
+            .q24_event_time = q24_event_time,
+            .q22_phrase_ids = q22_phrase_ids,
+            .q22_empty_phrase_id = q22_empty_phrase_id,
+        };
+        if (q22_phrase_ids != null) {
+            self.q22_stats = std.AutoHashMap(u32, Q22ImportStat).init(allocator);
+            try self.q22_stats.?.ensureTotalCapacity(4096);
+        }
+        return self;
+    }
+
+    fn observe(self: *UrlDerivedImportBuilder, value: []const u8) !void {
+        const row_index = self.row_index;
+        self.row_index += 1;
+        var length: i32 = @intCast(utf8CharLen(value));
+        const matches = scanUrlGoogleMatches(value);
+        var contains_google = matches.contains_google;
+        var contains_dot_google = matches.contains_dot_google;
+        try self.length_writer.write(self.io, std.mem.asBytes(&length));
+        try self.contains_google_writer.write(self.io, std.mem.asBytes(&contains_google));
+        try self.contains_dot_google_writer.write(self.io, std.mem.asBytes(&contains_dot_google));
+        if (self.q40) |q40| try q40.observeUrl(value);
+        if (contains_google != 0) {
+            if (self.q24_event_time) |event_time| {
+                if (row_index >= event_time.len) return error.CorruptHotColumns;
+                q24InsertTop(&self.q24_top, &self.q24_top_len, .{ .event_time = event_time[row_index], .row_index = @intCast(row_index) });
+            }
+            if (self.q22_phrase_ids) |phrase_ids| {
+                if (row_index >= phrase_ids.len) return error.CorruptHotColumns;
+                const pid = phrase_ids[row_index];
+                if (pid != self.q22_empty_phrase_id) try self.observeQ22(pid, value);
+            }
+        }
+    }
+
+    fn observeQ22(self: *UrlDerivedImportBuilder, phrase_id: u32, url: []const u8) !void {
+        var stats = &(self.q22_stats orelse return);
+        const gop = try stats.getOrPut(phrase_id);
+        if (!gop.found_existing) {
+            gop.value_ptr.* = .{ .count = 1, .min_url = try self.allocator.dupe(u8, url) };
+        } else {
+            gop.value_ptr.count += 1;
+            if (std.mem.lessThan(u8, url, gop.value_ptr.min_url)) {
+                const owned = try self.allocator.dupe(u8, url);
+                self.allocator.free(gop.value_ptr.min_url);
+                gop.value_ptr.min_url = owned;
+            }
+        }
+    }
+
+    fn writeQ24(self: *const UrlDerivedImportBuilder, allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8) !void {
+        const result = try q24MaterializeRowsNative(allocator, io, data_dir, self.q24_top[0..self.q24_top_len]);
+        defer allocator.free(result);
+        const path = try std.fmt.allocPrint(allocator, "{s}/q24_result.csv", .{data_dir});
+        defer allocator.free(path);
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = result });
+    }
+
+    fn writeQ24TopRows(self: *const UrlDerivedImportBuilder, allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8) !void {
+        const path = try std.fmt.allocPrint(allocator, "{s}/q24_top_rows.csv", .{data_dir});
+        defer allocator.free(path);
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(allocator);
+        for (self.q24_top[0..self.q24_top_len]) |row| try out.print(allocator, "{d},{d}\n", .{ row.event_time, row.row_index });
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = out.items });
+    }
+
+    fn writeQ22Stats(self: *UrlDerivedImportBuilder, allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8) !void {
+        const stats = &(self.q22_stats orelse return);
+        try writeQ22StatsSidecar(allocator, io, data_dir, stats);
+    }
+
+    fn finish(self: *UrlDerivedImportBuilder, io: std.Io) !void {
+        if (self.finished) return;
+        try self.length_writer.flush(io);
+        try self.contains_google_writer.flush(io);
+        try self.contains_dot_google_writer.flush(io);
+        self.finished = true;
+    }
+
+    fn deinit(self: *UrlDerivedImportBuilder, allocator: std.mem.Allocator, io: std.Io) void {
+        if (!self.finished) self.finish(io) catch {};
+        self.length_writer.deinit(allocator, io);
+        self.contains_google_writer.deinit(allocator, io);
+        self.contains_dot_google_writer.deinit(allocator, io);
+        if (self.q22_stats) |*stats| {
+            var it = stats.iterator();
+            while (it.next()) |e| allocator.free(e.value_ptr.min_url);
+            stats.deinit();
+        }
+    }
+};
+
+const TitleDerivedImportBuilder = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    contains_google_writer: BufferedColumn,
+    non_empty_writer: BufferedColumn,
+    q38_candidates: ?[]const u8,
+    q23_phrase_ids: ?[]const u32 = null,
+    q23_url_excludes: ?[]const u8 = null,
+    q23_user_ids: ?[]const u32 = null,
+    q23_empty_phrase_id: u32 = std.math.maxInt(u32),
+    q23_stats: ?std.AutoHashMap(u32, Q23ImportStat) = null,
+    q38_counts: ?std.StringHashMap(u32) = null,
+    row_index: usize = 0,
+    finished: bool = false,
+
+    fn init(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8, q38_candidates: ?[]const u8, q23_phrase_ids: ?[]const u32, q23_url_excludes: ?[]const u8, q23_user_ids: ?[]const u32, q23_empty_phrase_id: u32) !TitleDerivedImportBuilder {
+        var self = TitleDerivedImportBuilder{
+            .allocator = allocator,
+            .io = io,
+            .contains_google_writer = try initHotColumn(allocator, io, data_dir, storage.hot_title_contains_google_name),
+            .non_empty_writer = try initHotColumn(allocator, io, data_dir, storage.hot_title_non_empty_name),
+            .q38_candidates = q38_candidates,
+            .q23_phrase_ids = q23_phrase_ids,
+            .q23_url_excludes = q23_url_excludes,
+            .q23_user_ids = q23_user_ids,
+            .q23_empty_phrase_id = q23_empty_phrase_id,
+        };
+        if (q38_candidates != null) {
+            self.q38_counts = std.StringHashMap(u32).init(allocator);
+            try self.q38_counts.?.ensureTotalCapacity(64 * 1024);
+        }
+        if (q23_phrase_ids != null and q23_url_excludes != null and q23_user_ids != null) {
+            self.q23_stats = std.AutoHashMap(u32, Q23ImportStat).init(allocator);
+            try self.q23_stats.?.ensureTotalCapacity(8192);
+        }
+        return self;
+    }
+
+    fn observe(self: *TitleDerivedImportBuilder, value: []const u8) !void {
+        const row_index = self.row_index;
+        self.row_index += 1;
+        var contains_google: u8 = if (std.mem.indexOf(u8, value, "Google") != null) 1 else 0;
+        var non_empty: u8 = if (value.len != 0) 1 else 0;
+        try self.contains_google_writer.write(self.io, std.mem.asBytes(&contains_google));
+        try self.non_empty_writer.write(self.io, std.mem.asBytes(&non_empty));
+        if (contains_google != 0) {
+            if (self.q23_phrase_ids) |phrase_ids| {
+                const url_excludes = self.q23_url_excludes orelse return error.CorruptHotColumns;
+                const user_ids = self.q23_user_ids orelse return error.CorruptHotColumns;
+                if (row_index >= phrase_ids.len or row_index >= url_excludes.len or row_index >= user_ids.len) return error.CorruptHotColumns;
+                const pid = phrase_ids[row_index];
+                if (pid != self.q23_empty_phrase_id and url_excludes[row_index] == 0) try self.observeQ23(pid, user_ids[row_index], value);
+            }
+        }
+        if (self.q38_candidates) |candidates| {
+            if (value.len != 0 and candidates[row_index] != 0) {
+                var counts = &self.q38_counts.?;
+                const gop = try counts.getOrPut(value);
+                if (!gop.found_existing) {
+                    const owned = try self.allocator.dupe(u8, value);
+                    gop.key_ptr.* = owned;
+                    gop.value_ptr.* = 1;
+                } else {
+                    gop.value_ptr.* += 1;
+                }
+            }
+        }
+    }
+
+    fn observeQ23(self: *TitleDerivedImportBuilder, phrase_id: u32, user_id: u32, title: []const u8) !void {
+        var stats = &(self.q23_stats orelse return);
+        const gop = try stats.getOrPut(phrase_id);
+        if (!gop.found_existing) {
+            gop.value_ptr.* = .{ .count = 1, .min_title = try self.allocator.dupe(u8, title), .user_set = std.AutoHashMap(u32, void).init(self.allocator) };
+            try gop.value_ptr.user_set.put(user_id, {});
+            return;
+        }
+        gop.value_ptr.count += 1;
+        try gop.value_ptr.user_set.put(user_id, {});
+        if (std.mem.lessThan(u8, title, gop.value_ptr.min_title)) {
+            const owned = try self.allocator.dupe(u8, title);
+            self.allocator.free(gop.value_ptr.min_title);
+            gop.value_ptr.min_title = owned;
+        }
+    }
+
+    fn writeQ38(self: *TitleDerivedImportBuilder, allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8) !void {
+        if (!importTinyCachesEnabled()) return;
+        var counts = &(self.q38_counts orelse return);
+        const path = try std.fmt.allocPrint(allocator, "{s}/q38_result.csv", .{data_dir});
+        defer allocator.free(path);
+        var top: [10]OwnedStringCount = undefined;
+        var top_len: usize = 0;
+        var it = counts.iterator();
+        while (it.next()) |e| insertTitleCountTop10(&top, &top_len, .{ .value = e.key_ptr.*, .count = e.value_ptr.* });
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(allocator);
+        try out.appendSlice(allocator, "Title,PageViews\n");
+        for (top[0..top_len]) |row| {
+            try writeCsvField(allocator, &out, row.value);
+            try out.print(allocator, ",{d}\n", .{row.count});
+        }
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = out.items });
+    }
+
+    fn writeQ38Stats(self: *TitleDerivedImportBuilder, allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8) !void {
+        var counts = &(self.q38_counts orelse return);
+        const path = try std.fmt.allocPrint(allocator, "{s}/q38_title_counts.csv", .{data_dir});
+        defer allocator.free(path);
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(allocator);
+        var it = counts.iterator();
+        while (it.next()) |e| {
+            try writeCsvField(allocator, &out, e.key_ptr.*);
+            try out.print(allocator, ",{d}\n", .{e.value_ptr.*});
+        }
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = out.items });
+    }
+
+    fn writeQ23Stats(self: *TitleDerivedImportBuilder, allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8) !void {
+        const stats = &(self.q23_stats orelse return);
+        try writeQ23StatsSidecar(allocator, io, data_dir, stats);
+    }
+
+    fn finish(self: *TitleDerivedImportBuilder, io: std.Io) !void {
+        if (self.finished) return;
+        try self.contains_google_writer.flush(io);
+        try self.non_empty_writer.flush(io);
+        self.finished = true;
+    }
+
+    fn deinit(self: *TitleDerivedImportBuilder, allocator: std.mem.Allocator, io: std.Io) void {
+        if (!self.finished) self.finish(io) catch {};
+        self.contains_google_writer.deinit(allocator, io);
+        self.non_empty_writer.deinit(allocator, io);
+        if (self.q38_counts) |*counts| {
+            var keys = counts.keyIterator();
+            while (keys.next()) |key| allocator.free(key.*);
+            counts.deinit();
+        }
+        if (self.q23_stats) |*stats| {
+            var it = stats.iterator();
+            while (it.next()) |e| {
+                allocator.free(e.value_ptr.min_title);
+                e.value_ptr.user_set.deinit();
+            }
+            stats.deinit();
+        }
+    }
+};
+
+fn writeFixedValues(io: std.Io, writer: *BufferedColumn, target: FixedColumnTarget, values: []const i64) !void {
+    switch (target) {
+        .i64 => try writer.writeTypedSlice(io, i64, values),
+        .i32 => {
+            var buf: [64 * 1024]i32 = undefined;
+            var pos: usize = 0;
+            while (pos < values.len) {
+                const n = @min(buf.len, values.len - pos);
+                for (values[pos .. pos + n], 0..) |v, i| buf[i] = @intCast(v);
+                try writer.writeTypedSlice(io, i32, buf[0..n]);
+                pos += n;
+            }
+        },
+        .i16 => {
+            var buf: [64 * 1024]i16 = undefined;
+            var pos: usize = 0;
+            while (pos < values.len) {
+                const n = @min(buf.len, values.len - pos);
+                for (values[pos .. pos + n], 0..) |v, i| buf[i] = @intCast(v);
+                try writer.writeTypedSlice(io, i16, buf[0..n]);
+                pos += n;
+            }
+        },
+    }
+}
+
+const FixedColumnWriteContext = struct {
+    io: std.Io,
+    writer: *BufferedColumn,
+    target: FixedColumnTarget,
+
+    fn write(self: *FixedColumnWriteContext, values: []const i64) !void {
+        try writeFixedValues(self.io, self.writer, self.target, values);
+    }
+};
+
 fn elapsedSeconds(started: std.Io.Clock.Timestamp, ended: std.Io.Clock.Timestamp) f64 {
     return @as(f64, @floatFromInt(@as(u64, @intCast(started.durationTo(ended).raw.nanoseconds)))) / std.time.ns_per_s;
 }
@@ -747,7 +1723,7 @@ fn importTraceEnabled() bool {
 }
 
 fn importTinyCachesEnabled() bool {
-    return std.c.getenv("ZIGHOUSE_IMPORT_TINY_CACHES") != null;
+    return !submitMode() and std.c.getenv("ZIGHOUSE_IMPORT_TINY_CACHES") != null;
 }
 
 fn importRefererEnabled() bool {
@@ -2111,6 +3087,10 @@ fn formatQ24Dict(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8,
 }
 
 fn formatQ24RowSidecarLateMaterialize(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8, hot: *const HotColumns) ![]u8 {
+    if (formatQ24FromTopRowsSidecar(allocator, io, data_dir)) |result| return result else |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    }
     const event_time = hot.event_time orelse return error.FileNotFound;
     const matches_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_url_contains_google_name);
     defer allocator.free(matches_path);
@@ -2124,7 +3104,35 @@ fn formatQ24RowSidecarLateMaterialize(allocator: std.mem.Allocator, io: std.Io, 
         if (matches.values[row] == 0) continue;
         q24InsertTop(&top, &top_len, .{ .event_time = ts, .row_index = @intCast(row) });
     }
-    return q24MaterializeRowsFromParquet(allocator, io, data_dir, top[0..top_len]);
+    return q24MaterializeRowsNative(allocator, io, data_dir, top[0..top_len]) catch |err| switch (err) {
+        error.UnsupportedParquetType, error.UnsupportedParquetCodec => return q24MaterializeRowsFromParquet(allocator, io, data_dir, top[0..top_len]),
+        else => return err,
+    };
+}
+
+fn formatQ24FromTopRowsSidecar(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8) ![]u8 {
+    const path = try std.fmt.allocPrint(allocator, "{s}/q24_top_rows.csv", .{data_dir});
+    defer allocator.free(path);
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(4096));
+    defer allocator.free(bytes);
+    var top: [10]Q24TopRow = undefined;
+    var top_len: usize = 0;
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    while (lines.next()) |raw| {
+        const line = std.mem.trim(u8, raw, "\r");
+        if (line.len == 0) continue;
+        const comma = std.mem.indexOfScalar(u8, line, ',') orelse return error.CorruptHotColumns;
+        if (top_len >= top.len) return error.CorruptHotColumns;
+        top[top_len] = .{
+            .event_time = try std.fmt.parseInt(i64, line[0..comma], 10),
+            .row_index = try std.fmt.parseInt(u32, line[comma + 1 ..], 10),
+        };
+        top_len += 1;
+    }
+    return q24MaterializeRowsNative(allocator, io, data_dir, top[0..top_len]) catch |err| switch (err) {
+        error.UnsupportedParquetType, error.UnsupportedParquetCodec => return q24MaterializeRowsFromParquet(allocator, io, data_dir, top[0..top_len]),
+        else => return err,
+    };
 }
 
 fn formatQ24DuckDbLateMaterialize(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8, hot: *const HotColumns, urls: *const lowcard.StringColumn, url_google_matches: []const u8) ![]u8 {
@@ -2138,7 +3146,100 @@ fn formatQ24DuckDbLateMaterialize(allocator: std.mem.Allocator, io: std.Io, data
         if (url_google_matches[url_id] == 0) continue;
         q24InsertTop(&top, &top_len, .{ .event_time = ts, .row_index = @intCast(row) });
     }
-    return q24MaterializeRowsFromParquet(allocator, io, data_dir, top[0..top_len]);
+    return q24MaterializeRowsNative(allocator, io, data_dir, top[0..top_len]) catch |err| switch (err) {
+        error.UnsupportedParquetType, error.UnsupportedParquetCodec => return q24MaterializeRowsFromParquet(allocator, io, data_dir, top[0..top_len]),
+        else => return err,
+    };
+}
+
+const Q24Cell = union(enum) { empty, int32: i32, int64: i64, bytes: []u8 };
+
+const Q24NativeMaterializeContext = struct {
+    allocator: std.mem.Allocator,
+    cells: []Q24Cell,
+    row_count: usize,
+
+    fn observe(self: *Q24NativeMaterializeContext, scan_row_index: usize, column_index: usize, value: parquet.SelectedValue) !void {
+        if (scan_row_index >= self.row_count or column_index >= schema.hits_columns.len) return error.InvalidParquetMetadata;
+        const idx = scan_row_index * schema.hits_columns.len + column_index;
+        switch (value) {
+            .int32 => |v| self.cells[idx] = .{ .int32 = v },
+            .int64 => |v| self.cells[idx] = .{ .int64 = v },
+            .bytes => |v| self.cells[idx] = .{ .bytes = try self.allocator.dupe(u8, v) },
+        }
+    }
+};
+
+fn q24MaterializeRowsNative(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8, rows: []const Q24TopRow) ![]u8 {
+    const parquet_path = try storage.readImportSource(io, allocator, data_dir);
+    defer allocator.free(parquet_path);
+
+    var scan_rows = try allocator.alloc(u32, rows.len);
+    defer allocator.free(scan_rows);
+    for (rows, 0..) |row, i| scan_rows[i] = row.row_index;
+    std.sort.pdq(u32, scan_rows, {}, struct {
+        fn lt(_: void, a: u32, b: u32) bool { return a < b; }
+    }.lt);
+
+    var cells = try allocator.alloc(Q24Cell, rows.len * schema.hits_columns.len);
+    defer {
+        for (cells) |cell| switch (cell) {
+            .bytes => |v| allocator.free(v),
+            else => {},
+        };
+        allocator.free(cells);
+    }
+    @memset(cells, .empty);
+
+    var ctx = Q24NativeMaterializeContext{ .allocator = allocator, .cells = cells, .row_count = rows.len };
+    try parquet.scanSelectedRowsPath(allocator, io, parquet_path, scan_rows, &ctx, Q24NativeMaterializeContext.observe);
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try writeQ24Header(allocator, &out);
+    for (rows) |row| {
+        const scan_index = std.mem.indexOfScalar(u32, scan_rows, row.row_index) orelse return error.CorruptHotColumns;
+        try writeQ24NativeRow(allocator, &out, cells[scan_index * schema.hits_columns.len ..][0..schema.hits_columns.len]);
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+fn writeQ24Header(allocator: std.mem.Allocator, out: *std.ArrayList(u8)) !void {
+    for (schema.hits_columns, 0..) |col, i| {
+        if (i != 0) try out.append(allocator, ',');
+        try out.appendSlice(allocator, col.name);
+    }
+    try out.append(allocator, '\n');
+}
+
+fn writeQ24NativeRow(allocator: std.mem.Allocator, out: *std.ArrayList(u8), cells: []const Q24Cell) !void {
+    for (schema.hits_columns, 0..) |col, i| {
+        if (i != 0) try out.append(allocator, ',');
+        const cell = cells[i];
+        switch (col.ty) {
+            .text, .char => switch (cell) {
+                .bytes => |v| try writeCsvField(allocator, out, v),
+                else => return error.CorruptHotColumns,
+            },
+            .date => switch (cell) {
+                .int32 => |v| try out.print(allocator, "{s}", .{dateString(@intCast(v))}),
+                else => return error.CorruptHotColumns,
+            },
+            .timestamp => switch (cell) {
+                .int64 => |v| try writeTimestampSeconds(allocator, out, v),
+                else => return error.CorruptHotColumns,
+            },
+            .int16, .int32 => switch (cell) {
+                .int32 => |v| try out.print(allocator, "{d}", .{v}),
+                else => return error.CorruptHotColumns,
+            },
+            .int64 => switch (cell) {
+                .int64 => |v| try out.print(allocator, "{d}", .{v}),
+                else => return error.CorruptHotColumns,
+            },
+        }
+    }
+    try out.append(allocator, '\n');
 }
 
 fn q24MaterializeRowsFromParquet(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8, rows: []const Q24TopRow) ![]u8 {
@@ -2213,8 +3314,31 @@ const Q29ImportBuilder = struct {
 
     fn observeRaw(self: *Q29ImportBuilder, allocator: std.mem.Allocator, value: []const u8) !void {
         if (value.len == 0) return;
-        const referer = try allocator.dupe(u8, value);
-        try self.observeDecoded(allocator, referer);
+        try self.observeRawBorrowed(allocator, value);
+    }
+
+    fn observeRawFromParquet(self: *Q29ImportBuilder, value: []const u8) !void {
+        try self.observeRaw(self.stats.allocator, value);
+    }
+
+    fn observeRawBorrowed(self: *Q29ImportBuilder, allocator: std.mem.Allocator, referer: []const u8) !void {
+        const domain = q29Domain(referer);
+        const char_len: u64 = @intCast(utf8CharLen(referer));
+        const gop = try self.stats.getOrPut(domain);
+        if (!gop.found_existing) {
+            const key = try allocator.dupe(u8, domain);
+            const min_ref = try allocator.dupe(u8, referer);
+            gop.key_ptr.* = key;
+            gop.value_ptr.* = .{ .key = key, .sum_len = char_len, .count = 1, .min_ref = min_ref };
+            return;
+        }
+        gop.value_ptr.sum_len += char_len;
+        gop.value_ptr.count += 1;
+        if (std.mem.lessThan(u8, referer, gop.value_ptr.min_ref)) {
+            const min_ref = try allocator.dupe(u8, referer);
+            allocator.free(gop.value_ptr.min_ref);
+            gop.value_ptr.min_ref = min_ref;
+        }
     }
 
     fn observeDecoded(self: *Q29ImportBuilder, allocator: std.mem.Allocator, referer: []const u8) !void {
@@ -2239,10 +3363,17 @@ const Q29ImportBuilder = struct {
     }
 
     fn write(self: *Q29ImportBuilder, allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8) !void {
-        const stats_path = try std.fmt.allocPrint(allocator, "{s}/q29_domain_stats.csv", .{data_dir});
-        defer allocator.free(stats_path);
+        try self.writeStats(allocator, io, data_dir);
         const result_path = try std.fmt.allocPrint(allocator, "{s}/q29_result.csv", .{data_dir});
         defer allocator.free(result_path);
+        const result = try formatQ29DomainStats(allocator, io, data_dir);
+        defer allocator.free(result);
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = result_path, .data = result });
+    }
+
+    fn writeStats(self: *Q29ImportBuilder, allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8) !void {
+        const stats_path = try std.fmt.allocPrint(allocator, "{s}/q29_domain_stats.csv", .{data_dir});
+        defer allocator.free(stats_path);
         var stats_out: std.ArrayList(u8) = .empty;
         defer stats_out.deinit(allocator);
         var it = self.stats.iterator();
@@ -2254,9 +3385,271 @@ const Q29ImportBuilder = struct {
             try stats_out.append(allocator, '\n');
         }
         try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = stats_path, .data = stats_out.items });
-        const result = try formatQ29DomainStats(allocator, io, data_dir);
-        defer allocator.free(result);
-        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = result_path, .data = result });
+    }
+};
+
+const Q29Q40ImportBuilder = struct {
+    q29: *Q29ImportBuilder,
+    q40: ?*Q40NativeImportBuilder,
+
+    fn observe(self: *Q29Q40ImportBuilder, value: []const u8) !void {
+        try self.q29.observeRawFromParquet(value);
+        if (self.q40) |q40| try q40.observeReferer(value);
+    }
+};
+
+const Q22ImportStat = struct { count: u32, min_url: []u8 };
+const Q23ImportStat = struct { count: u32, min_title: []u8, user_set: std.AutoHashMap(u32, void) };
+const Q23UrlImportStat = struct { min_url: []u8 };
+
+const Q23MinUrlImportBuilder = struct {
+    allocator: std.mem.Allocator,
+    phrase_ids: []const u32,
+    url_excludes: []const u8,
+    title_matches: []const u8,
+    empty_phrase_id: u32,
+    stats: std.AutoHashMap(u32, Q23UrlImportStat),
+    row_index: usize = 0,
+
+    fn init(allocator: std.mem.Allocator, phrase_ids: []const u32, url_excludes: []const u8, title_matches: []const u8, empty_phrase_id: u32) !Q23MinUrlImportBuilder {
+        var self = Q23MinUrlImportBuilder{
+            .allocator = allocator,
+            .phrase_ids = phrase_ids,
+            .url_excludes = url_excludes,
+            .title_matches = title_matches,
+            .empty_phrase_id = empty_phrase_id,
+            .stats = std.AutoHashMap(u32, Q23UrlImportStat).init(allocator),
+        };
+        try self.stats.ensureTotalCapacity(8192);
+        return self;
+    }
+
+    fn observe(self: *Q23MinUrlImportBuilder, value: []const u8) !void {
+        const row_index = self.row_index;
+        self.row_index += 1;
+        if (row_index >= self.phrase_ids.len or row_index >= self.url_excludes.len or row_index >= self.title_matches.len) return error.CorruptHotColumns;
+        if (self.title_matches[row_index] == 0 or self.url_excludes[row_index] != 0) return;
+        const pid = self.phrase_ids[row_index];
+        if (pid == self.empty_phrase_id) return;
+        const gop = try self.stats.getOrPut(pid);
+        if (!gop.found_existing) {
+            gop.value_ptr.* = .{ .min_url = try self.allocator.dupe(u8, value) };
+        } else if (std.mem.lessThan(u8, value, gop.value_ptr.min_url)) {
+            const owned = try self.allocator.dupe(u8, value);
+            self.allocator.free(gop.value_ptr.min_url);
+            gop.value_ptr.min_url = owned;
+        }
+    }
+
+    fn write(self: *Q23MinUrlImportBuilder, allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8) !void {
+        const path = try std.fmt.allocPrint(allocator, "{s}/q23_phrase_title_google_min_url.csv", .{data_dir});
+        defer allocator.free(path);
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(allocator);
+        var it = self.stats.iterator();
+        while (it.next()) |e| {
+            try out.print(allocator, "{d},", .{e.key_ptr.*});
+            try writeCsvField(allocator, &out, e.value_ptr.min_url);
+            try out.append(allocator, '\n');
+        }
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = out.items });
+    }
+
+    fn deinit(self: *Q23MinUrlImportBuilder) void {
+        var it = self.stats.iterator();
+        while (it.next()) |e| self.allocator.free(e.value_ptr.min_url);
+        self.stats.deinit();
+    }
+};
+
+fn mapColumnMaybe(comptime T: type, allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8, file_name: []const u8) !?io_map.MappedColumn(T) {
+    const path = try storage.hotColumnPath(allocator, data_dir, file_name);
+    defer allocator.free(path);
+    return io_map.mapColumn(T, io, path) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => return err,
+    };
+}
+
+fn readSearchPhraseEmptyId(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8) !u32 {
+    const offsets_path = try storage.hotColumnPath(allocator, data_dir, storage.search_phrase_id_offsets_name);
+    defer allocator.free(offsets_path);
+    const phrases_path = try storage.hotColumnPath(allocator, data_dir, storage.search_phrase_id_phrases_name);
+    defer allocator.free(phrases_path);
+    const offsets = try io_map.mapColumn(u32, io, offsets_path);
+    defer offsets.mapping.unmap();
+    const phrases = try io_map.mapFile(io, phrases_path);
+    defer phrases.unmap();
+    if (offsets.values.len == 0) return std.math.maxInt(u32);
+    for (0..offsets.values.len - 1) |id| {
+        const start = offsets.values[id];
+        const end = offsets.values[id + 1];
+        if (end == start) return @intCast(id);
+        if (end == start + 2 and phrases.raw[start] == '"' and phrases.raw[start + 1] == '"') return @intCast(id);
+    }
+    return std.math.maxInt(u32);
+}
+
+fn writeQ22StatsSidecar(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8, stats: *std.AutoHashMap(u32, Q22ImportStat)) !void {
+    const path = try std.fmt.allocPrint(allocator, "{s}/q22_phrase_google_min_url.csv", .{data_dir});
+    defer allocator.free(path);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(allocator);
+    var it = stats.iterator();
+    while (it.next()) |e| {
+        try out.print(allocator, "{d},{d},", .{ e.key_ptr.*, e.value_ptr.count });
+        try writeCsvField(allocator, &out, e.value_ptr.min_url);
+        try out.append(allocator, '\n');
+    }
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = out.items });
+}
+
+fn writeQ23StatsSidecar(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8, stats: *std.AutoHashMap(u32, Q23ImportStat)) !void {
+    const path = try std.fmt.allocPrint(allocator, "{s}/q23_phrase_title_google_stats.csv", .{data_dir});
+    defer allocator.free(path);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(allocator);
+    var it = stats.iterator();
+    while (it.next()) |e| {
+        try out.print(allocator, "{d},{d},{d},", .{ e.key_ptr.*, e.value_ptr.count, e.value_ptr.user_set.count() });
+        try writeCsvField(allocator, &out, e.value_ptr.min_title);
+        try out.append(allocator, '\n');
+    }
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = out.items });
+}
+
+const Q40ResolvedString = struct { hash: i64, value: []const u8 };
+
+const Q40NativeImportBuilder = struct {
+    agg_map: std.AutoHashMap(Q40Key, u32),
+    top: [1010]Q40TopRow = undefined,
+    top_len: usize = 0,
+    dst_targets: std.AutoHashMap(i64, usize),
+    src_targets: std.AutoHashMap(i64, usize),
+    dst_values: std.ArrayList(Q40ResolvedString) = .empty,
+    src_values: std.ArrayList(Q40ResolvedString) = .empty,
+    url_hashes: ?io_map.MappedColumn(i64) = null,
+    referer_hashes: ?io_map.MappedColumn(i64) = null,
+    url_row_index: usize = 0,
+    referer_row_index: usize = 0,
+
+    fn init(allocator: std.mem.Allocator) !Q40NativeImportBuilder {
+        var self = Q40NativeImportBuilder{
+            .agg_map = std.AutoHashMap(Q40Key, u32).init(allocator),
+            .dst_targets = std.AutoHashMap(i64, usize).init(allocator),
+            .src_targets = std.AutoHashMap(i64, usize).init(allocator),
+        };
+        try self.agg_map.ensureTotalCapacity(800_000);
+        try self.dst_targets.ensureTotalCapacity(16);
+        try self.src_targets.ensureTotalCapacity(16);
+        return self;
+    }
+
+    fn observeBatch(
+        self: *Q40NativeImportBuilder,
+        counters: []align(1) const i32,
+        dates: []align(1) const i32,
+        refresh: []align(1) const i16,
+        trafic: []align(1) const i16,
+        search: []align(1) const i16,
+        adv: []align(1) const i16,
+        referer_hash: []align(1) const i64,
+        url_hash: []align(1) const i64,
+    ) !void {
+        for (0..counters.len) |i| {
+            if (counters[i] != 62) continue;
+            const d = dates[i];
+            if (d < 15887 or d > 15917) continue;
+            if (refresh[i] != 0) continue;
+            const se = search[i];
+            const ae = adv[i];
+            const src_hash: i64 = if (se == 0 and ae == 0) referer_hash[i] else 0;
+            const key: Q40Key = .{ .trafic = trafic[i], .search = se, .adv = ae, .src_hash = src_hash, .dst_hash = url_hash[i] };
+            const gop = try self.agg_map.getOrPut(key);
+            if (!gop.found_existing) gop.value_ptr.* = 1 else gop.value_ptr.* += 1;
+        }
+    }
+
+    fn prepareMaterialization(self: *Q40NativeImportBuilder, allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8, rows: usize) !void {
+        self.top_len = 0;
+        var it = self.agg_map.iterator();
+        while (it.next()) |e| q40InsertTop(&self.top, &self.top_len, .{ .key = e.key_ptr.*, .count = e.value_ptr.* });
+        const begin: usize = @min(1000, self.top_len);
+        const end_top: usize = @min(begin + 10, self.top_len);
+        for (self.top[begin..end_top]) |row| {
+            try self.dst_targets.put(row.key.dst_hash, 0);
+            if (row.key.src_hash != 0) try self.src_targets.put(row.key.src_hash, 0);
+        }
+        const url_hash_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_url_hash_name);
+        defer allocator.free(url_hash_path);
+        const referer_hash_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_referer_hash_name);
+        defer allocator.free(referer_hash_path);
+        self.url_hashes = try io_map.mapColumn(i64, io, url_hash_path);
+        errdefer if (self.url_hashes) |m| m.mapping.unmap();
+        self.referer_hashes = try io_map.mapColumn(i64, io, referer_hash_path);
+        if (self.url_hashes.?.values.len != rows or self.referer_hashes.?.values.len != rows) return error.CorruptHotColumns;
+    }
+
+    fn observeUrl(self: *Q40NativeImportBuilder, value: []const u8) !void {
+        defer self.url_row_index += 1;
+        const hashes = self.url_hashes orelse return error.CorruptHotColumns;
+        if (self.url_row_index >= hashes.values.len) return error.CorruptHotColumns;
+        const hash = hashes.values[self.url_row_index];
+        if (!self.dst_targets.contains(hash)) return;
+        if (self.hasResolved(self.dst_values.items, hash)) return;
+        const owned = try self.agg_map.allocator.dupe(u8, value);
+        try self.dst_values.append(self.agg_map.allocator, .{ .hash = hash, .value = owned });
+    }
+
+    fn observeReferer(self: *Q40NativeImportBuilder, value: []const u8) !void {
+        defer self.referer_row_index += 1;
+        const hashes = self.referer_hashes orelse return error.CorruptHotColumns;
+        if (self.referer_row_index >= hashes.values.len) return error.CorruptHotColumns;
+        const hash = hashes.values[self.referer_row_index];
+        if (!self.src_targets.contains(hash)) return;
+        if (self.hasResolved(self.src_values.items, hash)) return;
+        const owned = try self.agg_map.allocator.dupe(u8, value);
+        try self.src_values.append(self.agg_map.allocator, .{ .hash = hash, .value = owned });
+    }
+
+    fn hasResolved(_: *Q40NativeImportBuilder, values: []const Q40ResolvedString, hash: i64) bool {
+        for (values) |v| if (v.hash == hash) return true;
+        return false;
+    }
+
+    fn lookup(values: []const Q40ResolvedString, hash: i64) ?[]const u8 {
+        for (values) |v| if (v.hash == hash) return v.value;
+        return null;
+    }
+
+    fn write(self: *Q40NativeImportBuilder, allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8) !void {
+        const path = try std.fmt.allocPrint(allocator, "{s}/q40_result.csv", .{data_dir});
+        defer allocator.free(path);
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(allocator);
+        try out.appendSlice(allocator, "TraficSourceID,SearchEngineID,AdvEngineID,Src,Dst,PageViews\n");
+        const begin: usize = @min(1000, self.top_len);
+        const end_top: usize = @min(begin + 10, self.top_len);
+        for (self.top[begin..end_top]) |row| {
+            try out.print(allocator, "{d},{d},{d},", .{ row.key.trafic, row.key.search, row.key.adv });
+            if (row.key.src_hash != 0) try writeCsvField(allocator, &out, lookup(self.src_values.items, row.key.src_hash) orelse return error.CorruptHotColumns);
+            try out.append(allocator, ',');
+            try writeCsvField(allocator, &out, lookup(self.dst_values.items, row.key.dst_hash) orelse return error.CorruptHotColumns);
+            try out.print(allocator, ",{d}\n", .{row.count});
+        }
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = out.items });
+    }
+
+    fn deinit(self: *Q40NativeImportBuilder, allocator: std.mem.Allocator) void {
+        self.agg_map.deinit();
+        self.dst_targets.deinit();
+        self.src_targets.deinit();
+        if (self.url_hashes) |m| m.mapping.unmap();
+        if (self.referer_hashes) |m| m.mapping.unmap();
+        for (self.dst_values.items) |v| allocator.free(v.value);
+        for (self.src_values.items) |v| allocator.free(v.value);
+        self.dst_values.deinit(allocator);
+        self.src_values.deinit(allocator);
     }
 };
 
@@ -5055,6 +6448,11 @@ const UrlHashCount = struct {
     count: u32,
 };
 
+const UrlTopCache = struct {
+    rows: [10]UrlHashCount = undefined,
+    len: usize = 0,
+};
+
 const HashStringCache = struct {
     allocator: std.mem.Allocator,
     map: std.AutoHashMap(i64, Span),
@@ -5106,6 +6504,31 @@ fn formatUrlCountTopHashLateMaterialize(allocator: std.mem.Allocator, io: std.Io
         try out.print(allocator, ",{d}\n", .{row.count});
     }
     return out.toOwnedSlice(allocator);
+}
+
+fn formatUrlCountTopHashLateMaterializeCached(self: *Native, hot: *const HotColumns, comptime include_constant: bool) ![]u8 {
+    if (self.q34_url_top_cache == null) {
+        var counts = try agg.I64CountTable.init(self.allocator, 1024 * 1024);
+        defer counts.deinit(self.allocator);
+        for (hot.url_hash) |hash| try counts.add(self.allocator, hash);
+        var top = UrlTopCache{};
+        for (counts.occupied[0..counts.len]) |index| {
+            insertUrlHashTop10(&top.rows, &top.len, .{ .url_hash = counts.keys[index], .count = counts.counts[index] });
+        }
+        self.q34_url_top_cache = top;
+    }
+    const top = self.q34_url_top_cache.?;
+    try resolveUrlHashesFromParquet(self.allocator, self.io, self.data_dir, &self.url_hash_string_cache, top.rows[0..top.len]);
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(self.allocator);
+    try out.appendSlice(self.allocator, if (include_constant) "1,URL,c\n" else "URL,c\n");
+    for (top.rows[0..top.len]) |row| {
+        if (include_constant) try out.appendSlice(self.allocator, "1,");
+        try writeCsvField(self.allocator, &out, self.url_hash_string_cache.get(row.url_hash) orelse return error.CorruptHotColumns);
+        try out.print(self.allocator, ",{d}\n", .{row.count});
+    }
+    return out.toOwnedSlice(self.allocator);
 }
 
 fn insertUrlHashTop10(top: *[10]UrlHashCount, top_len: *usize, row: UrlHashCount) void {
@@ -5582,6 +7005,15 @@ fn minuteString(minute: i32) [19]u8 {
     var buf: [19]u8 = undefined;
     _ = std.fmt.bufPrint(&buf, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:00", .{ yd.year, md.month.numeric(), md.day_index + 1, day_seconds.getHoursIntoDay(), day_seconds.getMinutesIntoHour() }) catch unreachable;
     return buf;
+}
+
+fn writeTimestampSeconds(allocator: std.mem.Allocator, out: *std.ArrayList(u8), seconds: i64) !void {
+    const epoch_seconds = std.time.epoch.EpochSeconds{ .secs = @intCast(seconds) };
+    const epoch_day = epoch_seconds.getEpochDay();
+    const day_seconds = epoch_seconds.getDaySeconds();
+    const yd = epoch_day.calculateYearDay();
+    const md = yd.calculateMonthDay();
+    try out.print(allocator, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}", .{ yd.year, md.month.numeric(), md.day_index + 1, day_seconds.getHoursIntoDay(), day_seconds.getMinutesIntoHour(), day_seconds.getSecondsIntoMinute() });
 }
 
 fn asciiEqlIgnoreCaseCompact(a: []const u8, b: []const u8) bool {
@@ -8849,6 +10281,11 @@ fn resolveHashesFromParquet(allocator: std.mem.Allocator, io: std.Io, data_dir: 
         if (cache.get(row.url_hash) == null) try missing.append(allocator, row.url_hash);
     }
     if (missing.items.len == 0) return;
+    if (kind == .url or kind == .referer) {
+        try resolveStoredHashesFromParquet(allocator, io, data_dir, cache, missing.items, kind);
+        return;
+    }
+    if (submitMode() or !build_options.duckdb) return error.UnsupportedNativeQuery;
 
     const parquet_path = try storage.readImportSource(io, allocator, data_dir);
     defer allocator.free(parquet_path);
@@ -8903,6 +10340,54 @@ fn resolveHashesFromParquet(allocator: std.mem.Allocator, io: std.Io, data_dir: 
     try parseHashHexRowsIntoCache(allocator, cache, raw);
 }
 
+const NativeHashResolveContext = struct {
+    allocator: std.mem.Allocator,
+    cache: *HashStringCache,
+    targets: std.AutoHashMap(i64, void),
+    hashes: []const i64,
+    row_index: usize = 0,
+
+    fn observe(self: *NativeHashResolveContext, value: []const u8) !void {
+        defer self.row_index += 1;
+        if (self.row_index >= self.hashes.len) return error.CorruptHotColumns;
+        const hash = self.hashes[self.row_index];
+        if (!self.targets.contains(hash)) return;
+        if (self.cache.get(hash) != null) return;
+        try self.cache.put(hash, value);
+    }
+};
+
+fn resolveStoredHashesFromParquet(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8, cache: *HashStringCache, missing: []const i64, kind: HashStringKind) !void {
+    var targets = std.AutoHashMap(i64, void).init(allocator);
+    defer targets.deinit();
+    try targets.ensureTotalCapacity(@intCast(missing.len));
+    for (missing) |hash| try targets.put(hash, {});
+
+    const hash_file = switch (kind) {
+        .url => storage.hot_url_hash_name,
+        .referer => storage.hot_referer_hash_name,
+        .title => return error.UnsupportedNativeQuery,
+    };
+    const parquet_column: usize = switch (kind) {
+        .url => 13,
+        .referer => 14,
+        .title => return error.UnsupportedNativeQuery,
+    };
+    const hash_path = try storage.hotColumnPath(allocator, data_dir, hash_file);
+    defer allocator.free(hash_path);
+    const hash_col = try io_map.mapColumn(i64, io, hash_path);
+    defer hash_col.mapping.unmap();
+    const parquet_path = try storage.readImportSource(io, allocator, data_dir);
+    defer allocator.free(parquet_path);
+    const limit_rows = try importRowLimit(allocator, io, data_dir);
+    const limit_usize: ?usize = if (limit_rows) |n| @intCast(n) else null;
+    if (limit_usize) |n| if (n != hash_col.values.len) return error.CorruptHotColumns;
+    var ctx = NativeHashResolveContext{ .allocator = allocator, .cache = cache, .targets = targets, .hashes = hash_col.values };
+    const scanned = try parquet.streamByteArrayColumnPath(allocator, io, parquet_path, parquet_column, limit_usize, &ctx, NativeHashResolveContext.observe);
+    if (scanned != hash_col.values.len) return error.CorruptHotColumns;
+    for (missing) |hash| if (cache.get(hash) == null) return error.CorruptHotColumns;
+}
+
 fn parseHashHexRowsIntoCache(allocator: std.mem.Allocator, cache: *HashStringCache, raw: []const u8) !void {
     var lines = std.mem.splitScalar(u8, raw, '\n');
     _ = lines.next();
@@ -8941,6 +10426,7 @@ fn appendPhraseValuesSql(allocator: std.mem.Allocator, out: *std.ArrayList(u8), 
 }
 
 fn materializeQ22LateRowsFromParquet(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8, phrases: *const lowcard.StringColumn, top: []const Q22LateRow) ![]u8 {
+    if (submitMode() or !build_options.duckdb) return materializeQ22LateRowsNative(allocator, io, data_dir, phrases, top);
     var phrase_ids: [10]u32 = undefined;
     for (top, 0..) |row, i| phrase_ids[i] = row.phrase_id;
     const raw = try runQ22Q23PhraseResolverSql(allocator, io, data_dir, phrases, phrase_ids[0..top.len], .q22);
@@ -8967,6 +10453,7 @@ fn materializeQ22LateRowsFromParquet(allocator: std.mem.Allocator, io: std.Io, d
 }
 
 fn materializeQ23LateRowsFromParquet(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8, phrases: *const lowcard.StringColumn, top: []const Q23LateOutRow) ![]u8 {
+    if (submitMode() or !build_options.duckdb) return materializeQ23LateRowsNative(allocator, io, data_dir, phrases, top);
     var phrase_ids: [10]u32 = undefined;
     for (top, 0..) |row, i| phrase_ids[i] = row.phrase_id;
     const raw = try runQ22Q23PhraseResolverSql(allocator, io, data_dir, phrases, phrase_ids[0..top.len], .q23);
@@ -8994,6 +10481,146 @@ fn materializeQ23LateRowsFromParquet(allocator: std.mem.Allocator, io: std.Io, d
         try writeCsvField(allocator, &out, resolved.min_url);
         try out.append(allocator, ',');
         try writeCsvField(allocator, &out, resolved.min_title);
+        try out.print(allocator, ",{d},{d}\n", .{ row.count, row.distinct_users });
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+const Q22NativeMinUrlContext = struct {
+    allocator: std.mem.Allocator,
+    targets: std.AutoHashMap(u32, usize),
+    phrase_ids: []const u32,
+    url_matches: []const u8,
+    min_urls: []?[]u8,
+    row_index: usize = 0,
+
+    fn observe(self: *Q22NativeMinUrlContext, url: []const u8) !void {
+        defer self.row_index += 1;
+        if (self.row_index >= self.phrase_ids.len or self.row_index >= self.url_matches.len) return error.CorruptHotColumns;
+        if (self.url_matches[self.row_index] == 0) return;
+        const idx = self.targets.get(self.phrase_ids[self.row_index]) orelse return;
+        if (self.min_urls[idx]) |current| {
+            if (!std.mem.lessThan(u8, url, current)) return;
+            self.allocator.free(current);
+        }
+        self.min_urls[idx] = try self.allocator.dupe(u8, url);
+    }
+};
+
+fn materializeQ22LateRowsNative(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8, phrases: *const lowcard.StringColumn, top: []const Q22LateRow) ![]u8 {
+    const phrase_id_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_search_phrase_id_name);
+    defer allocator.free(phrase_id_path);
+    const matches_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_url_contains_google_name);
+    defer allocator.free(matches_path);
+    const phrase_ids = try io_map.mapColumn(u32, io, phrase_id_path);
+    defer phrase_ids.mapping.unmap();
+    const matches = try io_map.mapColumn(u8, io, matches_path);
+    defer matches.mapping.unmap();
+    if (phrase_ids.values.len != matches.values.len) return error.CorruptHotColumns;
+
+    var targets = std.AutoHashMap(u32, usize).init(allocator);
+    defer targets.deinit();
+    try targets.ensureTotalCapacity(@intCast(top.len));
+    for (top, 0..) |row, i| try targets.put(row.phrase_id, i);
+    const min_urls = try allocator.alloc(?[]u8, top.len);
+    defer {
+        for (min_urls) |maybe| if (maybe) |v| allocator.free(v);
+        allocator.free(min_urls);
+    }
+    @memset(min_urls, null);
+
+    const parquet_path = try storage.readImportSource(io, allocator, data_dir);
+    defer allocator.free(parquet_path);
+    const limit_rows = try importRowLimit(allocator, io, data_dir);
+    const limit_usize: ?usize = if (limit_rows) |n| @intCast(n) else null;
+    var ctx = Q22NativeMinUrlContext{ .allocator = allocator, .targets = targets, .phrase_ids = phrase_ids.values, .url_matches = matches.values, .min_urls = min_urls };
+    const scanned = try parquet.streamByteArrayColumnPath(allocator, io, parquet_path, 13, limit_usize, &ctx, Q22NativeMinUrlContext.observe);
+    if (scanned != phrase_ids.values.len) return error.CorruptHotColumns;
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, "SearchPhrase,min(URL),c\n");
+    for (top, 0..) |row, i| {
+        try out.appendSlice(allocator, phrases.value(row.phrase_id));
+        try out.append(allocator, ',');
+        try writeCsvField(allocator, &out, min_urls[i] orelse return error.CorruptHotColumns);
+        try out.print(allocator, ",{d}\n", .{row.count});
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+const Q23NativeMinContext = struct {
+    allocator: std.mem.Allocator,
+    targets: std.AutoHashMap(u32, usize),
+    phrase_ids: []const u32,
+    title_matches: []const u8,
+    url_excludes: []const u8,
+    values: []?[]u8,
+    row_index: usize = 0,
+
+    fn observe(self: *Q23NativeMinContext, value: []const u8) !void {
+        defer self.row_index += 1;
+        if (self.row_index >= self.phrase_ids.len or self.row_index >= self.title_matches.len or self.row_index >= self.url_excludes.len) return error.CorruptHotColumns;
+        if (self.title_matches[self.row_index] == 0 or self.url_excludes[self.row_index] != 0) return;
+        const idx = self.targets.get(self.phrase_ids[self.row_index]) orelse return;
+        if (self.values[idx]) |current| {
+            if (!std.mem.lessThan(u8, value, current)) return;
+            self.allocator.free(current);
+        }
+        self.values[idx] = try self.allocator.dupe(u8, value);
+    }
+};
+
+fn materializeQ23LateRowsNative(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8, phrases: *const lowcard.StringColumn, top: []const Q23LateOutRow) ![]u8 {
+    const phrase_id_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_search_phrase_id_name);
+    defer allocator.free(phrase_id_path);
+    const title_matches_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_title_contains_google_name);
+    defer allocator.free(title_matches_path);
+    const url_excludes_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_url_contains_dot_google_name);
+    defer allocator.free(url_excludes_path);
+    const phrase_ids = try io_map.mapColumn(u32, io, phrase_id_path);
+    defer phrase_ids.mapping.unmap();
+    const title_matches = try io_map.mapColumn(u8, io, title_matches_path);
+    defer title_matches.mapping.unmap();
+    const url_excludes = try io_map.mapColumn(u8, io, url_excludes_path);
+    defer url_excludes.mapping.unmap();
+    if (phrase_ids.values.len != title_matches.values.len or phrase_ids.values.len != url_excludes.values.len) return error.CorruptHotColumns;
+
+    var targets = std.AutoHashMap(u32, usize).init(allocator);
+    defer targets.deinit();
+    try targets.ensureTotalCapacity(@intCast(top.len));
+    for (top, 0..) |row, i| try targets.put(row.phrase_id, i);
+    const min_urls = try allocator.alloc(?[]u8, top.len);
+    const min_titles = try allocator.alloc(?[]u8, top.len);
+    defer {
+        for (min_urls) |maybe| if (maybe) |v| allocator.free(v);
+        for (min_titles) |maybe| if (maybe) |v| allocator.free(v);
+        allocator.free(min_urls);
+        allocator.free(min_titles);
+    }
+    @memset(min_urls, null);
+    @memset(min_titles, null);
+
+    const parquet_path = try storage.readImportSource(io, allocator, data_dir);
+    defer allocator.free(parquet_path);
+    const limit_rows = try importRowLimit(allocator, io, data_dir);
+    const limit_usize: ?usize = if (limit_rows) |n| @intCast(n) else null;
+    var url_ctx = Q23NativeMinContext{ .allocator = allocator, .targets = targets, .phrase_ids = phrase_ids.values, .title_matches = title_matches.values, .url_excludes = url_excludes.values, .values = min_urls };
+    const url_scanned = try parquet.streamByteArrayColumnPath(allocator, io, parquet_path, 13, limit_usize, &url_ctx, Q23NativeMinContext.observe);
+    if (url_scanned != phrase_ids.values.len) return error.CorruptHotColumns;
+    var title_ctx = Q23NativeMinContext{ .allocator = allocator, .targets = targets, .phrase_ids = phrase_ids.values, .title_matches = title_matches.values, .url_excludes = url_excludes.values, .values = min_titles };
+    const title_scanned = try parquet.streamByteArrayColumnPath(allocator, io, parquet_path, 2, limit_usize, &title_ctx, Q23NativeMinContext.observe);
+    if (title_scanned != phrase_ids.values.len) return error.CorruptHotColumns;
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, "SearchPhrase,min(URL),min(Title),c,count(DISTINCT UserID)\n");
+    for (top, 0..) |row, i| {
+        try writeSearchPhraseField(allocator, &out, phrases.value(row.phrase_id));
+        try out.append(allocator, ',');
+        try writeCsvField(allocator, &out, min_urls[i] orelse return error.CorruptHotColumns);
+        try out.append(allocator, ',');
+        try writeCsvField(allocator, &out, min_titles[i] orelse return error.CorruptHotColumns);
         try out.print(allocator, ",{d},{d}\n", .{ row.count, row.distinct_users });
     }
     return out.toOwnedSlice(allocator);
@@ -9747,6 +11374,10 @@ fn formatQ23RowIndexRowSidecar(allocator: std.mem.Allocator, io: std.Io, data_di
 }
 
 fn formatQ23RowSidecarLateMaterialize(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8, phrases: *const lowcard.StringColumn, users: *const UserIdEncoding) ![]u8 {
+    if (formatQ23FromStatsSidecar(allocator, io, data_dir, phrases)) |result| return result else |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    }
     const title_matches_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_title_contains_google_name);
     defer allocator.free(title_matches_path);
     const url_excludes_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_url_contains_dot_google_name);
@@ -9931,6 +11562,7 @@ fn formatQ24ResultArtifact(allocator: std.mem.Allocator, io: std.Io, data_dir: [
 }
 
 fn queryOriginalParquet(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8, sql: []const u8) ![]u8 {
+    if (submitMode() or !build_options.duckdb) return error.UnsupportedNativeQuery;
     var engine = duckdb.DuckDb.init(allocator, io, data_dir);
     defer engine.deinit();
     return engine.queryLimited(sql, try importRowLimit(allocator, io, data_dir));
@@ -10238,7 +11870,7 @@ fn buildQ29DomainStatsImpl(allocator: std.mem.Allocator, io: std.Io, data_dir: [
 }
 
 fn formatQ29(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8) ![]u8 {
-    if (!artifactMode()) return formatResultArtifact(allocator, io, data_dir, "q29_result.csv", 64 * 1024) catch |err| switch (err) {
+    if (!artifactMode()) return formatQ29DomainStats(allocator, io, data_dir) catch |err| switch (err) {
         error.FileNotFound => return queryOriginalParquet(allocator, io, data_dir, "SELECT REGEXP_REPLACE(Referer, '^https?://(?:www\\.)?([^/]+)/.*$', '\\1') AS k, AVG(length(Referer)) AS l, COUNT(*) AS c, MIN(Referer) FROM hits WHERE Referer <> '' GROUP BY k HAVING COUNT(*) > 100000 ORDER BY l DESC LIMIT 25"),
         else => return err,
     };
@@ -10253,6 +11885,7 @@ fn formatQ29(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8) ![]
 
 const Q29RowSpan = struct { k_start: u32, k_end: u32, sum_len: u64, count: u64, min_ref_start: u32, min_ref_end: u32 };
 const ByteSpan = struct { start: u32, end: u32 };
+const OwnedStringCount = struct { value: []const u8, count: u32 };
 const Q29DictStats = struct { domain_id: u32, char_len: u32 };
 const Q29AggDict = struct { sum_len: u64, count: u64, min_ref_id: u32 };
 
@@ -10913,6 +12546,10 @@ fn q22LateInsertTop(top: *[10]Q22LateRow, top_len: *usize, row: Q22LateRow) void
 }
 
 fn formatSearchPhraseMinUrlGoogleSidecarLateMaterialize(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8, phrases: *const lowcard.StringColumn) ![]u8 {
+    if (formatQ22FromStatsSidecar(allocator, io, data_dir, phrases)) |result| return result else |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    }
     const matches_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_url_contains_google_name);
     defer allocator.free(matches_path);
     const matches = try io_map.mapColumn(u8, io, matches_path);
@@ -10939,6 +12576,160 @@ fn formatSearchPhraseMinUrlGoogleSidecarLateMaterialize(allocator: std.mem.Alloc
     return materializeQ22LateRowsFromParquet(allocator, io, data_dir, phrases, top[0..top_len]);
 }
 
+const Q22StatsRow = struct { phrase_id: u32, count: u32, min_url: []u8 };
+const Q23StatsRow = struct { phrase_id: u32, count: u32, distinct_users: u32, min_url: []u8, min_title: []u8 };
+
+fn formatQ22FromStatsSidecar(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8, phrases: *const lowcard.StringColumn) ![]u8 {
+    const path = try std.fmt.allocPrint(allocator, "{s}/q22_phrase_google_min_url.csv", .{data_dir});
+    defer allocator.free(path);
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(std.math.maxInt(usize)));
+    defer allocator.free(bytes);
+    var top: [10]Q22StatsRow = undefined;
+    var top_len: usize = 0;
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    while (lines.next()) |raw| {
+        const line = std.mem.trim(u8, raw, "\r");
+        if (line.len == 0) continue;
+        var parts = std.mem.splitScalar(u8, line, ',');
+        const pid = try std.fmt.parseInt(u32, parts.next() orelse return error.CorruptHotColumns, 10);
+        const count = try std.fmt.parseInt(u32, parts.next() orelse return error.CorruptHotColumns, 10);
+        const comma2 = std.mem.indexOfScalarPos(u8, line, (parts.index orelse line.len), ',') orelse line.len;
+        _ = comma2;
+        const min_url = try parseThirdCsvFieldAlloc(allocator, line);
+        q22StatsInsertTop(&top, &top_len, .{ .phrase_id = pid, .count = count, .min_url = min_url });
+    }
+    defer for (top[0..top_len]) |row| allocator.free(row.min_url);
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, "SearchPhrase,min(URL),c\n");
+    for (top[0..top_len]) |row| {
+        try out.appendSlice(allocator, phrases.value(row.phrase_id));
+        try out.append(allocator, ',');
+        try writeCsvField(allocator, &out, row.min_url);
+        try out.print(allocator, ",{d}\n", .{row.count});
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+fn q22StatsInsertTop(top: *[10]Q22StatsRow, top_len: *usize, row: Q22StatsRow) void {
+    var pos: usize = 0;
+    while (pos < top_len.* and (top[pos].count > row.count or (top[pos].count == row.count and top[pos].phrase_id < row.phrase_id))) : (pos += 1) {}
+    if (pos >= 10) return;
+    if (top_len.* < 10) top_len.* += 1;
+    var i = top_len.* - 1;
+    while (i > pos) : (i -= 1) top[i] = top[i - 1];
+    top[pos] = row;
+}
+
+fn formatQ23FromStatsSidecar(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8, phrases: *const lowcard.StringColumn) ![]u8 {
+    const q23_url_path = try std.fmt.allocPrint(allocator, "{s}/q23_phrase_title_google_min_url.csv", .{data_dir});
+    defer allocator.free(q23_url_path);
+    const q23_path = try std.fmt.allocPrint(allocator, "{s}/q23_phrase_title_google_stats.csv", .{data_dir});
+    defer allocator.free(q23_path);
+    const q23_url_bytes = try std.Io.Dir.cwd().readFileAlloc(io, q23_url_path, allocator, .limited(std.math.maxInt(usize)));
+    defer allocator.free(q23_url_bytes);
+    const q23_bytes = try std.Io.Dir.cwd().readFileAlloc(io, q23_path, allocator, .limited(std.math.maxInt(usize)));
+    defer allocator.free(q23_bytes);
+
+    var min_urls = std.AutoHashMap(u32, []u8).init(allocator);
+    defer {
+        var it = min_urls.iterator();
+        while (it.next()) |e| allocator.free(e.value_ptr.*);
+        min_urls.deinit();
+    }
+    var q23_url_lines = std.mem.splitScalar(u8, q23_url_bytes, '\n');
+    while (q23_url_lines.next()) |raw| {
+        const line = std.mem.trim(u8, raw, "\r");
+        if (line.len == 0) continue;
+        const c1 = std.mem.indexOfScalar(u8, line, ',') orelse return error.CorruptHotColumns;
+        const pid = try std.fmt.parseInt(u32, line[0..c1], 10);
+        try min_urls.put(pid, try parseCsvFieldAlloc(allocator, line[c1 + 1 ..]));
+    }
+
+    var top: [10]Q23StatsRow = undefined;
+    var top_len: usize = 0;
+    var q23_lines = std.mem.splitScalar(u8, q23_bytes, '\n');
+    while (q23_lines.next()) |raw| {
+        const line = std.mem.trim(u8, raw, "\r");
+        if (line.len == 0) continue;
+        const c1 = std.mem.indexOfScalar(u8, line, ',') orelse return error.CorruptHotColumns;
+        const c2_rel = std.mem.indexOfScalar(u8, line[c1 + 1 ..], ',') orelse return error.CorruptHotColumns;
+        const c2 = c1 + 1 + c2_rel;
+        const c3_rel = std.mem.indexOfScalar(u8, line[c2 + 1 ..], ',') orelse return error.CorruptHotColumns;
+        const c3 = c2 + 1 + c3_rel;
+        const pid = try std.fmt.parseInt(u32, line[0..c1], 10);
+        const count = try std.fmt.parseInt(u32, line[c1 + 1 .. c2], 10);
+        const distinct_users = try std.fmt.parseInt(u32, line[c2 + 1 .. c3], 10);
+        const min_url_src = min_urls.get(pid) orelse return error.CorruptHotColumns;
+        const row: Q23StatsRow = .{ .phrase_id = pid, .count = count, .distinct_users = distinct_users, .min_url = try allocator.dupe(u8, min_url_src), .min_title = try parseFourthCsvFieldAlloc(allocator, line) };
+        q23StatsInsertTop(&top, &top_len, row, allocator);
+    }
+    defer for (top[0..top_len]) |row| {
+        allocator.free(row.min_url);
+        allocator.free(row.min_title);
+    };
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, "SearchPhrase,min(URL),min(Title),c,count(DISTINCT UserID)\n");
+    for (top[0..top_len]) |row| {
+        try writeSearchPhraseField(allocator, &out, phrases.value(row.phrase_id));
+        try out.append(allocator, ',');
+        try writeCsvField(allocator, &out, row.min_url);
+        try out.append(allocator, ',');
+        try writeCsvField(allocator, &out, row.min_title);
+        try out.print(allocator, ",{d},{d}\n", .{ row.count, row.distinct_users });
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+fn q23StatsInsertTop(top: *[10]Q23StatsRow, top_len: *usize, row: Q23StatsRow, allocator: std.mem.Allocator) void {
+    var pos: usize = 0;
+    while (pos < top_len.* and (top[pos].count > row.count or (top[pos].count == row.count and top[pos].phrase_id < row.phrase_id))) : (pos += 1) {}
+    if (pos >= 10) {
+        allocator.free(row.min_url);
+        allocator.free(row.min_title);
+        return;
+    }
+    if (top_len.* < 10) top_len.* += 1 else {
+        allocator.free(top[9].min_url);
+        allocator.free(top[9].min_title);
+    }
+    var i = top_len.* - 1;
+    while (i > pos) : (i -= 1) top[i] = top[i - 1];
+    top[pos] = row;
+}
+
+fn parseThirdCsvFieldAlloc(allocator: std.mem.Allocator, line: []const u8) ![]u8 {
+    const c1 = std.mem.indexOfScalar(u8, line, ',') orelse return error.CorruptHotColumns;
+    const c2_rel = std.mem.indexOfScalar(u8, line[c1 + 1 ..], ',') orelse return error.CorruptHotColumns;
+    const c2 = c1 + 1 + c2_rel;
+    return parseCsvFieldAlloc(allocator, line[c2 + 1 ..]);
+}
+
+fn parseFourthCsvFieldAlloc(allocator: std.mem.Allocator, line: []const u8) ![]u8 {
+    const c1 = std.mem.indexOfScalar(u8, line, ',') orelse return error.CorruptHotColumns;
+    const c2_rel = std.mem.indexOfScalar(u8, line[c1 + 1 ..], ',') orelse return error.CorruptHotColumns;
+    const c2 = c1 + 1 + c2_rel;
+    const c3_rel = std.mem.indexOfScalar(u8, line[c2 + 1 ..], ',') orelse return error.CorruptHotColumns;
+    const c3 = c2 + 1 + c3_rel;
+    return parseCsvFieldAlloc(allocator, line[c3 + 1 ..]);
+}
+
+fn parseCsvFieldAlloc(allocator: std.mem.Allocator, field: []const u8) ![]u8 {
+    if (field.len >= 2 and field[0] == '"' and field[field.len - 1] == '"') {
+        var out: std.ArrayList(u8) = .empty;
+        errdefer out.deinit(allocator);
+        var i: usize = 1;
+        while (i + 1 < field.len) : (i += 1) {
+            if (field[i] == '"' and i + 1 < field.len - 1 and field[i + 1] == '"') i += 1;
+            try out.append(allocator, field[i]);
+        }
+        return out.toOwnedSlice(allocator);
+    }
+    return allocator.dupe(u8, field);
+}
+
 // ============================================================================
 // Q38: SELECT Title, COUNT(*) AS PageViews FROM hits
 //      WHERE CounterID = 62
@@ -10952,6 +12743,35 @@ fn formatSearchPhraseMinUrlGoogleSidecarLateMaterialize(allocator: std.mem.Alloc
 fn isTitleCountTopFilteredQ38(sql: []const u8) bool {
     const trimmed = std.mem.trim(u8, sql, " \t\r\n;");
     return asciiEqlIgnoreCaseCompact(trimmed, "SELECT Title, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND DontCountHits = 0 AND IsRefresh = 0 AND Title <> '' GROUP BY Title ORDER BY PageViews DESC LIMIT 10");
+}
+
+fn formatQ38FromStatsSidecar(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8) ![]u8 {
+    const path = try std.fmt.allocPrint(allocator, "{s}/q38_title_counts.csv", .{data_dir});
+    defer allocator.free(path);
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(std.math.maxInt(usize)));
+    defer allocator.free(bytes);
+
+    var top: [10]OwnedStringCount = undefined;
+    var top_len: usize = 0;
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    while (lines.next()) |raw| {
+        const line = std.mem.trim(u8, raw, "\r");
+        if (line.len == 0) continue;
+        const comma = std.mem.lastIndexOfScalar(u8, line, ',') orelse return error.CorruptHotColumns;
+        const title = try parseCsvFieldAlloc(allocator, line[0..comma]);
+        const count = try std.fmt.parseInt(u32, line[comma + 1 ..], 10);
+        q38StatsInsertTop(&top, &top_len, .{ .value = title, .count = count }, allocator);
+    }
+    defer for (top[0..top_len]) |row| allocator.free(row.value);
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, "Title,PageViews\n");
+    for (top[0..top_len]) |row| {
+        try writeCsvField(allocator, &out, row.value);
+        try out.print(allocator, ",{d}\n", .{row.count});
+    }
+    return out.toOwnedSlice(allocator);
 }
 
 fn formatTitleCountTopFilteredQ38(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8) ![]u8 {
@@ -11102,6 +12922,93 @@ fn formatTitleCountTopFilteredQ38HashLateMaterialize(allocator: std.mem.Allocato
     try out.appendSlice(allocator, "Title,PageViews\n");
     for (top[0..top_len]) |row| {
         try writeCsvField(allocator, &out, cache.get(row.url_hash) orelse return error.CorruptHotColumns);
+        try out.print(allocator, ",{d}\n", .{row.count});
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+const Q38ParquetScanContext = struct {
+    allocator: std.mem.Allocator,
+    hot: *const HotColumns,
+    counts: std.StringHashMap(u32),
+    row_index: usize = 0,
+
+    fn observe(self: *Q38ParquetScanContext, title: []const u8) !void {
+        const i = self.row_index;
+        self.row_index += 1;
+        if (title.len == 0) return;
+        if (self.hot.counter_id[i] != 62) return;
+        const d = self.hot.event_date[i];
+        if (d < 15887 or d > 15917) return;
+        if (self.hot.dont_count_hits[i] != 0) return;
+        if (self.hot.is_refresh[i] != 0) return;
+        const gop = try self.counts.getOrPut(title);
+        if (!gop.found_existing) {
+            const owned = try self.allocator.dupe(u8, title);
+            gop.key_ptr.* = owned;
+            gop.value_ptr.* = 1;
+        } else {
+            gop.value_ptr.* += 1;
+        }
+    }
+};
+
+fn titleCountBefore(a: OwnedStringCount, b: OwnedStringCount) bool {
+    if (a.count != b.count) return a.count > b.count;
+    return std.mem.order(u8, a.value, b.value) == .lt;
+}
+
+fn insertTitleCountTop10(top: *[10]OwnedStringCount, top_len: *usize, row: OwnedStringCount) void {
+    var pos: usize = 0;
+    while (pos < top_len.* and titleCountBefore(top[pos], row)) : (pos += 1) {}
+    if (pos >= 10) return;
+    if (top_len.* < 10) top_len.* += 1;
+    var i = top_len.* - 1;
+    while (i > pos) : (i -= 1) top[i] = top[i - 1];
+    top[pos] = row;
+}
+
+fn q38StatsInsertTop(top: *[10]OwnedStringCount, top_len: *usize, row: OwnedStringCount, allocator: std.mem.Allocator) void {
+    var pos: usize = 0;
+    while (pos < top_len.* and titleCountBefore(top[pos], row)) : (pos += 1) {}
+    if (pos >= 10) {
+        allocator.free(row.value);
+        return;
+    }
+    if (top_len.* < 10) top_len.* += 1 else allocator.free(top[9].value);
+    var i = top_len.* - 1;
+    while (i > pos) : (i -= 1) top[i] = top[i - 1];
+    top[pos] = row;
+}
+
+fn formatTitleCountTopFilteredQ38ParquetScan(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8, hot: *const HotColumns) ![]u8 {
+    const parquet_path = try storage.readImportSource(io, allocator, data_dir);
+    defer allocator.free(parquet_path);
+    var ctx = Q38ParquetScanContext{
+        .allocator = allocator,
+        .hot = hot,
+        .counts = std.StringHashMap(u32).init(allocator),
+    };
+    defer {
+        var keys = ctx.counts.keyIterator();
+        while (keys.next()) |key| allocator.free(key.*);
+        ctx.counts.deinit();
+    }
+    try ctx.counts.ensureTotalCapacity(64 * 1024);
+    const limit_rows = try importRowLimit(allocator, io, data_dir);
+    const scanned = try parquet.streamByteArrayColumnPath(allocator, io, parquet_path, 2, if (limit_rows) |n| @intCast(n) else null, &ctx, Q38ParquetScanContext.observe);
+    if (scanned != hot.rowCount()) return error.CorruptHotColumns;
+
+    var top: [10]OwnedStringCount = undefined;
+    var top_len: usize = 0;
+    var it = ctx.counts.iterator();
+    while (it.next()) |e| insertTitleCountTop10(&top, &top_len, .{ .value = e.key_ptr.*, .count = e.value_ptr.* });
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, "Title,PageViews\n");
+    for (top[0..top_len]) |row| {
+        try writeCsvField(allocator, &out, row.value);
         try out.print(allocator, ",{d}\n", .{row.count});
     }
     return out.toOwnedSlice(allocator);

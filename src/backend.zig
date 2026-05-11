@@ -1,7 +1,8 @@
 const std = @import("std");
+const build_options = @import("build_options");
 const chdb = @import("chdb.zig");
 const clickhouse = @import("clickhouse.zig");
-const duckdb = @import("duckdb.zig");
+const duckdb = if (build_options.duckdb) @import("duckdb.zig") else @import("duckdb_stub.zig");
 const native = @import("native.zig");
 
 pub const Kind = enum {
@@ -20,7 +21,7 @@ pub const Kind = enum {
 };
 
 pub const Options = struct {
-    kind: Kind = .duckdb,
+    kind: Kind = .native,
 
     chdb_python: []const u8 = chdb.default_python,
     clickhouse_container: []const u8 = clickhouse.default_container,

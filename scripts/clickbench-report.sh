@@ -16,6 +16,7 @@ Runs a reproducible ClickBench-oriented report:
 Environment:
   ZIGHOUSE_DUCKDB_EXE   DuckDB CLI path, default /opt/homebrew/bin/duckdb
   ZIGHOUSE_IMPORT_TRACE Set to 1 to include import phase timings
+  ZIGHOUSE_IMPORTER      Import command, default import-clickbench-parquet-hot
   ZIGHOUSE_REPORT_FAST  Set to 1 to include Q24/Q29/Q40 tiny result artifacts
   ZIGHOUSE_REPORT_FAIR  Set to 1 to reject query-specific artifacts and run native with ZIGHOUSE_FAIR=1
   ZIGHOUSE_IMPORT_REFERER
@@ -46,6 +47,7 @@ RUNS=${4:-1}
 QUERIES=${QUERIES:-assets/queries.sql}
 ZIGHOUSE=${ZIGHOUSE:-zig-out/bin/zighouse}
 DUCKDB_EXE=${ZIGHOUSE_DUCKDB_EXE:-/opt/homebrew/bin/duckdb}
+IMPORTER=${ZIGHOUSE_IMPORTER:-import-clickbench-parquet-hot}
 
 mkdir -p "$REPORT_DIR"
 
@@ -79,10 +81,10 @@ check_fair_store() {
     q24_result.csv \
     q25_eventtime_phrase_candidates.qii \
     q19_result.csv \
-    q29_domain_stats.csv \
     q29_result.csv \
     q33_result.csv \
     q37_result.csv \
+    q38_result.csv \
     q40_referer_hash_map.csv \
     q40_result.csv; do
     if [[ -e "$STORE_DIR/$artifact" ]]; then
@@ -121,10 +123,15 @@ REPORT="$REPORT_DIR/report.md"
   "$DUCKDB_EXE" --version 2>/dev/null | sed 's/^- /- DuckDB version: /' || true
   echo "- Parquet: $PARQUET_PATH"
   echo "- Queries: $QUERIES"
+  echo "- Importer: $IMPORTER"
   echo
   echo "## Disclosure"
   echo
-  echo "- Import uses DuckDB C API vectors for Parquet decoding."
+  if [[ "$IMPORTER" == "import-clickbench-parquet-hot" || "$IMPORTER" == "import-clickbench-parquet-native-hot" || "$IMPORTER" == "import-clickbench-parquet-native-fixed-hot" ]]; then
+    echo "- Import uses the native Parquet hot importer."
+  else
+    echo "- Import uses $IMPORTER."
+  fi
   if [[ -n "${ZIGHOUSE_REPORT_REUSE_STORE:-}" ]]; then
     echo "- Reuses an existing zighouse store; import wall/RSS are not measured in this report."
   fi
@@ -188,7 +195,7 @@ while [[ $run -le $RUNS ]]; do
     if [[ -n "${ZIGHOUSE_IMPORT_REFERER:-}" ]]; then
       import_env+=(ZIGHOUSE_IMPORT_REFERER="$ZIGHOUSE_IMPORT_REFERER")
     fi
-    run_cmd "$IMPORT_LOG" "${import_env[@]}" "$ZIGHOUSE" import-clickbench-parquet-duckdb-vector-hot "$PARQUET_PATH" "$STORE_DIR"
+    run_cmd "$IMPORT_LOG" "${import_env[@]}" "$ZIGHOUSE" "$IMPORTER" "$PARQUET_PATH" "$STORE_DIR"
   else
     printf 'reuse existing store\n' >"$IMPORT_LOG"
   fi

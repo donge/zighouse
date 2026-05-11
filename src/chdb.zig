@@ -1,5 +1,6 @@
 const std = @import("std");
-const duckdb = @import("duckdb.zig");
+const build_options = @import("build_options");
+const duckdb = if (build_options.duckdb) @import("duckdb.zig") else @import("duckdb_stub.zig");
 const storage = @import("storage.zig");
 
 pub const default_python = "python3";

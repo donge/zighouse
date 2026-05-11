@@ -396,6 +396,160 @@ pub const ClickBenchHotChunk = struct {
     }
 };
 
+pub const ClickBenchFixedChunk = struct {
+    watch: []const i64,
+    event_time: []const i64,
+    event_date: []const i32,
+    counter: []const i32,
+    client_ip: []const i32,
+    region: []const i32,
+    user: []const i64,
+    refresh: []const i16,
+    width: []const i16,
+    mobile_phone: []const i16,
+    trafic_source: []const i16,
+    search_engine: []const i16,
+    adv: []const i16,
+    window_width: []const i16,
+    window_height: []const i16,
+    is_link: []const i16,
+    is_download: []const i16,
+    dont_count: []const i16,
+    referer_hash: []const i64,
+    url_hash: []const i64,
+
+    pub fn len(self: ClickBenchFixedChunk) usize {
+        return self.watch.len;
+    }
+};
+
+pub fn streamClickBenchFixedChunks(allocator: std.mem.Allocator, io: std.Io, parquet_path: []const u8, limit_rows: ?u64, context: anytype, callback: anytype) !void {
+    const parquet_literal = try sqlStringLiteral(allocator, parquet_path);
+    defer allocator.free(parquet_literal);
+    const limit_clause = if (limit_rows) |n| try std.fmt.allocPrint(allocator, "\nLIMIT {d}", .{n}) else try allocator.dupe(u8, "");
+    defer allocator.free(limit_clause);
+    const sql_text = try std.fmt.allocPrint(allocator,
+        \\SELECT CAST(WatchID AS BIGINT) AS WatchID,
+        \\       CAST(EventTime AS BIGINT) AS EventTime,
+        \\       CAST(EventDate AS INTEGER) AS EventDate,
+        \\       CAST(CounterID AS INTEGER) AS CounterID,
+        \\       CAST(ClientIP AS INTEGER) AS ClientIP,
+        \\       CAST(RegionID AS INTEGER) AS RegionID,
+        \\       CAST(UserID AS BIGINT) AS UserID,
+        \\       CAST(IsRefresh AS SMALLINT) AS IsRefresh,
+        \\       CAST(ResolutionWidth AS SMALLINT) AS ResolutionWidth,
+        \\       CAST(MobilePhone AS SMALLINT) AS MobilePhone,
+        \\       CAST(TraficSourceID AS SMALLINT) AS TraficSourceID,
+        \\       CAST(SearchEngineID AS SMALLINT) AS SearchEngineID,
+        \\       CAST(AdvEngineID AS SMALLINT) AS AdvEngineID,
+        \\       CAST(WindowClientWidth AS SMALLINT) AS WindowClientWidth,
+        \\       CAST(WindowClientHeight AS SMALLINT) AS WindowClientHeight,
+        \\       CAST(IsLink AS SMALLINT) AS IsLink,
+        \\       CAST(IsDownload AS SMALLINT) AS IsDownload,
+        \\       CAST(DontCountHits AS SMALLINT) AS DontCountHits,
+        \\       CAST(RefererHash AS BIGINT) AS RefererHash,
+        \\       CAST(URLHash AS BIGINT) AS URLHash
+        \\FROM read_parquet({s}, binary_as_string=True){s}
+    , .{ parquet_literal, limit_clause });
+    defer allocator.free(sql_text);
+    const sql = try allocator.dupeZ(u8, sql_text);
+    defer allocator.free(sql);
+
+    var db: c.duckdb_database = null;
+    if (c.duckdb_open(null, &db) != c.DuckDBSuccess) return error.DuckDbOpenFailed;
+    defer c.duckdb_close(&db);
+
+    var con: c.duckdb_connection = null;
+    if (c.duckdb_connect(db, &con) != c.DuckDBSuccess) return error.DuckDbConnectFailed;
+    defer c.duckdb_disconnect(&con);
+
+    var prepared: c.duckdb_prepared_statement = null;
+    if (c.duckdb_prepare(con, sql.ptr, &prepared) != c.DuckDBSuccess) {
+        const err = c.duckdb_prepare_error(prepared);
+        if (err != null) try printErr(io, "duckdb prepare error: {s}\n", .{std.mem.span(err)});
+        c.duckdb_destroy_prepare(&prepared);
+        return error.DuckDbPrepareFailed;
+    }
+    defer c.duckdb_destroy_prepare(&prepared);
+
+    var pending: c.duckdb_pending_result = null;
+    if (c.duckdb_pending_prepared_streaming(prepared, &pending) != c.DuckDBSuccess) {
+        const err = c.duckdb_pending_error(pending);
+        if (err != null) try printErr(io, "duckdb pending error: {s}\n", .{std.mem.span(err)});
+        c.duckdb_destroy_pending(&pending);
+        return error.DuckDbPendingFailed;
+    }
+    defer c.duckdb_destroy_pending(&pending);
+
+    while (true) {
+        const state = c.duckdb_pending_execute_task(pending);
+        if (state == c.DUCKDB_PENDING_RESULT_READY) break;
+        if (state == c.DUCKDB_PENDING_ERROR) {
+            const err = c.duckdb_pending_error(pending);
+            if (err != null) try printErr(io, "duckdb execution error: {s}\n", .{std.mem.span(err)});
+            return error.DuckDbExecutionFailed;
+        }
+    }
+
+    var result: c.duckdb_result = undefined;
+    if (c.duckdb_execute_pending(pending, &result) != c.DuckDBSuccess) {
+        const err = c.duckdb_result_error(&result);
+        if (err != null) try printErr(io, "duckdb result error: {s}\n", .{std.mem.span(err)});
+        c.duckdb_destroy_result(&result);
+        return error.DuckDbQueryFailed;
+    }
+    defer c.duckdb_destroy_result(&result);
+
+    while (true) {
+        var chunk = c.duckdb_stream_fetch_chunk(result);
+        if (chunk == null) break;
+        const n: usize = @intCast(c.duckdb_data_chunk_get_size(chunk));
+        const watch: [*]const i64 = @ptrCast(@alignCast(vectorData(chunk, 0)));
+        const event_time: [*]const i64 = @ptrCast(@alignCast(vectorData(chunk, 1)));
+        const event_date: [*]const i32 = @ptrCast(@alignCast(vectorData(chunk, 2)));
+        const counter: [*]const i32 = @ptrCast(@alignCast(vectorData(chunk, 3)));
+        const client_ip: [*]const i32 = @ptrCast(@alignCast(vectorData(chunk, 4)));
+        const region: [*]const i32 = @ptrCast(@alignCast(vectorData(chunk, 5)));
+        const user: [*]const i64 = @ptrCast(@alignCast(vectorData(chunk, 6)));
+        const refresh: [*]const i16 = @ptrCast(@alignCast(vectorData(chunk, 7)));
+        const width: [*]const i16 = @ptrCast(@alignCast(vectorData(chunk, 8)));
+        const mobile_phone: [*]const i16 = @ptrCast(@alignCast(vectorData(chunk, 9)));
+        const trafic_source: [*]const i16 = @ptrCast(@alignCast(vectorData(chunk, 10)));
+        const search_engine: [*]const i16 = @ptrCast(@alignCast(vectorData(chunk, 11)));
+        const adv: [*]const i16 = @ptrCast(@alignCast(vectorData(chunk, 12)));
+        const window_width: [*]const i16 = @ptrCast(@alignCast(vectorData(chunk, 13)));
+        const window_height: [*]const i16 = @ptrCast(@alignCast(vectorData(chunk, 14)));
+        const is_link: [*]const i16 = @ptrCast(@alignCast(vectorData(chunk, 15)));
+        const is_download: [*]const i16 = @ptrCast(@alignCast(vectorData(chunk, 16)));
+        const dont_count: [*]const i16 = @ptrCast(@alignCast(vectorData(chunk, 17)));
+        const referer_hash: [*]const i64 = @ptrCast(@alignCast(vectorData(chunk, 18)));
+        const url_hash: [*]const i64 = @ptrCast(@alignCast(vectorData(chunk, 19)));
+        try callback(context, ClickBenchFixedChunk{
+            .watch = watch[0..n],
+            .event_time = event_time[0..n],
+            .event_date = event_date[0..n],
+            .counter = counter[0..n],
+            .client_ip = client_ip[0..n],
+            .region = region[0..n],
+            .user = user[0..n],
+            .refresh = refresh[0..n],
+            .width = width[0..n],
+            .mobile_phone = mobile_phone[0..n],
+            .trafic_source = trafic_source[0..n],
+            .search_engine = search_engine[0..n],
+            .adv = adv[0..n],
+            .window_width = window_width[0..n],
+            .window_height = window_height[0..n],
+            .is_link = is_link[0..n],
+            .is_download = is_download[0..n],
+            .dont_count = dont_count[0..n],
+            .referer_hash = referer_hash[0..n],
+            .url_hash = url_hash[0..n],
+        });
+        c.duckdb_destroy_data_chunk(&chunk);
+    }
+}
+
 pub fn streamClickBenchHotRows(allocator: std.mem.Allocator, io: std.Io, parquet_path: []const u8, limit_rows: ?u64, context: anytype, callback: anytype) !void {
     const RowContext = struct {
         outer: @TypeOf(context),
