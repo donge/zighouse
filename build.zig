@@ -28,6 +28,9 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    if (b.option(bool, "strip", "Strip debug symbols from installed executable") orelse false) {
+        exe.root_module.strip = true;
+    }
     exe.root_module.addOptions("build_options", options);
     exe.root_module.link_libc = true;
     if (enable_duckdb) {
