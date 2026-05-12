@@ -426,25 +426,34 @@ pub const Native = struct {
     }
 
     fn executeGenericFiltered(self: *Native, plan: generic_sql.Plan, hot: *const HotColumns, filter: generic_sql.Filter) anyerror![]u8 {
-        const predicate = bindGenericColumn(hot, filter.column) catch return error.UnsupportedGenericQuery;
-        var predicate_owned = false;
-        const predicate_values = if (filter.op == .not_equal and filter.int_value == 0) switch (predicate) {
-            .i16 => |values| values,
-            else => blk: {
-                predicate_owned = true;
-                break :blk try materializeGenericPredicate(self.allocator, predicate, filter);
-            },
-        } else blk: {
-            predicate_owned = true;
-            break :blk try materializeGenericPredicate(self.allocator, predicate, filter);
-        };
-        defer if (predicate_owned) self.allocator.free(predicate_values);
+        const predicate = try materializePlanFilter(self.allocator, hot, filter);
+        defer if (predicate.owned) self.allocator.free(predicate.values);
         const values = try self.allocator.alloc(GenericValue, plan.projections.len);
         defer self.allocator.free(values);
         for (plan.projections, 0..) |expr, i| {
-            values[i] = try executeGenericFilteredProjection(expr, hot, predicate_values);
+            values[i] = try executeGenericFilteredProjection(expr, hot, predicate.values);
         }
         return formatGenericValues(self.allocator, plan, values);
+    }
+
+    const GenericPredicateMask = struct { values: []const i16, owned: bool };
+
+    fn materializePlanFilter(allocator: std.mem.Allocator, hot: *const HotColumns, filter: generic_sql.Filter) !GenericPredicateMask {
+        if (filter.second) |second| {
+            const left_column = bindGenericColumn(hot, filter.column) catch return error.UnsupportedGenericQuery;
+            const right_column = bindGenericColumn(hot, second.column) catch return error.UnsupportedGenericQuery;
+            const left = generic_sql.Predicate{ .column = filter.column, .op = filter.op, .int_value = filter.int_value };
+            return .{ .values = try materializeGenericAndPredicate(allocator, left_column, left, right_column, second), .owned = true };
+        }
+
+        const predicate = bindGenericColumn(hot, filter.column) catch return error.UnsupportedGenericQuery;
+        const predicate_values = if (filter.op == .not_equal and filter.int_value == 0) switch (predicate) {
+            .i16 => |values| values,
+            else => return .{ .values = try materializeGenericPredicate(allocator, predicate, filter), .owned = true },
+        } else blk: {
+            break :blk try materializeGenericPredicate(allocator, predicate, filter);
+        };
+        return .{ .values = predicate_values, .owned = !(filter.op == .not_equal and filter.int_value == 0) };
     }
 
     fn queryCompare(self: *Native, sql: []const u8, query_kind: clickbench_queries.Query) anyerror!?[]u8 {
@@ -5632,19 +5641,47 @@ fn bindGenericColumn(hot: *const HotColumns, name: []const u8) !GenericColumn {
 }
 
 fn materializeGenericPredicate(allocator: std.mem.Allocator, column: GenericColumn, filter: generic_sql.Filter) ![]i16 {
+    const predicate = generic_sql.Predicate{ .column = filter.column, .op = filter.op, .int_value = filter.int_value };
+    return materializeGenericPredicateFor(allocator, column, predicate);
+}
+
+fn materializeGenericPredicateFor(allocator: std.mem.Allocator, column: GenericColumn, predicate: generic_sql.Predicate) ![]i16 {
     return switch (column) {
-        .i16 => |values| materializeGenericPredicateTyped(i16, allocator, values, filter),
-        .i32, .date => |values| materializeGenericPredicateTyped(i32, allocator, values, filter),
-        .i64 => |values| materializeGenericPredicateTyped(i64, allocator, values, filter),
+        .i16 => |values| materializeGenericPredicateTyped(i16, allocator, values, predicate),
+        .i32, .date => |values| materializeGenericPredicateTyped(i32, allocator, values, predicate),
+        .i64 => |values| materializeGenericPredicateTyped(i64, allocator, values, predicate),
     };
 }
 
-fn materializeGenericPredicateTyped(comptime T: type, allocator: std.mem.Allocator, values: []const T, filter: generic_sql.Filter) ![]i16 {
-    const target = std.math.cast(T, filter.int_value) orelse return error.UnsupportedGenericQuery;
+fn materializeGenericAndPredicate(allocator: std.mem.Allocator, left_column: GenericColumn, left: generic_sql.Predicate, right_column: GenericColumn, right: generic_sql.Predicate) ![]i16 {
+    const mask = try materializeGenericPredicateFor(allocator, left_column, left);
+    errdefer allocator.free(mask);
+    try applyGenericPredicateAnd(right_column, right, mask);
+    return mask;
+}
+
+fn applyGenericPredicateAnd(column: GenericColumn, predicate: generic_sql.Predicate, mask: []i16) !void {
+    switch (column) {
+        .i16 => |values| try applyGenericPredicateAndTyped(i16, values, predicate, mask),
+        .i32, .date => |values| try applyGenericPredicateAndTyped(i32, values, predicate, mask),
+        .i64 => |values| try applyGenericPredicateAndTyped(i64, values, predicate, mask),
+    }
+}
+
+fn applyGenericPredicateAndTyped(comptime T: type, values: []const T, predicate: generic_sql.Predicate, mask: []i16) !void {
+    if (values.len != mask.len) return error.InvalidGenericResult;
+    const target = std.math.cast(T, predicate.int_value) orelse return error.UnsupportedGenericQuery;
+    for (values, mask) |value, *out| {
+        if (out.* != 0 and !genericPredicateMatches(T, value, target, predicate.op)) out.* = 0;
+    }
+}
+
+fn materializeGenericPredicateTyped(comptime T: type, allocator: std.mem.Allocator, values: []const T, predicate: generic_sql.Predicate) ![]i16 {
+    const target = std.math.cast(T, predicate.int_value) orelse return error.UnsupportedGenericQuery;
     const mask = try allocator.alloc(i16, values.len);
     errdefer allocator.free(mask);
     for (values, mask) |value, *out| {
-        out.* = if (genericPredicateMatches(T, value, target, filter.op)) 1 else 0;
+        out.* = if (genericPredicateMatches(T, value, target, predicate.op)) 1 else 0;
     }
     return mask;
 }

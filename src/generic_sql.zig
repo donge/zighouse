@@ -9,10 +9,17 @@ pub const Expr = struct {
 
 pub const FilterOp = enum { equal, not_equal, greater, greater_equal, less, less_equal };
 
+pub const Predicate = struct {
+    column: []const u8,
+    op: FilterOp,
+    int_value: i64,
+};
+
 pub const Filter = struct {
     column: []const u8,
     op: FilterOp,
     int_value: i64,
+    second: ?Predicate = null,
 };
 
 pub const Plan = struct {
@@ -87,6 +94,18 @@ fn parseCall(expr: []const u8, name: []const u8) ?[]const u8 {
 }
 
 fn parseFilter(where_body: []const u8) ?Filter {
+    if (indexOfKeyword(where_body, "and")) |and_pos| {
+        const right = std.mem.trim(u8, where_body[and_pos + "and".len ..], " \t\r\n");
+        if (indexOfKeyword(right, "and") != null) return null;
+        const first = parsePredicate(std.mem.trim(u8, where_body[0..and_pos], " \t\r\n")) orelse return null;
+        const second = parsePredicate(right) orelse return null;
+        return .{ .column = first.column, .op = first.op, .int_value = first.int_value, .second = second };
+    }
+    const predicate = parsePredicate(where_body) orelse return null;
+    return .{ .column = predicate.column, .op = predicate.op, .int_value = predicate.int_value };
+}
+
+fn parsePredicate(where_body: []const u8) ?Predicate {
     const ParsedOp = struct { pos: usize, text: []const u8, op: FilterOp };
     const parsed_op = blk: {
         const ops = [_]struct { text: []const u8, op: FilterOp }{
@@ -186,8 +205,21 @@ test "parses comparison filters" {
     }
 }
 
+test "parses two predicate and filter" {
+    const plan = (try parse(std.testing.allocator, "SELECT COUNT(*) FROM hits WHERE CounterID = 62 AND IsRefresh = 0")).?;
+    defer deinit(std.testing.allocator, plan);
+    try std.testing.expect(plan.filter != null);
+    try std.testing.expectEqualStrings("CounterID", plan.filter.?.column);
+    try std.testing.expectEqual(FilterOp.equal, plan.filter.?.op);
+    try std.testing.expectEqual(@as(i64, 62), plan.filter.?.int_value);
+    try std.testing.expect(plan.filter.?.second != null);
+    try std.testing.expectEqualStrings("IsRefresh", plan.filter.?.second.?.column);
+    try std.testing.expectEqual(FilterOp.equal, plan.filter.?.second.?.op);
+    try std.testing.expectEqual(@as(i64, 0), plan.filter.?.second.?.int_value);
+}
+
 test "rejects unsupported sql" {
     try std.testing.expect((try parse(std.testing.allocator, "SELECT URL FROM hits")) == null);
     try std.testing.expect((try parse(std.testing.allocator, "SELECT COUNT(*) FROM other")) == null);
-    try std.testing.expect((try parse(std.testing.allocator, "SELECT COUNT(*) FROM hits WHERE AdvEngineID <> 0 AND ResolutionWidth > 0")) == null);
+    try std.testing.expect((try parse(std.testing.allocator, "SELECT COUNT(*) FROM hits WHERE AdvEngineID <> 0 AND ResolutionWidth > 0 AND IsRefresh = 0")) == null);
 }
