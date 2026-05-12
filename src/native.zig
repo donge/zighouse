@@ -5611,19 +5611,11 @@ fn filteredAvgI64(predicate: []const i16, values: []const i64) f64 {
 }
 
 fn filteredMinI16(predicate: []const i16, values: []const i16) i16 {
-    var result: i16 = std.math.maxInt(i16);
-    for (predicate, values) |p, value| {
-        if (p != 0) result = @min(result, value);
-    }
-    return result;
+    return simd.filteredMinMaxI16NonZero(predicate, values).min;
 }
 
 fn filteredMaxI16(predicate: []const i16, values: []const i16) i16 {
-    var result: i16 = std.math.minInt(i16);
-    for (predicate, values) |p, value| {
-        if (p != 0) result = @max(result, value);
-    }
-    return result;
+    return simd.filteredMinMaxI16NonZero(predicate, values).max;
 }
 
 fn filteredMinI32(predicate: []const i16, values: []const i32) i32 {
