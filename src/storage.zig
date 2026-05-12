@@ -151,6 +151,43 @@ pub fn readImportManifest(io: std.Io, allocator: std.mem.Allocator, data_dir: []
     return try dir.readFileAlloc(io, import_name, allocator, .limited(64 * 1024));
 }
 
+pub const ImportInfo = struct {
+    source: ?[]const u8 = null,
+    row_count: ?u64 = null,
+
+    pub fn deinit(self: ImportInfo, allocator: std.mem.Allocator) void {
+        if (self.source) |source| allocator.free(source);
+    }
+
+    pub fn rowLimit(self: ImportInfo) ?u64 {
+        const rows = self.row_count orelse return null;
+        return if (rows == 0) null else rows;
+    }
+};
+
+pub fn parseImportInfo(allocator: std.mem.Allocator, text: []const u8) !ImportInfo {
+    var info: ImportInfo = .{};
+    errdefer info.deinit(allocator);
+
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.startsWith(u8, line, "source=")) {
+            if (info.source) |source| allocator.free(source);
+            info.source = try allocator.dupe(u8, std.mem.trim(u8, line["source=".len..], " \t\r"));
+        } else if (std.mem.startsWith(u8, line, "row_count=")) {
+            const raw = std.mem.trim(u8, line["row_count=".len..], " \t\r");
+            info.row_count = try std.fmt.parseInt(u64, raw, 10);
+        }
+    }
+    return info;
+}
+
+pub fn readImportInfo(io: std.Io, allocator: std.mem.Allocator, data_dir: []const u8) !ImportInfo {
+    const text = try readImportManifest(io, allocator, data_dir);
+    defer allocator.free(text);
+    return parseImportInfo(allocator, text);
+}
+
 pub fn readStoreManifest(io: std.Io, allocator: std.mem.Allocator, data_dir: []const u8) ![]u8 {
     var dir = try std.Io.Dir.cwd().openDir(io, data_dir, .{});
     defer dir.close(io);
@@ -158,24 +195,10 @@ pub fn readStoreManifest(io: std.Io, allocator: std.mem.Allocator, data_dir: []c
 }
 
 pub fn readImportSource(io: std.Io, allocator: std.mem.Allocator, data_dir: []const u8) ![]u8 {
-    var dir = try std.Io.Dir.cwd().openDir(io, data_dir, .{});
-    defer dir.close(io);
-
-    const text = try dir.readFileAlloc(io, import_name, allocator, .limited(16 * 1024));
-    errdefer allocator.free(text);
-
-    var lines = std.mem.splitScalar(u8, text, '\n');
-    while (lines.next()) |line| {
-        if (std.mem.startsWith(u8, line, "source=")) {
-            const source = line["source=".len..];
-            const copy = try allocator.dupe(u8, source);
-            allocator.free(text);
-            return copy;
-        }
-    }
-
-    allocator.free(text);
-    return error.MissingImportSource;
+    var info = try readImportInfo(io, allocator, data_dir);
+    defer info.deinit(allocator);
+    const source = info.source orelse return error.MissingImportSource;
+    return try allocator.dupe(u8, source);
 }
 
 pub fn duckDbPath(allocator: std.mem.Allocator, data_dir: []const u8) ![]u8 {
@@ -281,4 +304,25 @@ test "segment rows are power of two" {
 test "schema exposes fixed widths" {
     try std.testing.expectEqual(@as(?usize, 2), schema.ColumnType.int16.fixedWidth());
     try std.testing.expectEqual(@as(?usize, null), schema.ColumnType.text.fixedWidth());
+}
+
+test "parses import manifest info" {
+    const allocator = std.testing.allocator;
+    var info = try parseImportInfo(allocator,
+        \\source=data/hits.parquet
+        \\status=imported
+        \\row_count=0
+        \\
+    );
+    defer info.deinit(allocator);
+    try std.testing.expectEqualStrings("data/hits.parquet", info.source.?);
+    try std.testing.expectEqual(@as(?u64, null), info.rowLimit());
+
+    var limited = try parseImportInfo(allocator,
+        \\source=data/hits.parquet
+        \\row_count=10000000
+        \\
+    );
+    defer limited.deinit(allocator);
+    try std.testing.expectEqual(@as(?u64, 10000000), limited.rowLimit());
 }
