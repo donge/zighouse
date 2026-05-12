@@ -5629,29 +5629,10 @@ fn executeGenericProjection(expr: generic_sql.Expr, hot: *const HotColumns) !Gen
     const column = bindGenericColumn(hot, expr.column orelse return error.UnsupportedGenericQuery) catch return error.UnsupportedGenericQuery;
     return switch (expr.func) {
         .count_star => unreachable,
-        .sum => switch (column) {
-            .i16 => |values| .{ .int = simd.sum(i16, values) },
-            .i32 => |values| .{ .int = simd.sum(i32, values) },
-            .date, .i64 => error.UnsupportedGenericQuery,
-        },
-        .avg => switch (column) {
-            .i16 => |values| .{ .float = avgFromSum(simd.sum(i16, values), values.len) },
-            .i32 => |values| .{ .float = avgFromSum(simd.sum(i32, values), values.len) },
-            .i64 => |values| .{ .float = simd.avg(i64, values) },
-            .date => error.UnsupportedGenericQuery,
-        },
-        .min => switch (column) {
-            .i16 => |values| .{ .int = simd.minMax(i16, values).min },
-            .i32 => |values| .{ .int = simd.minMax(i32, values).min },
-            .date => |values| .{ .date = simd.minMax(i32, values).min },
-            .i64 => |values| .{ .int = simd.minMax(i64, values).min },
-        },
-        .max => switch (column) {
-            .i16 => |values| .{ .int = simd.minMax(i16, values).max },
-            .i32 => |values| .{ .int = simd.minMax(i32, values).max },
-            .date => |values| .{ .date = simd.minMax(i32, values).max },
-            .i64 => |values| .{ .int = simd.minMax(i64, values).max },
-        },
+        .sum => aggregateSum(column, null),
+        .avg => aggregateAvg(column, null),
+        .min => aggregateMin(column, null),
+        .max => aggregateMax(column, null),
     };
 }
 
@@ -5660,29 +5641,45 @@ fn executeGenericFilteredProjection(expr: generic_sql.Expr, hot: *const HotColum
     const column = bindGenericColumn(hot, expr.column orelse return error.UnsupportedGenericQuery) catch return error.UnsupportedGenericQuery;
     return switch (expr.func) {
         .count_star => unreachable,
-        .sum => switch (column) {
-            .i16 => |values| .{ .int = simd.filteredSumNonZero(i16, predicate, values) },
-            .i32 => |values| .{ .int = simd.filteredSumNonZero(i32, predicate, values) },
-            .date, .i64 => error.UnsupportedGenericQuery,
-        },
-        .avg => switch (column) {
-            .i16 => |values| .{ .float = simd.filteredAvgNonZero(i16, predicate, values) },
-            .i32 => |values| .{ .float = simd.filteredAvgNonZero(i32, predicate, values) },
-            .i64 => |values| .{ .float = simd.filteredAvgNonZero(i64, predicate, values) },
-            .date => error.UnsupportedGenericQuery,
-        },
-        .min => switch (column) {
-            .i16 => |values| .{ .int = simd.filteredMinMaxNonZero(i16, predicate, values).min },
-            .i32 => |values| .{ .int = simd.filteredMinMaxNonZero(i32, predicate, values).min },
-            .date => |values| .{ .date = simd.filteredMinMaxNonZero(i32, predicate, values).min },
-            .i64 => |values| .{ .int = simd.filteredMinMaxNonZero(i64, predicate, values).min },
-        },
-        .max => switch (column) {
-            .i16 => |values| .{ .int = simd.filteredMinMaxNonZero(i16, predicate, values).max },
-            .i32 => |values| .{ .int = simd.filteredMinMaxNonZero(i32, predicate, values).max },
-            .date => |values| .{ .date = simd.filteredMinMaxNonZero(i32, predicate, values).max },
-            .i64 => |values| .{ .int = simd.filteredMinMaxNonZero(i64, predicate, values).max },
-        },
+        .sum => aggregateSum(column, predicate),
+        .avg => aggregateAvg(column, predicate),
+        .min => aggregateMin(column, predicate),
+        .max => aggregateMax(column, predicate),
+    };
+}
+
+fn aggregateSum(column: GenericColumn, predicate: ?[]const i16) !GenericValue {
+    return switch (column) {
+        .i16 => |values| .{ .int = if (predicate) |p| simd.filteredSumNonZero(i16, p, values) else simd.sum(i16, values) },
+        .i32 => |values| .{ .int = if (predicate) |p| simd.filteredSumNonZero(i32, p, values) else simd.sum(i32, values) },
+        .date, .i64 => error.UnsupportedGenericQuery,
+    };
+}
+
+fn aggregateAvg(column: GenericColumn, predicate: ?[]const i16) !GenericValue {
+    return switch (column) {
+        .i16 => |values| .{ .float = if (predicate) |p| simd.filteredAvgNonZero(i16, p, values) else avgFromSum(simd.sum(i16, values), values.len) },
+        .i32 => |values| .{ .float = if (predicate) |p| simd.filteredAvgNonZero(i32, p, values) else avgFromSum(simd.sum(i32, values), values.len) },
+        .i64 => |values| .{ .float = if (predicate) |p| simd.filteredAvgNonZero(i64, p, values) else simd.avg(i64, values) },
+        .date => error.UnsupportedGenericQuery,
+    };
+}
+
+fn aggregateMin(column: GenericColumn, predicate: ?[]const i16) !GenericValue {
+    return switch (column) {
+        .i16 => |values| .{ .int = if (predicate) |p| simd.filteredMinMaxNonZero(i16, p, values).min else simd.minMax(i16, values).min },
+        .i32 => |values| .{ .int = if (predicate) |p| simd.filteredMinMaxNonZero(i32, p, values).min else simd.minMax(i32, values).min },
+        .date => |values| .{ .date = if (predicate) |p| simd.filteredMinMaxNonZero(i32, p, values).min else simd.minMax(i32, values).min },
+        .i64 => |values| .{ .int = if (predicate) |p| simd.filteredMinMaxNonZero(i64, p, values).min else simd.minMax(i64, values).min },
+    };
+}
+
+fn aggregateMax(column: GenericColumn, predicate: ?[]const i16) !GenericValue {
+    return switch (column) {
+        .i16 => |values| .{ .int = if (predicate) |p| simd.filteredMinMaxNonZero(i16, p, values).max else simd.minMax(i16, values).max },
+        .i32 => |values| .{ .int = if (predicate) |p| simd.filteredMinMaxNonZero(i32, p, values).max else simd.minMax(i32, values).max },
+        .date => |values| .{ .date = if (predicate) |p| simd.filteredMinMaxNonZero(i32, p, values).max else simd.minMax(i32, values).max },
+        .i64 => |values| .{ .int = if (predicate) |p| simd.filteredMinMaxNonZero(i64, p, values).max else simd.minMax(i64, values).max },
     };
 }
 
@@ -5695,6 +5692,10 @@ fn executeGenericFusedMinMax(allocator: std.mem.Allocator, plan: generic_sql.Pla
     const second_col = second.column orelse return error.UnsupportedGenericQuery;
     if (!asciiEqlIgnoreCase(first_col, second_col)) return null;
     return switch (bindGenericColumn(hot, first_col) catch return error.UnsupportedGenericQuery) {
+        .i16 => |values| blk: {
+            const mm = simd.minMax(i16, values);
+            break :blk try formatGenericValues(allocator, plan, &.{ .{ .int = mm.min }, .{ .int = mm.max } });
+        },
         .i32 => |values| blk: {
             const mm = simd.minMax(i32, values);
             break :blk try formatGenericValues(allocator, plan, &.{ .{ .int = mm.min }, .{ .int = mm.max } });
@@ -5703,7 +5704,10 @@ fn executeGenericFusedMinMax(allocator: std.mem.Allocator, plan: generic_sql.Pla
             const mm = simd.minMax(i32, values);
             break :blk try formatGenericValues(allocator, plan, &.{ .{ .date = mm.min }, .{ .date = mm.max } });
         },
-        else => null,
+        .i64 => |values| blk: {
+            const mm = simd.minMax(i64, values);
+            break :blk try formatGenericValues(allocator, plan, &.{ .{ .int = mm.min }, .{ .int = mm.max } });
+        },
     };
 }
 
