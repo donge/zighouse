@@ -1,6 +1,6 @@
 const std = @import("std");
 
-pub const AggregateFn = enum { count_star, sum, avg, min, max };
+pub const AggregateFn = enum { column_ref, count_star, sum, avg, min, max };
 
 pub const Expr = struct {
     func: AggregateFn,
@@ -26,6 +26,8 @@ pub const Plan = struct {
     table: []const u8,
     projections: []const Expr,
     filter: ?Filter = null,
+    group_by: ?[]const u8 = null,
+    order_by_count_desc: bool = false,
 };
 
 pub fn parse(allocator: std.mem.Allocator, sql: []const u8) !?Plan {
@@ -39,7 +41,10 @@ pub fn parse(allocator: std.mem.Allocator, sql: []const u8) !?Plan {
     if (select_body.len == 0 or after_from.len == 0) return null;
 
     const where_pos = indexOfKeyword(after_from, "where");
-    const table_text = if (where_pos) |pos| std.mem.trim(u8, after_from[0..pos], " \t\r\n") else after_from;
+    const group_by_pos = indexOfKeywordPair(after_from, "group", "by");
+    const order_by_pos = indexOfKeywordPair(after_from, "order", "by");
+    const table_end = minOptionalPos(where_pos, minOptionalPos(group_by_pos, order_by_pos)) orelse after_from.len;
+    const table_text = std.mem.trim(u8, after_from[0..table_end], " \t\r\n");
     if (!asciiEqlIgnoreCase(table_text, "hits")) return null;
 
     var projections: std.ArrayList(Expr) = .empty;
@@ -53,22 +58,57 @@ pub fn parse(allocator: std.mem.Allocator, sql: []const u8) !?Plan {
     if (projections.items.len == 0) return null;
 
     const filter = if (where_pos) |pos| blk: {
-        const where_body = std.mem.trim(u8, after_from[pos + "where".len ..], " \t\r\n");
+        const where_end = minOptionalPos(group_by_pos, order_by_pos) orelse after_from.len;
+        if (where_end <= pos) return null;
+        const where_body = std.mem.trim(u8, after_from[pos + "where".len .. where_end], " \t\r\n");
         break :blk parseFilter(where_body) orelse {
             projections.deinit(allocator);
             return null;
         };
     } else null;
 
+    const group_by = if (group_by_pos) |pos| blk: {
+        const group_by_end = order_by_pos orelse after_from.len;
+        if (group_by_end <= pos) return null;
+        const group_body = std.mem.trim(u8, after_from[pos + "group".len + "by".len + 1 .. group_by_end], " \t\r\n");
+        if (group_body.len == 0 or std.mem.indexOfScalar(u8, group_body, ',') != null) return null;
+        break :blk group_body;
+    } else null;
+
+    const order_by_count_desc = if (order_by_pos) |pos| blk: {
+        const order_body = std.mem.trim(u8, after_from[pos + "order".len + "by".len + 1 ..], " \t\r\n");
+        break :blk asciiEqlIgnoreCase(order_body, "COUNT(*) DESC");
+    } else false;
+    if (order_by_pos != null and !order_by_count_desc) {
+        projections.deinit(allocator);
+        return null;
+    }
+    if (!validPlanShape(projections.items, group_by)) {
+        projections.deinit(allocator);
+        return null;
+    }
+
     return .{
         .table = table_text,
         .projections = try projections.toOwnedSlice(allocator),
         .filter = filter,
+        .group_by = group_by,
+        .order_by_count_desc = order_by_count_desc,
     };
 }
 
 pub fn deinit(allocator: std.mem.Allocator, plan: Plan) void {
     allocator.free(plan.projections);
+}
+
+fn validPlanShape(projections: []const Expr, group_by: ?[]const u8) bool {
+    if (group_by == null) {
+        for (projections) |expr| if (expr.func == .column_ref) return false;
+        return true;
+    }
+    if (projections.len != 2) return false;
+    if (projections[0].func != .column_ref or projections[1].func != .count_star) return false;
+    return asciiEqlIgnoreCase(projections[0].column orelse return false, group_by.?);
 }
 
 fn parseExpr(expr: []const u8) ?Expr {
@@ -80,6 +120,7 @@ fn parseExpr(expr: []const u8) ?Expr {
     if (parseCall(expr, "avg")) |arg| return .{ .func = .avg, .column = std.mem.trim(u8, arg, " \t\r\n") };
     if (parseCall(expr, "min")) |arg| return .{ .func = .min, .column = std.mem.trim(u8, arg, " \t\r\n") };
     if (parseCall(expr, "max")) |arg| return .{ .func = .max, .column = std.mem.trim(u8, arg, " \t\r\n") };
+    if (isIdentifierText(expr)) return .{ .func = .column_ref, .column = expr };
     return null;
 }
 
@@ -142,6 +183,23 @@ fn indexOfKeyword(sql: []const u8, keyword: []const u8) ?usize {
     return null;
 }
 
+fn indexOfKeywordPair(sql: []const u8, first: []const u8, second: []const u8) ?usize {
+    var search_from: usize = 0;
+    while (search_from < sql.len) {
+        const rel = indexOfKeyword(sql[search_from..], first) orelse return null;
+        const pos = search_from + rel;
+        const after_first = std.mem.trim(u8, sql[pos + first.len ..], " \t\r\n");
+        if (startsWithKeyword(after_first, second)) return pos;
+        search_from = pos + first.len;
+    }
+    return null;
+}
+
+fn minOptionalPos(a: ?usize, b: ?usize) ?usize {
+    if (a) |av| if (b) |bv| return @min(av, bv) else return av;
+    return b;
+}
+
 fn startsWithKeyword(sql: []const u8, keyword: []const u8) bool {
     if (sql.len < keyword.len) return false;
     if (!asciiEqlIgnoreCase(sql[0..keyword.len], keyword)) return false;
@@ -150,6 +208,12 @@ fn startsWithKeyword(sql: []const u8, keyword: []const u8) bool {
 
 fn isIdent(c: u8) bool {
     return std.ascii.isAlphanumeric(c) or c == '_';
+}
+
+fn isIdentifierText(text: []const u8) bool {
+    if (text.len == 0) return false;
+    for (text) |c| if (!isIdent(c)) return false;
+    return true;
 }
 
 fn asciiEqlIgnoreCase(a: []const u8, b: []const u8) bool {
@@ -176,6 +240,21 @@ test "parses aggregate list" {
     try std.testing.expectEqual(AggregateFn.count_star, plan.projections[1].func);
     try std.testing.expectEqual(AggregateFn.avg, plan.projections[2].func);
     try std.testing.expectEqualStrings("ResolutionWidth", plan.projections[2].column.?);
+}
+
+test "parses group by count query" {
+    const plan = (try parse(std.testing.allocator, "SELECT AdvEngineID, COUNT(*) FROM hits WHERE AdvEngineID <> 0 GROUP BY AdvEngineID ORDER BY COUNT(*) DESC")).?;
+    defer deinit(std.testing.allocator, plan);
+    try std.testing.expectEqual(@as(usize, 2), plan.projections.len);
+    try std.testing.expectEqual(AggregateFn.column_ref, plan.projections[0].func);
+    try std.testing.expectEqualStrings("AdvEngineID", plan.projections[0].column.?);
+    try std.testing.expectEqual(AggregateFn.count_star, plan.projections[1].func);
+    try std.testing.expectEqualStrings("AdvEngineID", plan.group_by.?);
+    try std.testing.expect(plan.order_by_count_desc);
+}
+
+test "rejects unsupported order by" {
+    try std.testing.expect((try parse(std.testing.allocator, "SELECT AdvEngineID, COUNT(*) FROM hits GROUP BY AdvEngineID ORDER BY AdvEngineID")) == null);
 }
 
 test "parses not equal filter" {

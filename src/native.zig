@@ -412,6 +412,8 @@ pub const Native = struct {
             else => return err,
         };
 
+        if (plan.group_by != null) return try self.executeGenericGroupBy(plan, hot);
+
         if (plan.filter) |filter| return self.executeGenericFiltered(plan, hot, filter);
 
         const fused_minmax = try executeGenericFusedMinMax(self.allocator, plan, hot);
@@ -423,6 +425,23 @@ pub const Native = struct {
             values[i] = try executeGenericProjection(expr, hot);
         }
         return formatGenericValues(self.allocator, plan, values);
+    }
+
+    fn executeGenericGroupBy(self: *Native, plan: generic_sql.Plan, hot: *const HotColumns) anyerror![]u8 {
+        const group_col = plan.group_by orelse return error.UnsupportedGenericQuery;
+        if (!plan.order_by_count_desc) return error.UnsupportedGenericQuery;
+        if (plan.projections.len != 2) return error.UnsupportedGenericQuery;
+        if (plan.projections[0].func != .column_ref or plan.projections[1].func != .count_star) return error.UnsupportedGenericQuery;
+        const selected_col = plan.projections[0].column orelse return error.UnsupportedGenericQuery;
+        if (!asciiEqlIgnoreCase(selected_col, group_col)) return error.UnsupportedGenericQuery;
+
+        const group_values = bindGenericColumn(hot, group_col) catch return error.UnsupportedGenericQuery;
+        if (plan.filter) |filter| {
+            const predicate = try materializePlanFilter(self.allocator, hot, filter);
+            defer if (predicate.owned) self.allocator.free(predicate.values);
+            return formatGenericGroupCount(self.allocator, selected_col, group_values, predicate.values);
+        }
+        return formatGenericGroupCount(self.allocator, selected_col, group_values, null);
     }
 
     fn executeGenericFiltered(self: *Native, plan: generic_sql.Plan, hot: *const HotColumns, filter: generic_sql.Filter) anyerror![]u8 {
@@ -5629,6 +5648,11 @@ const GenericColumn = union(enum) {
     i64: []const i64,
 };
 
+const GenericGroupRow = struct {
+    key: i64,
+    count: u64,
+};
+
 fn bindGenericColumn(hot: *const HotColumns, name: []const u8) !GenericColumn {
     if (asciiEqlIgnoreCase(name, "AdvEngineID")) return .{ .i16 = hot.adv_engine_id };
     if (asciiEqlIgnoreCase(name, "ResolutionWidth")) return .{ .i16 = hot.resolution_width };
@@ -5697,10 +5721,58 @@ fn genericPredicateMatches(comptime T: type, value: T, target: T, op: generic_sq
     };
 }
 
+fn formatGenericGroupCount(allocator: std.mem.Allocator, header_col: []const u8, column: GenericColumn, predicate: ?[]const i16) ![]u8 {
+    const rows = switch (column) {
+        .i16 => |values| try genericGroupCountTyped(i16, allocator, values, predicate),
+        .i32 => |values| try genericGroupCountTyped(i32, allocator, values, predicate),
+        .date => return error.UnsupportedGenericQuery,
+        .i64 => |values| try genericGroupCountTyped(i64, allocator, values, predicate),
+    };
+    defer allocator.free(rows);
+    std.mem.sort(GenericGroupRow, rows, {}, genericGroupRowDesc);
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.print(allocator, "{s},count_star()\n", .{header_col});
+    for (rows) |row| try out.print(allocator, "{d},{d}\n", .{ row.key, row.count });
+    return out.toOwnedSlice(allocator);
+}
+
+fn genericGroupCountTyped(comptime T: type, allocator: std.mem.Allocator, values: []const T, predicate: ?[]const i16) ![]GenericGroupRow {
+    if (T == i16) {
+        const min_key = std.math.minInt(i16);
+        const bucket_count = @as(usize, std.math.maxInt(u16)) + 1;
+        const counts = try allocator.alloc(u64, bucket_count);
+        defer allocator.free(counts);
+        @memset(counts, 0);
+        for (values, 0..) |value, i| {
+            if (predicate) |p| if (p[i] == 0) continue;
+            const index: usize = @intCast(@as(i32, value) - @as(i32, min_key));
+            counts[index] += 1;
+        }
+
+        var rows: std.ArrayList(GenericGroupRow) = .empty;
+        errdefer rows.deinit(allocator);
+        for (counts, 0..) |count, index| {
+            if (count == 0) continue;
+            const key: i16 = @intCast(@as(i32, @intCast(index)) + @as(i32, min_key));
+            try rows.append(allocator, .{ .key = key, .count = count });
+        }
+        return rows.toOwnedSlice(allocator);
+    }
+    return error.UnsupportedGenericQuery;
+}
+
+fn genericGroupRowDesc(_: void, a: GenericGroupRow, b: GenericGroupRow) bool {
+    if (a.count == b.count) return a.key < b.key;
+    return a.count > b.count;
+}
+
 fn executeGenericProjection(expr: generic_sql.Expr, hot: *const HotColumns) !GenericValue {
     if (expr.func == .count_star) return .{ .int = @intCast(hot.rowCount()) };
     const column = bindGenericColumn(hot, expr.column orelse return error.UnsupportedGenericQuery) catch return error.UnsupportedGenericQuery;
     return switch (expr.func) {
+        .column_ref => error.UnsupportedGenericQuery,
         .count_star => unreachable,
         .sum => aggregateSum(column, null),
         .avg => aggregateAvg(column, null),
@@ -5713,6 +5785,7 @@ fn executeGenericFilteredProjection(expr: generic_sql.Expr, hot: *const HotColum
     if (expr.func == .count_star) return .{ .int = @intCast(simd.countNonZero(i16, predicate)) };
     const column = bindGenericColumn(hot, expr.column orelse return error.UnsupportedGenericQuery) catch return error.UnsupportedGenericQuery;
     return switch (expr.func) {
+        .column_ref => error.UnsupportedGenericQuery,
         .count_star => unreachable,
         .sum => aggregateSum(column, predicate),
         .avg => aggregateAvg(column, predicate),
@@ -5801,6 +5874,7 @@ fn writeGenericHeader(out: *std.ArrayList(u8), allocator: std.mem.Allocator, pla
     for (plan.projections, 0..) |expr, i| {
         if (i != 0) try out.append(allocator, ',');
         switch (expr.func) {
+            .column_ref => try out.print(allocator, "{s}", .{expr.column.?}),
             .count_star => try out.appendSlice(allocator, "count_star()"),
             .sum => try out.print(allocator, "sum({s})", .{expr.column.?}),
             .avg => try out.print(allocator, "avg({s})", .{expr.column.?}),
