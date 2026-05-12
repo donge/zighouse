@@ -456,6 +456,11 @@ pub const Native = struct {
             if (isGenericSearchPhraseCountPlan(plan)) return formatSearchPhraseCountTopCached(self.allocator, try self.getSearchPhraseColumn());
             if (isGenericSearchPhraseDistinctPlan(plan)) return formatSearchPhraseDistinctUserIdTop(self.allocator, self.io, self.data_dir);
             if (isGenericSearchEnginePhraseCountPlan(plan)) return formatSearchEnginePhraseCountTop(self.allocator, self.io, self.data_dir);
+            if (isGenericUserIdSearchPhraseCountTopPlan(plan)) return formatUserIdSearchPhraseCountTopCached(self.allocator, try self.getUserIdEncoding(), try self.getSearchPhraseColumn());
+            if (isGenericUserIdMinuteSearchPhraseCountTopPlan(plan)) return formatUserIdMinuteSearchPhraseCountTopCached(self.allocator, self.io, self.data_dir, try self.getUserIdEncoding(), try self.getSearchPhraseColumn());
+        }
+        if (isGenericUserIdSearchPhraseLimitPlan(plan)) {
+            return formatUserIdSearchPhraseLimitNoOrderCached(self.allocator, try self.getUserIdEncoding(), try self.getSearchPhraseColumn());
         }
         if (asciiEqlIgnoreCase(group_col, "RegionID") and plan.limit == 10) {
             if (plan.projections.len == 2 and plan.projections[1].func == .count_distinct and asciiEqlIgnoreCase(plan.projections[1].column orelse return error.UnsupportedGenericQuery, "UserID")) {
@@ -565,6 +570,33 @@ pub const Native = struct {
         if (plan.projections[0].func != .column_ref or !asciiEqlIgnoreCase(plan.projections[0].column orelse return false, "SearchEngineID")) return false;
         if (plan.projections[1].func != .column_ref or !asciiEqlIgnoreCase(plan.projections[1].column orelse return false, "SearchPhrase")) return false;
         return plan.projections[2].func == .count_star;
+    }
+
+    fn isGenericUserIdSearchPhraseCountTopPlan(plan: generic_sql.Plan) bool {
+        return isGenericUserIdSearchPhraseCountPlan(plan) and plan.filter == null and plan.limit == 10 and plan.order_by_count_desc;
+    }
+
+    fn isGenericUserIdSearchPhraseLimitPlan(plan: generic_sql.Plan) bool {
+        return isGenericUserIdSearchPhraseCountPlan(plan) and plan.filter == null and plan.limit == 10 and !plan.order_by_count_desc and plan.order_by_alias == null;
+    }
+
+    fn isGenericUserIdSearchPhraseCountPlan(plan: generic_sql.Plan) bool {
+        if (!asciiEqlIgnoreCase(plan.group_by orelse return false, "UserID, SearchPhrase")) return false;
+        if (plan.projections.len != 3) return false;
+        if (plan.projections[0].func != .column_ref or !asciiEqlIgnoreCase(plan.projections[0].column orelse return false, "UserID")) return false;
+        if (plan.projections[1].func != .column_ref or !asciiEqlIgnoreCase(plan.projections[1].column orelse return false, "SearchPhrase")) return false;
+        return plan.projections[2].func == .count_star;
+    }
+
+    fn isGenericUserIdMinuteSearchPhraseCountTopPlan(plan: generic_sql.Plan) bool {
+        if (plan.filter != null or plan.limit != 10 or !plan.order_by_count_desc) return false;
+        if (!asciiEqlIgnoreCase(plan.group_by orelse return false, "UserID, m, SearchPhrase")) return false;
+        if (plan.projections.len != 4) return false;
+        if (plan.projections[0].func != .column_ref or !asciiEqlIgnoreCase(plan.projections[0].column orelse return false, "UserID")) return false;
+        if (plan.projections[1].func != .column_ref or !asciiEqlIgnoreCase(plan.projections[1].column orelse return false, "EventMinuteOfHour")) return false;
+        if (!asciiEqlIgnoreCase(plan.projections[1].alias orelse return false, "m")) return false;
+        if (plan.projections[2].func != .column_ref or !asciiEqlIgnoreCase(plan.projections[2].column orelse return false, "SearchPhrase")) return false;
+        return plan.projections[3].func == .count_star;
     }
 
     const GenericPredicateMask = struct { values: []const i16, owned: bool };

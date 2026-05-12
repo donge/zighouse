@@ -36,7 +36,7 @@ pub const Plan = struct {
 
 pub fn parse(allocator: std.mem.Allocator, sql: []const u8) !?Plan {
     const trimmed = std.mem.trim(u8, sql, " \t\r\n;");
-    const from_pos = indexOfKeyword(trimmed, "from") orelse return null;
+    const from_pos = indexOfTopLevelKeyword(trimmed, "from") orelse return null;
     const select_kw = "select";
     if (!startsWithKeyword(trimmed, select_kw)) return null;
 
@@ -54,12 +54,10 @@ pub fn parse(allocator: std.mem.Allocator, sql: []const u8) !?Plan {
 
     var projections: std.ArrayList(Expr) = .empty;
     errdefer projections.deinit(allocator);
-    var parts = std.mem.splitScalar(u8, select_body, ',');
-    while (parts.next()) |raw_part| {
-        const part = std.mem.trim(u8, raw_part, " \t\r\n");
-        if (part.len == 0) return null;
-        try projections.append(allocator, parseAliasedExpr(part) orelse return null);
-    }
+    parseProjectionList(allocator, &projections, select_body) catch {
+        projections.deinit(allocator);
+        return null;
+    };
     if (projections.items.len == 0) return null;
 
     const filter = if (where_pos) |pos| blk: {
@@ -138,11 +136,30 @@ fn validPlanShape(projections: []const Expr, filter: ?Filter, group_by: ?[]const
     }
     if (validRegionStatsShape(projections, group_by.?)) return true;
     if (validClickBenchStringTopShape(projections, filter, group_by.?)) return true;
+    if (validUserSearchPhraseTopShape(projections, group_by.?)) return true;
     if (projections.len != 2) return false;
     if (projections[0].func != .column_ref) return false;
     if (!asciiEqlIgnoreCase(projections[0].column orelse return false, group_by.?)) return false;
     if (projections[1].func == .count_star) return true;
     if (projections[1].func == .count_distinct and asciiEqlIgnoreCase(group_by.?, "RegionID")) return asciiEqlIgnoreCase(projections[1].column orelse return false, "UserID");
+    return false;
+}
+
+fn validUserSearchPhraseTopShape(projections: []const Expr, group_by: []const u8) bool {
+    if (projections.len == 3) {
+        if (!asciiEqlIgnoreCase(group_by, "UserID, SearchPhrase")) return false;
+        if (projections[0].func != .column_ref or !asciiEqlIgnoreCase(projections[0].column orelse return false, "UserID")) return false;
+        if (projections[1].func != .column_ref or !asciiEqlIgnoreCase(projections[1].column orelse return false, "SearchPhrase")) return false;
+        return projections[2].func == .count_star;
+    }
+    if (projections.len == 4) {
+        if (!asciiEqlIgnoreCase(group_by, "UserID, m, SearchPhrase")) return false;
+        if (projections[0].func != .column_ref or !asciiEqlIgnoreCase(projections[0].column orelse return false, "UserID")) return false;
+        if (projections[1].func != .column_ref or !asciiEqlIgnoreCase(projections[1].column orelse return false, "EventMinuteOfHour")) return false;
+        if (!asciiEqlIgnoreCase(projections[1].alias orelse return false, "m")) return false;
+        if (projections[2].func != .column_ref or !asciiEqlIgnoreCase(projections[2].column orelse return false, "SearchPhrase")) return false;
+        return projections[3].func == .count_star;
+    }
     return false;
 }
 
@@ -193,6 +210,31 @@ fn parseAliasedExpr(expr: []const u8) ?Expr {
     return parsed;
 }
 
+fn parseProjectionList(allocator: std.mem.Allocator, projections: *std.ArrayList(Expr), select_body: []const u8) !void {
+    var start: usize = 0;
+    var depth: usize = 0;
+    for (select_body, 0..) |c, i| {
+        switch (c) {
+            '(' => depth += 1,
+            ')' => {
+                if (depth == 0) return error.UnsupportedGenericQuery;
+                depth -= 1;
+            },
+            ',' => if (depth == 0) {
+                const part = std.mem.trim(u8, select_body[start..i], " \t\r\n");
+                if (part.len == 0) return error.UnsupportedGenericQuery;
+                try projections.append(allocator, parseAliasedExpr(part) orelse return error.UnsupportedGenericQuery);
+                start = i + 1;
+            },
+            else => {},
+        }
+    }
+    if (depth != 0) return error.UnsupportedGenericQuery;
+    const part = std.mem.trim(u8, select_body[start..], " \t\r\n");
+    if (part.len == 0) return error.UnsupportedGenericQuery;
+    try projections.append(allocator, parseAliasedExpr(part) orelse return error.UnsupportedGenericQuery);
+}
+
 fn parseExpr(expr: []const u8) ?Expr {
     if (parseCall(expr, "count")) |arg| {
         const trimmed_arg = std.mem.trim(u8, arg, " \t\r\n");
@@ -211,8 +253,17 @@ fn parseExpr(expr: []const u8) ?Expr {
     if (parseCall(expr, "avg")) |arg| return .{ .func = .avg, .column = std.mem.trim(u8, arg, " \t\r\n") };
     if (parseCall(expr, "min")) |arg| return .{ .func = .min, .column = std.mem.trim(u8, arg, " \t\r\n") };
     if (parseCall(expr, "max")) |arg| return .{ .func = .max, .column = std.mem.trim(u8, arg, " \t\r\n") };
+    if (parseExtractMinute(expr)) return .{ .func = .column_ref, .column = "EventMinuteOfHour" };
     if (isIdentifierText(expr)) return .{ .func = .column_ref, .column = expr };
     return null;
+}
+
+fn parseExtractMinute(expr: []const u8) bool {
+    const arg = parseCall(expr, "extract") orelse return false;
+    const from_pos = indexOfKeyword(arg, "from") orelse return false;
+    const field = std.mem.trim(u8, arg[0..from_pos], " \t\r\n");
+    const source = std.mem.trim(u8, arg[from_pos + "from".len ..], " \t\r\n");
+    return asciiEqlIgnoreCase(field, "minute") and asciiEqlIgnoreCase(source, "EventTime");
 }
 
 fn parseSumArg(arg: []const u8) ?struct { column: []const u8, int_offset: i64 } {
@@ -276,6 +327,27 @@ fn parsePredicate(where_body: []const u8) ?Predicate {
 fn indexOfKeyword(sql: []const u8, keyword: []const u8) ?usize {
     var i: usize = 0;
     while (i + keyword.len <= sql.len) : (i += 1) {
+        if (!asciiEqlIgnoreCase(sql[i .. i + keyword.len], keyword)) continue;
+        const before_ok = i == 0 or !isIdent(sql[i - 1]);
+        const after = i + keyword.len;
+        const after_ok = after == sql.len or !isIdent(sql[after]);
+        if (before_ok and after_ok) return i;
+    }
+    return null;
+}
+
+fn indexOfTopLevelKeyword(sql: []const u8, keyword: []const u8) ?usize {
+    var depth: usize = 0;
+    var i: usize = 0;
+    while (i + keyword.len <= sql.len) : (i += 1) {
+        switch (sql[i]) {
+            '(' => depth += 1,
+            ')' => {
+                if (depth > 0) depth -= 1;
+            },
+            else => {},
+        }
+        if (depth != 0) continue;
         if (!asciiEqlIgnoreCase(sql[i .. i + keyword.len], keyword)) continue;
         const before_ok = i == 0 or !isIdent(sql[i - 1]);
         const after = i + keyword.len;
@@ -444,6 +516,28 @@ test "parses clickbench string top shapes" {
         try std.testing.expect(plan.order_by_alias != null);
         try std.testing.expectEqual(@as(?usize, 10), plan.limit);
     }
+}
+
+test "parses user search phrase top shapes" {
+    const q17 = (try parse(std.testing.allocator, "SELECT UserID, SearchPhrase, COUNT(*) FROM hits GROUP BY UserID, SearchPhrase ORDER BY COUNT(*) DESC LIMIT 10")).?;
+    defer deinit(std.testing.allocator, q17);
+    try std.testing.expectEqual(@as(usize, 3), q17.projections.len);
+    try std.testing.expectEqualStrings("UserID, SearchPhrase", q17.group_by.?);
+    try std.testing.expect(q17.order_by_count_desc);
+
+    const q18 = (try parse(std.testing.allocator, "SELECT UserID, SearchPhrase, COUNT(*) FROM hits GROUP BY UserID, SearchPhrase LIMIT 10")).?;
+    defer deinit(std.testing.allocator, q18);
+    try std.testing.expectEqual(@as(usize, 3), q18.projections.len);
+    try std.testing.expectEqualStrings("UserID, SearchPhrase", q18.group_by.?);
+    try std.testing.expect(!q18.order_by_count_desc);
+
+    const q19 = (try parse(std.testing.allocator, "SELECT UserID, extract(minute FROM EventTime) AS m, SearchPhrase, COUNT(*) FROM hits GROUP BY UserID, m, SearchPhrase ORDER BY COUNT(*) DESC LIMIT 10")).?;
+    defer deinit(std.testing.allocator, q19);
+    try std.testing.expectEqual(@as(usize, 4), q19.projections.len);
+    try std.testing.expectEqualStrings("EventMinuteOfHour", q19.projections[1].column.?);
+    try std.testing.expectEqualStrings("m", q19.projections[1].alias.?);
+    try std.testing.expectEqualStrings("UserID, m, SearchPhrase", q19.group_by.?);
+    try std.testing.expect(q19.order_by_count_desc);
 }
 
 test "rejects unsupported order by" {
