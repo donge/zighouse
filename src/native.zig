@@ -292,7 +292,7 @@ pub const Native = struct {
                 error.FileNotFound => return formatUrlCountTopFilteredQ37Cached(self.allocator, hot, try self.getUrlColumn()),
                 else => return err,
             };
-            return formatResultArtifact(self.allocator, self.io, self.data_dir, "q37_result.csv", 64 * 1024) catch |err| switch (err) {
+            return formatResultArtifact(self.allocator, self.io, self.data_dir, clickbench_import.q37_result_csv, 64 * 1024) catch |err| switch (err) {
                 error.FileNotFound => return formatUrlCountTopFilteredQ37HashLateMaterialize(self.allocator, self.io, self.data_dir, hot, &self.url_hash_string_cache) catch |late_err| switch (late_err) {
                     error.FileNotFound => return formatUrlCountTopFilteredQ37Cached(self.allocator, hot, try self.getUrlColumn()),
                     else => return late_err,
@@ -322,7 +322,7 @@ pub const Native = struct {
         };
         if (clickbench_query == .title_count_top_filtered_dashboard) return formatQ38FromStatsSidecar(self.allocator, self.io, self.data_dir) catch |stats_err| switch (stats_err) {
             error.FileNotFound => if (artifactMode())
-            formatResultArtifact(self.allocator, self.io, self.data_dir, "q38_result.csv", 64 * 1024) catch |artifact_err| switch (artifact_err) {
+            formatResultArtifact(self.allocator, self.io, self.data_dir, clickbench_import.q38_result_csv, 64 * 1024) catch |artifact_err| switch (artifact_err) {
                 error.FileNotFound => return formatTitleCountTopFilteredQ38HashLateMaterialize(self.allocator, self.io, self.data_dir, hot, &self.title_hash_string_cache) catch |err| switch (err) {
                     error.FileNotFound => return formatTitleCountTopFilteredQ38ParquetScan(self.allocator, self.io, self.data_dir, hot) catch |scan_err| switch (scan_err) {
                         error.FileNotFound => return formatTitleCountTopFilteredQ38Cached(self.allocator, hot, try self.getTitleColumn()),
@@ -2098,8 +2098,8 @@ fn writeQ19ResultFromParquet(allocator: std.mem.Allocator, io: std.Io, data_dir:
 
 fn writeTinyResultCachesFromParquet(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8, parquet_path: []const u8, limit_rows: ?u64) !void {
     try writeQ24ResultFromParquet(allocator, io, data_dir, parquet_path, limit_rows);
-    try writeSmallResultCacheFromParquet(allocator, io, data_dir, parquet_path, limit_rows, "q29_result.csv", clickbench_queries.q29_sql);
-    try writeSmallResultCacheFromParquet(allocator, io, data_dir, parquet_path, limit_rows, "q40_result.csv", clickbench_queries.q40_sql);
+    try writeSmallResultCacheFromParquet(allocator, io, data_dir, parquet_path, limit_rows, clickbench_import.q29_result_csv, clickbench_queries.q29_sql);
+    try writeSmallResultCacheFromParquet(allocator, io, data_dir, parquet_path, limit_rows, clickbench_import.q40_result_csv, clickbench_queries.q40_sql);
 }
 
 fn writeSmallResultCacheFromParquet(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8, parquet_path: []const u8, limit_rows: ?u64, file_name: []const u8, query_body: []const u8) !void {
@@ -9323,7 +9323,7 @@ const Q33Row = struct {
 
 fn formatWatchIdClientIpAggTop(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8) ![]u8 {
     if (!artifactMode()) return formatWatchIdClientIpAggTopScan(allocator, io, data_dir);
-    return formatResultArtifact(allocator, io, data_dir, "q33_result.csv", 64 * 1024) catch |err| switch (err) {
+    return formatResultArtifact(allocator, io, data_dir, clickbench_import.q33_result_csv, 64 * 1024) catch |err| switch (err) {
         error.FileNotFound => formatWatchIdClientIpAggTopScan(allocator, io, data_dir),
         else => return err,
     };
@@ -10529,7 +10529,7 @@ fn formatQ40Result(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u
         },
         else => return err,
     };
-    return formatResultArtifact(allocator, io, data_dir, "q40_result.csv", 256 * 1024) catch |err| switch (err) {
+    return formatResultArtifact(allocator, io, data_dir, clickbench_import.q40_result_csv, 256 * 1024) catch |err| switch (err) {
         error.FileNotFound => return formatQ40(allocator, io, data_dir) catch |q40_err| switch (q40_err) {
             error.FileNotFound => return queryOriginalParquet(allocator, io, data_dir, clickbench_queries.q40_sql),
             else => return q40_err,
@@ -11331,7 +11331,7 @@ fn scanQ23CandidatesRowSidecar(allocator: std.mem.Allocator, empty_phrase_id: u3
 // result artifact for the deterministic 10-row LIMIT result.
 fn formatQ24ResultArtifact(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8) ![]u8 {
     if (!artifactMode()) return queryOriginalParquet(allocator, io, data_dir, clickbench_queries.q24_sql);
-    return formatResultArtifact(allocator, io, data_dir, "q24_result.csv", 64 * 1024) catch |err| switch (err) {
+    return formatResultArtifact(allocator, io, data_dir, clickbench_import.q24_result_csv, 64 * 1024) catch |err| switch (err) {
         error.FileNotFound => return queryOriginalParquet(allocator, io, data_dir, clickbench_queries.q24_sql),
         else => return err,
     };
@@ -11628,7 +11628,7 @@ fn formatQ29(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8) ![]
         error.FileNotFound => return queryOriginalParquet(allocator, io, data_dir, clickbench_queries.q29_sql),
         else => return err,
     };
-    return formatResultArtifact(allocator, io, data_dir, "q29_result.csv", 64 * 1024) catch |err| switch (err) {
+    return formatResultArtifact(allocator, io, data_dir, clickbench_import.q29_result_csv, 64 * 1024) catch |err| switch (err) {
         error.FileNotFound => return formatQ29DomainStats(allocator, io, data_dir) catch |stats_err| switch (stats_err) {
             error.FileNotFound => return queryOriginalParquet(allocator, io, data_dir, clickbench_queries.q29_sql),
             else => return stats_err,
@@ -12947,7 +12947,7 @@ fn q19InsertTop10(top: *[10]Q19Row, top_len: *usize, row: Q19Row) void {
 
 fn formatUserIdMinuteSearchPhraseCountTop(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8) ![]u8 {
     if (!artifactMode()) return formatUserIdMinuteSearchPhraseCountTopScan(allocator, io, data_dir);
-    return formatResultArtifact(allocator, io, data_dir, "q19_result.csv", 64 * 1024) catch |err| switch (err) {
+    return formatResultArtifact(allocator, io, data_dir, clickbench_import.q19_result_csv, 64 * 1024) catch |err| switch (err) {
         error.FileNotFound => formatUserIdMinuteSearchPhraseCountTopScan(allocator, io, data_dir),
         else => return err,
     };
@@ -12955,7 +12955,7 @@ fn formatUserIdMinuteSearchPhraseCountTop(allocator: std.mem.Allocator, io: std.
 
 fn formatUserIdMinuteSearchPhraseCountTopCached(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8, users: *const UserIdEncoding, phrases: *const lowcard.StringColumn) ![]u8 {
     if (!artifactMode()) return formatUserIdMinuteSearchPhraseCountTopScanCached(allocator, io, data_dir, users, phrases);
-    return formatResultArtifact(allocator, io, data_dir, "q19_result.csv", 64 * 1024) catch |err| switch (err) {
+    return formatResultArtifact(allocator, io, data_dir, clickbench_import.q19_result_csv, 64 * 1024) catch |err| switch (err) {
         error.FileNotFound => formatUserIdMinuteSearchPhraseCountTopScanCached(allocator, io, data_dir, users, phrases),
         else => return err,
     };

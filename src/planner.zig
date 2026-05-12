@@ -1,4 +1,5 @@
 const std = @import("std");
+const clickbench_import = @import("clickbench_import.zig");
 const clickbench_queries = @import("clickbench_queries.zig");
 
 pub const ArtifactCsvPlan = struct {
@@ -18,10 +19,10 @@ pub const CsvCountPlan = struct {
 pub fn plan(sql: []const u8) ?PhysicalPlan {
     const query = clickbench_queries.match(sql) orelse return null;
     return switch (query) {
-        .count_star => artifact("q1_count.csv", 1024),
-        .url_like_google_order_by_event_time => artifact("q24_result.csv", 64 * 1024),
-        .referer_domain_stats_top => artifact("q29_result.csv", 64 * 1024),
-        .traffic_source_dashboard => artifact("q40_result.csv", 256 * 1024),
+        .count_star => artifact(clickbench_import.q1_count_csv, 1024),
+        .url_like_google_order_by_event_time => artifact(clickbench_import.q24_result_csv, 64 * 1024),
+        .referer_domain_stats_top => artifact(clickbench_import.q29_result_csv, 64 * 1024),
+        .traffic_source_dashboard => artifact(clickbench_import.q40_result_csv, 256 * 1024),
         else => null,
     };
 }
