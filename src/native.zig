@@ -603,6 +603,8 @@ pub const Native = struct {
             .search_phrase_event_time_top => try formatSearchPhraseEventTimeCandidatesCached(self.allocator, self.io, self.data_dir, try self.getSearchPhraseColumn(), false),
             .search_phrase_event_time_phrase_top => try formatSearchPhraseEventTimeCandidatesCached(self.allocator, self.io, self.data_dir, try self.getSearchPhraseColumn(), true),
             .search_phrase_order_by_phrase_top => try formatSearchPhraseOrderByPhraseTopCached(self.allocator, try self.getSearchPhraseColumn()),
+            .url_length_by_counter => try formatUrlLengthByCounter(self.allocator, hot.counter_id, hot.url_length orelse return error.UnsupportedNativeQuery),
+            .referer_domain_stats_top => try formatQ29(self.allocator, self.io, self.data_dir),
             else => null,
         };
     }
