@@ -1,0 +1,313 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ZigHouse 数据库原理简介</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f7f3ea;
+      --paper: #fffaf0;
+      --ink: #17211b;
+      --muted: #5f6b61;
+      --line: #dfd3bf;
+      --accent: #b45309;
+      --accent-2: #155e75;
+      --code-bg: #17211b;
+      --code-ink: #eef8ef;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background:
+        radial-gradient(circle at top left, rgba(180, 83, 9, 0.13), transparent 34rem),
+        linear-gradient(180deg, #fbf6ea, var(--bg));
+      color: var(--ink);
+      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      line-height: 1.65;
+    }
+    main {
+      width: min(1080px, calc(100% - 32px));
+      margin: 0 auto;
+      padding: 48px 0 72px;
+    }
+    header {
+      padding: 40px;
+      border: 1px solid var(--line);
+      border-radius: 28px;
+      background: rgba(255, 250, 240, 0.86);
+      box-shadow: 0 24px 80px rgba(42, 33, 18, 0.12);
+    }
+    h1 {
+      margin: 0 0 12px;
+      font-size: clamp(2.1rem, 5vw, 4.7rem);
+      line-height: 1;
+      letter-spacing: -0.055em;
+    }
+    h2 {
+      margin: 0 0 14px;
+      font-size: clamp(1.45rem, 2.5vw, 2.15rem);
+      line-height: 1.15;
+      letter-spacing: -0.03em;
+    }
+    h3 { margin: 24px 0 8px; }
+    p { margin: 0 0 14px; }
+    .lede {
+      max-width: 760px;
+      color: var(--muted);
+      font-size: 1.15rem;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(12, 1fr);
+      gap: 18px;
+      margin-top: 22px;
+    }
+    section, .card {
+      border: 1px solid var(--line);
+      border-radius: 24px;
+      background: rgba(255, 250, 240, 0.9);
+      padding: 26px;
+    }
+    section { margin-top: 22px; }
+    .span-4 { grid-column: span 4; }
+    .span-6 { grid-column: span 6; }
+    .span-8 { grid-column: span 8; }
+    .span-12 { grid-column: span 12; }
+    .tag {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 12px;
+      color: var(--accent);
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      font-size: 0.78rem;
+    }
+    .flow {
+      display: grid;
+      grid-template-columns: repeat(5, 1fr);
+      gap: 12px;
+      margin-top: 18px;
+    }
+    .step {
+      min-height: 118px;
+      padding: 16px;
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      background: #fffdf7;
+    }
+    .step strong { display: block; margin-bottom: 8px; color: var(--accent-2); }
+    code, pre {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+    }
+    code { color: #7c2d12; }
+    pre {
+      overflow: auto;
+      margin: 16px 0 0;
+      padding: 18px;
+      border-radius: 18px;
+      background: var(--code-bg);
+      color: var(--code-ink);
+      font-size: 0.92rem;
+      line-height: 1.5;
+    }
+    pre code { color: inherit; }
+    ul { margin: 10px 0 0; padding-left: 1.2rem; }
+    li { margin: 8px 0; }
+    .note {
+      border-left: 4px solid var(--accent);
+      padding: 12px 16px;
+      background: #fff4dc;
+      border-radius: 12px;
+      color: #51391f;
+    }
+    .metric {
+      font-size: 2rem;
+      line-height: 1;
+      color: var(--accent-2);
+      font-weight: 800;
+      letter-spacing: -0.04em;
+    }
+    footer {
+      margin-top: 28px;
+      color: var(--muted);
+      font-size: 0.94rem;
+    }
+    @media (max-width: 820px) {
+      main { width: min(100% - 20px, 1080px); padding-top: 20px; }
+      header, section, .card { padding: 20px; border-radius: 20px; }
+      .span-4, .span-6, .span-8 { grid-column: span 12; }
+      .flow { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <div class="tag">ZigHouse internals</div>
+    <h1>从一条 SQL 到 SIMD 扫描</h1>
+    <p class="lede">
+      ZigHouse 是一个用 Zig 写的列式分析执行器。它的核心思想很朴素：把数据按列放好，
+      把 SQL 变成少量明确的计算计划，然后用 mmap、向量化和编译期泛型把 CPU 的吞吐打满。
+    </p>
+  </header>
+
+  <section>
+    <h2>1. ZigHouse 像什么？</h2>
+    <p>
+      如果传统行式数据库像一本账本，每一行是一条完整记录；列式数据库更像把账本拆成很多竖条：
+      <code>user_id</code> 一列、<code>event_date</code> 一列、<code>metric_value</code> 一列。
+      分析查询通常只看少数列，所以列式执行可以少读很多数据。
+    </p>
+    <div class="grid">
+      <div class="card span-4">
+        <div class="metric">列式</div>
+        <p>同一列连续存放，适合顺序扫描、SIMD reduce、mmap。</p>
+      </div>
+      <div class="card span-4">
+        <div class="metric">单机</div>
+        <p>先把单机 CPU、内存和文件系统吃透，再考虑更复杂的分布式形态。</p>
+      </div>
+      <div class="card span-4">
+        <div class="metric">分析</div>
+        <p>重点是 <code>COUNT</code>、<code>SUM</code>、<code>AVG</code>、<code>MIN/MAX</code>、过滤和聚合。</p>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>2. 最小端到端路径</h2>
+    <p>
+      通用路径不应该靠某个固定查询编号触发，而是从 SQL 文本解析出一个很小的计划。
+      例如：
+    </p>
+    <pre><code>SELECT AVG(value_column)
+FROM events
+WHERE predicate_column &lt;&gt; 0;</code></pre>
+    <div class="flow">
+      <div class="step"><strong>SQL</strong>用户输入文本。</div>
+      <div class="step"><strong>Parser</strong>识别 SELECT、聚合函数、表名和 WHERE。</div>
+      <div class="step"><strong>Plan</strong>得到 aggregate plan。</div>
+      <div class="step"><strong>Bind</strong>把列名绑定到 typed hot column。</div>
+      <div class="step"><strong>Execute</strong>调用 SIMD kernel 输出 CSV。</div>
+    </div>
+  </section>
+
+  <section>
+    <h2>3. 架构分层</h2>
+    <div class="grid">
+      <div class="card span-6">
+        <h3>查询层</h3>
+        <ul>
+          <li>解析器把 SQL 文本转成一个很小的查询计划。</li>
+          <li>绑定阶段把列名解析成具体的列数据。</li>
+          <li>执行阶段选择适合列类型的计算内核。</li>
+        </ul>
+      </div>
+      <div class="card span-6">
+        <h3>存储层</h3>
+        <ul>
+          <li>hot columns 是固定宽度二进制列。</li>
+          <li>mmap 后直接把 bytes 视为 <code>[]const i16/i32/i64</code>。</li>
+          <li>扫描时不构造行对象，尽量避免分配。</li>
+        </ul>
+      </div>
+      <div class="card span-6">
+        <h3>执行层</h3>
+        <ul>
+          <li><code>COUNT(*)</code> 直接用行数。</li>
+          <li><code>SUM/AVG/MIN/MAX</code> 按列类型选择 SIMD kernel。</li>
+          <li>filtered aggregate 使用 predicate column 作为 mask。</li>
+        </ul>
+      </div>
+      <div class="card span-6">
+        <h3>性能保护层</h3>
+        <ul>
+          <li>保留已知最快路径作为基线。</li>
+          <li>新路径先和旧路径比较结果，再逐步扩大覆盖面。</li>
+          <li>每次重构都要验证正确性和性能。</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>4. 为什么 Zig 适合做这个？</h2>
+    <p>
+      ZigHouse 需要同时处理系统编程和性能内核。Zig 的优势是：低层能力直接、编译期能力强、没有隐藏运行时。
+    </p>
+    <div class="grid">
+      <div class="card span-4">
+        <h3>显式内存</h3>
+        <p>allocator、mmap、slice 都很直接，适合控制分配和生命周期。</p>
+      </div>
+      <div class="card span-4">
+        <h3>直接 SIMD</h3>
+        <p><code>@Vector</code>、<code>@select</code>、<code>@reduce</code> 可以写出清晰的向量化 kernel。</p>
+      </div>
+      <div class="card span-4">
+        <h3>comptime</h3>
+        <p>用一个函数描述逻辑，让编译器为 <code>i16/i32/i64</code> 生成专门代码。</p>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>5. SIMD 和 vector 是什么？</h2>
+    <p>
+      普通循环一次处理一个数。SIMD 是一次处理一组数，比如 16 个 <code>i32</code> 或 32 个 <code>i16</code>。
+      对列式扫描来说，这非常自然，因为一列数据在内存里连续排列。
+    </p>
+    <pre><code>// 标量思维：一次加一个
+for (values) |v| total += v;
+
+// SIMD 思维：一次读 lanes 个，向量相加，再 reduce
+const V = @Vector(lanes, i32);
+const v: V = values[i..][0..lanes].*;
+total += @reduce(.Add, v);</code></pre>
+    <p class="note">
+      SIMD 不等于“自动魔法”。要获得稳定收益，数据布局、类型宽度、lane 数、tail 处理都要明确。
+      一个好的执行器会把这些细节封装在少数通用计算内核里。
+    </p>
+  </section>
+
+  <section>
+    <h2>6. comptime 怎样减少重复代码？</h2>
+    <p>
+      数据库执行器经常要对不同整数宽度做同一种事情：扫描、过滤、求和、求最小值、求最大值。
+      如果每种类型都写一遍，代码会越来越像复制粘贴。Zig 的 <code>comptime</code> 可以把“类型”变成编译期参数，
+      用一个模板描述算法，再由编译器生成各个具体类型的机器码。
+    </p>
+    <pre><code>fn lanesFor(comptime T: type) comptime_int {
+    return switch (T) {
+        i16 => 32,
+        i32 => 16,
+        i64 => 8,
+        else => @compileError("unsupported type"),
+    };
+}
+
+fn loadVector(comptime T: type, values: []const T, i: usize) @Vector(lanesFor(T), T) {
+    const lanes = lanesFor(T);
+    return values[i..][0..lanes].*;
+}</code></pre>
+    <p>
+      这段代码表达的是“对一列做 reduce”。它不关心这一列具体是 16 位整数、32 位整数还是 64 位整数。
+      调用时类型是编译期已知的，向量宽度、累加器类型、初始值都会被编译器固定下来。
+    </p>
+    <pre><code>const a = loadVector(i16, small_values, 0); // 32 lanes
+const b = loadVector(i64, big_values, 0);   // 8 lanes</code></pre>
+    <p>
+      这不是运行时反射，也不是虚函数调用。每个具体类型仍然会生成专门的 SIMD 版本，只是源码不再为每个类型写一套函数。
+    </p>
+  </section>
+
+  <footer>
+    本文档用 ZigHouse 作为背景，解释列式分析执行器的基本原理：列式布局、向量化扫描、编译期泛型和性能验证。
+  </footer>
+</main>
+</body>
+</html>

@@ -1,0 +1,318 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ZigHouse: Columnar Analytics, Explained</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f7f3ea;
+      --paper: #fffaf0;
+      --ink: #17211b;
+      --muted: #5f6b61;
+      --line: #dfd3bf;
+      --accent: #b45309;
+      --accent-2: #155e75;
+      --code-bg: #17211b;
+      --code-ink: #eef8ef;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background:
+        radial-gradient(circle at top left, rgba(180, 83, 9, 0.13), transparent 34rem),
+        linear-gradient(180deg, #fbf6ea, var(--bg));
+      color: var(--ink);
+      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      line-height: 1.65;
+    }
+    main {
+      width: min(1080px, calc(100% - 32px));
+      margin: 0 auto;
+      padding: 48px 0 72px;
+    }
+    header, section, .card {
+      border: 1px solid var(--line);
+      background: rgba(255, 250, 240, 0.9);
+      box-shadow: 0 24px 80px rgba(42, 33, 18, 0.08);
+    }
+    header {
+      padding: 40px;
+      border-radius: 28px;
+    }
+    section {
+      margin-top: 22px;
+      padding: 26px;
+      border-radius: 24px;
+    }
+    h1 {
+      margin: 0 0 12px;
+      font-size: clamp(2.25rem, 5vw, 4.9rem);
+      line-height: 1;
+      letter-spacing: -0.06em;
+    }
+    h2 {
+      margin: 0 0 14px;
+      font-size: clamp(1.45rem, 2.5vw, 2.15rem);
+      line-height: 1.15;
+      letter-spacing: -0.03em;
+    }
+    h3 { margin: 20px 0 8px; }
+    p { margin: 0 0 14px; }
+    .lede {
+      max-width: 760px;
+      color: var(--muted);
+      font-size: 1.15rem;
+    }
+    .tag {
+      display: inline-flex;
+      margin-bottom: 12px;
+      color: var(--accent);
+      font-weight: 800;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      font-size: 0.78rem;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(12, 1fr);
+      gap: 18px;
+      margin-top: 18px;
+    }
+    .card {
+      border-radius: 22px;
+      padding: 22px;
+      box-shadow: none;
+    }
+    .span-4 { grid-column: span 4; }
+    .span-6 { grid-column: span 6; }
+    .span-12 { grid-column: span 12; }
+    .metric {
+      font-size: 2rem;
+      line-height: 1;
+      color: var(--accent-2);
+      font-weight: 850;
+      letter-spacing: -0.04em;
+    }
+    .flow {
+      display: grid;
+      grid-template-columns: repeat(5, 1fr);
+      gap: 12px;
+      margin-top: 18px;
+    }
+    .step {
+      min-height: 118px;
+      padding: 16px;
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      background: #fffdf7;
+    }
+    .step strong { display: block; margin-bottom: 8px; color: var(--accent-2); }
+    code, pre {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+    }
+    code { color: #7c2d12; }
+    pre {
+      overflow: auto;
+      margin: 16px 0 0;
+      padding: 18px;
+      border-radius: 18px;
+      background: var(--code-bg);
+      color: var(--code-ink);
+      font-size: 0.92rem;
+      line-height: 1.5;
+    }
+    pre code { color: inherit; }
+    ul { margin: 10px 0 0; padding-left: 1.2rem; }
+    li { margin: 8px 0; }
+    .note {
+      border-left: 4px solid var(--accent);
+      padding: 12px 16px;
+      background: #fff4dc;
+      border-radius: 12px;
+      color: #51391f;
+    }
+    footer {
+      margin-top: 28px;
+      color: var(--muted);
+      font-size: 0.94rem;
+    }
+    @media (max-width: 820px) {
+      main { width: min(100% - 20px, 1080px); padding-top: 20px; }
+      header, section, .card { padding: 20px; border-radius: 20px; }
+      .span-4, .span-6 { grid-column: span 12; }
+      .flow { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <div class="tag">ZigHouse principles</div>
+    <h1>From SQL to SIMD</h1>
+    <p class="lede">
+      ZigHouse is an experiment in building a small, native analytical engine in Zig.
+      The idea is simple: store data by column, turn SQL into a compact execution plan,
+      and use memory mapping, vectorized scans, and compile-time specialization to keep the CPU busy.
+    </p>
+  </header>
+
+  <section>
+    <h2>1. What Kind of Database Is This?</h2>
+    <p>
+      A row store is like a ledger: each row keeps all fields for one event together.
+      A column store splits the ledger into vertical strips: one array for <code>user_id</code>,
+      one for <code>event_date</code>, one for <code>metric_value</code>, and so on.
+      Analytical queries usually touch only a few columns, so columnar execution reads less data.
+    </p>
+    <div class="grid">
+      <div class="card span-4">
+        <div class="metric">Columnar</div>
+        <p>Values of the same type sit next to each other, which is ideal for sequential scans and SIMD reductions.</p>
+      </div>
+      <div class="card span-4">
+        <div class="metric">Native</div>
+        <p>The engine works close to the operating system: memory maps, typed slices, explicit allocation.</p>
+      </div>
+      <div class="card span-4">
+        <div class="metric">Analytical</div>
+        <p>The first-class operations are counts, sums, averages, minimums, maximums, filters, and aggregations.</p>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>2. The Minimal End-to-End Path</h2>
+    <p>
+      A useful generic engine should not recognize only one hard-coded benchmark query.
+      It should parse a SQL shape, bind names to columns, and choose a numerical kernel.
+    </p>
+    <pre><code>SELECT AVG(value_column)
+FROM events
+WHERE predicate_column &lt;&gt; 0;</code></pre>
+    <div class="flow">
+      <div class="step"><strong>SQL</strong>The user writes a query.</div>
+      <div class="step"><strong>Parse</strong>The engine recognizes projection, table, and filter.</div>
+      <div class="step"><strong>Plan</strong>The query becomes a small aggregate plan.</div>
+      <div class="step"><strong>Bind</strong>Column names become typed arrays.</div>
+      <div class="step"><strong>Execute</strong>A SIMD kernel scans and returns rows.</div>
+    </div>
+  </section>
+
+  <section>
+    <h2>3. Architecture in Plain Terms</h2>
+    <div class="grid">
+      <div class="card span-6">
+        <h3>Query Layer</h3>
+        <ul>
+          <li>Parse SQL into a compact plan.</li>
+          <li>Bind column names to actual column data.</li>
+          <li>Select the best computation strategy for each expression.</li>
+        </ul>
+      </div>
+      <div class="card span-6">
+        <h3>Storage Layer</h3>
+        <ul>
+          <li>Keep hot numeric columns in fixed-width binary form.</li>
+          <li>Map column files into memory and treat them as typed arrays.</li>
+          <li>Avoid constructing row objects during scans.</li>
+        </ul>
+      </div>
+      <div class="card span-6">
+        <h3>Execution Layer</h3>
+        <ul>
+          <li><code>COUNT(*)</code> can often use metadata directly.</li>
+          <li><code>SUM</code>, <code>AVG</code>, <code>MIN</code>, and <code>MAX</code> scan only the needed columns.</li>
+          <li>Filtered aggregates use one column as a mask and another as the values.</li>
+        </ul>
+      </div>
+      <div class="card span-6">
+        <h3>Verification Layer</h3>
+        <ul>
+          <li>Keep a known fast path as the baseline.</li>
+          <li>Compare new generic paths against known-correct output.</li>
+          <li>Check correctness and performance after each refactor.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>4. Why Zig?</h2>
+    <p>
+      Analytical engines need systems programming and tight compute kernels at the same time.
+      Zig is a good fit because it keeps memory explicit, exposes vector operations, and lets the programmer
+      specialize code at compile time without adding a runtime abstraction layer.
+    </p>
+    <div class="grid">
+      <div class="card span-4">
+        <h3>Explicit Memory</h3>
+        <p>Allocators, memory maps, and slices make ownership and data layout visible.</p>
+      </div>
+      <div class="card span-4">
+        <h3>Direct SIMD</h3>
+        <p><code>@Vector</code>, <code>@select</code>, and <code>@reduce</code> describe vector kernels directly.</p>
+      </div>
+      <div class="card span-4">
+        <h3>Compile-Time Code</h3>
+        <p><code>comptime</code> lets one function become specialized code for several numeric widths.</p>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>5. SIMD and Vectors</h2>
+    <p>
+      A scalar loop processes one value at a time. SIMD processes a small group of values at once.
+      This is natural for column stores because values in one column are contiguous in memory.
+    </p>
+    <pre><code>// Scalar idea: one value at a time.
+for (values) |v| total += v;
+
+// Vector idea: one chunk at a time.
+const V = @Vector(lanes, i32);
+const chunk: V = values[i..][0..lanes].*;
+total += @reduce(.Add, chunk);</code></pre>
+    <p class="note">
+      SIMD is not automatic magic. Stable speedups come from clear data layout, known numeric widths,
+      chosen lane counts, and careful handling of the scalar tail.
+    </p>
+  </section>
+
+  <section>
+    <h2>6. How <code>comptime</code> Reduces Duplication</h2>
+    <p>
+      A database executor often runs the same algorithm over different integer widths.
+      Instead of writing a separate function for every width, Zig can take the type as a compile-time argument.
+    </p>
+    <pre><code>fn lanesFor(comptime T: type) comptime_int {
+    return switch (T) {
+        i16 => 32,
+        i32 => 16,
+        i64 => 8,
+        else => @compileError("unsupported type"),
+    };
+}
+
+fn loadVector(comptime T: type, values: []const T, i: usize) @Vector(lanesFor(T), T) {
+    const lanes = lanesFor(T);
+    return values[i..][0..lanes].*;
+}</code></pre>
+    <p>
+      The call site stays simple, while the compiler still generates concrete SIMD code for each type.
+    </p>
+    <pre><code>const a = loadVector(i16, small_values, 0); // 32 lanes
+const b = loadVector(i64, big_values, 0);   // 8 lanes</code></pre>
+    <p>
+      This is not runtime reflection or a virtual call. The vector type and lane count are known at compile time.
+    </p>
+  </section>
+
+  <footer>
+    This page uses ZigHouse as context to explain the principles of columnar analytical execution:
+    column layout, vectorized scans, compile-time specialization, and continuous performance validation.
+  </footer>
+</main>
+</body>
+</html>
