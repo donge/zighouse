@@ -1,6 +1,6 @@
 const std = @import("std");
 
-pub const AggregateFn = enum { column_ref, count_star, count_distinct, sum, avg, min, max };
+pub const AggregateFn = enum { column_ref, int_literal, count_star, count_distinct, sum, avg, min, max };
 
 pub const Expr = struct {
     func: AggregateFn,
@@ -137,12 +137,53 @@ fn validPlanShape(projections: []const Expr, filter: ?Filter, group_by: ?[]const
     if (validRegionStatsShape(projections, group_by.?)) return true;
     if (validClickBenchStringTopShape(projections, filter, group_by.?)) return true;
     if (validUserSearchPhraseTopShape(projections, group_by.?)) return true;
+    if (validClientIpAggTopShape(projections, filter, group_by.?)) return true;
+    if (validUrlCountTopShape(projections, filter, group_by.?)) return true;
     if (projections.len != 2) return false;
     if (projections[0].func != .column_ref) return false;
     if (!asciiEqlIgnoreCase(projections[0].column orelse return false, group_by.?)) return false;
     if (projections[1].func == .count_star) return true;
     if (projections[1].func == .count_distinct and asciiEqlIgnoreCase(group_by.?, "RegionID")) return asciiEqlIgnoreCase(projections[1].column orelse return false, "UserID");
     return false;
+}
+
+fn validClientIpAggTopShape(projections: []const Expr, filter: ?Filter, group_by: []const u8) bool {
+    if (projections.len != 5) return false;
+    if (!aggTopTailShape(projections, "c")) return false;
+    if (filter) |f| {
+        if (f.second != null or f.op != .not_equal or f.int_value != 0 or !asciiEqlIgnoreCase(f.column, "SearchPhrase")) return false;
+        if (asciiEqlIgnoreCase(group_by, "SearchEngineID, ClientIP")) return firstTwoColumns(projections, "SearchEngineID", "ClientIP");
+        if (asciiEqlIgnoreCase(group_by, "WatchID, ClientIP")) return firstTwoColumns(projections, "WatchID", "ClientIP");
+        return false;
+    }
+    return asciiEqlIgnoreCase(group_by, "WatchID, ClientIP") and firstTwoColumns(projections, "WatchID", "ClientIP");
+}
+
+fn validUrlCountTopShape(projections: []const Expr, filter: ?Filter, group_by: []const u8) bool {
+    if (filter != null) return false;
+    if (projections.len == 2) {
+        if (!asciiEqlIgnoreCase(group_by, "URL")) return false;
+        if (projections[0].func != .column_ref or !asciiEqlIgnoreCase(projections[0].column orelse return false, "URL")) return false;
+        return projections[1].func == .count_star and asciiEqlIgnoreCase(projections[1].alias orelse return false, "c");
+    }
+    if (projections.len == 3) {
+        if (!asciiEqlIgnoreCase(group_by, "1, URL")) return false;
+        if (projections[0].func != .int_literal or projections[0].int_offset != 1) return false;
+        if (projections[1].func != .column_ref or !asciiEqlIgnoreCase(projections[1].column orelse return false, "URL")) return false;
+        return projections[2].func == .count_star and asciiEqlIgnoreCase(projections[2].alias orelse return false, "c");
+    }
+    return false;
+}
+
+fn firstTwoColumns(projections: []const Expr, first: []const u8, second: []const u8) bool {
+    return projections[0].func == .column_ref and asciiEqlIgnoreCase(projections[0].column orelse return false, first) and
+        projections[1].func == .column_ref and asciiEqlIgnoreCase(projections[1].column orelse return false, second);
+}
+
+fn aggTopTailShape(projections: []const Expr, count_alias: []const u8) bool {
+    if (projections[2].func != .count_star or !asciiEqlIgnoreCase(projections[2].alias orelse return false, count_alias)) return false;
+    if (projections[3].func != .sum or !asciiEqlIgnoreCase(projections[3].column orelse return false, "IsRefresh")) return false;
+    return projections[4].func == .avg and asciiEqlIgnoreCase(projections[4].column orelse return false, "ResolutionWidth");
 }
 
 fn validUserSearchPhraseTopShape(projections: []const Expr, group_by: []const u8) bool {
@@ -254,6 +295,7 @@ fn parseExpr(expr: []const u8) ?Expr {
     if (parseCall(expr, "min")) |arg| return .{ .func = .min, .column = std.mem.trim(u8, arg, " \t\r\n") };
     if (parseCall(expr, "max")) |arg| return .{ .func = .max, .column = std.mem.trim(u8, arg, " \t\r\n") };
     if (parseExtractMinute(expr)) return .{ .func = .column_ref, .column = "EventMinuteOfHour" };
+    if (std.mem.eql(u8, std.mem.trim(u8, expr, " \t\r\n"), "1")) return .{ .func = .int_literal, .int_offset = 1 };
     if (isIdentifierText(expr)) return .{ .func = .column_ref, .column = expr };
     return null;
 }
@@ -538,6 +580,23 @@ test "parses user search phrase top shapes" {
     try std.testing.expectEqualStrings("m", q19.projections[1].alias.?);
     try std.testing.expectEqualStrings("UserID, m, SearchPhrase", q19.group_by.?);
     try std.testing.expect(q19.order_by_count_desc);
+}
+
+test "parses client ip and url top shapes" {
+    const cases = [_][]const u8{
+        "SELECT SearchEngineID, ClientIP, COUNT(*) AS c, SUM(IsRefresh), AVG(ResolutionWidth) FROM hits WHERE SearchPhrase <> '' GROUP BY SearchEngineID, ClientIP ORDER BY c DESC LIMIT 10",
+        "SELECT WatchID, ClientIP, COUNT(*) AS c, SUM(IsRefresh), AVG(ResolutionWidth) FROM hits WHERE SearchPhrase <> '' GROUP BY WatchID, ClientIP ORDER BY c DESC LIMIT 10",
+        "SELECT WatchID, ClientIP, COUNT(*) AS c, SUM(IsRefresh), AVG(ResolutionWidth) FROM hits GROUP BY WatchID, ClientIP ORDER BY c DESC LIMIT 10",
+        "SELECT URL, COUNT(*) AS c FROM hits GROUP BY URL ORDER BY c DESC LIMIT 10",
+        "SELECT 1, URL, COUNT(*) AS c FROM hits GROUP BY 1, URL ORDER BY c DESC LIMIT 10",
+    };
+    for (cases) |sql| {
+        const plan = (try parse(std.testing.allocator, sql)).?;
+        defer deinit(std.testing.allocator, plan);
+        try std.testing.expect(plan.group_by != null);
+        try std.testing.expectEqualStrings("c", plan.order_by_alias.?);
+        try std.testing.expectEqual(@as(?usize, 10), plan.limit);
+    }
 }
 
 test "rejects unsupported order by" {

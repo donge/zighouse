@@ -458,6 +458,17 @@ pub const Native = struct {
             if (isGenericSearchEnginePhraseCountPlan(plan)) return formatSearchEnginePhraseCountTop(self.allocator, self.io, self.data_dir);
             if (isGenericUserIdSearchPhraseCountTopPlan(plan)) return formatUserIdSearchPhraseCountTopCached(self.allocator, try self.getUserIdEncoding(), try self.getSearchPhraseColumn());
             if (isGenericUserIdMinuteSearchPhraseCountTopPlan(plan)) return formatUserIdMinuteSearchPhraseCountTopCached(self.allocator, self.io, self.data_dir, try self.getUserIdEncoding(), try self.getSearchPhraseColumn());
+            if (isGenericSearchEngineClientIpAggTopPlan(plan)) return formatSearchEngineClientIpAggTop(self.allocator, self.io, self.data_dir);
+            if (isGenericWatchIdClientIpAggTopFilteredPlan(plan)) return formatWatchIdClientIpAggTopFilteredCached(self.allocator, hot, try self.getSearchPhraseColumn());
+            if (isGenericWatchIdClientIpAggTopPlan(plan)) return formatWatchIdClientIpAggTop(self.allocator, self.io, self.data_dir);
+            if (isGenericUrlCountTopPlan(plan)) return formatUrlCountTopHashLateMaterializeCached(self, hot, false) catch |err| switch (err) {
+                error.FileNotFound => return formatUrlCountTop(self.allocator, self.io, self.data_dir),
+                else => return err,
+            };
+            if (isGenericOneUrlCountTopPlan(plan)) return formatUrlCountTopHashLateMaterializeCached(self, hot, true) catch |err| switch (err) {
+                error.FileNotFound => return formatOneUrlCountTop(self.allocator, self.io, self.data_dir),
+                else => return err,
+            };
         }
         if (isGenericUserIdSearchPhraseLimitPlan(plan)) {
             return formatUserIdSearchPhraseLimitNoOrderCached(self.allocator, try self.getUserIdEncoding(), try self.getSearchPhraseColumn());
@@ -597,6 +608,47 @@ pub const Native = struct {
         if (!asciiEqlIgnoreCase(plan.projections[1].alias orelse return false, "m")) return false;
         if (plan.projections[2].func != .column_ref or !asciiEqlIgnoreCase(plan.projections[2].column orelse return false, "SearchPhrase")) return false;
         return plan.projections[3].func == .count_star;
+    }
+
+    fn isGenericSearchEngineClientIpAggTopPlan(plan: generic_sql.Plan) bool {
+        return isGenericClientIpAggTopPlan(plan, "SearchEngineID", true);
+    }
+
+    fn isGenericWatchIdClientIpAggTopFilteredPlan(plan: generic_sql.Plan) bool {
+        return isGenericClientIpAggTopPlan(plan, "WatchID", true);
+    }
+
+    fn isGenericWatchIdClientIpAggTopPlan(plan: generic_sql.Plan) bool {
+        return isGenericClientIpAggTopPlan(plan, "WatchID", false);
+    }
+
+    fn isGenericClientIpAggTopPlan(plan: generic_sql.Plan, first_col: []const u8, filtered: bool) bool {
+        if (plan.limit != 10 or !genericOrderByAlias(plan, "c")) return false;
+        if (filtered != hasGenericEmptyStringFilter(plan, "SearchPhrase")) return false;
+        if (!asciiEqlIgnoreCase(plan.group_by orelse return false, if (asciiEqlIgnoreCase(first_col, "SearchEngineID")) "SearchEngineID, ClientIP" else "WatchID, ClientIP")) return false;
+        if (plan.projections.len != 5) return false;
+        if (plan.projections[0].func != .column_ref or !asciiEqlIgnoreCase(plan.projections[0].column orelse return false, first_col)) return false;
+        if (plan.projections[1].func != .column_ref or !asciiEqlIgnoreCase(plan.projections[1].column orelse return false, "ClientIP")) return false;
+        if (plan.projections[2].func != .count_star or !asciiEqlIgnoreCase(plan.projections[2].alias orelse return false, "c")) return false;
+        if (plan.projections[3].func != .sum or !asciiEqlIgnoreCase(plan.projections[3].column orelse return false, "IsRefresh")) return false;
+        return plan.projections[4].func == .avg and asciiEqlIgnoreCase(plan.projections[4].column orelse return false, "ResolutionWidth");
+    }
+
+    fn isGenericUrlCountTopPlan(plan: generic_sql.Plan) bool {
+        if (plan.filter != null or plan.limit != 10 or !genericOrderByAlias(plan, "c")) return false;
+        if (!asciiEqlIgnoreCase(plan.group_by orelse return false, "URL")) return false;
+        if (plan.projections.len != 2) return false;
+        if (plan.projections[0].func != .column_ref or !asciiEqlIgnoreCase(plan.projections[0].column orelse return false, "URL")) return false;
+        return plan.projections[1].func == .count_star and asciiEqlIgnoreCase(plan.projections[1].alias orelse return false, "c");
+    }
+
+    fn isGenericOneUrlCountTopPlan(plan: generic_sql.Plan) bool {
+        if (plan.filter != null or plan.limit != 10 or !genericOrderByAlias(plan, "c")) return false;
+        if (!asciiEqlIgnoreCase(plan.group_by orelse return false, "1, URL")) return false;
+        if (plan.projections.len != 3) return false;
+        if (plan.projections[0].func != .int_literal or plan.projections[0].int_offset != 1) return false;
+        if (plan.projections[1].func != .column_ref or !asciiEqlIgnoreCase(plan.projections[1].column orelse return false, "URL")) return false;
+        return plan.projections[2].func == .count_star and asciiEqlIgnoreCase(plan.projections[2].alias orelse return false, "c");
     }
 
     const GenericPredicateMask = struct { values: []const i16, owned: bool };
@@ -6075,9 +6127,11 @@ fn executeGenericFusedSumOffsets(allocator: std.mem.Allocator, plan: generic_sql
 
 fn executeGenericProjection(expr: generic_sql.Expr, hot: *const HotColumns) !GenericValue {
     if (expr.func == .count_star) return .{ .int = @intCast(hot.rowCount()) };
+    if (expr.func == .int_literal) return .{ .int = expr.int_offset };
     const column = bindGenericColumn(hot, expr.column orelse return error.UnsupportedGenericQuery) catch return error.UnsupportedGenericQuery;
     return switch (expr.func) {
         .column_ref => error.UnsupportedGenericQuery,
+        .int_literal => unreachable,
         .count_distinct => error.UnsupportedGenericQuery,
         .count_star => unreachable,
         .sum => aggregateSum(column, null, expr.int_offset),
@@ -6089,9 +6143,11 @@ fn executeGenericProjection(expr: generic_sql.Expr, hot: *const HotColumns) !Gen
 
 fn executeGenericFilteredProjection(expr: generic_sql.Expr, hot: *const HotColumns, predicate: []const i16) !GenericValue {
     if (expr.func == .count_star) return .{ .int = @intCast(simd.countNonZero(i16, predicate)) };
+    if (expr.func == .int_literal) return .{ .int = expr.int_offset };
     const column = bindGenericColumn(hot, expr.column orelse return error.UnsupportedGenericQuery) catch return error.UnsupportedGenericQuery;
     return switch (expr.func) {
         .column_ref => error.UnsupportedGenericQuery,
+        .int_literal => unreachable,
         .count_distinct => error.UnsupportedGenericQuery,
         .count_star => unreachable,
         .sum => aggregateSum(column, predicate, expr.int_offset),
@@ -6186,6 +6242,7 @@ fn writeGenericHeader(out: *std.ArrayList(u8), allocator: std.mem.Allocator, pla
         if (i != 0) try out.append(allocator, ',');
         switch (expr.func) {
             .column_ref => try out.print(allocator, "{s}", .{expr.column.?}),
+            .int_literal => try out.print(allocator, "{d}", .{expr.int_offset}),
             .count_distinct => try out.print(allocator, "count(DISTINCT {s})", .{expr.column.?}),
             .count_star => try out.appendSlice(allocator, "count_star()"),
             .sum => if (expr.int_offset == 0) try out.print(allocator, "sum({s})", .{expr.column.?}) else try out.print(allocator, "sum(({s} + {d}))", .{ expr.column.?, expr.int_offset }),
