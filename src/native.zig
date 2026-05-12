@@ -448,6 +448,16 @@ pub const Native = struct {
     }
 
     fn executeGenericFiltered(self: *Native, plan: generic_sql.Plan, hot: *const HotColumns, filter: generic_sql.Filter) anyerror![]u8 {
+        if (plan.projections.len == 1 and plan.projections[0].func == .column_ref) {
+            const column_name = plan.projections[0].column orelse return error.UnsupportedGenericQuery;
+            const column = bindGenericColumn(hot, column_name) catch return error.UnsupportedGenericQuery;
+            if (filter.second == null and filter.op == .equal and asciiEqlIgnoreCase(column_name, filter.column)) {
+                return formatGenericPointLookupColumn(self.allocator, column_name, column, filter.int_value);
+            }
+            const predicate = try materializePlanFilter(self.allocator, hot, filter);
+            defer if (predicate.owned) self.allocator.free(predicate.values);
+            return formatGenericFilteredColumn(self.allocator, column_name, column, predicate.values);
+        }
         const predicate = try materializePlanFilter(self.allocator, hot, filter);
         defer if (predicate.owned) self.allocator.free(predicate.values);
         const values = try self.allocator.alloc(GenericValue, plan.projections.len);
@@ -5769,6 +5779,66 @@ fn genericGroupCountTyped(comptime T: type, allocator: std.mem.Allocator, values
 fn genericGroupRowDesc(_: void, a: GenericGroupRow, b: GenericGroupRow) bool {
     if (a.count == b.count) return a.key < b.key;
     return a.count > b.count;
+}
+
+fn formatGenericFilteredColumn(allocator: std.mem.Allocator, header_col: []const u8, column: GenericColumn, predicate: []const i16) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.print(allocator, "{s}\n", .{header_col});
+    switch (column) {
+        .i16 => |values| try writeFilteredColumnValues(i16, &out, allocator, values, predicate),
+        .i32 => |values| try writeFilteredColumnValues(i32, &out, allocator, values, predicate),
+        .date => |values| try writeFilteredDateValues(&out, allocator, values, predicate),
+        .i64 => |values| try writeFilteredColumnValues(i64, &out, allocator, values, predicate),
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+fn formatGenericPointLookupColumn(allocator: std.mem.Allocator, header_col: []const u8, column: GenericColumn, int_value: i64) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.print(allocator, "{s}\n", .{header_col});
+    switch (column) {
+        .i16 => |values| try writePointLookupValues(i16, &out, allocator, values, int_value),
+        .i32 => |values| try writePointLookupValues(i32, &out, allocator, values, int_value),
+        .date => |values| try writePointLookupDateValues(&out, allocator, values, int_value),
+        .i64 => |values| try writePointLookupValues(i64, &out, allocator, values, int_value),
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+fn writePointLookupValues(comptime T: type, out: *std.ArrayList(u8), allocator: std.mem.Allocator, values: []const T, int_value: i64) !void {
+    const target = std.math.cast(T, int_value) orelse return error.UnsupportedGenericQuery;
+    for (values) |value| {
+        if (value != target) continue;
+        try out.print(allocator, "{d}\n", .{value});
+    }
+}
+
+fn writePointLookupDateValues(out: *std.ArrayList(u8), allocator: std.mem.Allocator, values: []const i32, int_value: i64) !void {
+    const target = std.math.cast(i32, int_value) orelse return error.UnsupportedGenericQuery;
+    for (values) |value| {
+        if (value != target) continue;
+        const text = dateString(@intCast(value));
+        try out.print(allocator, "{s}\n", .{text});
+    }
+}
+
+fn writeFilteredColumnValues(comptime T: type, out: *std.ArrayList(u8), allocator: std.mem.Allocator, values: []const T, predicate: []const i16) !void {
+    if (values.len != predicate.len) return error.InvalidGenericResult;
+    for (values, predicate) |value, p| {
+        if (p == 0) continue;
+        try out.print(allocator, "{d}\n", .{value});
+    }
+}
+
+fn writeFilteredDateValues(out: *std.ArrayList(u8), allocator: std.mem.Allocator, values: []const i32, predicate: []const i16) !void {
+    if (values.len != predicate.len) return error.InvalidGenericResult;
+    for (values, predicate) |value, p| {
+        if (p == 0) continue;
+        const text = dateString(@intCast(value));
+        try out.print(allocator, "{s}\n", .{text});
+    }
 }
 
 fn executeGenericFusedSumOffsets(allocator: std.mem.Allocator, plan: generic_sql.Plan, hot: *const HotColumns) !?[]u8 {

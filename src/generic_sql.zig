@@ -84,7 +84,7 @@ pub fn parse(allocator: std.mem.Allocator, sql: []const u8) !?Plan {
         projections.deinit(allocator);
         return null;
     }
-    if (!validPlanShape(projections.items, group_by)) {
+    if (!validPlanShape(projections.items, filter, group_by)) {
         projections.deinit(allocator);
         return null;
     }
@@ -102,8 +102,9 @@ pub fn deinit(allocator: std.mem.Allocator, plan: Plan) void {
     allocator.free(plan.projections);
 }
 
-fn validPlanShape(projections: []const Expr, group_by: ?[]const u8) bool {
+fn validPlanShape(projections: []const Expr, filter: ?Filter, group_by: ?[]const u8) bool {
     if (group_by == null) {
+        if (projections.len == 1 and projections[0].func == .column_ref) return filter != null;
         for (projections) |expr| if (expr.func == .column_ref) return false;
         return true;
     }
@@ -328,4 +329,13 @@ test "rejects unsupported sql" {
     try std.testing.expect((try parse(std.testing.allocator, "SELECT URL FROM hits")) == null);
     try std.testing.expect((try parse(std.testing.allocator, "SELECT COUNT(*) FROM other")) == null);
     try std.testing.expect((try parse(std.testing.allocator, "SELECT COUNT(*) FROM hits WHERE AdvEngineID <> 0 AND ResolutionWidth > 0 AND IsRefresh = 0")) == null);
+}
+
+test "parses filtered column projection" {
+    const plan = (try parse(std.testing.allocator, "SELECT UserID FROM hits WHERE UserID = 435090932899640449")).?;
+    defer deinit(std.testing.allocator, plan);
+    try std.testing.expectEqual(@as(usize, 1), plan.projections.len);
+    try std.testing.expectEqual(AggregateFn.column_ref, plan.projections[0].func);
+    try std.testing.expectEqualStrings("UserID", plan.projections[0].column.?);
+    try std.testing.expect(plan.filter != null);
 }
