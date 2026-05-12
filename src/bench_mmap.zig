@@ -89,7 +89,7 @@ fn sumOver(bytes: []const u8, name: []const u8) i64 {
     if (std.mem.endsWith(u8, name, ".i16")) {
         const elem_count = bytes.len / @sizeOf(i16);
         const ptr: [*]const i16 = @ptrCast(@alignCast(bytes.ptr));
-        return simd.sumI16(ptr[0..elem_count]);
+        return simd.sum(i16, ptr[0..elem_count]);
     }
     if (std.mem.endsWith(u8, name, ".i64")) {
         const elem_count = bytes.len / @sizeOf(i64);

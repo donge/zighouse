@@ -285,14 +285,14 @@ pub const Native = struct {
         };
 
         if (clickbench_query) |query_kind| switch (query_kind) {
-            .count_adv_engine_non_zero => return formatOneInt(self.allocator, "count_star()", countNonZeroI16(hot.adv_engine_id)),
-            .sum_count_avg => return formatSumCountAvg(self.allocator, sumI16(hot.adv_engine_id), hot.rowCount(), avgI16(hot.resolution_width)),
-            .avg_user_id => return formatOneFloat(self.allocator, "avg(UserID)", avgI64(hot.user_id)),
+            .count_adv_engine_non_zero => return formatOneInt(self.allocator, "count_star()", simd.countNonZero(i16, hot.adv_engine_id)),
+            .sum_count_avg => return formatSumCountAvg(self.allocator, simd.sum(i16, hot.adv_engine_id), hot.rowCount(), avgFromSum(simd.sum(i16, hot.resolution_width), hot.resolution_width.len)),
+            .avg_user_id => return formatOneFloat(self.allocator, "avg(UserID)", simd.avg(i64, hot.user_id)),
             .min_max_event_date => {
-                const mm = simd.minMaxI32(hot.event_date);
+                const mm = simd.minMax(i32, hot.event_date);
                 return formatMinMaxDate(self.allocator, mm.min, mm.max);
             },
-            .wide_resolution_sums => return formatWideResolutionSums(self.allocator, sumI16(hot.resolution_width), hot.rowCount()),
+            .wide_resolution_sums => return formatWideResolutionSums(self.allocator, simd.sum(i16, hot.resolution_width), hot.rowCount()),
             .adv_engine_group_by => return formatAdvEngineGroupBy(self.allocator, hot.adv_engine_id),
             .user_id_point_lookup => return formatUserIdPointLookup(self.allocator, hot.user_id, 435090932899640449),
             .url_length_by_counter => return formatUrlLengthByCounter(self.allocator, hot.counter_id, hot.url_length orelse return error.UnsupportedNativeQuery),
@@ -5524,24 +5524,10 @@ fn readI64Column(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8,
     return out;
 }
 
-fn countNonZeroI16(values: []const i16) u64 {
-    return simd.countNonZeroI16(values);
-}
-
 fn genericCountNonZeroI16(values: []const i16) u64 {
     var count: u64 = 0;
     for (values) |value| count += @intFromBool(value != 0);
     return count;
-}
-
-fn sumI16(values: []const i16) i64 {
-    return simd.sumI16(values);
-}
-
-fn sumI32(values: []const i32) i64 {
-    var sum: i64 = 0;
-    for (values) |value| sum += value;
-    return sum;
 }
 
 fn genericSumI16(values: []const i16) i64 {
@@ -5550,88 +5536,9 @@ fn genericSumI16(values: []const i16) i64 {
     return sum;
 }
 
-fn avgI16(values: []const i16) f64 {
-    if (values.len == 0) return 0;
-    return @as(f64, @floatFromInt(sumI16(values))) / @as(f64, @floatFromInt(values.len));
-}
-
-fn avgI32(values: []const i32) f64 {
-    if (values.len == 0) return 0;
-    return @as(f64, @floatFromInt(sumI32(values))) / @as(f64, @floatFromInt(values.len));
-}
-
 fn genericAvgI16(values: []const i16) f64 {
     if (values.len == 0) return 0;
     return @as(f64, @floatFromInt(genericSumI16(values))) / @as(f64, @floatFromInt(values.len));
-}
-
-fn avgI64(values: []const i64) f64 {
-    return simd.avgI64(values);
-}
-
-fn filteredSumI16(predicate: []const i16, values: []const i16) i64 {
-    return simd.filteredSumI16NonZero(predicate, values);
-}
-
-fn filteredSumI32(predicate: []const i16, values: []const i32) i64 {
-    return simd.filteredSumI32NonZero(predicate, values);
-}
-
-fn filteredAvgI16(predicate: []const i16, values: []const i16) f64 {
-    var sum: i64 = 0;
-    var count: u64 = 0;
-    for (predicate, values) |p, value| if (p != 0) {
-        sum += value;
-        count += 1;
-    };
-    if (count == 0) return 0;
-    return @as(f64, @floatFromInt(sum)) / @as(f64, @floatFromInt(count));
-}
-
-fn filteredAvgI32(predicate: []const i16, values: []const i32) f64 {
-    var sum: i64 = 0;
-    var count: u64 = 0;
-    for (predicate, values) |p, value| if (p != 0) {
-        sum += value;
-        count += 1;
-    };
-    if (count == 0) return 0;
-    return @as(f64, @floatFromInt(sum)) / @as(f64, @floatFromInt(count));
-}
-
-fn filteredAvgI64(predicate: []const i16, values: []const i64) f64 {
-    var sum: f64 = 0;
-    var count: u64 = 0;
-    for (predicate, values) |p, value| if (p != 0) {
-        sum += @floatFromInt(value);
-        count += 1;
-    };
-    if (count == 0) return 0;
-    return sum / @as(f64, @floatFromInt(count));
-}
-
-fn filteredMinI16(predicate: []const i16, values: []const i16) i16 {
-    return simd.filteredMinMaxI16NonZero(predicate, values).min;
-}
-
-fn filteredMaxI16(predicate: []const i16, values: []const i16) i16 {
-    return simd.filteredMinMaxI16NonZero(predicate, values).max;
-}
-
-fn filteredMinI32(predicate: []const i16, values: []const i32) i32 {
-    return simd.filteredMinMaxI32NonZero(predicate, values).min;
-}
-
-fn filteredMaxI32(predicate: []const i16, values: []const i32) i32 {
-    return simd.filteredMinMaxI32NonZero(predicate, values).max;
-}
-
-fn filteredMinI64(predicate: []const i16, values: []const i64) i64 {
-    return simd.filteredMinMaxI64NonZero(predicate, values).min;
-}
-
-fn filteredMaxI64(predicate: []const i16, values: []const i64) i64 {
-    return simd.filteredMinMaxI64NonZero(predicate, values).max;
 }
 
 fn genericAvgI64(values: []const i64) f64 {
@@ -5639,6 +5546,11 @@ fn genericAvgI64(values: []const i64) f64 {
     var sum: i128 = 0;
     for (values) |value| sum += value;
     return @as(f64, @floatFromInt(sum)) / @as(f64, @floatFromInt(values.len));
+}
+
+fn avgFromSum(sum: i64, count: usize) f64 {
+    if (count == 0) return 0;
+    return @as(f64, @floatFromInt(sum)) / @as(f64, @floatFromInt(count));
 }
 
 const MinMaxI32 = struct { min: i32, max: i32 };
@@ -5718,58 +5630,58 @@ fn executeGenericProjection(expr: generic_sql.Expr, hot: *const HotColumns) !Gen
     return switch (expr.func) {
         .count_star => unreachable,
         .sum => switch (column) {
-            .i16 => |values| .{ .int = sumI16(values) },
-            .i32 => |values| .{ .int = sumI32(values) },
+            .i16 => |values| .{ .int = simd.sum(i16, values) },
+            .i32 => |values| .{ .int = simd.sum(i32, values) },
             .date, .i64 => error.UnsupportedGenericQuery,
         },
         .avg => switch (column) {
-            .i16 => |values| .{ .float = avgI16(values) },
-            .i32 => |values| .{ .float = avgI32(values) },
-            .i64 => |values| .{ .float = avgI64(values) },
+            .i16 => |values| .{ .float = avgFromSum(simd.sum(i16, values), values.len) },
+            .i32 => |values| .{ .float = avgFromSum(simd.sum(i32, values), values.len) },
+            .i64 => |values| .{ .float = simd.avg(i64, values) },
             .date => error.UnsupportedGenericQuery,
         },
         .min => switch (column) {
-            .i16 => |values| .{ .int = minI16(values) },
-            .i32 => |values| .{ .int = minI32(values) },
-            .date => |values| .{ .date = minI32(values) },
-            .i64 => |values| .{ .int = minI64(values) },
+            .i16 => |values| .{ .int = simd.minMax(i16, values).min },
+            .i32 => |values| .{ .int = simd.minMax(i32, values).min },
+            .date => |values| .{ .date = simd.minMax(i32, values).min },
+            .i64 => |values| .{ .int = simd.minMax(i64, values).min },
         },
         .max => switch (column) {
-            .i16 => |values| .{ .int = maxI16(values) },
-            .i32 => |values| .{ .int = maxI32(values) },
-            .date => |values| .{ .date = maxI32(values) },
-            .i64 => |values| .{ .int = maxI64(values) },
+            .i16 => |values| .{ .int = simd.minMax(i16, values).max },
+            .i32 => |values| .{ .int = simd.minMax(i32, values).max },
+            .date => |values| .{ .date = simd.minMax(i32, values).max },
+            .i64 => |values| .{ .int = simd.minMax(i64, values).max },
         },
     };
 }
 
 fn executeGenericFilteredProjection(expr: generic_sql.Expr, hot: *const HotColumns, predicate: []const i16) !GenericValue {
-    if (expr.func == .count_star) return .{ .int = @intCast(simd.countNonZeroI16(predicate)) };
+    if (expr.func == .count_star) return .{ .int = @intCast(simd.countNonZero(i16, predicate)) };
     const column = bindGenericColumn(hot, expr.column orelse return error.UnsupportedGenericQuery) catch return error.UnsupportedGenericQuery;
     return switch (expr.func) {
         .count_star => unreachable,
         .sum => switch (column) {
-            .i16 => |values| .{ .int = filteredSumI16(predicate, values) },
-            .i32 => |values| .{ .int = filteredSumI32(predicate, values) },
+            .i16 => |values| .{ .int = simd.filteredSumNonZero(i16, predicate, values) },
+            .i32 => |values| .{ .int = simd.filteredSumNonZero(i32, predicate, values) },
             .date, .i64 => error.UnsupportedGenericQuery,
         },
         .avg => switch (column) {
-            .i16 => |values| .{ .float = filteredAvgI16(predicate, values) },
-            .i32 => |values| .{ .float = filteredAvgI32(predicate, values) },
-            .i64 => |values| .{ .float = filteredAvgI64(predicate, values) },
+            .i16 => |values| .{ .float = simd.filteredAvgNonZero(i16, predicate, values) },
+            .i32 => |values| .{ .float = simd.filteredAvgNonZero(i32, predicate, values) },
+            .i64 => |values| .{ .float = simd.filteredAvgNonZero(i64, predicate, values) },
             .date => error.UnsupportedGenericQuery,
         },
         .min => switch (column) {
-            .i16 => |values| .{ .int = filteredMinI16(predicate, values) },
-            .i32 => |values| .{ .int = filteredMinI32(predicate, values) },
-            .date => |values| .{ .date = filteredMinI32(predicate, values) },
-            .i64 => |values| .{ .int = filteredMinI64(predicate, values) },
+            .i16 => |values| .{ .int = simd.filteredMinMaxNonZero(i16, predicate, values).min },
+            .i32 => |values| .{ .int = simd.filteredMinMaxNonZero(i32, predicate, values).min },
+            .date => |values| .{ .date = simd.filteredMinMaxNonZero(i32, predicate, values).min },
+            .i64 => |values| .{ .int = simd.filteredMinMaxNonZero(i64, predicate, values).min },
         },
         .max => switch (column) {
-            .i16 => |values| .{ .int = filteredMaxI16(predicate, values) },
-            .i32 => |values| .{ .int = filteredMaxI32(predicate, values) },
-            .date => |values| .{ .date = filteredMaxI32(predicate, values) },
-            .i64 => |values| .{ .int = filteredMaxI64(predicate, values) },
+            .i16 => |values| .{ .int = simd.filteredMinMaxNonZero(i16, predicate, values).max },
+            .i32 => |values| .{ .int = simd.filteredMinMaxNonZero(i32, predicate, values).max },
+            .date => |values| .{ .date = simd.filteredMinMaxNonZero(i32, predicate, values).max },
+            .i64 => |values| .{ .int = simd.filteredMinMaxNonZero(i64, predicate, values).max },
         },
     };
 }
@@ -5784,11 +5696,11 @@ fn executeGenericFusedMinMax(allocator: std.mem.Allocator, plan: generic_sql.Pla
     if (!asciiEqlIgnoreCase(first_col, second_col)) return null;
     return switch (bindGenericColumn(hot, first_col) catch return error.UnsupportedGenericQuery) {
         .i32 => |values| blk: {
-            const mm = simd.minMaxI32(values);
+            const mm = simd.minMax(i32, values);
             break :blk try formatGenericValues(allocator, plan, &.{ .{ .int = mm.min }, .{ .int = mm.max } });
         },
         .date => |values| blk: {
-            const mm = simd.minMaxI32(values);
+            const mm = simd.minMax(i32, values);
             break :blk try formatGenericValues(allocator, plan, &.{ .{ .date = mm.min }, .{ .date = mm.max } });
         },
         else => null,
@@ -5871,30 +5783,6 @@ fn asciiEqlIgnoreCase(a: []const u8, b: []const u8) bool {
     if (a.len != b.len) return false;
     for (a, b) |ac, bc| if (std.ascii.toLower(ac) != std.ascii.toLower(bc)) return false;
     return true;
-}
-
-fn minI32(values: []const i32) i32 {
-    return simd.minI32(values);
-}
-
-fn minI16(values: []const i16) i16 {
-    return simd.minMaxI16(values).min;
-}
-
-fn maxI32(values: []const i32) i32 {
-    return simd.maxI32(values);
-}
-
-fn minI64(values: []const i64) i64 {
-    return simd.minMaxI64(values).min;
-}
-
-fn maxI64(values: []const i64) i64 {
-    return simd.minMaxI64(values).max;
-}
-
-fn maxI16(values: []const i16) i16 {
-    return simd.minMaxI16(values).max;
 }
 
 fn formatOneInt(allocator: std.mem.Allocator, header: []const u8, value: u64) ![]u8 {

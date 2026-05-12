@@ -1,7 +1,7 @@
 // A.3 micro-benchmark: parallel sumI16 fan-out vs single-thread SIMD.
 //
 // Splits the column into N equal chunks and spawns N threads, each running
-// simd.sumI16 on its chunk; the main thread sums the partials.
+// simd.sum(i16, ...) on each chunk; the main thread sums the partials.
 //
 // Gate: parallel must be >= 2.5x single-thread to graduate into
 // src/parallel.zig.
@@ -51,7 +51,7 @@ fn benchSingle(io: std.Io, values: []const i16) !void {
     var sum: i64 = 0;
     for (0..iterations) |idx| {
         const start = std.Io.Clock.awake.now(io);
-        const partial = simd.sumI16(values);
+        const partial = simd.sum(i16, values);
         const stop = std.Io.Clock.awake.now(io);
         samples[idx] = @intCast(stop.nanoseconds - start.nanoseconds);
         sum ^= partial;
@@ -68,7 +68,7 @@ const ThreadCtx = struct {
 };
 
 fn workerSum(ctx: *ThreadCtx) void {
-    ctx.out = simd.sumI16(ctx.chunk);
+    ctx.out = simd.sum(i16, ctx.chunk);
 }
 
 fn benchThreaded(allocator: std.mem.Allocator, io: std.Io, values: []const i16, n_threads: usize) !void {

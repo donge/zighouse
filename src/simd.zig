@@ -13,29 +13,30 @@
 
 const std = @import("std");
 
-pub fn sumI16(values: []const i16) i64 {
-    const lanes = 32;
-    const V = @Vector(lanes, i16);
+pub fn sum(comptime T: type, values: []const T) i64 {
+    const lanes = lanesForSum(T);
+    const V = @Vector(lanes, T);
+    const AccT = sumAccumulator(T);
     var total: i64 = 0;
     var i: usize = 0;
     while (i + lanes <= values.len) : (i += lanes) {
         const v: V = values[i..][0..lanes].*;
-        total += @reduce(.Add, @as(@Vector(lanes, i32), v));
+        total += @reduce(.Add, @as(@Vector(lanes, AccT), v));
     }
     while (i < values.len) : (i += 1) total += values[i];
     return total;
 }
 
-pub fn countNonZeroI16(values: []const i16) u64 {
-    const lanes = 64;
-    const V = @Vector(lanes, i16);
+pub fn countNonZero(comptime T: type, values: []const T) u64 {
+    const lanes = lanesForCount(T);
+    const V = @Vector(lanes, T);
     const zero: V = @splat(0);
     var count: u64 = 0;
     var i: usize = 0;
     while (i + lanes <= values.len) : (i += lanes) {
         const v: V = values[i..][0..lanes].*;
         const mask = v != zero;
-        count += @intCast(@popCount(@as(u64, @bitCast(mask))));
+        count += popCountMask(mask);
     }
     while (i < values.len) : (i += 1) if (values[i] != 0) {
         count += 1;
@@ -43,16 +44,10 @@ pub fn countNonZeroI16(values: []const i16) u64 {
     return count;
 }
 
-pub fn filteredSumI16NonZero(predicate: []const i16, values: []const i16) i64 {
-    return filteredSumNonZero(i16, predicate, values);
-}
+pub const SumCount = struct { sum: i64, count: u64 };
 
-pub fn filteredSumI32NonZero(predicate: []const i16, values: []const i32) i64 {
-    return filteredSumNonZero(i32, predicate, values);
-}
-
-fn filteredSumNonZero(comptime T: type, predicate: []const i16, values: []const T) i64 {
-    const lanes = lanesFor(T);
+pub fn filteredSumNonZero(comptime T: type, predicate: []const i16, values: []const T) i64 {
+    const lanes = lanesForSum(T);
     const VP = @Vector(lanes, i16);
     const VV = @Vector(lanes, T);
     const AccT = sumAccumulator(T);
@@ -72,19 +67,67 @@ fn filteredSumNonZero(comptime T: type, predicate: []const i16, values: []const 
     return total;
 }
 
-pub fn filteredMinMaxI16NonZero(predicate: []const i16, values: []const i16) MinMax(i16) {
-    return filteredMinMaxNonZero(i16, predicate, values);
+pub fn filteredSumCountNonZero(comptime T: type, predicate: []const i16, values: []const T) SumCount {
+    const lanes = lanesForSum(T);
+    const VP = @Vector(lanes, i16);
+    const VV = @Vector(lanes, T);
+    const AccT = sumAccumulator(T);
+    var total: i64 = 0;
+    var count: u64 = 0;
+    var i: usize = 0;
+    const p_zero: VP = @splat(0);
+    const v_zero: VV = @splat(0);
+    while (i + lanes <= predicate.len) : (i += lanes) {
+        const p: VP = predicate[i..][0..lanes].*;
+        const v: VV = values[i..][0..lanes].*;
+        const mask = p != p_zero;
+        const selected = @select(T, mask, v, v_zero);
+        total += @reduce(.Add, @as(@Vector(lanes, AccT), selected));
+        count += popCountMask(mask);
+    }
+    while (i < predicate.len) : (i += 1) if (predicate[i] != 0) {
+        total += values[i];
+        count += 1;
+    };
+    return .{ .sum = total, .count = count };
 }
 
-pub fn filteredMinMaxI32NonZero(predicate: []const i16, values: []const i32) MinMax(i32) {
-    return filteredMinMaxNonZero(i32, predicate, values);
+pub fn filteredAvgNonZero(comptime T: type, predicate: []const i16, values: []const T) f64 {
+    return switch (T) {
+        i16, i32 => blk: {
+            const result = filteredSumCountNonZero(T, predicate, values);
+            if (result.count == 0) return 0;
+            break :blk @as(f64, @floatFromInt(result.sum)) / @as(f64, @floatFromInt(result.count));
+        },
+        i64 => blk: {
+            const lanes = 8;
+            const VP = @Vector(lanes, i16);
+            const VI = @Vector(lanes, i64);
+            const VF = @Vector(lanes, f64);
+            var total: f64 = 0;
+            var count: u64 = 0;
+            var i: usize = 0;
+            const p_zero: VP = @splat(0);
+            const f_zero: VF = @splat(0);
+            while (i + lanes <= predicate.len) : (i += lanes) {
+                const p: VP = predicate[i..][0..lanes].*;
+                const v: VI = values[i..][0..lanes].*;
+                const mask = p != p_zero;
+                total += @reduce(.Add, @select(f64, mask, @as(VF, @floatFromInt(v)), f_zero));
+                count += popCountMask(mask);
+            }
+            while (i < predicate.len) : (i += 1) if (predicate[i] != 0) {
+                total += @floatFromInt(values[i]);
+                count += 1;
+            };
+            if (count == 0) return 0;
+            break :blk total / @as(f64, @floatFromInt(count));
+        },
+        else => @compileError("unsupported filtered average type"),
+    };
 }
 
-pub fn filteredMinMaxI64NonZero(predicate: []const i16, values: []const i64) MinMax(i64) {
-    return filteredMinMaxNonZero(i64, predicate, values);
-}
-
-fn filteredMinMaxNonZero(comptime T: type, predicate: []const i16, values: []const T) MinMax(T) {
+pub fn filteredMinMaxNonZero(comptime T: type, predicate: []const i16, values: []const T) MinMax(T) {
     const lanes = lanesFor(T);
     const VP = @Vector(lanes, i16);
     const VV = @Vector(lanes, T);
@@ -119,6 +162,33 @@ fn lanesFor(comptime T: type) comptime_int {
     };
 }
 
+fn lanesForSum(comptime T: type) comptime_int {
+    return switch (T) {
+        i16 => 32,
+        i32 => 16,
+        else => @compileError("unsupported SIMD sum type"),
+    };
+}
+
+fn lanesForCount(comptime T: type) comptime_int {
+    return switch (T) {
+        i16 => 64,
+        i32 => 16,
+        i64 => 8,
+        else => @compileError("unsupported SIMD count type"),
+    };
+}
+
+fn popCountMask(mask: anytype) u64 {
+    return switch (@bitSizeOf(@TypeOf(mask))) {
+        8 => @intCast(@popCount(@as(u8, @bitCast(mask)))),
+        16 => @intCast(@popCount(@as(u16, @bitCast(mask)))),
+        32 => @intCast(@popCount(@as(u32, @bitCast(mask)))),
+        64 => @intCast(@popCount(@as(u64, @bitCast(mask)))),
+        else => @compileError("unsupported mask width"),
+    };
+}
+
 fn MinMax(comptime T: type) type {
     return struct { min: T, max: T };
 }
@@ -131,29 +201,9 @@ fn sumAccumulator(comptime T: type) type {
     };
 }
 
-pub fn minI32(values: []const i32) i32 {
-    return minMax(i32, values).min;
-}
-
-pub fn maxI32(values: []const i32) i32 {
-    return minMax(i32, values).max;
-}
-
 /// Fused single-pass min and max over the same column. ~8x scalar; ~2x
 /// vs running minI32 then maxI32 thanks to a single memory traversal.
-pub fn minMaxI32(values: []const i32) MinMax(i32) {
-    return minMax(i32, values);
-}
-
-pub fn minMaxI16(values: []const i16) MinMax(i16) {
-    return minMax(i16, values);
-}
-
-pub fn minMaxI64(values: []const i64) MinMax(i64) {
-    return minMax(i64, values);
-}
-
-fn minMax(comptime T: type, values: []const T) MinMax(T) {
+pub fn minMax(comptime T: type, values: []const T) MinMax(T) {
     const lanes = lanesFor(T);
     const V = @Vector(lanes, T);
     var lo_acc: V = @splat(std.math.maxInt(T));
@@ -173,10 +223,11 @@ fn minMax(comptime T: type, values: []const T) MinMax(T) {
     return .{ .min = lo, .max = hi };
 }
 
-pub fn avgI64(values: []const i64) f64 {
+pub fn avg(comptime T: type, values: []const T) f64 {
     if (values.len == 0) return 0;
-    const lanes = 8;
-    const VI = @Vector(lanes, i64);
+    if (T != i64) @compileError("unsupported SIMD average type");
+    const lanes = lanesFor(T);
+    const VI = @Vector(lanes, T);
     const VF = @Vector(lanes, f64);
     var acc: VF = @splat(0);
     var i: usize = 0;
@@ -192,16 +243,16 @@ pub fn avgI64(values: []const i64) f64 {
 /// Counts elements equal to `target`. Used by point lookups where we only
 /// need the cardinality (Q20 prints each match, but the SIMD prefilter
 /// here lets the caller scan only matching lanes scalarly).
-pub fn countEqI64(values: []const i64, target: i64) u64 {
-    const lanes = 8;
-    const V = @Vector(lanes, i64);
+pub fn countEq(comptime T: type, values: []const T, target: T) u64 {
+    const lanes = lanesFor(T);
+    const V = @Vector(lanes, T);
     const target_vec: V = @splat(target);
     var count: u64 = 0;
     var i: usize = 0;
     while (i + lanes <= values.len) : (i += lanes) {
         const v: V = values[i..][0..lanes].*;
         const mask = v == target_vec;
-        count += @intCast(@popCount(@as(u8, @bitCast(mask))));
+        count += popCountMask(mask);
     }
     while (i < values.len) : (i += 1) if (values[i] == target) {
         count += 1;
@@ -209,16 +260,16 @@ pub fn countEqI64(values: []const i64, target: i64) u64 {
     return count;
 }
 
-test "sumI16 matches scalar" {
+test "sum i16 matches scalar" {
     var data: [200]i16 = undefined;
     var rng = std.Random.DefaultPrng.init(7);
     for (&data) |*v| v.* = rng.random().intRangeLessThan(i16, -1000, 1000);
     var expected: i64 = 0;
     for (data) |v| expected += v;
-    try std.testing.expectEqual(expected, sumI16(&data));
+    try std.testing.expectEqual(expected, sum(i16, &data));
 }
 
-test "countNonZeroI16 matches scalar" {
+test "countNonZero i16 matches scalar" {
     var data: [300]i16 = undefined;
     var rng = std.Random.DefaultPrng.init(11);
     for (&data) |*v| v.* = if (rng.random().boolean()) 0 else rng.random().intRangeLessThan(i16, 1, 100);
@@ -226,10 +277,10 @@ test "countNonZeroI16 matches scalar" {
     for (data) |v| if (v != 0) {
         expected += 1;
     };
-    try std.testing.expectEqual(expected, countNonZeroI16(&data));
+    try std.testing.expectEqual(expected, countNonZero(i16, &data));
 }
 
-test "filteredSumI16NonZero matches scalar" {
+test "filtered sum i16 matches scalar" {
     var pred: [257]i16 = undefined;
     var data: [257]i16 = undefined;
     var rng = std.Random.DefaultPrng.init(41);
@@ -239,10 +290,12 @@ test "filteredSumI16NonZero matches scalar" {
         v.* = rng.random().intRangeLessThan(i16, -1000, 1000);
         if (p.* != 0) expected += v.*;
     }
-    try std.testing.expectEqual(expected, filteredSumI16NonZero(&pred, &data));
+    try std.testing.expectEqual(expected, filteredSumNonZero(i16, &pred, &data));
+    const got = filteredSumCountNonZero(i16, &pred, &data);
+    try std.testing.expectEqual(expected, got.sum);
 }
 
-test "filteredSumI32NonZero matches scalar" {
+test "filtered sum i32 matches scalar" {
     var pred: [257]i16 = undefined;
     var data: [257]i32 = undefined;
     var rng = std.Random.DefaultPrng.init(43);
@@ -252,10 +305,46 @@ test "filteredSumI32NonZero matches scalar" {
         v.* = rng.random().intRangeLessThan(i32, -100000, 100000);
         if (p.* != 0) expected += v.*;
     }
-    try std.testing.expectEqual(expected, filteredSumI32NonZero(&pred, &data));
+    try std.testing.expectEqual(expected, filteredSumNonZero(i32, &pred, &data));
+    const got = filteredSumCountNonZero(i32, &pred, &data);
+    try std.testing.expectEqual(expected, got.sum);
 }
 
-test "filteredMinMaxI16NonZero matches scalar" {
+test "filtered sum count returns matching counts" {
+    var pred: [257]i16 = undefined;
+    var i16_data: [257]i16 = undefined;
+    var i32_data: [257]i32 = undefined;
+    var rng = std.Random.DefaultPrng.init(45);
+    var expected_count: u64 = 0;
+    for (&pred, &i16_data, &i32_data) |*p, *v16, *v32| {
+        p.* = if (rng.random().boolean()) 0 else rng.random().intRangeLessThan(i16, 1, 8);
+        v16.* = rng.random().intRangeLessThan(i16, -1000, 1000);
+        v32.* = rng.random().intRangeLessThan(i32, -100000, 100000);
+        if (p.* != 0) expected_count += 1;
+    }
+    try std.testing.expectEqual(expected_count, filteredSumCountNonZero(i16, &pred, &i16_data).count);
+    try std.testing.expectEqual(expected_count, filteredSumCountNonZero(i32, &pred, &i32_data).count);
+}
+
+test "filtered avg i64 matches scalar" {
+    var pred: [257]i16 = undefined;
+    var data: [257]i64 = undefined;
+    var rng = std.Random.DefaultPrng.init(46);
+    var expected_sum: f64 = 0;
+    var count: u64 = 0;
+    for (&pred, &data) |*p, *v| {
+        p.* = if (rng.random().boolean()) 0 else rng.random().intRangeLessThan(i16, 1, 8);
+        v.* = rng.random().intRangeLessThan(i64, -1000000000000, 1000000000000);
+        if (p.* != 0) {
+            expected_sum += @floatFromInt(v.*);
+            count += 1;
+        }
+    }
+    const expected = expected_sum / @as(f64, @floatFromInt(count));
+    try std.testing.expectApproxEqRel(expected, filteredAvgNonZero(i64, &pred, &data), 1e-12);
+}
+
+test "filtered minmax i16 matches scalar" {
     var pred: [257]i16 = undefined;
     var data: [257]i16 = undefined;
     var rng = std.Random.DefaultPrng.init(47);
@@ -269,12 +358,12 @@ test "filteredMinMaxI16NonZero matches scalar" {
             hi = @max(hi, v.*);
         }
     }
-    const got = filteredMinMaxI16NonZero(&pred, &data);
+    const got = filteredMinMaxNonZero(i16, &pred, &data);
     try std.testing.expectEqual(lo, got.min);
     try std.testing.expectEqual(hi, got.max);
 }
 
-test "filteredMinMaxI32NonZero matches scalar" {
+test "filtered minmax i32 matches scalar" {
     var pred: [257]i16 = undefined;
     var data: [257]i32 = undefined;
     var rng = std.Random.DefaultPrng.init(47);
@@ -288,12 +377,12 @@ test "filteredMinMaxI32NonZero matches scalar" {
             hi = @max(hi, v.*);
         }
     }
-    const got = filteredMinMaxI32NonZero(&pred, &data);
+    const got = filteredMinMaxNonZero(i32, &pred, &data);
     try std.testing.expectEqual(lo, got.min);
     try std.testing.expectEqual(hi, got.max);
 }
 
-test "filteredMinMaxI64NonZero matches scalar" {
+test "filtered minmax i64 matches scalar" {
     var pred: [257]i16 = undefined;
     var data: [257]i64 = undefined;
     var rng = std.Random.DefaultPrng.init(53);
@@ -307,7 +396,7 @@ test "filteredMinMaxI64NonZero matches scalar" {
             hi = @max(hi, v.*);
         }
     }
-    const got = filteredMinMaxI64NonZero(&pred, &data);
+    const got = filteredMinMaxNonZero(i64, &pred, &data);
     try std.testing.expectEqual(lo, got.min);
     try std.testing.expectEqual(hi, got.max);
 }
@@ -331,13 +420,13 @@ test "minMax wrappers match scalar" {
     for (&i16_data) |*v| v.* = rng.random().intRangeLessThan(i16, -1000, 1000);
     for (&i32_data) |*v| v.* = rng.random().intRangeLessThan(i32, -100000, 100000);
     for (&i64_data) |*v| v.* = rng.random().intRangeLessThan(i64, -1000000000000, 1000000000000);
-    try expectMinMax(i16, &i16_data, minMaxI16(&i16_data));
-    try expectMinMax(i32, &i32_data, minMaxI32(&i32_data));
-    try expectMinMax(i64, &i64_data, minMaxI64(&i64_data));
+    try expectMinMax(i16, &i16_data, minMax(i16, &i16_data));
+    try expectMinMax(i32, &i32_data, minMax(i32, &i32_data));
+    try expectMinMax(i64, &i64_data, minMax(i64, &i64_data));
 }
 
-test "countEqI64 matches scalar" {
+test "countEq i64 matches scalar" {
     var data: [97]i64 = undefined;
     for (&data, 0..) |*v, i| v.* = if (i % 5 == 0) 42 else -@as(i64, @intCast(i + 1));
-    try std.testing.expectEqual(@as(u64, 20), countEqI64(&data, 42));
+    try std.testing.expectEqual(@as(u64, 20), countEq(i64, &data, 42));
 }
