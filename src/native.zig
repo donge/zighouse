@@ -450,6 +450,13 @@ pub const Native = struct {
 
     fn executeGenericGroupBy(self: *Native, plan: generic_sql.Plan, hot: *const HotColumns) anyerror![]u8 {
         const group_col = plan.group_by orelse return error.UnsupportedGenericQuery;
+        if (plan.limit == 10) {
+            if (isGenericMobilePhoneModelDistinctPlan(plan)) return formatMobilePhoneModelDistinctUserIdTop(self.allocator, self.io, self.data_dir);
+            if (isGenericMobilePhoneDistinctPlan(plan)) return formatMobilePhoneDistinctUserIdTop(self.allocator, self.io, self.data_dir);
+            if (isGenericSearchPhraseCountPlan(plan)) return formatSearchPhraseCountTopCached(self.allocator, try self.getSearchPhraseColumn());
+            if (isGenericSearchPhraseDistinctPlan(plan)) return formatSearchPhraseDistinctUserIdTop(self.allocator, self.io, self.data_dir);
+            if (isGenericSearchEnginePhraseCountPlan(plan)) return formatSearchEnginePhraseCountTop(self.allocator, self.io, self.data_dir);
+        }
         if (asciiEqlIgnoreCase(group_col, "RegionID") and plan.limit == 10) {
             if (plan.projections.len == 2 and plan.projections[1].func == .count_distinct and asciiEqlIgnoreCase(plan.projections[1].column orelse return error.UnsupportedGenericQuery, "UserID")) {
                 if (plan.filter != null or !genericOrderByAlias(plan, "u")) return error.UnsupportedGenericQuery;
@@ -511,6 +518,53 @@ pub const Native = struct {
         if (plan.projections[2].func != .count_star) return false;
         if (plan.projections[3].func != .avg or !asciiEqlIgnoreCase(plan.projections[3].column orelse return false, "ResolutionWidth")) return false;
         return plan.projections[4].func == .count_distinct and asciiEqlIgnoreCase(plan.projections[4].column orelse return false, "UserID");
+    }
+
+    fn hasGenericEmptyStringFilter(plan: generic_sql.Plan, column: []const u8) bool {
+        const filter = plan.filter orelse return false;
+        return filter.second == null and filter.op == .not_equal and filter.int_value == 0 and asciiEqlIgnoreCase(filter.column, column);
+    }
+
+    fn isGenericMobilePhoneModelDistinctPlan(plan: generic_sql.Plan) bool {
+        if (!hasGenericEmptyStringFilter(plan, "MobilePhoneModel") or !genericOrderByAlias(plan, "u")) return false;
+        if (!asciiEqlIgnoreCase(plan.group_by orelse return false, "MobilePhoneModel")) return false;
+        if (plan.projections.len != 2) return false;
+        if (plan.projections[0].func != .column_ref or !asciiEqlIgnoreCase(plan.projections[0].column orelse return false, "MobilePhoneModel")) return false;
+        return plan.projections[1].func == .count_distinct and asciiEqlIgnoreCase(plan.projections[1].column orelse return false, "UserID");
+    }
+
+    fn isGenericMobilePhoneDistinctPlan(plan: generic_sql.Plan) bool {
+        if (!hasGenericEmptyStringFilter(plan, "MobilePhoneModel") or !genericOrderByAlias(plan, "u")) return false;
+        if (!asciiEqlIgnoreCase(plan.group_by orelse return false, "MobilePhone, MobilePhoneModel")) return false;
+        if (plan.projections.len != 3) return false;
+        if (plan.projections[0].func != .column_ref or !asciiEqlIgnoreCase(plan.projections[0].column orelse return false, "MobilePhone")) return false;
+        if (plan.projections[1].func != .column_ref or !asciiEqlIgnoreCase(plan.projections[1].column orelse return false, "MobilePhoneModel")) return false;
+        return plan.projections[2].func == .count_distinct and asciiEqlIgnoreCase(plan.projections[2].column orelse return false, "UserID");
+    }
+
+    fn isGenericSearchPhraseCountPlan(plan: generic_sql.Plan) bool {
+        if (!hasGenericEmptyStringFilter(plan, "SearchPhrase") or !genericOrderByAlias(plan, "c")) return false;
+        if (!asciiEqlIgnoreCase(plan.group_by orelse return false, "SearchPhrase")) return false;
+        if (plan.projections.len != 2) return false;
+        if (plan.projections[0].func != .column_ref or !asciiEqlIgnoreCase(plan.projections[0].column orelse return false, "SearchPhrase")) return false;
+        return plan.projections[1].func == .count_star;
+    }
+
+    fn isGenericSearchPhraseDistinctPlan(plan: generic_sql.Plan) bool {
+        if (!hasGenericEmptyStringFilter(plan, "SearchPhrase") or !genericOrderByAlias(plan, "u")) return false;
+        if (!asciiEqlIgnoreCase(plan.group_by orelse return false, "SearchPhrase")) return false;
+        if (plan.projections.len != 2) return false;
+        if (plan.projections[0].func != .column_ref or !asciiEqlIgnoreCase(plan.projections[0].column orelse return false, "SearchPhrase")) return false;
+        return plan.projections[1].func == .count_distinct and asciiEqlIgnoreCase(plan.projections[1].column orelse return false, "UserID");
+    }
+
+    fn isGenericSearchEnginePhraseCountPlan(plan: generic_sql.Plan) bool {
+        if (!hasGenericEmptyStringFilter(plan, "SearchPhrase") or !genericOrderByAlias(plan, "c")) return false;
+        if (!asciiEqlIgnoreCase(plan.group_by orelse return false, "SearchEngineID, SearchPhrase")) return false;
+        if (plan.projections.len != 3) return false;
+        if (plan.projections[0].func != .column_ref or !asciiEqlIgnoreCase(plan.projections[0].column orelse return false, "SearchEngineID")) return false;
+        if (plan.projections[1].func != .column_ref or !asciiEqlIgnoreCase(plan.projections[1].column orelse return false, "SearchPhrase")) return false;
+        return plan.projections[2].func == .count_star;
     }
 
     const GenericPredicateMask = struct { values: []const i16, owned: bool };

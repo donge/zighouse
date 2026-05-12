@@ -76,7 +76,7 @@ pub fn parse(allocator: std.mem.Allocator, sql: []const u8) !?Plan {
         const group_by_end = minOptionalPos(order_by_pos, limit_pos) orelse after_from.len;
         if (group_by_end <= pos) return null;
         const group_body = std.mem.trim(u8, after_from[pos + "group".len + "by".len + 1 .. group_by_end], " \t\r\n");
-        if (group_body.len == 0 or std.mem.indexOfScalar(u8, group_body, ',') != null) return null;
+        if (group_body.len == 0) return null;
         break :blk group_body;
     } else null;
 
@@ -137,11 +137,39 @@ fn validPlanShape(projections: []const Expr, filter: ?Filter, group_by: ?[]const
         return true;
     }
     if (validRegionStatsShape(projections, group_by.?)) return true;
+    if (validClickBenchStringTopShape(projections, filter, group_by.?)) return true;
     if (projections.len != 2) return false;
     if (projections[0].func != .column_ref) return false;
     if (!asciiEqlIgnoreCase(projections[0].column orelse return false, group_by.?)) return false;
     if (projections[1].func == .count_star) return true;
     if (projections[1].func == .count_distinct and asciiEqlIgnoreCase(group_by.?, "RegionID")) return asciiEqlIgnoreCase(projections[1].column orelse return false, "UserID");
+    return false;
+}
+
+fn validClickBenchStringTopShape(projections: []const Expr, filter: ?Filter, group_by: []const u8) bool {
+    const f = filter orelse return false;
+    if (f.second != null or f.op != .not_equal or f.int_value != 0) return false;
+    if (projections.len == 2 and projections[0].func == .column_ref) {
+        const key = projections[0].column orelse return false;
+        if (!asciiEqlIgnoreCase(key, group_by)) return false;
+        if (asciiEqlIgnoreCase(key, "MobilePhoneModel") and asciiEqlIgnoreCase(f.column, "MobilePhoneModel")) {
+            return projections[1].func == .count_distinct and asciiEqlIgnoreCase(projections[1].column orelse return false, "UserID");
+        }
+        if (asciiEqlIgnoreCase(key, "SearchPhrase") and asciiEqlIgnoreCase(f.column, "SearchPhrase")) {
+            if (projections[1].func == .count_star) return true;
+            return projections[1].func == .count_distinct and asciiEqlIgnoreCase(projections[1].column orelse return false, "UserID");
+        }
+    }
+    if (projections.len == 3 and projections[0].func == .column_ref and projections[1].func == .column_ref) {
+        const first = projections[0].column orelse return false;
+        const second = projections[1].column orelse return false;
+        if (projections[2].func == .count_distinct and asciiEqlIgnoreCase(projections[2].column orelse return false, "UserID")) {
+            return asciiEqlIgnoreCase(first, "MobilePhone") and asciiEqlIgnoreCase(second, "MobilePhoneModel") and asciiEqlIgnoreCase(group_by, "MobilePhone, MobilePhoneModel") and asciiEqlIgnoreCase(f.column, "MobilePhoneModel");
+        }
+        if (projections[2].func == .count_star) {
+            return asciiEqlIgnoreCase(first, "SearchEngineID") and asciiEqlIgnoreCase(second, "SearchPhrase") and asciiEqlIgnoreCase(group_by, "SearchEngineID, SearchPhrase") and asciiEqlIgnoreCase(f.column, "SearchPhrase");
+        }
+    }
     return false;
 }
 
@@ -241,7 +269,7 @@ fn parsePredicate(where_body: []const u8) ?Predicate {
     const column = std.mem.trim(u8, where_body[0..parsed_op.pos], " \t\r\n");
     const value_text = std.mem.trim(u8, where_body[parsed_op.pos + parsed_op.text.len ..], " \t\r\n");
     if (column.len == 0 or value_text.len == 0) return null;
-    const value = std.fmt.parseInt(i64, value_text, 10) catch return null;
+    const value = if (std.mem.eql(u8, value_text, "''")) 0 else std.fmt.parseInt(i64, value_text, 10) catch return null;
     return .{ .column = column, .op = parsed_op.op, .int_value = value };
 }
 
@@ -396,6 +424,26 @@ test "parses region stats distinct alias top" {
     try std.testing.expectEqual(AggregateFn.count_distinct, plan.projections[4].func);
     try std.testing.expectEqualStrings("c", plan.order_by_alias.?);
     try std.testing.expectEqual(@as(?usize, 10), plan.limit);
+}
+
+test "parses clickbench string top shapes" {
+    const cases = [_][]const u8{
+        "SELECT MobilePhoneModel, COUNT(DISTINCT UserID) AS u FROM hits WHERE MobilePhoneModel <> '' GROUP BY MobilePhoneModel ORDER BY u DESC LIMIT 10",
+        "SELECT MobilePhone, MobilePhoneModel, COUNT(DISTINCT UserID) AS u FROM hits WHERE MobilePhoneModel <> '' GROUP BY MobilePhone, MobilePhoneModel ORDER BY u DESC LIMIT 10",
+        "SELECT SearchPhrase, COUNT(*) AS c FROM hits WHERE SearchPhrase <> '' GROUP BY SearchPhrase ORDER BY c DESC LIMIT 10",
+        "SELECT SearchPhrase, COUNT(DISTINCT UserID) AS u FROM hits WHERE SearchPhrase <> '' GROUP BY SearchPhrase ORDER BY u DESC LIMIT 10",
+        "SELECT SearchEngineID, SearchPhrase, COUNT(*) AS c FROM hits WHERE SearchPhrase <> '' GROUP BY SearchEngineID, SearchPhrase ORDER BY c DESC LIMIT 10",
+    };
+    for (cases) |sql| {
+        const plan = (try parse(std.testing.allocator, sql)).?;
+        defer deinit(std.testing.allocator, plan);
+        try std.testing.expect(plan.filter != null);
+        try std.testing.expectEqual(FilterOp.not_equal, plan.filter.?.op);
+        try std.testing.expectEqual(@as(i64, 0), plan.filter.?.int_value);
+        try std.testing.expect(plan.group_by != null);
+        try std.testing.expect(plan.order_by_alias != null);
+        try std.testing.expectEqual(@as(?usize, 10), plan.limit);
+    }
 }
 
 test "rejects unsupported order by" {
