@@ -416,6 +416,9 @@ pub const Native = struct {
 
         if (plan.filter) |filter| return self.executeGenericFiltered(plan, hot, filter);
 
+        const fused_sum_offsets = try executeGenericFusedSumOffsets(self.allocator, plan, hot);
+        if (fused_sum_offsets) |output| return output;
+
         const fused_minmax = try executeGenericFusedMinMax(self.allocator, plan, hot);
         if (fused_minmax) |output| return output;
 
@@ -5768,13 +5771,38 @@ fn genericGroupRowDesc(_: void, a: GenericGroupRow, b: GenericGroupRow) bool {
     return a.count > b.count;
 }
 
+fn executeGenericFusedSumOffsets(allocator: std.mem.Allocator, plan: generic_sql.Plan, hot: *const HotColumns) !?[]u8 {
+    if (plan.projections.len < 2) return null;
+    const first_col = plan.projections[0].column orelse return null;
+    for (plan.projections) |expr| {
+        if (expr.func != .sum) return null;
+        const col = expr.column orelse return null;
+        if (!asciiEqlIgnoreCase(col, first_col)) return null;
+    }
+
+    const column = bindGenericColumn(hot, first_col) catch return error.UnsupportedGenericQuery;
+    const base_sum: i64 = switch (column) {
+        .i16 => |values| simd.sum(i16, values),
+        .i32 => |values| simd.sum(i32, values),
+        .date, .i64 => return error.UnsupportedGenericQuery,
+    };
+    const row_count: i64 = @intCast(hot.rowCount());
+
+    const values = try allocator.alloc(GenericValue, plan.projections.len);
+    defer allocator.free(values);
+    for (plan.projections, values) |expr, *out| {
+        out.* = .{ .int = base_sum + expr.int_offset * row_count };
+    }
+    return try formatGenericValues(allocator, plan, values);
+}
+
 fn executeGenericProjection(expr: generic_sql.Expr, hot: *const HotColumns) !GenericValue {
     if (expr.func == .count_star) return .{ .int = @intCast(hot.rowCount()) };
     const column = bindGenericColumn(hot, expr.column orelse return error.UnsupportedGenericQuery) catch return error.UnsupportedGenericQuery;
     return switch (expr.func) {
         .column_ref => error.UnsupportedGenericQuery,
         .count_star => unreachable,
-        .sum => aggregateSum(column, null),
+        .sum => aggregateSum(column, null, expr.int_offset),
         .avg => aggregateAvg(column, null),
         .min => aggregateMin(column, null),
         .max => aggregateMax(column, null),
@@ -5787,19 +5815,23 @@ fn executeGenericFilteredProjection(expr: generic_sql.Expr, hot: *const HotColum
     return switch (expr.func) {
         .column_ref => error.UnsupportedGenericQuery,
         .count_star => unreachable,
-        .sum => aggregateSum(column, predicate),
+        .sum => aggregateSum(column, predicate, expr.int_offset),
         .avg => aggregateAvg(column, predicate),
         .min => aggregateMin(column, predicate),
         .max => aggregateMax(column, predicate),
     };
 }
 
-fn aggregateSum(column: GenericColumn, predicate: ?[]const i16) !GenericValue {
+fn aggregateSum(column: GenericColumn, predicate: ?[]const i16, int_offset: i64) !GenericValue {
     return switch (column) {
-        .i16 => |values| .{ .int = if (predicate) |p| simd.filteredSumNonZero(i16, p, values) else simd.sum(i16, values) },
-        .i32 => |values| .{ .int = if (predicate) |p| simd.filteredSumNonZero(i32, p, values) else simd.sum(i32, values) },
+        .i16 => |values| .{ .int = if (predicate) |p| sumWithOffset(simd.filteredSumCountNonZero(i16, p, values), int_offset) else sumWithOffset(.{ .sum = simd.sum(i16, values), .count = @intCast(values.len) }, int_offset) },
+        .i32 => |values| .{ .int = if (predicate) |p| sumWithOffset(simd.filteredSumCountNonZero(i32, p, values), int_offset) else sumWithOffset(.{ .sum = simd.sum(i32, values), .count = @intCast(values.len) }, int_offset) },
         .date, .i64 => error.UnsupportedGenericQuery,
     };
+}
+
+fn sumWithOffset(sum_count: simd.SumCount, int_offset: i64) i64 {
+    return sum_count.sum + int_offset * @as(i64, @intCast(sum_count.count));
 }
 
 fn aggregateAvg(column: GenericColumn, predicate: ?[]const i16) !GenericValue {
@@ -5876,7 +5908,7 @@ fn writeGenericHeader(out: *std.ArrayList(u8), allocator: std.mem.Allocator, pla
         switch (expr.func) {
             .column_ref => try out.print(allocator, "{s}", .{expr.column.?}),
             .count_star => try out.appendSlice(allocator, "count_star()"),
-            .sum => try out.print(allocator, "sum({s})", .{expr.column.?}),
+            .sum => if (expr.int_offset == 0) try out.print(allocator, "sum({s})", .{expr.column.?}) else try out.print(allocator, "sum(({s} + {d}))", .{ expr.column.?, expr.int_offset }),
             .avg => try out.print(allocator, "avg({s})", .{expr.column.?}),
             .min => try out.print(allocator, "min({s})", .{expr.column.?}),
             .max => try out.print(allocator, "max({s})", .{expr.column.?}),

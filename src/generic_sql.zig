@@ -5,6 +5,7 @@ pub const AggregateFn = enum { column_ref, count_star, sum, avg, min, max };
 pub const Expr = struct {
     func: AggregateFn,
     column: ?[]const u8 = null,
+    int_offset: i64 = 0,
 };
 
 pub const FilterOp = enum { equal, not_equal, greater, greater_equal, less, less_equal };
@@ -116,12 +117,26 @@ fn parseExpr(expr: []const u8) ?Expr {
         if (std.mem.eql(u8, std.mem.trim(u8, arg, " \t\r\n"), "*")) return .{ .func = .count_star };
         return null;
     }
-    if (parseCall(expr, "sum")) |arg| return .{ .func = .sum, .column = std.mem.trim(u8, arg, " \t\r\n") };
+    if (parseCall(expr, "sum")) |arg| {
+        const sum_arg = parseSumArg(std.mem.trim(u8, arg, " \t\r\n")) orelse return null;
+        return .{ .func = .sum, .column = sum_arg.column, .int_offset = sum_arg.int_offset };
+    }
     if (parseCall(expr, "avg")) |arg| return .{ .func = .avg, .column = std.mem.trim(u8, arg, " \t\r\n") };
     if (parseCall(expr, "min")) |arg| return .{ .func = .min, .column = std.mem.trim(u8, arg, " \t\r\n") };
     if (parseCall(expr, "max")) |arg| return .{ .func = .max, .column = std.mem.trim(u8, arg, " \t\r\n") };
     if (isIdentifierText(expr)) return .{ .func = .column_ref, .column = expr };
     return null;
+}
+
+fn parseSumArg(arg: []const u8) ?struct { column: []const u8, int_offset: i64 } {
+    if (isIdentifierText(arg)) return .{ .column = arg, .int_offset = 0 };
+    const plus_pos = std.mem.indexOfScalar(u8, arg, '+') orelse return null;
+    if (std.mem.indexOfScalar(u8, arg[plus_pos + 1 ..], '+') != null) return null;
+    const column = std.mem.trim(u8, arg[0..plus_pos], " \t\r\n");
+    const value_text = std.mem.trim(u8, arg[plus_pos + 1 ..], " \t\r\n");
+    if (!isIdentifierText(column) or value_text.len == 0) return null;
+    const int_offset = std.fmt.parseInt(i64, value_text, 10) catch return null;
+    return .{ .column = column, .int_offset = int_offset };
 }
 
 fn parseCall(expr: []const u8, name: []const u8) ?[]const u8 {
@@ -240,6 +255,18 @@ test "parses aggregate list" {
     try std.testing.expectEqual(AggregateFn.count_star, plan.projections[1].func);
     try std.testing.expectEqual(AggregateFn.avg, plan.projections[2].func);
     try std.testing.expectEqualStrings("ResolutionWidth", plan.projections[2].column.?);
+}
+
+test "parses sum with integer offset" {
+    const plan = (try parse(std.testing.allocator, "SELECT SUM(ResolutionWidth), SUM(ResolutionWidth + 42) FROM hits")).?;
+    defer deinit(std.testing.allocator, plan);
+    try std.testing.expectEqual(@as(usize, 2), plan.projections.len);
+    try std.testing.expectEqual(AggregateFn.sum, plan.projections[0].func);
+    try std.testing.expectEqualStrings("ResolutionWidth", plan.projections[0].column.?);
+    try std.testing.expectEqual(@as(i64, 0), plan.projections[0].int_offset);
+    try std.testing.expectEqual(AggregateFn.sum, plan.projections[1].func);
+    try std.testing.expectEqualStrings("ResolutionWidth", plan.projections[1].column.?);
+    try std.testing.expectEqual(@as(i64, 42), plan.projections[1].int_offset);
 }
 
 test "parses group by count query" {
