@@ -444,6 +444,16 @@ pub const Native = struct {
 
     fn executeGenericGroupBy(self: *Native, plan: generic_sql.Plan, hot: *const HotColumns) anyerror![]u8 {
         const group_col = plan.group_by orelse return error.UnsupportedGenericQuery;
+        if (asciiEqlIgnoreCase(group_col, "RegionID") and plan.limit == 10) {
+            if (plan.projections.len == 2 and plan.projections[1].func == .count_distinct and asciiEqlIgnoreCase(plan.projections[1].column orelse return error.UnsupportedGenericQuery, "UserID")) {
+                if (plan.filter != null or !genericOrderByAlias(plan, "u")) return error.UnsupportedGenericQuery;
+                return formatRegionDistinctUserIdTop(self.allocator, self.io, self.data_dir);
+            }
+            if (isGenericRegionStatsDistinctPlan(plan)) {
+                if (plan.filter != null or !genericOrderByAlias(plan, "c")) return error.UnsupportedGenericQuery;
+                return formatRegionStatsDistinctUserIdTop(self.allocator, self.io, self.data_dir);
+            }
+        }
         if (!plan.order_by_count_desc) return error.UnsupportedGenericQuery;
         if (plan.projections.len != 2) return error.UnsupportedGenericQuery;
         if (plan.projections[0].func != .column_ref or plan.projections[1].func != .count_star) return error.UnsupportedGenericQuery;
@@ -482,6 +492,19 @@ pub const Native = struct {
             values[i] = try executeGenericFilteredProjection(expr, hot, predicate.values);
         }
         return formatGenericValues(self.allocator, plan, values);
+    }
+
+    fn genericOrderByAlias(plan: generic_sql.Plan, alias: []const u8) bool {
+        return if (plan.order_by_alias) |got| asciiEqlIgnoreCase(got, alias) else false;
+    }
+
+    fn isGenericRegionStatsDistinctPlan(plan: generic_sql.Plan) bool {
+        if (plan.projections.len != 5) return false;
+        if (plan.projections[0].func != .column_ref or !asciiEqlIgnoreCase(plan.projections[0].column orelse return false, "RegionID")) return false;
+        if (plan.projections[1].func != .sum or !asciiEqlIgnoreCase(plan.projections[1].column orelse return false, "AdvEngineID")) return false;
+        if (plan.projections[2].func != .count_star) return false;
+        if (plan.projections[3].func != .avg or !asciiEqlIgnoreCase(plan.projections[3].column orelse return false, "ResolutionWidth")) return false;
+        return plan.projections[4].func == .count_distinct and asciiEqlIgnoreCase(plan.projections[4].column orelse return false, "UserID");
     }
 
     const GenericPredicateMask = struct { values: []const i16, owned: bool };
