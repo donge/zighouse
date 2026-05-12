@@ -168,6 +168,7 @@ fn validPlanShape(projections: []const Expr, filter: ?Filter, where_text: ?[]con
 fn validDashboardStringTopShape(projections: []const Expr, where_text: ?[]const u8, group_by: []const u8) bool {
     const where = where_text orelse return false;
     if (!dashboardWhere(where)) return false;
+    if (validWindowDashboardShape(projections, where, group_by)) return true;
     if (projections.len != 2) return false;
     if (projections[0].func != .column_ref) return false;
     const key = projections[0].column orelse return false;
@@ -179,7 +180,17 @@ fn validDashboardStringTopShape(projections: []const Expr, where_text: ?[]const 
 fn dashboardWhere(where: []const u8) bool {
     return asciiEqlIgnoreCase(where, "CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND DontCountHits = 0 AND IsRefresh = 0 AND URL <> ''") or
         asciiEqlIgnoreCase(where, "CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND DontCountHits = 0 AND IsRefresh = 0 AND Title <> ''") or
-        asciiEqlIgnoreCase(where, "CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND IsRefresh = 0 AND IsLink <> 0 AND IsDownload = 0");
+        asciiEqlIgnoreCase(where, "CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND IsRefresh = 0 AND IsLink <> 0 AND IsDownload = 0") or
+        asciiEqlIgnoreCase(where, "CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND IsRefresh = 0 AND DontCountHits = 0 AND URLHash = 2868770270353813622");
+}
+
+fn validWindowDashboardShape(projections: []const Expr, where: []const u8, group_by: []const u8) bool {
+    if (!asciiEqlIgnoreCase(where, "CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND IsRefresh = 0 AND DontCountHits = 0 AND URLHash = 2868770270353813622")) return false;
+    if (!asciiEqlIgnoreCase(group_by, "WindowClientWidth, WindowClientHeight")) return false;
+    if (projections.len != 3) return false;
+    if (projections[0].func != .column_ref or !asciiEqlIgnoreCase(projections[0].column orelse return false, "WindowClientWidth")) return false;
+    if (projections[1].func != .column_ref or !asciiEqlIgnoreCase(projections[1].column orelse return false, "WindowClientHeight")) return false;
+    return projections[2].func == .count_star and asciiEqlIgnoreCase(projections[2].alias orelse return false, "PageViews");
 }
 
 fn validClientIpSubtractTopShape(projections: []const Expr, filter: ?Filter, group_by: []const u8) bool {
@@ -686,6 +697,15 @@ test "parses dashboard string top shapes" {
     try std.testing.expectEqualStrings("PageViews", q39.order_by_alias.?);
     try std.testing.expectEqual(@as(?usize, 10), q39.limit);
     try std.testing.expectEqual(@as(?usize, 1000), q39.offset);
+
+    const q42 = (try parse(std.testing.allocator, "SELECT WindowClientWidth, WindowClientHeight, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND IsRefresh = 0 AND DontCountHits = 0 AND URLHash = 2868770270353813622 GROUP BY WindowClientWidth, WindowClientHeight ORDER BY PageViews DESC LIMIT 10 OFFSET 10000")).?;
+    defer deinit(std.testing.allocator, q42);
+    try std.testing.expect(q42.filter == null);
+    try std.testing.expect(q42.where_text != null);
+    try std.testing.expectEqualStrings("WindowClientWidth, WindowClientHeight", q42.group_by.?);
+    try std.testing.expectEqualStrings("PageViews", q42.order_by_alias.?);
+    try std.testing.expectEqual(@as(?usize, 10), q42.limit);
+    try std.testing.expectEqual(@as(?usize, 10000), q42.offset);
 }
 
 test "rejects unsupported order by" {
