@@ -62,6 +62,7 @@ const usage =
     \\  ZIGHOUSE_CLICKHOUSE_PASSWORD          ClickHouse password, default: Sw@123456
     \\  ZIGHOUSE_IMPORT_TRACE                 print import phase timings
     \\  ZIGHOUSE_IMPORT_TINY_CACHES           write Q24/Q29/Q40 result artifacts during import
+    \\  ZIGHOUSE_QUERY_PATH                   specialized|generic|compare, default: specialized
     \\
     \\Current milestone:
     \\  compare explicit duckdb and native backends; native has no DuckDB fallback.

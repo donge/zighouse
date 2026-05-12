@@ -6,6 +6,7 @@ const clickbench_queries = @import("clickbench_queries.zig");
 const build_options = @import("build_options");
 const duckdb = if (build_options.duckdb) @import("duckdb.zig") else @import("duckdb_stub.zig");
 const executor = @import("executor.zig");
+const generic_sql = @import("generic_sql.zig");
 const schema = @import("schema.zig");
 const simd = @import("simd.zig");
 const io_map = @import("io_map.zig");
@@ -27,6 +28,16 @@ fn submitMode() bool {
 
 fn artifactMode() bool {
     return !fairMode() and !submitMode();
+}
+
+const QueryPathMode = enum { specialized, generic, compare };
+
+fn queryPathMode() QueryPathMode {
+    const raw = std.c.getenv("ZIGHOUSE_QUERY_PATH") orelse return .specialized;
+    const value = std.mem.span(raw);
+    if (std.mem.eql(u8, value, "generic")) return .generic;
+    if (std.mem.eql(u8, value, "compare")) return .compare;
+    return .specialized;
 }
 
 pub const Native = struct {
@@ -194,7 +205,29 @@ pub const Native = struct {
     }
 
     pub fn query(self: *Native, sql: []const u8) ![]u8 {
+        return self.queryWithMode(sql, queryPathMode());
+    }
+
+    fn queryWithMode(self: *Native, sql: []const u8, mode: QueryPathMode) anyerror![]u8 {
+        switch (mode) {
+            .generic, .compare => {
+                const generic_plan = try generic_sql.parse(self.allocator, sql);
+                defer if (generic_plan) |plan| generic_sql.deinit(self.allocator, plan);
+                if (generic_plan) |plan| switch (mode) {
+                    .generic => return try self.executeGenericSql(plan),
+                    .compare => return try self.queryCompareGenericSql(sql, plan),
+                    .specialized => unreachable,
+                };
+            },
+            .specialized => {},
+        }
+
         const clickbench_query = clickbench_queries.match(sql);
+        if (clickbench_query) |query_kind| switch (mode) {
+            .generic => if (try self.queryGeneric(query_kind)) |output| return output,
+            .compare => if (try self.queryCompare(sql, query_kind)) |output| return output,
+            .specialized => {},
+        };
         if (planner.plan(sql)) |physical| {
             var store_reader = reader.StoreReader.init(self.allocator, self.io, self.data_dir);
             if (executor.execute(&store_reader, physical) catch |err| switch (err) {
@@ -348,6 +381,100 @@ pub const Native = struct {
         if (clickbench_query == .referer_domain_stats_top) return formatQ29(self.allocator, self.io, self.data_dir);
         if (clickbench_query == .search_phrase_order_by_phrase_top) return formatSearchPhraseOrderByPhraseTopCached(self.allocator, try self.getSearchPhraseColumn());
         return error.UnsupportedNativeQuery;
+    }
+
+    fn queryCompareGenericSql(self: *Native, sql: []const u8, plan: generic_sql.Plan) anyerror![]u8 {
+        const generic_started = std.Io.Clock.Timestamp.now(self.io, .awake);
+        const generic_output = try self.executeGenericSql(plan);
+        const generic_finished = std.Io.Clock.Timestamp.now(self.io, .awake);
+
+        const specialized_started = std.Io.Clock.Timestamp.now(self.io, .awake);
+        const specialized_output = try self.queryWithMode(sql, .specialized);
+        const specialized_finished = std.Io.Clock.Timestamp.now(self.io, .awake);
+
+        const generic_seconds = elapsedSeconds(generic_started, generic_finished);
+        const specialized_seconds = elapsedSeconds(specialized_started, specialized_finished);
+        const same = genericOutputsEquivalent(generic_output, specialized_output);
+        std.debug.print("query_path_compare path=generic_sql generic_seconds={d:.6} specialized_seconds={d:.6} ratio={d:.3} equal={any}\n", .{
+            generic_seconds,
+            specialized_seconds,
+            if (specialized_seconds == 0) 0 else generic_seconds / specialized_seconds,
+            same,
+        });
+        self.allocator.free(generic_output);
+        return specialized_output;
+    }
+
+    fn executeGenericSql(self: *Native, plan: generic_sql.Plan) anyerror![]u8 {
+        if (!asciiEqlIgnoreCase(plan.table, "hits")) return error.UnsupportedGenericQuery;
+        const hot = self.getHotColumns() catch |err| switch (err) {
+            error.FileNotFound => return error.UnsupportedGenericQuery,
+            else => return err,
+        };
+
+        if (plan.filter) |filter| return self.executeGenericFiltered(plan, hot, filter);
+
+        const fused_minmax = try executeGenericFusedMinMax(self.allocator, plan, hot);
+        if (fused_minmax) |output| return output;
+
+        const values = try self.allocator.alloc(GenericValue, plan.projections.len);
+        defer self.allocator.free(values);
+        for (plan.projections, 0..) |expr, i| {
+            values[i] = try executeGenericProjection(expr, hot);
+        }
+        return formatGenericValues(self.allocator, plan, values);
+    }
+
+    fn executeGenericFiltered(self: *Native, plan: generic_sql.Plan, hot: *const HotColumns, filter: generic_sql.Filter) anyerror![]u8 {
+        if (plan.projections.len != 1 or plan.projections[0].func != .count_star) return error.UnsupportedGenericQuery;
+        if (filter.op != .not_equal or filter.int_value != 0) return error.UnsupportedGenericQuery;
+        const column = bindGenericColumn(hot, filter.column) catch return error.UnsupportedGenericQuery;
+        const count = switch (column) {
+            .i16 => |values| simd.countNonZeroI16(values),
+            else => return error.UnsupportedGenericQuery,
+        };
+        return formatGenericValues(self.allocator, plan, &.{.{ .int = @intCast(count) }});
+    }
+
+    fn queryCompare(self: *Native, sql: []const u8, query_kind: clickbench_queries.Query) anyerror!?[]u8 {
+        const generic_started = std.Io.Clock.Timestamp.now(self.io, .awake);
+        const generic_output = try self.queryGeneric(query_kind) orelse return null;
+        const generic_finished = std.Io.Clock.Timestamp.now(self.io, .awake);
+
+        const specialized_started = std.Io.Clock.Timestamp.now(self.io, .awake);
+        const specialized_output = try self.queryWithMode(sql, .specialized);
+        const specialized_finished = std.Io.Clock.Timestamp.now(self.io, .awake);
+
+        const generic_seconds = elapsedSeconds(generic_started, generic_finished);
+        const specialized_seconds = elapsedSeconds(specialized_started, specialized_finished);
+        const same = queryOutputsEquivalent(query_kind, generic_output, specialized_output);
+        std.debug.print("query_path_compare query={s} generic_seconds={d:.6} specialized_seconds={d:.6} ratio={d:.3} equal={any}\n", .{
+            @tagName(query_kind),
+            generic_seconds,
+            specialized_seconds,
+            if (specialized_seconds == 0) 0 else generic_seconds / specialized_seconds,
+            same,
+        });
+        self.allocator.free(generic_output);
+        return specialized_output;
+    }
+
+    fn queryGeneric(self: *Native, query_kind: clickbench_queries.Query) anyerror!?[]u8 {
+        const hot = self.getHotColumns() catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => return err,
+        };
+        return switch (query_kind) {
+            .count_star => try formatOneInt(self.allocator, "count_star()", hot.rowCount()),
+            .count_adv_engine_non_zero => try formatOneInt(self.allocator, "count_star()", genericCountNonZeroI16(hot.adv_engine_id)),
+            .sum_count_avg => try formatSumCountAvg(self.allocator, genericSumI16(hot.adv_engine_id), hot.rowCount(), genericAvgI16(hot.resolution_width)),
+            .avg_user_id => try formatOneFloat(self.allocator, "avg(UserID)", genericAvgI64(hot.user_id)),
+            .min_max_event_date => blk: {
+                const mm = genericMinMaxI32(hot.event_date);
+                break :blk try formatMinMaxDate(self.allocator, mm.min, mm.max);
+            },
+            else => null,
+        };
     }
 
     pub fn bench(self: *Native, queries_path: []const u8, range: duckdb.QueryRange) !void {
@@ -5397,8 +5524,26 @@ fn countNonZeroI16(values: []const i16) u64 {
     return simd.countNonZeroI16(values);
 }
 
+fn genericCountNonZeroI16(values: []const i16) u64 {
+    var count: u64 = 0;
+    for (values) |value| count += @intFromBool(value != 0);
+    return count;
+}
+
 fn sumI16(values: []const i16) i64 {
     return simd.sumI16(values);
+}
+
+fn sumI32(values: []const i32) i64 {
+    var sum: i64 = 0;
+    for (values) |value| sum += value;
+    return sum;
+}
+
+fn genericSumI16(values: []const i16) i64 {
+    var sum: i64 = 0;
+    for (values) |value| sum += value;
+    return sum;
 }
 
 fn avgI16(values: []const i16) f64 {
@@ -5406,16 +5551,246 @@ fn avgI16(values: []const i16) f64 {
     return @as(f64, @floatFromInt(sumI16(values))) / @as(f64, @floatFromInt(values.len));
 }
 
+fn avgI32(values: []const i32) f64 {
+    if (values.len == 0) return 0;
+    return @as(f64, @floatFromInt(sumI32(values))) / @as(f64, @floatFromInt(values.len));
+}
+
+fn genericAvgI16(values: []const i16) f64 {
+    if (values.len == 0) return 0;
+    return @as(f64, @floatFromInt(genericSumI16(values))) / @as(f64, @floatFromInt(values.len));
+}
+
 fn avgI64(values: []const i64) f64 {
     return simd.avgI64(values);
+}
+
+fn genericAvgI64(values: []const i64) f64 {
+    if (values.len == 0) return 0;
+    var sum: i128 = 0;
+    for (values) |value| sum += value;
+    return @as(f64, @floatFromInt(sum)) / @as(f64, @floatFromInt(values.len));
+}
+
+const MinMaxI32 = struct { min: i32, max: i32 };
+
+fn genericMinMaxI32(values: []const i32) MinMaxI32 {
+    if (values.len == 0) return .{ .min = 0, .max = 0 };
+    var min_value = values[0];
+    var max_value = values[0];
+    for (values[1..]) |value| {
+        if (value < min_value) min_value = value;
+        if (value > max_value) max_value = value;
+    }
+    return .{ .min = min_value, .max = max_value };
+}
+
+fn queryOutputsEquivalent(query_kind: clickbench_queries.Query, a: []const u8, b: []const u8) bool {
+    if (std.mem.eql(u8, trimOutput(a), trimOutput(b))) return true;
+    return switch (query_kind) {
+        .avg_user_id => oneFloatOutputEquivalent(a, b, 1e-9),
+        else => false,
+    };
+}
+
+fn trimOutput(bytes: []const u8) []const u8 {
+    var end = bytes.len;
+    while (end > 0) {
+        switch (bytes[end - 1]) {
+            ' ', '\t', '\r', '\n' => end -= 1,
+            else => break,
+        }
+    }
+    return bytes[0..end];
+}
+
+fn oneFloatOutputEquivalent(a: []const u8, b: []const u8, rel_tol: f64) bool {
+    const av = parseSingleResultFloat(a) catch return false;
+    const bv = parseSingleResultFloat(b) catch return false;
+    const diff = @abs(av - bv);
+    const scale = @max(@abs(av), @abs(bv));
+    return diff <= @max(1e-12, scale * rel_tol);
+}
+
+fn parseSingleResultFloat(bytes: []const u8) !f64 {
+    const trimmed = trimOutput(bytes);
+    const newline = std.mem.indexOfScalar(u8, trimmed, '\n') orelse return error.InvalidQueryOutput;
+    const value = std.mem.trim(u8, trimmed[newline + 1 ..], " \t\r\n");
+    return try std.fmt.parseFloat(f64, value);
+}
+
+const GenericValue = union(enum) {
+    int: i64,
+    float: f64,
+    date: i32,
+};
+
+const GenericColumn = union(enum) {
+    i16: []const i16,
+    i32: []const i32,
+    date: []const i32,
+    i64: []const i64,
+};
+
+fn bindGenericColumn(hot: *const HotColumns, name: []const u8) !GenericColumn {
+    if (asciiEqlIgnoreCase(name, "AdvEngineID")) return .{ .i16 = hot.adv_engine_id };
+    if (asciiEqlIgnoreCase(name, "ResolutionWidth")) return .{ .i16 = hot.resolution_width };
+    if (asciiEqlIgnoreCase(name, "UserID")) return .{ .i64 = hot.user_id };
+    if (asciiEqlIgnoreCase(name, "EventDate")) return .{ .date = hot.event_date };
+    if (asciiEqlIgnoreCase(name, "CounterID")) return .{ .i32 = hot.counter_id };
+    if (asciiEqlIgnoreCase(name, "IsRefresh")) return .{ .i16 = hot.is_refresh };
+    if (asciiEqlIgnoreCase(name, "DontCountHits")) return .{ .i16 = hot.dont_count_hits };
+    return error.UnsupportedGenericColumn;
+}
+
+fn executeGenericProjection(expr: generic_sql.Expr, hot: *const HotColumns) !GenericValue {
+    if (expr.func == .count_star) return .{ .int = @intCast(hot.rowCount()) };
+    const column = bindGenericColumn(hot, expr.column orelse return error.UnsupportedGenericQuery) catch return error.UnsupportedGenericQuery;
+    return switch (expr.func) {
+        .count_star => unreachable,
+        .sum => switch (column) {
+            .i16 => |values| .{ .int = sumI16(values) },
+            .i32 => |values| .{ .int = sumI32(values) },
+            .date, .i64 => error.UnsupportedGenericQuery,
+        },
+        .avg => switch (column) {
+            .i16 => |values| .{ .float = avgI16(values) },
+            .i32 => |values| .{ .float = avgI32(values) },
+            .i64 => |values| .{ .float = avgI64(values) },
+            .date => error.UnsupportedGenericQuery,
+        },
+        .min => switch (column) {
+            .i16 => |values| .{ .int = minI16(values) },
+            .i32 => |values| .{ .int = minI32(values) },
+            .date => |values| .{ .date = minI32(values) },
+            .i64 => error.UnsupportedGenericQuery,
+        },
+        .max => switch (column) {
+            .i16 => |values| .{ .int = maxI16(values) },
+            .i32 => |values| .{ .int = maxI32(values) },
+            .date => |values| .{ .date = maxI32(values) },
+            .i64 => error.UnsupportedGenericQuery,
+        },
+    };
+}
+
+fn executeGenericFusedMinMax(allocator: std.mem.Allocator, plan: generic_sql.Plan, hot: *const HotColumns) !?[]u8 {
+    if (plan.projections.len != 2) return null;
+    const first = plan.projections[0];
+    const second = plan.projections[1];
+    if (first.func != .min or second.func != .max) return null;
+    const first_col = first.column orelse return error.UnsupportedGenericQuery;
+    const second_col = second.column orelse return error.UnsupportedGenericQuery;
+    if (!asciiEqlIgnoreCase(first_col, second_col)) return null;
+    return switch (bindGenericColumn(hot, first_col) catch return error.UnsupportedGenericQuery) {
+        .i32 => |values| blk: {
+            const mm = simd.minMaxI32(values);
+            break :blk try formatGenericValues(allocator, plan, &.{ .{ .int = mm.min }, .{ .int = mm.max } });
+        },
+        .date => |values| blk: {
+            const mm = simd.minMaxI32(values);
+            break :blk try formatGenericValues(allocator, plan, &.{ .{ .date = mm.min }, .{ .date = mm.max } });
+        },
+        else => null,
+    };
+}
+
+fn formatGenericValues(allocator: std.mem.Allocator, plan: generic_sql.Plan, values: []const GenericValue) ![]u8 {
+    if (values.len != plan.projections.len) return error.InvalidGenericResult;
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try writeGenericHeader(&out, allocator, plan);
+    for (values, 0..) |value, i| {
+        if (i != 0) try out.append(allocator, ',');
+        try writeGenericValue(&out, allocator, value);
+    }
+    try out.append(allocator, '\n');
+    return out.toOwnedSlice(allocator);
+}
+
+fn writeGenericHeader(out: *std.ArrayList(u8), allocator: std.mem.Allocator, plan: generic_sql.Plan) !void {
+    for (plan.projections, 0..) |expr, i| {
+        if (i != 0) try out.append(allocator, ',');
+        switch (expr.func) {
+            .count_star => try out.appendSlice(allocator, "count_star()"),
+            .sum => try out.print(allocator, "sum({s})", .{expr.column.?}),
+            .avg => try out.print(allocator, "avg({s})", .{expr.column.?}),
+            .min => try out.print(allocator, "min({s})", .{expr.column.?}),
+            .max => try out.print(allocator, "max({s})", .{expr.column.?}),
+        }
+    }
+    try out.append(allocator, '\n');
+}
+
+fn writeGenericValue(out: *std.ArrayList(u8), allocator: std.mem.Allocator, value: GenericValue) !void {
+    switch (value) {
+        .int => |v| try out.print(allocator, "{d}", .{v}),
+        .float => |v| try out.print(allocator, "{d}", .{v}),
+        .date => |v| {
+            const text = dateString(@intCast(v));
+            try out.print(allocator, "{s}", .{text});
+        },
+    }
+}
+
+fn genericOutputsEquivalent(a: []const u8, b: []const u8) bool {
+    if (std.mem.eql(u8, trimOutput(a), trimOutput(b))) return true;
+    return singleRowCsvFloatsEquivalent(a, b, 1e-9);
+}
+
+fn singleRowCsvFloatsEquivalent(a: []const u8, b: []const u8, rel_tol: f64) bool {
+    const a_row = singleDataRow(a) orelse return false;
+    const b_row = singleDataRow(b) orelse return false;
+    var ait = std.mem.splitScalar(u8, a_row, ',');
+    var bit = std.mem.splitScalar(u8, b_row, ',');
+    while (true) {
+        const av_raw = ait.next();
+        const bv_raw = bit.next();
+        if (av_raw == null and bv_raw == null) return true;
+        if (av_raw == null or bv_raw == null) return false;
+        const av_text = std.mem.trim(u8, av_raw.?, " \t\r\n");
+        const bv_text = std.mem.trim(u8, bv_raw.?, " \t\r\n");
+        if (std.mem.eql(u8, av_text, bv_text)) continue;
+        const av = std.fmt.parseFloat(f64, av_text) catch return false;
+        const bv = std.fmt.parseFloat(f64, bv_text) catch return false;
+        const diff = @abs(av - bv);
+        const scale = @max(@abs(av), @abs(bv));
+        if (diff > @max(1e-12, scale * rel_tol)) return false;
+    }
+}
+
+fn singleDataRow(bytes: []const u8) ?[]const u8 {
+    const trimmed = trimOutput(bytes);
+    const first_newline = std.mem.indexOfScalar(u8, trimmed, '\n') orelse return null;
+    const row = trimmed[first_newline + 1 ..];
+    if (std.mem.indexOfScalar(u8, row, '\n') != null) return null;
+    return row;
+}
+
+fn asciiEqlIgnoreCase(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |ac, bc| if (std.ascii.toLower(ac) != std.ascii.toLower(bc)) return false;
+    return true;
 }
 
 fn minI32(values: []const i32) i32 {
     return simd.minI32(values);
 }
 
+fn minI16(values: []const i16) i16 {
+    var min_value: i16 = std.math.maxInt(i16);
+    for (values) |value| min_value = @min(min_value, value);
+    return min_value;
+}
+
 fn maxI32(values: []const i32) i32 {
     return simd.maxI32(values);
+}
+
+fn maxI16(values: []const i16) i16 {
+    var max_value: i16 = std.math.minInt(i16);
+    for (values) |value| max_value = @max(max_value, value);
+    return max_value;
 }
 
 fn formatOneInt(allocator: std.mem.Allocator, header: []const u8, value: u64) ![]u8 {

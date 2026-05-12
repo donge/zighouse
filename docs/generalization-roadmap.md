@@ -93,6 +93,14 @@ Acceptance:
 
 Goal: turn current specialized kernels into reusable operators.
 
+Path modes during migration:
+
+- `ZIGHOUSE_QUERY_PATH=specialized`: current default fast path.
+- `ZIGHOUSE_QUERY_PATH=generic`: generic operators when available.
+- `ZIGHOUSE_QUERY_PATH=compare`: run both paths for supported queries, log correctness/timing to stderr, and return specialized output.
+
+The first generic slice covers simple fixed-column queries: row count, filtered count, sum/count/avg, avg, and min/max. This path is intentionally simpler and slower than SIMD-specialized kernels; it is a correctness and evolution path, not the default performance path yet.
+
 Initial operators:
 
 - `ColumnScan`

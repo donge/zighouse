@@ -109,6 +109,15 @@ pub fn build(b: *std.Build) void {
     });
     const reader_test_cmd = b.addRunArtifact(reader_tests);
 
+    const generic_sql_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/generic_sql.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const generic_sql_test_cmd = b.addRunArtifact(generic_sql_tests);
+
     const lowcard_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/lowcard.zig"),
@@ -134,6 +143,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&hashmap_test_cmd.step);
     test_step.dependOn(&planner_test_cmd.step);
     test_step.dependOn(&reader_test_cmd.step);
+    test_step.dependOn(&generic_sql_test_cmd.step);
     test_step.dependOn(&lowcard_test_cmd.step);
     test_step.dependOn(&parquet_test_cmd.step);
 
