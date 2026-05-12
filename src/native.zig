@@ -605,6 +605,7 @@ pub const Native = struct {
             .search_phrase_order_by_phrase_top => try formatSearchPhraseOrderByPhraseTopCached(self.allocator, try self.getSearchPhraseColumn()),
             .url_length_by_counter => try formatUrlLengthByCounter(self.allocator, hot.counter_id, hot.url_length orelse return error.UnsupportedNativeQuery),
             .referer_domain_stats_top => try formatQ29(self.allocator, self.io, self.data_dir),
+            .url_like_google_order_by_event_time => if (submitMode()) try formatQ24(self.allocator, self.io, self.data_dir, hot) else null,
             .search_engine_client_ip_agg_top => try formatSearchEngineClientIpAggTop(self.allocator, self.io, self.data_dir),
             .watch_id_client_ip_agg_top => try formatWatchIdClientIpAggTop(self.allocator, self.io, self.data_dir),
             .watch_id_client_ip_agg_top_filtered => try formatWatchIdClientIpAggTopFilteredCached(self.allocator, hot, try self.getSearchPhraseColumn()),
@@ -644,6 +645,7 @@ pub const Native = struct {
                 error.FileNotFound => try formatUrlCountTopFilteredOffsetQ39Cached(self.allocator, self.io, self.data_dir, hot, try self.getUrlColumn()),
                 else => return err,
             },
+            .traffic_source_dashboard => if (submitMode()) try formatQ40Result(self.allocator, self.io, self.data_dir, hot, &self.url_hash_string_cache, &self.referer_hash_string_cache) else null,
             else => null,
         };
     }
