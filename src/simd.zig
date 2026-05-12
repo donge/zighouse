@@ -43,6 +43,70 @@ pub fn countNonZeroI16(values: []const i16) u64 {
     return count;
 }
 
+pub fn filteredSumI16NonZero(predicate: []const i16, values: []const i16) i64 {
+    const lanes = 32;
+    const V = @Vector(lanes, i16);
+    var total: i64 = 0;
+    var i: usize = 0;
+    const zero: V = @splat(0);
+    while (i + lanes <= predicate.len) : (i += lanes) {
+        const p: V = predicate[i..][0..lanes].*;
+        const v: V = values[i..][0..lanes].*;
+        const selected = @select(i16, p != zero, v, zero);
+        total += @reduce(.Add, @as(@Vector(lanes, i32), selected));
+    }
+    while (i < predicate.len) : (i += 1) if (predicate[i] != 0) {
+        total += values[i];
+    };
+    return total;
+}
+
+pub fn filteredSumI32NonZero(predicate: []const i16, values: []const i32) i64 {
+    const lanes = 16;
+    const VP = @Vector(lanes, i16);
+    const VI = @Vector(lanes, i32);
+    var total: i64 = 0;
+    var i: usize = 0;
+    const p_zero: VP = @splat(0);
+    const v_zero: VI = @splat(0);
+    while (i + lanes <= predicate.len) : (i += lanes) {
+        const p: VP = predicate[i..][0..lanes].*;
+        const v: VI = values[i..][0..lanes].*;
+        const selected = @select(i32, p != p_zero, v, v_zero);
+        total += @reduce(.Add, @as(@Vector(lanes, i64), selected));
+    }
+    while (i < predicate.len) : (i += 1) if (predicate[i] != 0) {
+        total += values[i];
+    };
+    return total;
+}
+
+pub fn filteredMinMaxI32NonZero(predicate: []const i16, values: []const i32) struct { min: i32, max: i32 } {
+    const lanes = 16;
+    const VP = @Vector(lanes, i16);
+    const VI = @Vector(lanes, i32);
+    var lo_acc: VI = @splat(std.math.maxInt(i32));
+    var hi_acc: VI = @splat(std.math.minInt(i32));
+    var i: usize = 0;
+    const p_zero: VP = @splat(0);
+    const lo_sentinel: VI = @splat(std.math.maxInt(i32));
+    const hi_sentinel: VI = @splat(std.math.minInt(i32));
+    while (i + lanes <= predicate.len) : (i += lanes) {
+        const p: VP = predicate[i..][0..lanes].*;
+        const v: VI = values[i..][0..lanes].*;
+        const mask = p != p_zero;
+        lo_acc = @min(lo_acc, @select(i32, mask, v, lo_sentinel));
+        hi_acc = @max(hi_acc, @select(i32, mask, v, hi_sentinel));
+    }
+    var lo = @reduce(.Min, lo_acc);
+    var hi = @reduce(.Max, hi_acc);
+    while (i < predicate.len) : (i += 1) if (predicate[i] != 0) {
+        lo = @min(lo, values[i]);
+        hi = @max(hi, values[i]);
+    };
+    return .{ .min = lo, .max = hi };
+}
+
 pub fn minI32(values: []const i32) i32 {
     const lanes = 16;
     const V = @Vector(lanes, i32);
@@ -147,6 +211,51 @@ test "countNonZeroI16 matches scalar" {
         expected += 1;
     };
     try std.testing.expectEqual(expected, countNonZeroI16(&data));
+}
+
+test "filteredSumI16NonZero matches scalar" {
+    var pred: [257]i16 = undefined;
+    var data: [257]i16 = undefined;
+    var rng = std.Random.DefaultPrng.init(41);
+    var expected: i64 = 0;
+    for (&pred, &data) |*p, *v| {
+        p.* = if (rng.random().boolean()) 0 else rng.random().intRangeLessThan(i16, 1, 8);
+        v.* = rng.random().intRangeLessThan(i16, -1000, 1000);
+        if (p.* != 0) expected += v.*;
+    }
+    try std.testing.expectEqual(expected, filteredSumI16NonZero(&pred, &data));
+}
+
+test "filteredSumI32NonZero matches scalar" {
+    var pred: [257]i16 = undefined;
+    var data: [257]i32 = undefined;
+    var rng = std.Random.DefaultPrng.init(43);
+    var expected: i64 = 0;
+    for (&pred, &data) |*p, *v| {
+        p.* = if (rng.random().boolean()) 0 else rng.random().intRangeLessThan(i16, 1, 8);
+        v.* = rng.random().intRangeLessThan(i32, -100000, 100000);
+        if (p.* != 0) expected += v.*;
+    }
+    try std.testing.expectEqual(expected, filteredSumI32NonZero(&pred, &data));
+}
+
+test "filteredMinMaxI32NonZero matches scalar" {
+    var pred: [257]i16 = undefined;
+    var data: [257]i32 = undefined;
+    var rng = std.Random.DefaultPrng.init(47);
+    var lo: i32 = std.math.maxInt(i32);
+    var hi: i32 = std.math.minInt(i32);
+    for (&pred, &data, 0..) |*p, *v, i| {
+        p.* = if (i == 0 or rng.random().boolean()) 1 else 0;
+        v.* = rng.random().intRangeLessThan(i32, -100000, 100000);
+        if (p.* != 0) {
+            lo = @min(lo, v.*);
+            hi = @max(hi, v.*);
+        }
+    }
+    const got = filteredMinMaxI32NonZero(&pred, &data);
+    try std.testing.expectEqual(lo, got.min);
+    try std.testing.expectEqual(hi, got.max);
 }
 
 test "minMaxI32 matches scalar" {
