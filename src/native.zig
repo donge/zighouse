@@ -2097,12 +2097,8 @@ fn writeQ19ResultFromParquet(allocator: std.mem.Allocator, io: std.Io, data_dir:
 
 fn writeTinyResultCachesFromParquet(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8, parquet_path: []const u8, limit_rows: ?u64) !void {
     try writeQ24ResultFromParquet(allocator, io, data_dir, parquet_path, limit_rows);
-    try writeSmallResultCacheFromParquet(allocator, io, data_dir, parquet_path, limit_rows, "q29_result.csv",
-        "SELECT REGEXP_REPLACE(Referer, '^https?://(?:www\\.)?([^/]+)/.*$', '\\1') AS k, AVG(length(Referer)) AS l, COUNT(*) AS c, MIN(Referer) FROM hits WHERE Referer <> '' GROUP BY k HAVING COUNT(*) > 100000 ORDER BY l DESC LIMIT 25"
-    );
-    try writeSmallResultCacheFromParquet(allocator, io, data_dir, parquet_path, limit_rows, "q40_result.csv",
-        "SELECT TraficSourceID, SearchEngineID, AdvEngineID, CASE WHEN (SearchEngineID = 0 AND AdvEngineID = 0) THEN Referer ELSE '' END AS Src, URL AS Dst, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND IsRefresh = 0 GROUP BY TraficSourceID, SearchEngineID, AdvEngineID, Src, Dst ORDER BY PageViews DESC LIMIT 10 OFFSET 1000"
-    );
+    try writeSmallResultCacheFromParquet(allocator, io, data_dir, parquet_path, limit_rows, "q29_result.csv", clickbench_queries.q29_sql);
+    try writeSmallResultCacheFromParquet(allocator, io, data_dir, parquet_path, limit_rows, "q40_result.csv", clickbench_queries.q40_sql);
 }
 
 fn writeSmallResultCacheFromParquet(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8, parquet_path: []const u8, limit_rows: ?u64, file_name: []const u8, query_body: []const u8) !void {
@@ -3063,12 +3059,12 @@ fn q24InsertTop(top: *[10]Q24TopRow, top_len: *usize, row: Q24TopRow) void {
 
 fn formatQ24(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8, hot: *const HotColumns) ![]u8 {
     if (!artifactMode()) return formatQ24RowSidecarLateMaterialize(allocator, io, data_dir, hot) catch |err| switch (err) {
-        error.FileNotFound => return queryOriginalParquet(allocator, io, data_dir, "SELECT * FROM hits WHERE URL LIKE '%google%' ORDER BY EventTime LIMIT 10"),
+        error.FileNotFound => return queryOriginalParquet(allocator, io, data_dir, clickbench_queries.q24_sql),
         else => return err,
     };
     return formatQ24ResultArtifact(allocator, io, data_dir) catch |err| switch (err) {
         error.FileNotFound => return formatQ24RowSidecarLateMaterialize(allocator, io, data_dir, hot) catch |row_err| switch (row_err) {
-            error.FileNotFound => return queryOriginalParquet(allocator, io, data_dir, "SELECT * FROM hits WHERE URL LIKE '%google%' ORDER BY EventTime LIMIT 10"),
+            error.FileNotFound => return queryOriginalParquet(allocator, io, data_dir, clickbench_queries.q24_sql),
             else => return row_err,
         },
         else => return err,
@@ -3077,12 +3073,12 @@ fn formatQ24(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8, hot
 
 fn formatQ24Dict(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8, hot: *const HotColumns, urls: *const lowcard.StringColumn, url_google_matches: []const u8) ![]u8 {
     if (!artifactMode()) return formatQ24DuckDbLateMaterialize(allocator, io, data_dir, hot, urls, url_google_matches) catch |err| switch (err) {
-        error.FileNotFound => return queryOriginalParquet(allocator, io, data_dir, "SELECT * FROM hits WHERE URL LIKE '%google%' ORDER BY EventTime LIMIT 10"),
+        error.FileNotFound => return queryOriginalParquet(allocator, io, data_dir, clickbench_queries.q24_sql),
         else => return err,
     };
     return formatQ24ResultArtifact(allocator, io, data_dir) catch |err| switch (err) {
         error.FileNotFound => return formatQ24DuckDbLateMaterialize(allocator, io, data_dir, hot, urls, url_google_matches) catch |row_err| switch (row_err) {
-            error.FileNotFound => return queryOriginalParquet(allocator, io, data_dir, "SELECT * FROM hits WHERE URL LIKE '%google%' ORDER BY EventTime LIMIT 10"),
+            error.FileNotFound => return queryOriginalParquet(allocator, io, data_dir, clickbench_queries.q24_sql),
             else => return row_err,
         },
         else => return err,
@@ -10511,7 +10507,7 @@ fn buildQ40ResultImpl(allocator: std.mem.Allocator, io: std.Io, data_dir: []cons
     defer engine.deinit();
 
     const output = try engine.query(
-        "SELECT TraficSourceID, SearchEngineID, AdvEngineID, CASE WHEN (SearchEngineID = 0 AND AdvEngineID = 0) THEN Referer ELSE '' END AS Src, URL AS Dst, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND IsRefresh = 0 GROUP BY TraficSourceID, SearchEngineID, AdvEngineID, Src, Dst ORDER BY PageViews DESC LIMIT 10 OFFSET 1000"
+        clickbench_queries.q40_sql
     );
     defer allocator.free(output);
 
@@ -10527,14 +10523,14 @@ fn buildQ40ResultImpl(allocator: std.mem.Allocator, io: std.Io, data_dir: []cons
 fn formatQ40Result(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8, hot: *const HotColumns, url_cache: *HashStringCache, referer_cache: *HashStringCache) ![]u8 {
     if (!artifactMode()) return formatQ40HashLateMaterialize(allocator, io, data_dir, hot, url_cache, referer_cache) catch |err| switch (err) {
         error.FileNotFound => return formatQ40RefererDict(allocator, io, data_dir) catch |dict_err| switch (dict_err) {
-            error.FileNotFound => return queryOriginalParquet(allocator, io, data_dir, "SELECT TraficSourceID, SearchEngineID, AdvEngineID, CASE WHEN (SearchEngineID = 0 AND AdvEngineID = 0) THEN Referer ELSE '' END AS Src, URL AS Dst, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND IsRefresh = 0 GROUP BY TraficSourceID, SearchEngineID, AdvEngineID, Src, Dst ORDER BY PageViews DESC LIMIT 10 OFFSET 1000"),
+            error.FileNotFound => return queryOriginalParquet(allocator, io, data_dir, clickbench_queries.q40_sql),
             else => return dict_err,
         },
         else => return err,
     };
     return formatResultArtifact(allocator, io, data_dir, "q40_result.csv", 256 * 1024) catch |err| switch (err) {
         error.FileNotFound => return formatQ40(allocator, io, data_dir) catch |q40_err| switch (q40_err) {
-            error.FileNotFound => return queryOriginalParquet(allocator, io, data_dir, "SELECT TraficSourceID, SearchEngineID, AdvEngineID, CASE WHEN (SearchEngineID = 0 AND AdvEngineID = 0) THEN Referer ELSE '' END AS Src, URL AS Dst, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND IsRefresh = 0 GROUP BY TraficSourceID, SearchEngineID, AdvEngineID, Src, Dst ORDER BY PageViews DESC LIMIT 10 OFFSET 1000"),
+            error.FileNotFound => return queryOriginalParquet(allocator, io, data_dir, clickbench_queries.q40_sql),
             else => return q40_err,
         },
         else => return err,
@@ -11333,9 +11329,9 @@ fn scanQ23CandidatesRowSidecar(allocator: std.mem.Allocator, empty_phrase_id: u3
 // store intentionally does not materialize every column, so Q24 uses a compact
 // result artifact for the deterministic 10-row LIMIT result.
 fn formatQ24ResultArtifact(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8) ![]u8 {
-    if (!artifactMode()) return queryOriginalParquet(allocator, io, data_dir, "SELECT * FROM hits WHERE URL LIKE '%google%' ORDER BY EventTime LIMIT 10");
+    if (!artifactMode()) return queryOriginalParquet(allocator, io, data_dir, clickbench_queries.q24_sql);
     return formatResultArtifact(allocator, io, data_dir, "q24_result.csv", 64 * 1024) catch |err| switch (err) {
-        error.FileNotFound => return queryOriginalParquet(allocator, io, data_dir, "SELECT * FROM hits WHERE URL LIKE '%google%' ORDER BY EventTime LIMIT 10"),
+        error.FileNotFound => return queryOriginalParquet(allocator, io, data_dir, clickbench_queries.q24_sql),
         else => return err,
     };
 }
@@ -11620,7 +11616,7 @@ fn buildQ29DomainStatsImpl(allocator: std.mem.Allocator, io: std.Io, data_dir: [
     defer engine.deinit();
 
     const output = try engine.query(
-        "SELECT REGEXP_REPLACE(Referer, '^https?://(?:www\\.)?([^/]+)/.*$', '\\1') AS k, AVG(length(Referer)) AS l, COUNT(*) AS c, MIN(Referer) FROM hits WHERE Referer <> '' GROUP BY k HAVING COUNT(*) > 100000 ORDER BY l DESC LIMIT 25"
+        clickbench_queries.q29_sql
     );
     defer allocator.free(output);
 
@@ -11635,12 +11631,12 @@ fn buildQ29DomainStatsImpl(allocator: std.mem.Allocator, io: std.Io, data_dir: [
 
 fn formatQ29(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8) ![]u8 {
     if (!artifactMode()) return formatQ29DomainStats(allocator, io, data_dir) catch |err| switch (err) {
-        error.FileNotFound => return queryOriginalParquet(allocator, io, data_dir, "SELECT REGEXP_REPLACE(Referer, '^https?://(?:www\\.)?([^/]+)/.*$', '\\1') AS k, AVG(length(Referer)) AS l, COUNT(*) AS c, MIN(Referer) FROM hits WHERE Referer <> '' GROUP BY k HAVING COUNT(*) > 100000 ORDER BY l DESC LIMIT 25"),
+        error.FileNotFound => return queryOriginalParquet(allocator, io, data_dir, clickbench_queries.q29_sql),
         else => return err,
     };
     return formatResultArtifact(allocator, io, data_dir, "q29_result.csv", 64 * 1024) catch |err| switch (err) {
         error.FileNotFound => return formatQ29DomainStats(allocator, io, data_dir) catch |stats_err| switch (stats_err) {
-            error.FileNotFound => return queryOriginalParquet(allocator, io, data_dir, "SELECT REGEXP_REPLACE(Referer, '^https?://(?:www\\.)?([^/]+)/.*$', '\\1') AS k, AVG(length(Referer)) AS l, COUNT(*) AS c, MIN(Referer) FROM hits WHERE Referer <> '' GROUP BY k HAVING COUNT(*) > 100000 ORDER BY l DESC LIMIT 25"),
+            error.FileNotFound => return queryOriginalParquet(allocator, io, data_dir, clickbench_queries.q29_sql),
             else => return stats_err,
         },
         else => return err,
