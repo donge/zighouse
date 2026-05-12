@@ -7,6 +7,7 @@ cd "$ROOT"
 PARQUET_PATH=${ZIGHOUSE_PERF_PARQUET:-data/hits.parquet}
 BASELINE=${ZIGHOUSE_PERF_BASELINE:-perf/baselines/local-10m-submit.json}
 LIMIT_ROWS=${ZIGHOUSE_PERF_LIMIT_ROWS:-10000000}
+QUERY_PATH=${ZIGHOUSE_PERF_QUERY_PATH:-compare}
 TMP_ROOT=${TMPDIR:-/tmp}
 
 if [[ ! -f "$PARQUET_PATH" ]]; then
@@ -25,6 +26,6 @@ trap 'rm -rf "$WORK_DIR"' EXIT
 STORE_DIR="$WORK_DIR/store"
 OUT_JSON="$WORK_DIR/perf.json"
 
-echo "pre-commit perf: running ClickBench ${LIMIT_ROWS}-row gate"
+echo "pre-commit perf: running ClickBench ${LIMIT_ROWS}-row gate (${QUERY_PATH})"
 scripts/perf-baseline.sh "$PARQUET_PATH" "$STORE_DIR" "$OUT_JSON" "$LIMIT_ROWS"
 scripts/perf-compare.py --import-threshold 1000 "$BASELINE" "$OUT_JSON"

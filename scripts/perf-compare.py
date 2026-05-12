@@ -28,6 +28,11 @@ def main() -> int:
     cand = load(args.candidate)
     failures: list[str] = []
 
+    base_path = base.get("query_path")
+    cand_path = cand.get("query_path")
+    if base_path != cand_path:
+        failures.append(f"query_path mismatch ({base_path!r} baseline vs {cand_path!r} candidate)")
+
     base_q = float(base["query"]["warm_best_sum"])
     cand_q = float(cand["query"]["warm_best_sum"])
     q_delta = pct(cand_q, base_q)
@@ -61,6 +66,8 @@ def main() -> int:
         if d > args.per_query_threshold and c - b > 0.002:
             failures.append(f"q{idx} warm best regressed {d:.2f}% ({b:.6f}s -> {c:.6f}s)")
 
+    if base_path is not None or cand_path is not None:
+        print(f"query_path: {base_path!r} -> {cand_path!r}")
     print(f"warm_best_sum: {base_q:.6f}s -> {cand_q:.6f}s ({q_delta:+.2f}%)")
     if import_delta is not None:
         print(f"import_{import_metric}: {float(base_import):.6f}s -> {float(cand_import):.6f}s ({import_delta:+.2f}%)")

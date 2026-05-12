@@ -214,8 +214,14 @@ pub const Native = struct {
                 const generic_plan = try generic_sql.parse(self.allocator, sql);
                 defer if (generic_plan) |plan| generic_sql.deinit(self.allocator, plan);
                 if (generic_plan) |plan| switch (mode) {
-                    .generic => return try self.executeGenericSql(plan),
-                    .compare => return try self.queryCompareGenericSql(sql, plan),
+                    .generic => if (self.executeGenericSql(plan) catch |err| switch (err) {
+                        error.UnsupportedGenericQuery => null,
+                        else => return err,
+                    }) |output| return output,
+                    .compare => if (self.queryCompareGenericSql(sql, plan) catch |err| switch (err) {
+                        error.UnsupportedGenericQuery => null,
+                        else => return err,
+                    }) |output| return output,
                     .specialized => unreachable,
                 };
             },
@@ -560,6 +566,7 @@ pub const Native = struct {
             .count_adv_engine_non_zero => try formatOneInt(self.allocator, "count_star()", genericCountNonZeroI16(hot.adv_engine_id)),
             .sum_count_avg => try formatSumCountAvg(self.allocator, genericSumI16(hot.adv_engine_id), hot.rowCount(), genericAvgI16(hot.resolution_width)),
             .avg_user_id => try formatOneFloat(self.allocator, "avg(UserID)", genericAvgI64(hot.user_id)),
+            .count_distinct_search_phrase => try formatSearchPhraseDistinctCountCached(self.allocator, try self.getSearchPhraseColumn()),
             .min_max_event_date => blk: {
                 const mm = genericMinMaxI32(hot.event_date);
                 break :blk try formatMinMaxDate(self.allocator, mm.min, mm.max);

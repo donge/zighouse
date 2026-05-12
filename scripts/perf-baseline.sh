@@ -12,7 +12,7 @@ Default limit_rows is 10000000. Set limit_rows to 0 to import the full file.
 
 Environment:
   PERF_REPEATS  Number of import+query measurements to run, default 3.
-  ZIGHOUSE_PERF_QUERY_PATH  Query path for the benchmark, default specialized.
+  ZIGHOUSE_PERF_QUERY_PATH  Query path for the benchmark, default compare.
 USAGE
 }
 
@@ -34,7 +34,7 @@ QUERIES=${QUERIES:-assets/queries.sql}
 ZIGHOUSE=${ZIGHOUSE:-zig-out/bin/zighouse}
 BUILD_ARGS=(-Dduckdb=false)
 PERF_REPEATS=${PERF_REPEATS:-3}
-ZIGHOUSE_PERF_QUERY_PATH=${ZIGHOUSE_PERF_QUERY_PATH:-specialized}
+ZIGHOUSE_PERF_QUERY_PATH=${ZIGHOUSE_PERF_QUERY_PATH:-compare}
 
 if [[ "$(uname -s)" == "Darwin" ]]; then
   TIME_CMD=(/usr/bin/time -l)
@@ -130,12 +130,13 @@ def extract_summary(text: str) -> dict:
 
 
 def extract_rows(text: str):
+    text = re.sub(r"query_path_compare[^\n]*\n", "", text)
     rows = []
     for line in text.splitlines():
         s = line.strip()
         if not s.startswith("["):
             continue
-        rows.append(ast.literal_eval(s.rstrip(",")))
+        rows.append(ast.literal_eval(s.rstrip(",").replace("null", "None")))
     if len(rows) != 43:
         raise SystemExit(f"expected 43 timing rows, got {len(rows)}")
     return rows
