@@ -138,6 +138,7 @@ fn validPlanShape(projections: []const Expr, filter: ?Filter, group_by: ?[]const
     if (validClickBenchStringTopShape(projections, filter, group_by.?)) return true;
     if (validUserSearchPhraseTopShape(projections, group_by.?)) return true;
     if (validClientIpAggTopShape(projections, filter, group_by.?)) return true;
+    if (validClientIpSubtractTopShape(projections, filter, group_by.?)) return true;
     if (validUrlCountTopShape(projections, filter, group_by.?)) return true;
     if (projections.len != 2) return false;
     if (projections[0].func != .column_ref) return false;
@@ -145,6 +146,21 @@ fn validPlanShape(projections: []const Expr, filter: ?Filter, group_by: ?[]const
     if (projections[1].func == .count_star) return true;
     if (projections[1].func == .count_distinct and asciiEqlIgnoreCase(group_by.?, "RegionID")) return asciiEqlIgnoreCase(projections[1].column orelse return false, "UserID");
     return false;
+}
+
+fn validClientIpSubtractTopShape(projections: []const Expr, filter: ?Filter, group_by: []const u8) bool {
+    if (filter != null) return false;
+    if (!asciiEqlIgnoreCase(group_by, "ClientIP, ClientIP - 1, ClientIP - 2, ClientIP - 3")) return false;
+    if (projections.len != 5) return false;
+    if (!clientIpOffsetExpr(projections[0], 0)) return false;
+    if (!clientIpOffsetExpr(projections[1], -1)) return false;
+    if (!clientIpOffsetExpr(projections[2], -2)) return false;
+    if (!clientIpOffsetExpr(projections[3], -3)) return false;
+    return projections[4].func == .count_star and asciiEqlIgnoreCase(projections[4].alias orelse return false, "c");
+}
+
+fn clientIpOffsetExpr(expr: Expr, offset: i64) bool {
+    return expr.func == .column_ref and asciiEqlIgnoreCase(expr.column orelse return false, "ClientIP") and expr.int_offset == offset;
 }
 
 fn validClientIpAggTopShape(projections: []const Expr, filter: ?Filter, group_by: []const u8) bool {
@@ -296,8 +312,20 @@ fn parseExpr(expr: []const u8) ?Expr {
     if (parseCall(expr, "max")) |arg| return .{ .func = .max, .column = std.mem.trim(u8, arg, " \t\r\n") };
     if (parseExtractMinute(expr)) return .{ .func = .column_ref, .column = "EventMinuteOfHour" };
     if (std.mem.eql(u8, std.mem.trim(u8, expr, " \t\r\n"), "1")) return .{ .func = .int_literal, .int_offset = 1 };
+    if (parseSubtractExpr(expr)) |parsed| return parsed;
     if (isIdentifierText(expr)) return .{ .func = .column_ref, .column = expr };
     return null;
+}
+
+fn parseSubtractExpr(expr: []const u8) ?Expr {
+    const minus_pos = std.mem.indexOfScalar(u8, expr, '-') orelse return null;
+    if (std.mem.indexOfScalar(u8, expr[minus_pos + 1 ..], '-') != null) return null;
+    const column = std.mem.trim(u8, expr[0..minus_pos], " \t\r\n");
+    const value_text = std.mem.trim(u8, expr[minus_pos + 1 ..], " \t\r\n");
+    if (!isIdentifierText(column) or value_text.len == 0) return null;
+    const int_offset = std.fmt.parseInt(i64, value_text, 10) catch return null;
+    if (int_offset <= 0) return null;
+    return .{ .func = .column_ref, .column = column, .int_offset = -int_offset };
 }
 
 fn parseExtractMinute(expr: []const u8) bool {
@@ -587,6 +615,7 @@ test "parses client ip and url top shapes" {
         "SELECT SearchEngineID, ClientIP, COUNT(*) AS c, SUM(IsRefresh), AVG(ResolutionWidth) FROM hits WHERE SearchPhrase <> '' GROUP BY SearchEngineID, ClientIP ORDER BY c DESC LIMIT 10",
         "SELECT WatchID, ClientIP, COUNT(*) AS c, SUM(IsRefresh), AVG(ResolutionWidth) FROM hits WHERE SearchPhrase <> '' GROUP BY WatchID, ClientIP ORDER BY c DESC LIMIT 10",
         "SELECT WatchID, ClientIP, COUNT(*) AS c, SUM(IsRefresh), AVG(ResolutionWidth) FROM hits GROUP BY WatchID, ClientIP ORDER BY c DESC LIMIT 10",
+        "SELECT ClientIP, ClientIP - 1, ClientIP - 2, ClientIP - 3, COUNT(*) AS c FROM hits GROUP BY ClientIP, ClientIP - 1, ClientIP - 2, ClientIP - 3 ORDER BY c DESC LIMIT 10",
         "SELECT URL, COUNT(*) AS c FROM hits GROUP BY URL ORDER BY c DESC LIMIT 10",
         "SELECT 1, URL, COUNT(*) AS c FROM hits GROUP BY 1, URL ORDER BY c DESC LIMIT 10",
     };

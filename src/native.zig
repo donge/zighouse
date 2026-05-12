@@ -461,6 +461,7 @@ pub const Native = struct {
             if (isGenericSearchEngineClientIpAggTopPlan(plan)) return formatSearchEngineClientIpAggTop(self.allocator, self.io, self.data_dir);
             if (isGenericWatchIdClientIpAggTopFilteredPlan(plan)) return formatWatchIdClientIpAggTopFilteredCached(self.allocator, hot, try self.getSearchPhraseColumn());
             if (isGenericWatchIdClientIpAggTopPlan(plan)) return formatWatchIdClientIpAggTop(self.allocator, self.io, self.data_dir);
+            if (isGenericClientIpSubtractTopPlan(plan)) return formatClientIpTop10(self.allocator, hot.client_ip orelse return error.UnsupportedGenericQuery);
             if (isGenericUrlCountTopPlan(plan)) return formatUrlCountTopHashLateMaterializeCached(self, hot, false) catch |err| switch (err) {
                 error.FileNotFound => return formatUrlCountTop(self.allocator, self.io, self.data_dir),
                 else => return err,
@@ -632,6 +633,21 @@ pub const Native = struct {
         if (plan.projections[2].func != .count_star or !asciiEqlIgnoreCase(plan.projections[2].alias orelse return false, "c")) return false;
         if (plan.projections[3].func != .sum or !asciiEqlIgnoreCase(plan.projections[3].column orelse return false, "IsRefresh")) return false;
         return plan.projections[4].func == .avg and asciiEqlIgnoreCase(plan.projections[4].column orelse return false, "ResolutionWidth");
+    }
+
+    fn isGenericClientIpSubtractTopPlan(plan: generic_sql.Plan) bool {
+        if (plan.filter != null or plan.limit != 10 or !genericOrderByAlias(plan, "c")) return false;
+        if (!asciiEqlIgnoreCase(plan.group_by orelse return false, "ClientIP, ClientIP - 1, ClientIP - 2, ClientIP - 3")) return false;
+        if (plan.projections.len != 5) return false;
+        if (!genericClientIpOffsetExpr(plan.projections[0], 0)) return false;
+        if (!genericClientIpOffsetExpr(plan.projections[1], -1)) return false;
+        if (!genericClientIpOffsetExpr(plan.projections[2], -2)) return false;
+        if (!genericClientIpOffsetExpr(plan.projections[3], -3)) return false;
+        return plan.projections[4].func == .count_star and asciiEqlIgnoreCase(plan.projections[4].alias orelse return false, "c");
+    }
+
+    fn genericClientIpOffsetExpr(expr: generic_sql.Expr, offset: i64) bool {
+        return expr.func == .column_ref and asciiEqlIgnoreCase(expr.column orelse return false, "ClientIP") and expr.int_offset == offset;
     }
 
     fn isGenericUrlCountTopPlan(plan: generic_sql.Plan) bool {
