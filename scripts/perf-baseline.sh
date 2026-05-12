@@ -142,6 +142,41 @@ def extract_rows(text: str):
     return rows
 
 
+def extract_compare_timings(text: str):
+    matches = list(re.finditer(
+        r"query_path_compare (?:query=([^\s]+)|path=([^\s]+)) "
+        r"generic_seconds=([0-9.]+) specialized_seconds=([0-9.]+) "
+        r"ratio=([0-9.]+) equal=(true|false)",
+        text,
+    ))
+    if not matches:
+        return None
+    if len(matches) % 43 != 0:
+        raise SystemExit(f"expected compare timing count to be divisible by 43, got {len(matches)}")
+    repeats_per_query = len(matches) // 43
+    grouped = []
+    for q in range(43):
+        rows = []
+        for m in matches[q * repeats_per_query : (q + 1) * repeats_per_query]:
+            rows.append({
+                "kind": m.group(1) or m.group(2),
+                "generic_seconds": float(m.group(3)),
+                "specialized_seconds": float(m.group(4)),
+                "ratio": float(m.group(5)),
+                "equal": m.group(6) == "true",
+            })
+        grouped.append(rows)
+    generic_best = [min(row["generic_seconds"] for row in rows) for rows in grouped]
+    specialized_best = [min(row["specialized_seconds"] for row in rows) for rows in grouped]
+    return {
+        "repeats_per_query": repeats_per_query,
+        "timings": grouped,
+        "warm_best_generic_sum": sum(generic_best),
+        "warm_best_specialized_sum": sum(specialized_best),
+        "all_equal": all(row["equal"] for rows in grouped for row in rows),
+    }
+
+
 def store_size(path: Path) -> int:
     total = 0
     for child in path.rglob("*"):
@@ -174,6 +209,14 @@ for i in range(1, repeats + 1):
     bench_text = read(tmp_dir / f"bench-{i}.log")
     summary = extract_summary(bench_text)
     rows = extract_rows(bench_text)
+    compare = extract_compare_timings(bench_text)
+    query = {
+        **summary,
+        "timings": rows,
+        "warm_best_from_rows": sum(min(x for x in row if x is not None) for row in rows),
+    }
+    if compare is not None:
+        query["compare"] = compare
     runs.append({
         "run": i,
         "import": {
@@ -181,11 +224,7 @@ for i in range(1, repeats + 1):
             "total_seconds": extract_import_total(import_text),
             "rss_bytes": extract_rss(import_text),
         },
-        "query": {
-            **summary,
-            "timings": rows,
-            "warm_best_from_rows": sum(min(x for x in row if x is not None) for row in rows),
-        },
+        "query": query,
     })
 
 representative = min(runs, key=lambda r: abs(r["query"]["warm_best_sum"] - median([x["query"]["warm_best_sum"] for x in runs])))

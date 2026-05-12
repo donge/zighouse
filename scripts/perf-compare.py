@@ -15,6 +15,10 @@ def pct(new: float, base: float) -> float:
     return (new - base) / base * 100.0
 
 
+def compare_summary(data: dict):
+    return data.get("query", {}).get("compare")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Compare a ZigHouse perf result against a baseline.")
     parser.add_argument("baseline", type=Path)
@@ -66,14 +70,44 @@ def main() -> int:
         if d > args.per_query_threshold and c - b > 0.002:
             failures.append(f"q{idx} warm best regressed {d:.2f}% ({b:.6f}s -> {c:.6f}s)")
 
+    base_cmp = compare_summary(base)
+    cand_cmp = compare_summary(cand)
+    compare_generic = []
+    compare_specialized = []
+    if base_cmp is not None and cand_cmp is not None:
+        base_gen = float(base_cmp["warm_best_generic_sum"])
+        cand_gen = float(cand_cmp["warm_best_generic_sum"])
+        base_spec = float(base_cmp["warm_best_specialized_sum"])
+        cand_spec = float(cand_cmp["warm_best_specialized_sum"])
+        generic_delta = pct(cand_gen, base_gen)
+        specialized_delta = pct(cand_spec, base_spec)
+        for idx, (brows, crows) in enumerate(zip(base_cmp["timings"], cand_cmp["timings"]), 1):
+            bg = min(float(row["generic_seconds"]) for row in brows)
+            cg = min(float(row["generic_seconds"]) for row in crows)
+            bs = min(float(row["specialized_seconds"]) for row in brows)
+            cs = min(float(row["specialized_seconds"]) for row in crows)
+            compare_generic.append((idx, bg, cg, pct(cg, bg)))
+            compare_specialized.append((idx, bs, cs, pct(cs, bs)))
+        if not cand_cmp.get("all_equal", False):
+            failures.append("compare output equality failed")
+    else:
+        base_gen = cand_gen = base_spec = cand_spec = generic_delta = specialized_delta = None
+
     if base_path is not None or cand_path is not None:
         print(f"query_path: {base_path!r} -> {cand_path!r}")
     print(f"warm_best_sum: {base_q:.6f}s -> {cand_q:.6f}s ({q_delta:+.2f}%)")
+    if base_cmp is not None and cand_cmp is not None:
+        print(f"compare_generic_sum: {base_gen:.6f}s -> {cand_gen:.6f}s ({generic_delta:+.2f}%)")
+        print(f"compare_specialized_sum: {base_spec:.6f}s -> {cand_spec:.6f}s ({specialized_delta:+.2f}%)")
     if import_delta is not None:
         print(f"import_{import_metric}: {float(base_import):.6f}s -> {float(cand_import):.6f}s ({import_delta:+.2f}%)")
     print("largest per-query regressions:")
     for idx, b, c, d in sorted(per_query, key=lambda x: x[3], reverse=True)[:10]:
         print(f"  q{idx}: {b:.6f}s -> {c:.6f}s ({d:+.2f}%)")
+    if compare_generic:
+        print("largest compare generic regressions:")
+        for idx, b, c, d in sorted(compare_generic, key=lambda x: x[3], reverse=True)[:10]:
+            print(f"  q{idx}: {b:.6f}s -> {c:.6f}s ({d:+.2f}%)")
 
     if failures:
         print("FAIL:", file=sys.stderr)
