@@ -605,6 +605,45 @@ pub const Native = struct {
             .search_phrase_order_by_phrase_top => try formatSearchPhraseOrderByPhraseTopCached(self.allocator, try self.getSearchPhraseColumn()),
             .url_length_by_counter => try formatUrlLengthByCounter(self.allocator, hot.counter_id, hot.url_length orelse return error.UnsupportedNativeQuery),
             .referer_domain_stats_top => try formatQ29(self.allocator, self.io, self.data_dir),
+            .search_engine_client_ip_agg_top => try formatSearchEngineClientIpAggTop(self.allocator, self.io, self.data_dir),
+            .watch_id_client_ip_agg_top => try formatWatchIdClientIpAggTop(self.allocator, self.io, self.data_dir),
+            .watch_id_client_ip_agg_top_filtered => try formatWatchIdClientIpAggTopFilteredCached(self.allocator, hot, try self.getSearchPhraseColumn()),
+            .url_count_top => blk: {
+                const output = formatUrlCountTopHashLateMaterializeCached(self, hot, false) catch |err| switch (err) {
+                    error.FileNotFound => try formatUrlCountTop(self.allocator, self.io, self.data_dir),
+                    else => return err,
+                };
+                break :blk output;
+            },
+            .one_url_count_top => blk: {
+                const output = formatUrlCountTopHashLateMaterializeCached(self, hot, true) catch |err| switch (err) {
+                    error.FileNotFound => try formatOneUrlCountTop(self.allocator, self.io, self.data_dir),
+                    else => return err,
+                };
+                break :blk output;
+            },
+            .client_ip_top10 => try formatClientIpTop10(self.allocator, hot.client_ip orelse return error.UnsupportedNativeQuery),
+            .window_size_dashboard => try formatWindowSizeDashboard(self, hot),
+            .time_bucket_dashboard => try formatTimeBucketDashboard(self, hot, hot.event_minute orelse return error.UnsupportedNativeQuery),
+            .url_hash_date_dashboard => try formatUrlHashDateDashboard(self, hot, hot.trafic_source_id orelse return error.UnsupportedNativeQuery, hot.referer_hash orelse return error.UnsupportedNativeQuery),
+            .url_count_top_filtered_dashboard => formatUrlCountTopFilteredQ37HashLateMaterialize(self.allocator, self.io, self.data_dir, hot, &self.url_hash_string_cache) catch |err| switch (err) {
+                error.FileNotFound => try formatUrlCountTopFilteredQ37Cached(self.allocator, hot, try self.getUrlColumn()),
+                else => return err,
+            },
+            .title_count_top_filtered_dashboard => formatTitleCountTopFilteredQ38HashLateMaterialize(self.allocator, self.io, self.data_dir, hot, &self.title_hash_string_cache) catch |err| switch (err) {
+                error.FileNotFound => blk: {
+                    const output = formatTitleCountTopFilteredQ38ParquetScan(self.allocator, self.io, self.data_dir, hot) catch |scan_err| switch (scan_err) {
+                        error.FileNotFound => try formatTitleCountTopFilteredQ38Cached(self.allocator, hot, try self.getTitleColumn()),
+                        else => return scan_err,
+                    };
+                    break :blk output;
+                },
+                else => return err,
+            },
+            .url_count_top_filtered_offset_dashboard => formatUrlCountTopFilteredOffsetQ39HashLateMaterialize(self.allocator, self.io, self.data_dir, hot, &self.url_hash_string_cache) catch |err| switch (err) {
+                error.FileNotFound => try formatUrlCountTopFilteredOffsetQ39Cached(self.allocator, self.io, self.data_dir, hot, try self.getUrlColumn()),
+                else => return err,
+            },
             else => null,
         };
     }
