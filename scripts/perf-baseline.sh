@@ -12,6 +12,7 @@ Default limit_rows is 10000000. Set limit_rows to 0 to import the full file.
 
 Environment:
   PERF_REPEATS  Number of import+query measurements to run, default 3.
+  ZIGHOUSE_PERF_QUERY_PATH  Query path for the benchmark, default specialized.
 USAGE
 }
 
@@ -33,6 +34,7 @@ QUERIES=${QUERIES:-assets/queries.sql}
 ZIGHOUSE=${ZIGHOUSE:-zig-out/bin/zighouse}
 BUILD_ARGS=(-Dduckdb=false)
 PERF_REPEATS=${PERF_REPEATS:-3}
+ZIGHOUSE_PERF_QUERY_PATH=${ZIGHOUSE_PERF_QUERY_PATH:-specialized}
 
 if [[ "$(uname -s)" == "Darwin" ]]; then
   TIME_CMD=(/usr/bin/time -l)
@@ -59,11 +61,11 @@ while [[ $run -le $PERF_REPEATS ]]; do
   fi
 
   "${TIME_CMD[@]}" env ZIGHOUSE_CLICKBENCH_SUBMIT=1 ZIGHOUSE_IMPORT_TRACE=1 "${import_args[@]}" >"$import_log" 2>&1
-  "${TIME_CMD[@]}" env ZIGHOUSE_CLICKBENCH_SUBMIT=1 "$ZIGHOUSE" --backend native bench "$STORE_DIR" "$QUERIES" >"$bench_log" 2>&1
+  "${TIME_CMD[@]}" env ZIGHOUSE_CLICKBENCH_SUBMIT=1 ZIGHOUSE_QUERY_PATH="$ZIGHOUSE_PERF_QUERY_PATH" "$ZIGHOUSE" --backend native bench "$STORE_DIR" "$QUERIES" >"$bench_log" 2>&1
   run=$((run + 1))
 done
 
-python3 - "$OUT_JSON" "$PARQUET_PATH" "$STORE_DIR" "$LIMIT_ROWS" "$PERF_REPEATS" "$tmp_dir" <<'PY'
+python3 - "$OUT_JSON" "$PARQUET_PATH" "$STORE_DIR" "$LIMIT_ROWS" "$PERF_REPEATS" "$tmp_dir" "$ZIGHOUSE_PERF_QUERY_PATH" <<'PY'
 import ast
 import json
 import platform
@@ -78,6 +80,7 @@ store_dir = Path(sys.argv[3])
 limit_rows = int(sys.argv[4])
 repeats = int(sys.argv[5])
 tmp_dir = Path(sys.argv[6])
+query_path = sys.argv[7]
 
 
 def read(path: Path) -> str:
@@ -195,6 +198,7 @@ data = {
     "parquet": parquet_path,
     "limit_rows": limit_rows or None,
     "queries": "assets/queries.sql",
+    "query_path": query_path,
     "build": {
         "args": ["-Dduckdb=false"],
         "git_commit": git_value(["rev-parse", "HEAD"]),

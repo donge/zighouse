@@ -1,0 +1,10 @@
+SELECT COUNT(*) FROM hits;
+SELECT COUNT(*) FROM hits WHERE AdvEngineID <> 0;
+SELECT SUM(AdvEngineID), COUNT(*), AVG(ResolutionWidth) FROM hits;
+SELECT AVG(UserID) FROM hits;
+SELECT MIN(EventDate), MAX(EventDate) FROM hits;
+SELECT COUNT(*) FROM hits WHERE AdvEngineID = 0;
+SELECT COUNT(*), MIN(ResolutionWidth), MAX(ResolutionWidth) FROM hits WHERE ResolutionWidth > 1024;
+SELECT COUNT(*), MIN(ResolutionWidth), MAX(ResolutionWidth) FROM hits WHERE ResolutionWidth <= 1024;
+SELECT COUNT(*), SUM(ResolutionWidth), AVG(ResolutionWidth), MIN(ResolutionWidth), MAX(ResolutionWidth) FROM hits WHERE CounterID = 62 AND IsRefresh = 0;
+SELECT COUNT(*), MIN(EventDate), MAX(EventDate) FROM hits WHERE CounterID = 62 AND IsRefresh = 0;

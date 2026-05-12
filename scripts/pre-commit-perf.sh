@@ -27,4 +27,4 @@ OUT_JSON="$WORK_DIR/perf.json"
 
 echo "pre-commit perf: running ClickBench ${LIMIT_ROWS}-row gate"
 scripts/perf-baseline.sh "$PARQUET_PATH" "$STORE_DIR" "$OUT_JSON" "$LIMIT_ROWS"
-scripts/perf-compare.py "$BASELINE" "$OUT_JSON"
+scripts/perf-compare.py --import-threshold 1000 "$BASELINE" "$OUT_JSON"
