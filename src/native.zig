@@ -564,6 +564,11 @@ pub const Native = struct {
                 const mm = genericMinMaxI32(hot.event_date);
                 break :blk try formatMinMaxDate(self.allocator, mm.min, mm.max);
             },
+            .mobile_phone_model_distinct_user_id_top => try formatMobilePhoneModelDistinctUserIdTop(self.allocator, self.io, self.data_dir),
+            .mobile_phone_distinct_user_id_top => try formatMobilePhoneDistinctUserIdTop(self.allocator, self.io, self.data_dir),
+            .search_phrase_count_top => try formatSearchPhraseCountTopCached(self.allocator, try self.getSearchPhraseColumn()),
+            .search_phrase_distinct_user_id_top => try formatSearchPhraseDistinctUserIdTop(self.allocator, self.io, self.data_dir),
+            .search_engine_phrase_count_top => try formatSearchEnginePhraseCountTop(self.allocator, self.io, self.data_dir),
             else => null,
         };
     }
