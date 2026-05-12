@@ -51,6 +51,18 @@ pub const Column = struct {
     storage: StorageHint = .auto,
 };
 
+pub const Table = struct {
+    name: []const u8,
+    columns: []const Column,
+
+    pub fn findColumn(self: Table, name: []const u8) ?usize {
+        for (self.columns, 0..) |column, i| {
+            if (asciiEqlIgnoreCase(column.name, name)) return i;
+        }
+        return null;
+    }
+};
+
 fn fixed(name: []const u8, ty: ColumnType) Column {
     return .{ .name = name, .ty = ty, .storage = .fixed_eager };
 }
@@ -171,11 +183,13 @@ pub const hits_columns = [_]Column{
     fixed("CLID", .int32),
 };
 
+pub const hits = Table{
+    .name = "hits",
+    .columns = &hits_columns,
+};
+
 pub fn findColumn(name: []const u8) ?usize {
-    for (hits_columns, 0..) |column, i| {
-        if (asciiEqlIgnoreCase(column.name, name)) return i;
-    }
-    return null;
+    return hits.findColumn(name);
 }
 
 fn asciiEqlIgnoreCase(a: []const u8, b: []const u8) bool {
@@ -194,6 +208,7 @@ fn asciiLower(c: u8) u8 {
 test "finds columns case insensitively" {
     const std = @import("std");
     try std.testing.expectEqual(@as(?usize, 0), findColumn("watchid"));
+    try std.testing.expectEqual(@as(?usize, 0), hits.findColumn("watchid"));
     try std.testing.expectEqual(@as(?usize, 39), findColumn("SearchPhrase"));
     try std.testing.expectEqual(@as(?usize, null), findColumn("missing"));
 }

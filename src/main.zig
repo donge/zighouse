@@ -779,7 +779,7 @@ fn printSnippet(io: std.Io, label: []const u8, bytes: []const u8) !void {
 }
 
 fn printSchema(io: std.Io) !void {
-    for (schema.hits_columns, 0..) |column, i| {
+    for (schema.hits.columns, 0..) |column, i| {
         try printOut(io, "{d}\t{s}\t{s}\n", .{ i, column.name, @tagName(column.ty) });
     }
 }
@@ -801,5 +801,5 @@ fn printErr(io: std.Io, comptime fmt: []const u8, args: anytype) !void {
 }
 
 test "schema has ClickBench column count" {
-    try std.testing.expectEqual(@as(usize, 105), schema.hits_columns.len);
+    try std.testing.expectEqual(@as(usize, 105), schema.hits.columns.len);
 }

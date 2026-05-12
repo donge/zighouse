@@ -63,6 +63,10 @@ pub const hot_segment_stats_name = "hot_segments.stats";
 pub const q37_url_dict_name = "q37_url_dict.tsv";
 
 pub fn initStore(io: std.Io, data_dir: []const u8) !void {
+    try initStoreWithSchema(io, data_dir, schema.hits);
+}
+
+pub fn initStoreWithSchema(io: std.Io, data_dir: []const u8, table: schema.Table) !void {
     const cwd = std.Io.Dir.cwd();
     try cwd.createDirPath(io, data_dir);
 
@@ -73,8 +77,8 @@ pub fn initStore(io: std.Io, data_dir: []const u8) !void {
 
     var text: std.ArrayList(u8) = .empty;
     defer text.deinit(std.heap.smp_allocator);
-    try text.print(std.heap.smp_allocator, "format=zighouse-native-v0\nsegment_rows={d}\ncolumns={d}\n", .{ segment_rows, schema.hits_columns.len });
-    for (schema.hits_columns, 0..) |column, i| {
+    try text.print(std.heap.smp_allocator, "format=zighouse-native-v0\ntable={s}\nsegment_rows={d}\ncolumns={d}\n", .{ table.name, segment_rows, table.columns.len });
+    for (table.columns, 0..) |column, i| {
         try text.print(std.heap.smp_allocator, "column={d}:{s}:{s}:cardinality={s}:storage={s}\n", .{ i, column.name, @tagName(column.ty), @tagName(column.cardinality), @tagName(column.storage) });
         try createColumnPlaceholders(io, dir, i, column);
     }
