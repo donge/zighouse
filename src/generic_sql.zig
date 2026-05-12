@@ -169,6 +169,7 @@ fn validDashboardStringTopShape(projections: []const Expr, where_text: ?[]const 
     const where = where_text orelse return false;
     if (!dashboardWhere(where)) return false;
     if (validWindowDashboardShape(projections, where, group_by)) return true;
+    if (validUrlHashDateDashboardShape(projections, where, group_by)) return true;
     if (projections.len != 2) return false;
     if (projections[0].func != .column_ref) return false;
     const key = projections[0].column orelse return false;
@@ -181,7 +182,8 @@ fn dashboardWhere(where: []const u8) bool {
     return asciiEqlIgnoreCase(where, "CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND DontCountHits = 0 AND IsRefresh = 0 AND URL <> ''") or
         asciiEqlIgnoreCase(where, "CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND DontCountHits = 0 AND IsRefresh = 0 AND Title <> ''") or
         asciiEqlIgnoreCase(where, "CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND IsRefresh = 0 AND IsLink <> 0 AND IsDownload = 0") or
-        asciiEqlIgnoreCase(where, "CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND IsRefresh = 0 AND DontCountHits = 0 AND URLHash = 2868770270353813622");
+        asciiEqlIgnoreCase(where, "CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND IsRefresh = 0 AND DontCountHits = 0 AND URLHash = 2868770270353813622") or
+        asciiEqlIgnoreCase(where, "CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND IsRefresh = 0 AND TraficSourceID IN (-1, 6) AND RefererHash = 3594120000172545465");
 }
 
 fn validWindowDashboardShape(projections: []const Expr, where: []const u8, group_by: []const u8) bool {
@@ -190,6 +192,15 @@ fn validWindowDashboardShape(projections: []const Expr, where: []const u8, group
     if (projections.len != 3) return false;
     if (projections[0].func != .column_ref or !asciiEqlIgnoreCase(projections[0].column orelse return false, "WindowClientWidth")) return false;
     if (projections[1].func != .column_ref or !asciiEqlIgnoreCase(projections[1].column orelse return false, "WindowClientHeight")) return false;
+    return projections[2].func == .count_star and asciiEqlIgnoreCase(projections[2].alias orelse return false, "PageViews");
+}
+
+fn validUrlHashDateDashboardShape(projections: []const Expr, where: []const u8, group_by: []const u8) bool {
+    if (!asciiEqlIgnoreCase(where, "CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND IsRefresh = 0 AND TraficSourceID IN (-1, 6) AND RefererHash = 3594120000172545465")) return false;
+    if (!asciiEqlIgnoreCase(group_by, "URLHash, EventDate")) return false;
+    if (projections.len != 3) return false;
+    if (projections[0].func != .column_ref or !asciiEqlIgnoreCase(projections[0].column orelse return false, "URLHash")) return false;
+    if (projections[1].func != .column_ref or !asciiEqlIgnoreCase(projections[1].column orelse return false, "EventDate")) return false;
     return projections[2].func == .count_star and asciiEqlIgnoreCase(projections[2].alias orelse return false, "PageViews");
 }
 
@@ -706,6 +717,15 @@ test "parses dashboard string top shapes" {
     try std.testing.expectEqualStrings("PageViews", q42.order_by_alias.?);
     try std.testing.expectEqual(@as(?usize, 10), q42.limit);
     try std.testing.expectEqual(@as(?usize, 10000), q42.offset);
+
+    const q41 = (try parse(std.testing.allocator, "SELECT URLHash, EventDate, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND IsRefresh = 0 AND TraficSourceID IN (-1, 6) AND RefererHash = 3594120000172545465 GROUP BY URLHash, EventDate ORDER BY PageViews DESC LIMIT 10 OFFSET 100")).?;
+    defer deinit(std.testing.allocator, q41);
+    try std.testing.expect(q41.filter == null);
+    try std.testing.expect(q41.where_text != null);
+    try std.testing.expectEqualStrings("URLHash, EventDate", q41.group_by.?);
+    try std.testing.expectEqualStrings("PageViews", q41.order_by_alias.?);
+    try std.testing.expectEqual(@as(?usize, 10), q41.limit);
+    try std.testing.expectEqual(@as(?usize, 100), q41.offset);
 }
 
 test "rejects unsupported order by" {

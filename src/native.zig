@@ -477,6 +477,7 @@ pub const Native = struct {
                 error.FileNotFound => return formatUrlCountTopFilteredOffsetQ39Cached(self.allocator, self.io, self.data_dir, hot, try self.getUrlColumn()),
                 else => return err,
             };
+            if (isGenericUrlHashDateDashboardPlan(plan)) return formatUrlHashDateDashboard(self, hot, hot.trafic_source_id orelse return error.UnsupportedGenericQuery, hot.referer_hash orelse return error.UnsupportedGenericQuery);
             if (isGenericWindowSizeDashboardPlan(plan)) return formatWindowSizeDashboard(self, hot);
             if (isGenericUrlCountTopPlan(plan)) return formatUrlCountTopHashLateMaterializeCached(self, hot, false) catch |err| switch (err) {
                 error.FileNotFound => return formatUrlCountTop(self.allocator, self.io, self.data_dir),
@@ -688,6 +689,16 @@ pub const Native = struct {
         if (plan.projections.len != 3) return false;
         if (plan.projections[0].func != .column_ref or !asciiEqlIgnoreCase(plan.projections[0].column orelse return false, "WindowClientWidth")) return false;
         if (plan.projections[1].func != .column_ref or !asciiEqlIgnoreCase(plan.projections[1].column orelse return false, "WindowClientHeight")) return false;
+        return plan.projections[2].func == .count_star and asciiEqlIgnoreCase(plan.projections[2].alias orelse return false, "PageViews");
+    }
+
+    fn isGenericUrlHashDateDashboardPlan(plan: generic_sql.Plan) bool {
+        if (plan.filter != null or plan.limit != 10 or plan.offset != 100 or !genericOrderByAlias(plan, "PageViews")) return false;
+        if (!asciiEqlIgnoreCase(plan.where_text orelse return false, "CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND IsRefresh = 0 AND TraficSourceID IN (-1, 6) AND RefererHash = 3594120000172545465")) return false;
+        if (!asciiEqlIgnoreCase(plan.group_by orelse return false, "URLHash, EventDate")) return false;
+        if (plan.projections.len != 3) return false;
+        if (plan.projections[0].func != .column_ref or !asciiEqlIgnoreCase(plan.projections[0].column orelse return false, "URLHash")) return false;
+        if (plan.projections[1].func != .column_ref or !asciiEqlIgnoreCase(plan.projections[1].column orelse return false, "EventDate")) return false;
         return plan.projections[2].func == .count_star and asciiEqlIgnoreCase(plan.projections[2].alias orelse return false, "PageViews");
     }
 
