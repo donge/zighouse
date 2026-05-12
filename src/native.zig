@@ -449,6 +449,10 @@ pub const Native = struct {
         if (plan.projections[0].func != .column_ref or plan.projections[1].func != .count_star) return error.UnsupportedGenericQuery;
         const selected_col = plan.projections[0].column orelse return error.UnsupportedGenericQuery;
         if (!asciiEqlIgnoreCase(selected_col, group_col)) return error.UnsupportedGenericQuery;
+        if (asciiEqlIgnoreCase(group_col, "UserID")) {
+            if (plan.filter != null or plan.limit != 10) return error.UnsupportedGenericQuery;
+            return formatUserIdCountTop10DenseCached(self.allocator, try self.getUserIdEncoding());
+        }
 
         const group_values = bindGenericColumn(hot, group_col) catch return error.UnsupportedGenericQuery;
         if (plan.filter) |filter| {

@@ -29,6 +29,7 @@ pub const Plan = struct {
     filter: ?Filter = null,
     group_by: ?[]const u8 = null,
     order_by_count_desc: bool = false,
+    limit: ?usize = null,
 };
 
 pub fn parse(allocator: std.mem.Allocator, sql: []const u8) !?Plan {
@@ -44,7 +45,8 @@ pub fn parse(allocator: std.mem.Allocator, sql: []const u8) !?Plan {
     const where_pos = indexOfKeyword(after_from, "where");
     const group_by_pos = indexOfKeywordPair(after_from, "group", "by");
     const order_by_pos = indexOfKeywordPair(after_from, "order", "by");
-    const table_end = minOptionalPos(where_pos, minOptionalPos(group_by_pos, order_by_pos)) orelse after_from.len;
+    const limit_pos = indexOfKeyword(after_from, "limit");
+    const table_end = minOptionalPos(where_pos, minOptionalPos(group_by_pos, minOptionalPos(order_by_pos, limit_pos))) orelse after_from.len;
     const table_text = std.mem.trim(u8, after_from[0..table_end], " \t\r\n");
     if (!asciiEqlIgnoreCase(table_text, "hits")) return null;
 
@@ -59,7 +61,7 @@ pub fn parse(allocator: std.mem.Allocator, sql: []const u8) !?Plan {
     if (projections.items.len == 0) return null;
 
     const filter = if (where_pos) |pos| blk: {
-        const where_end = minOptionalPos(group_by_pos, order_by_pos) orelse after_from.len;
+        const where_end = minOptionalPos(group_by_pos, minOptionalPos(order_by_pos, limit_pos)) orelse after_from.len;
         if (where_end <= pos) return null;
         const where_body = std.mem.trim(u8, after_from[pos + "where".len .. where_end], " \t\r\n");
         break :blk parseFilter(where_body) orelse {
@@ -69,7 +71,7 @@ pub fn parse(allocator: std.mem.Allocator, sql: []const u8) !?Plan {
     } else null;
 
     const group_by = if (group_by_pos) |pos| blk: {
-        const group_by_end = order_by_pos orelse after_from.len;
+        const group_by_end = minOptionalPos(order_by_pos, limit_pos) orelse after_from.len;
         if (group_by_end <= pos) return null;
         const group_body = std.mem.trim(u8, after_from[pos + "group".len + "by".len + 1 .. group_by_end], " \t\r\n");
         if (group_body.len == 0 or std.mem.indexOfScalar(u8, group_body, ',') != null) return null;
@@ -77,13 +79,26 @@ pub fn parse(allocator: std.mem.Allocator, sql: []const u8) !?Plan {
     } else null;
 
     const order_by_count_desc = if (order_by_pos) |pos| blk: {
-        const order_body = std.mem.trim(u8, after_from[pos + "order".len + "by".len + 1 ..], " \t\r\n");
+        const order_end = limit_pos orelse after_from.len;
+        const order_body = std.mem.trim(u8, after_from[pos + "order".len + "by".len + 1 .. order_end], " \t\r\n");
         break :blk asciiEqlIgnoreCase(order_body, "COUNT(*) DESC");
     } else false;
     if (order_by_pos != null and !order_by_count_desc) {
         projections.deinit(allocator);
         return null;
     }
+    const limit = if (limit_pos) |pos| blk: {
+        const limit_body = std.mem.trim(u8, after_from[pos + "limit".len ..], " \t\r\n");
+        if (limit_body.len == 0 or std.mem.indexOfAny(u8, limit_body, " \t\r\n") != null) {
+            projections.deinit(allocator);
+            return null;
+        }
+        break :blk std.fmt.parseInt(usize, limit_body, 10) catch {
+            projections.deinit(allocator);
+            return null;
+        };
+    } else null;
+
     if (!validPlanShape(projections.items, filter, group_by)) {
         projections.deinit(allocator);
         return null;
@@ -95,6 +110,7 @@ pub fn parse(allocator: std.mem.Allocator, sql: []const u8) !?Plan {
         .filter = filter,
         .group_by = group_by,
         .order_by_count_desc = order_by_count_desc,
+        .limit = limit,
     };
 }
 
@@ -293,6 +309,15 @@ test "parses group by count query" {
     try std.testing.expectEqual(AggregateFn.count_star, plan.projections[1].func);
     try std.testing.expectEqualStrings("AdvEngineID", plan.group_by.?);
     try std.testing.expect(plan.order_by_count_desc);
+}
+
+test "parses group by count limit" {
+    const plan = (try parse(std.testing.allocator, "SELECT UserID, COUNT(*) FROM hits GROUP BY UserID ORDER BY COUNT(*) DESC LIMIT 10")).?;
+    defer deinit(std.testing.allocator, plan);
+    try std.testing.expectEqual(@as(usize, 2), plan.projections.len);
+    try std.testing.expectEqualStrings("UserID", plan.group_by.?);
+    try std.testing.expect(plan.order_by_count_desc);
+    try std.testing.expectEqual(@as(?usize, 10), plan.limit);
 }
 
 test "rejects unsupported order by" {
