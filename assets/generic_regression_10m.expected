@@ -6,6 +6,8 @@ sum(AdvEngineID),count_star(),avg(ResolutionWidth)
 3152344,10000000,1508.8046441
 avg(UserID)
 2513100748938151000
+count(DISTINCT UserID)
+1530334
 min(EventDate),max(EventDate)
 2013-07-02,2013-07-31
 count_star()

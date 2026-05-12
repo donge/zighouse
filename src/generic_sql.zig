@@ -1,6 +1,6 @@
 const std = @import("std");
 
-pub const AggregateFn = enum { column_ref, count_star, sum, avg, min, max };
+pub const AggregateFn = enum { column_ref, count_star, count_distinct, sum, avg, min, max };
 
 pub const Expr = struct {
     func: AggregateFn,
@@ -115,7 +115,13 @@ fn validPlanShape(projections: []const Expr, filter: ?Filter, group_by: ?[]const
 
 fn parseExpr(expr: []const u8) ?Expr {
     if (parseCall(expr, "count")) |arg| {
-        if (std.mem.eql(u8, std.mem.trim(u8, arg, " \t\r\n"), "*")) return .{ .func = .count_star };
+        const trimmed_arg = std.mem.trim(u8, arg, " \t\r\n");
+        if (std.mem.eql(u8, trimmed_arg, "*")) return .{ .func = .count_star };
+        const distinct_kw = "distinct";
+        if (startsWithKeyword(trimmed_arg, distinct_kw)) {
+            const column = std.mem.trim(u8, trimmed_arg[distinct_kw.len..], " \t\r\n");
+            if (isIdentifierText(column)) return .{ .func = .count_distinct, .column = column };
+        }
         return null;
     }
     if (parseCall(expr, "sum")) |arg| {
@@ -256,6 +262,14 @@ test "parses aggregate list" {
     try std.testing.expectEqual(AggregateFn.count_star, plan.projections[1].func);
     try std.testing.expectEqual(AggregateFn.avg, plan.projections[2].func);
     try std.testing.expectEqualStrings("ResolutionWidth", plan.projections[2].column.?);
+}
+
+test "parses count distinct" {
+    const plan = (try parse(std.testing.allocator, "SELECT COUNT(DISTINCT UserID) FROM hits")).?;
+    defer deinit(std.testing.allocator, plan);
+    try std.testing.expectEqual(@as(usize, 1), plan.projections.len);
+    try std.testing.expectEqual(AggregateFn.count_distinct, plan.projections[0].func);
+    try std.testing.expectEqualStrings("UserID", plan.projections[0].column.?);
 }
 
 test "parses sum with integer offset" {

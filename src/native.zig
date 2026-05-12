@@ -416,6 +416,9 @@ pub const Native = struct {
 
         if (plan.filter) |filter| return self.executeGenericFiltered(plan, hot, filter);
 
+        const distinct_count = try self.executeGenericDistinctCount(plan);
+        if (distinct_count) |output| return output;
+
         const fused_sum_offsets = try executeGenericFusedSumOffsets(self.allocator, plan, hot);
         if (fused_sum_offsets) |output| return output;
 
@@ -428,6 +431,15 @@ pub const Native = struct {
             values[i] = try executeGenericProjection(expr, hot);
         }
         return formatGenericValues(self.allocator, plan, values);
+    }
+
+    fn executeGenericDistinctCount(self: *Native, plan: generic_sql.Plan) !?[]u8 {
+        if (plan.projections.len != 1) return null;
+        const expr = plan.projections[0];
+        if (expr.func != .count_distinct) return null;
+        const column = expr.column orelse return error.UnsupportedGenericQuery;
+        if (asciiEqlIgnoreCase(column, "UserID")) return try formatUserIdDistinctCountCached(self.allocator, try self.getUserIdEncoding());
+        return error.UnsupportedGenericQuery;
     }
 
     fn executeGenericGroupBy(self: *Native, plan: generic_sql.Plan, hot: *const HotColumns) anyerror![]u8 {
@@ -5871,6 +5883,7 @@ fn executeGenericProjection(expr: generic_sql.Expr, hot: *const HotColumns) !Gen
     const column = bindGenericColumn(hot, expr.column orelse return error.UnsupportedGenericQuery) catch return error.UnsupportedGenericQuery;
     return switch (expr.func) {
         .column_ref => error.UnsupportedGenericQuery,
+        .count_distinct => error.UnsupportedGenericQuery,
         .count_star => unreachable,
         .sum => aggregateSum(column, null, expr.int_offset),
         .avg => aggregateAvg(column, null),
@@ -5884,6 +5897,7 @@ fn executeGenericFilteredProjection(expr: generic_sql.Expr, hot: *const HotColum
     const column = bindGenericColumn(hot, expr.column orelse return error.UnsupportedGenericQuery) catch return error.UnsupportedGenericQuery;
     return switch (expr.func) {
         .column_ref => error.UnsupportedGenericQuery,
+        .count_distinct => error.UnsupportedGenericQuery,
         .count_star => unreachable,
         .sum => aggregateSum(column, predicate, expr.int_offset),
         .avg => aggregateAvg(column, predicate),
@@ -5977,6 +5991,7 @@ fn writeGenericHeader(out: *std.ArrayList(u8), allocator: std.mem.Allocator, pla
         if (i != 0) try out.append(allocator, ',');
         switch (expr.func) {
             .column_ref => try out.print(allocator, "{s}", .{expr.column.?}),
+            .count_distinct => try out.print(allocator, "count(DISTINCT {s})", .{expr.column.?}),
             .count_star => try out.appendSlice(allocator, "count_star()"),
             .sum => if (expr.int_offset == 0) try out.print(allocator, "sum({s})", .{expr.column.?}) else try out.print(allocator, "sum(({s} + {d}))", .{ expr.column.?, expr.int_offset }),
             .avg => try out.print(allocator, "avg({s})", .{expr.column.?}),
