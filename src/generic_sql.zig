@@ -7,7 +7,7 @@ pub const Expr = struct {
     column: ?[]const u8 = null,
 };
 
-pub const FilterOp = enum { not_equal };
+pub const FilterOp = enum { equal, not_equal, greater, greater_equal, less, less_equal };
 
 pub const Filter = struct {
     column: []const u8,
@@ -87,12 +87,28 @@ fn parseCall(expr: []const u8, name: []const u8) ?[]const u8 {
 }
 
 fn parseFilter(where_body: []const u8) ?Filter {
-    const op_pos = std.mem.indexOf(u8, where_body, "<>") orelse return null;
-    const column = std.mem.trim(u8, where_body[0..op_pos], " \t\r\n");
-    const value_text = std.mem.trim(u8, where_body[op_pos + 2 ..], " \t\r\n");
+    const ParsedOp = struct { pos: usize, text: []const u8, op: FilterOp };
+    const parsed_op = blk: {
+        const ops = [_]struct { text: []const u8, op: FilterOp }{
+            .{ .text = "<>", .op = .not_equal },
+            .{ .text = ">=", .op = .greater_equal },
+            .{ .text = "<=", .op = .less_equal },
+            .{ .text = "=", .op = .equal },
+            .{ .text = ">", .op = .greater },
+            .{ .text = "<", .op = .less },
+        };
+        for (ops) |candidate| {
+            if (std.mem.indexOf(u8, where_body, candidate.text)) |pos| {
+                break :blk ParsedOp{ .pos = pos, .text = candidate.text, .op = candidate.op };
+            }
+        }
+        return null;
+    };
+    const column = std.mem.trim(u8, where_body[0..parsed_op.pos], " \t\r\n");
+    const value_text = std.mem.trim(u8, where_body[parsed_op.pos + parsed_op.text.len ..], " \t\r\n");
     if (column.len == 0 or value_text.len == 0) return null;
     const value = std.fmt.parseInt(i64, value_text, 10) catch return null;
-    return .{ .column = column, .op = .not_equal, .int_value = value };
+    return .{ .column = column, .op = parsed_op.op, .int_value = value };
 }
 
 fn indexOfKeyword(sql: []const u8, keyword: []const u8) ?usize {
@@ -148,11 +164,30 @@ test "parses not equal filter" {
     defer deinit(std.testing.allocator, plan);
     try std.testing.expect(plan.filter != null);
     try std.testing.expectEqualStrings("AdvEngineID", plan.filter.?.column);
+    try std.testing.expectEqual(FilterOp.not_equal, plan.filter.?.op);
     try std.testing.expectEqual(@as(i64, 0), plan.filter.?.int_value);
+}
+
+test "parses comparison filters" {
+    const cases = [_]struct { sql: []const u8, op: FilterOp, value: i64 }{
+        .{ .sql = "SELECT COUNT(*) FROM hits WHERE AdvEngineID = 1", .op = .equal, .value = 1 },
+        .{ .sql = "SELECT COUNT(*) FROM hits WHERE ResolutionWidth > 1024", .op = .greater, .value = 1024 },
+        .{ .sql = "SELECT COUNT(*) FROM hits WHERE ResolutionWidth >= 1024", .op = .greater_equal, .value = 1024 },
+        .{ .sql = "SELECT COUNT(*) FROM hits WHERE ResolutionWidth < 1024", .op = .less, .value = 1024 },
+        .{ .sql = "SELECT COUNT(*) FROM hits WHERE ResolutionWidth <= 1024", .op = .less_equal, .value = 1024 },
+        .{ .sql = "SELECT COUNT(*) FROM hits WHERE AdvEngineID=-1", .op = .equal, .value = -1 },
+    };
+    for (cases) |case| {
+        const plan = (try parse(std.testing.allocator, case.sql)).?;
+        defer deinit(std.testing.allocator, plan);
+        try std.testing.expect(plan.filter != null);
+        try std.testing.expectEqual(case.op, plan.filter.?.op);
+        try std.testing.expectEqual(case.value, plan.filter.?.int_value);
+    }
 }
 
 test "rejects unsupported sql" {
     try std.testing.expect((try parse(std.testing.allocator, "SELECT URL FROM hits")) == null);
     try std.testing.expect((try parse(std.testing.allocator, "SELECT COUNT(*) FROM other")) == null);
-    try std.testing.expect((try parse(std.testing.allocator, "SELECT COUNT(*) FROM hits WHERE AdvEngineID = 0")) == null);
+    try std.testing.expect((try parse(std.testing.allocator, "SELECT COUNT(*) FROM hits WHERE AdvEngineID <> 0 AND ResolutionWidth > 0")) == null);
 }

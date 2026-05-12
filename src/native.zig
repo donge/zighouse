@@ -426,12 +426,19 @@ pub const Native = struct {
     }
 
     fn executeGenericFiltered(self: *Native, plan: generic_sql.Plan, hot: *const HotColumns, filter: generic_sql.Filter) anyerror![]u8 {
-        if (filter.op != .not_equal or filter.int_value != 0) return error.UnsupportedGenericQuery;
         const predicate = bindGenericColumn(hot, filter.column) catch return error.UnsupportedGenericQuery;
-        const predicate_values = switch (predicate) {
+        var predicate_owned = false;
+        const predicate_values = if (filter.op == .not_equal and filter.int_value == 0) switch (predicate) {
             .i16 => |values| values,
-            else => return error.UnsupportedGenericQuery,
+            else => blk: {
+                predicate_owned = true;
+                break :blk try materializeGenericPredicate(self.allocator, predicate, filter);
+            },
+        } else blk: {
+            predicate_owned = true;
+            break :blk try materializeGenericPredicate(self.allocator, predicate, filter);
         };
+        defer if (predicate_owned) self.allocator.free(predicate_values);
         const values = try self.allocator.alloc(GenericValue, plan.projections.len);
         defer self.allocator.free(values);
         for (plan.projections, 0..) |expr, i| {
@@ -5622,6 +5629,35 @@ fn bindGenericColumn(hot: *const HotColumns, name: []const u8) !GenericColumn {
     if (asciiEqlIgnoreCase(name, "IsRefresh")) return .{ .i16 = hot.is_refresh };
     if (asciiEqlIgnoreCase(name, "DontCountHits")) return .{ .i16 = hot.dont_count_hits };
     return error.UnsupportedGenericColumn;
+}
+
+fn materializeGenericPredicate(allocator: std.mem.Allocator, column: GenericColumn, filter: generic_sql.Filter) ![]i16 {
+    return switch (column) {
+        .i16 => |values| materializeGenericPredicateTyped(i16, allocator, values, filter),
+        .i32, .date => |values| materializeGenericPredicateTyped(i32, allocator, values, filter),
+        .i64 => |values| materializeGenericPredicateTyped(i64, allocator, values, filter),
+    };
+}
+
+fn materializeGenericPredicateTyped(comptime T: type, allocator: std.mem.Allocator, values: []const T, filter: generic_sql.Filter) ![]i16 {
+    const target = std.math.cast(T, filter.int_value) orelse return error.UnsupportedGenericQuery;
+    const mask = try allocator.alloc(i16, values.len);
+    errdefer allocator.free(mask);
+    for (values, mask) |value, *out| {
+        out.* = if (genericPredicateMatches(T, value, target, filter.op)) 1 else 0;
+    }
+    return mask;
+}
+
+fn genericPredicateMatches(comptime T: type, value: T, target: T, op: generic_sql.FilterOp) bool {
+    return switch (op) {
+        .equal => value == target,
+        .not_equal => value != target,
+        .greater => value > target,
+        .greater_equal => value >= target,
+        .less => value < target,
+        .less_equal => value <= target,
+    };
 }
 
 fn executeGenericProjection(expr: generic_sql.Expr, hot: *const HotColumns) !GenericValue {
