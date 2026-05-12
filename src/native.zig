@@ -576,6 +576,9 @@ pub const Native = struct {
             .search_phrase_count_top => try formatSearchPhraseCountTopCached(self.allocator, try self.getSearchPhraseColumn()),
             .search_phrase_distinct_user_id_top => try formatSearchPhraseDistinctUserIdTop(self.allocator, self.io, self.data_dir),
             .search_engine_phrase_count_top => try formatSearchEnginePhraseCountTop(self.allocator, self.io, self.data_dir),
+            .user_id_search_phrase_count_top => try formatUserIdSearchPhraseCountTopCached(self.allocator, try self.getUserIdEncoding(), try self.getSearchPhraseColumn()),
+            .user_id_search_phrase_limit_no_order => try formatUserIdSearchPhraseLimitNoOrderCached(self.allocator, try self.getUserIdEncoding(), try self.getSearchPhraseColumn()),
+            .user_id_minute_search_phrase_count_top => try formatUserIdMinuteSearchPhraseCountTopCached(self.allocator, self.io, self.data_dir, try self.getUserIdEncoding(), try self.getSearchPhraseColumn()),
             else => null,
         };
     }
