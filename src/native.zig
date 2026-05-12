@@ -1,6 +1,7 @@
 const std = @import("std");
 const agg = @import("agg.zig");
 const chdb = @import("chdb.zig");
+const clickbench_import = @import("clickbench_import.zig");
 const clickbench_queries = @import("clickbench_queries.zig");
 const build_options = @import("build_options");
 const duckdb = if (build_options.duckdb) @import("duckdb.zig") else @import("duckdb_stub.zig");
@@ -125,9 +126,9 @@ pub const Native = struct {
         traceImportWallPhase("total", elapsedWallSeconds(total_wall_started, cache_wall_finished));
         try storage.writeDetailedImportManifest(self.io, self.allocator, self.data_dir, .{
             .source = parquet_path,
-            .status = "imported",
-            .profile = "clickbench-hot-minimal",
-            .decoder = "duckdb-c-api-vector",
+            .status = clickbench_import.status_imported,
+            .profile = clickbench_import.profile_hot_minimal,
+            .decoder = clickbench_import.decoder_duckdb_vector,
             .row_count = stats.row_count,
             .user_id_dict_size = stats.user_id_dict_size,
             .mobile_model_dict_size = stats.mobile_model_dict_size,
@@ -156,9 +157,9 @@ pub const Native = struct {
         const total_seconds = elapsedSeconds(total_started, total_finished);
         try storage.writeDetailedImportManifest(self.io, self.allocator, self.data_dir, .{
             .source = parquet_path,
-            .status = "imported",
-            .profile = if (importTinyCachesEnabled()) "clickbench-hot-native-domain-stats-q38" else "clickbench-hot-native-domain-stats",
-            .decoder = "native-parquet-fixed-byte-array",
+            .status = clickbench_import.status_imported,
+            .profile = clickbench_import.nativeProfile(importTinyCachesEnabled()),
+            .decoder = clickbench_import.decoder_native_parquet_fixed_byte_array,
             .row_count = stats.row_count,
             .user_id_dict_size = stats.user_id_dict_size,
             .mobile_model_dict_size = stats.mobile_model_dict_size,
@@ -182,9 +183,9 @@ pub const Native = struct {
         const total_seconds = elapsedSeconds(total_started, total_finished);
         try storage.writeDetailedImportManifest(self.io, self.allocator, self.data_dir, .{
             .source = parquet_path,
-            .status = "experimental-fixed-only",
-            .profile = "clickbench-hot-fixed-only",
-            .decoder = "duckdb-c-api-vector-fixed",
+            .status = clickbench_import.status_experimental_fixed_only,
+            .profile = clickbench_import.profile_hot_fixed_only,
+            .decoder = clickbench_import.decoder_duckdb_vector_fixed,
             .row_count = stats.row_count,
             .main_store_seconds = total_seconds,
             .total_seconds = total_seconds,
