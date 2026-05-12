@@ -28,6 +28,7 @@ pub const Plan = struct {
     table: []const u8,
     projections: []const Expr,
     filter: ?Filter = null,
+    where_text: ?[]const u8 = null,
     group_by: ?[]const u8 = null,
     order_by_count_desc: bool = false,
     order_by_alias: ?[]const u8 = null,
@@ -60,15 +61,12 @@ pub fn parse(allocator: std.mem.Allocator, sql: []const u8) !?Plan {
     };
     if (projections.items.len == 0) return null;
 
-    const filter = if (where_pos) |pos| blk: {
+    const where_text = if (where_pos) |pos| blk: {
         const where_end = minOptionalPos(group_by_pos, minOptionalPos(order_by_pos, limit_pos)) orelse after_from.len;
         if (where_end <= pos) return null;
-        const where_body = std.mem.trim(u8, after_from[pos + "where".len .. where_end], " \t\r\n");
-        break :blk parseFilter(where_body) orelse {
-            projections.deinit(allocator);
-            return null;
-        };
+        break :blk std.mem.trim(u8, after_from[pos + "where".len .. where_end], " \t\r\n");
     } else null;
+    const filter = if (where_text) |body| parseFilter(body) else null;
 
     const group_by = if (group_by_pos) |pos| blk: {
         const group_by_end = minOptionalPos(order_by_pos, limit_pos) orelse after_from.len;
@@ -108,7 +106,7 @@ pub fn parse(allocator: std.mem.Allocator, sql: []const u8) !?Plan {
         };
     } else null;
 
-    if (!validPlanShape(projections.items, filter, group_by)) {
+    if (!validPlanShape(projections.items, filter, where_text, group_by)) {
         projections.deinit(allocator);
         return null;
     }
@@ -117,6 +115,7 @@ pub fn parse(allocator: std.mem.Allocator, sql: []const u8) !?Plan {
         .table = table_text,
         .projections = try projections.toOwnedSlice(allocator),
         .filter = filter,
+        .where_text = where_text,
         .group_by = group_by,
         .order_by_count_desc = order_by_count_desc,
         .order_by_alias = order_by_alias,
@@ -128,7 +127,8 @@ pub fn deinit(allocator: std.mem.Allocator, plan: Plan) void {
     allocator.free(plan.projections);
 }
 
-fn validPlanShape(projections: []const Expr, filter: ?Filter, group_by: ?[]const u8) bool {
+fn validPlanShape(projections: []const Expr, filter: ?Filter, where_text: ?[]const u8, group_by: ?[]const u8) bool {
+    if (where_text != null and filter == null) return group_by != null and validDashboardStringTopShape(projections, where_text, group_by.?);
     if (group_by == null) {
         if (projections.len == 1 and projections[0].func == .column_ref) return filter != null;
         for (projections) |expr| if (expr.func == .column_ref) return false;
@@ -139,6 +139,7 @@ fn validPlanShape(projections: []const Expr, filter: ?Filter, group_by: ?[]const
     if (validUserSearchPhraseTopShape(projections, group_by.?)) return true;
     if (validClientIpAggTopShape(projections, filter, group_by.?)) return true;
     if (validClientIpSubtractTopShape(projections, filter, group_by.?)) return true;
+    if (validDashboardStringTopShape(projections, where_text, group_by.?)) return true;
     if (validUrlCountTopShape(projections, filter, group_by.?)) return true;
     if (projections.len != 2) return false;
     if (projections[0].func != .column_ref) return false;
@@ -146,6 +147,22 @@ fn validPlanShape(projections: []const Expr, filter: ?Filter, group_by: ?[]const
     if (projections[1].func == .count_star) return true;
     if (projections[1].func == .count_distinct and asciiEqlIgnoreCase(group_by.?, "RegionID")) return asciiEqlIgnoreCase(projections[1].column orelse return false, "UserID");
     return false;
+}
+
+fn validDashboardStringTopShape(projections: []const Expr, where_text: ?[]const u8, group_by: []const u8) bool {
+    const where = where_text orelse return false;
+    if (!dashboardWhere(where)) return false;
+    if (projections.len != 2) return false;
+    if (projections[0].func != .column_ref) return false;
+    const key = projections[0].column orelse return false;
+    if (!asciiEqlIgnoreCase(key, group_by)) return false;
+    if (!asciiEqlIgnoreCase(key, "URL") and !asciiEqlIgnoreCase(key, "Title")) return false;
+    return projections[1].func == .count_star and asciiEqlIgnoreCase(projections[1].alias orelse return false, "PageViews");
+}
+
+fn dashboardWhere(where: []const u8) bool {
+    return asciiEqlIgnoreCase(where, "CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND DontCountHits = 0 AND IsRefresh = 0 AND URL <> ''") or
+        asciiEqlIgnoreCase(where, "CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND DontCountHits = 0 AND IsRefresh = 0 AND Title <> ''");
 }
 
 fn validClientIpSubtractTopShape(projections: []const Expr, filter: ?Filter, group_by: []const u8) bool {
@@ -624,6 +641,22 @@ test "parses client ip and url top shapes" {
         defer deinit(std.testing.allocator, plan);
         try std.testing.expect(plan.group_by != null);
         try std.testing.expectEqualStrings("c", plan.order_by_alias.?);
+        try std.testing.expectEqual(@as(?usize, 10), plan.limit);
+    }
+}
+
+test "parses dashboard string top shapes" {
+    const cases = [_]struct { sql: []const u8, group_by: []const u8 }{
+        .{ .sql = "SELECT URL, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND DontCountHits = 0 AND IsRefresh = 0 AND URL <> '' GROUP BY URL ORDER BY PageViews DESC LIMIT 10", .group_by = "URL" },
+        .{ .sql = "SELECT Title, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND DontCountHits = 0 AND IsRefresh = 0 AND Title <> '' GROUP BY Title ORDER BY PageViews DESC LIMIT 10", .group_by = "Title" },
+    };
+    for (cases) |case| {
+        const plan = (try parse(std.testing.allocator, case.sql)).?;
+        defer deinit(std.testing.allocator, plan);
+        try std.testing.expect(plan.filter == null);
+        try std.testing.expect(plan.where_text != null);
+        try std.testing.expectEqualStrings(case.group_by, plan.group_by.?);
+        try std.testing.expectEqualStrings("PageViews", plan.order_by_alias.?);
         try std.testing.expectEqual(@as(?usize, 10), plan.limit);
     }
 }

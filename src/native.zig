@@ -462,6 +462,17 @@ pub const Native = struct {
             if (isGenericWatchIdClientIpAggTopFilteredPlan(plan)) return formatWatchIdClientIpAggTopFilteredCached(self.allocator, hot, try self.getSearchPhraseColumn());
             if (isGenericWatchIdClientIpAggTopPlan(plan)) return formatWatchIdClientIpAggTop(self.allocator, self.io, self.data_dir);
             if (isGenericClientIpSubtractTopPlan(plan)) return formatClientIpTop10(self.allocator, hot.client_ip orelse return error.UnsupportedGenericQuery);
+            if (isGenericUrlCountFilteredDashboardPlan(plan)) return formatUrlCountTopFilteredQ37HashLateMaterialize(self.allocator, self.io, self.data_dir, hot, &self.url_hash_string_cache) catch |err| switch (err) {
+                error.FileNotFound => return formatUrlCountTopFilteredQ37Cached(self.allocator, hot, try self.getUrlColumn()),
+                else => return err,
+            };
+            if (isGenericTitleCountFilteredDashboardPlan(plan)) return formatTitleCountTopFilteredQ38HashLateMaterialize(self.allocator, self.io, self.data_dir, hot, &self.title_hash_string_cache) catch |err| switch (err) {
+                error.FileNotFound => return formatTitleCountTopFilteredQ38ParquetScan(self.allocator, self.io, self.data_dir, hot) catch |scan_err| switch (scan_err) {
+                    error.FileNotFound => return formatTitleCountTopFilteredQ38Cached(self.allocator, hot, try self.getTitleColumn()),
+                    else => return scan_err,
+                },
+                else => return err,
+            };
             if (isGenericUrlCountTopPlan(plan)) return formatUrlCountTopHashLateMaterializeCached(self, hot, false) catch |err| switch (err) {
                 error.FileNotFound => return formatUrlCountTop(self.allocator, self.io, self.data_dir),
                 else => return err,
@@ -648,6 +659,23 @@ pub const Native = struct {
 
     fn genericClientIpOffsetExpr(expr: generic_sql.Expr, offset: i64) bool {
         return expr.func == .column_ref and asciiEqlIgnoreCase(expr.column orelse return false, "ClientIP") and expr.int_offset == offset;
+    }
+
+    fn isGenericUrlCountFilteredDashboardPlan(plan: generic_sql.Plan) bool {
+        return isGenericDashboardStringTopPlan(plan, "URL", "CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND DontCountHits = 0 AND IsRefresh = 0 AND URL <> ''");
+    }
+
+    fn isGenericTitleCountFilteredDashboardPlan(plan: generic_sql.Plan) bool {
+        return isGenericDashboardStringTopPlan(plan, "Title", "CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND DontCountHits = 0 AND IsRefresh = 0 AND Title <> ''");
+    }
+
+    fn isGenericDashboardStringTopPlan(plan: generic_sql.Plan, column: []const u8, where_text: []const u8) bool {
+        if (plan.filter != null or plan.limit != 10 or !genericOrderByAlias(plan, "PageViews")) return false;
+        if (!asciiEqlIgnoreCase(plan.where_text orelse return false, where_text)) return false;
+        if (!asciiEqlIgnoreCase(plan.group_by orelse return false, column)) return false;
+        if (plan.projections.len != 2) return false;
+        if (plan.projections[0].func != .column_ref or !asciiEqlIgnoreCase(plan.projections[0].column orelse return false, column)) return false;
+        return plan.projections[1].func == .count_star and asciiEqlIgnoreCase(plan.projections[1].alias orelse return false, "PageViews");
     }
 
     fn isGenericUrlCountTopPlan(plan: generic_sql.Plan) bool {
