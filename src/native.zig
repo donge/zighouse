@@ -600,6 +600,9 @@ pub const Native = struct {
                 };
                 break :blk output;
             },
+            .search_phrase_event_time_top => try formatSearchPhraseEventTimeCandidatesCached(self.allocator, self.io, self.data_dir, try self.getSearchPhraseColumn(), false),
+            .search_phrase_event_time_phrase_top => try formatSearchPhraseEventTimeCandidatesCached(self.allocator, self.io, self.data_dir, try self.getSearchPhraseColumn(), true),
+            .search_phrase_order_by_phrase_top => try formatSearchPhraseOrderByPhraseTopCached(self.allocator, try self.getSearchPhraseColumn()),
             else => null,
         };
     }
