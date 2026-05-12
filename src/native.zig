@@ -426,14 +426,18 @@ pub const Native = struct {
     }
 
     fn executeGenericFiltered(self: *Native, plan: generic_sql.Plan, hot: *const HotColumns, filter: generic_sql.Filter) anyerror![]u8 {
-        if (plan.projections.len != 1 or plan.projections[0].func != .count_star) return error.UnsupportedGenericQuery;
         if (filter.op != .not_equal or filter.int_value != 0) return error.UnsupportedGenericQuery;
-        const column = bindGenericColumn(hot, filter.column) catch return error.UnsupportedGenericQuery;
-        const count = switch (column) {
-            .i16 => |values| simd.countNonZeroI16(values),
+        const predicate = bindGenericColumn(hot, filter.column) catch return error.UnsupportedGenericQuery;
+        const predicate_values = switch (predicate) {
+            .i16 => |values| values,
             else => return error.UnsupportedGenericQuery,
         };
-        return formatGenericValues(self.allocator, plan, &.{.{ .int = @intCast(count) }});
+        const values = try self.allocator.alloc(GenericValue, plan.projections.len);
+        defer self.allocator.free(values);
+        for (plan.projections, 0..) |expr, i| {
+            values[i] = try executeGenericFilteredProjection(expr, hot, predicate_values);
+        }
+        return formatGenericValues(self.allocator, plan, values);
     }
 
     fn queryCompare(self: *Native, sql: []const u8, query_kind: clickbench_queries.Query) anyerror!?[]u8 {
@@ -5565,6 +5569,87 @@ fn avgI64(values: []const i64) f64 {
     return simd.avgI64(values);
 }
 
+fn filteredSumI16(predicate: []const i16, values: []const i16) i64 {
+    var sum: i64 = 0;
+    for (predicate, values) |p, value| {
+        if (p != 0) sum += value;
+    }
+    return sum;
+}
+
+fn filteredSumI32(predicate: []const i16, values: []const i32) i64 {
+    var sum: i64 = 0;
+    for (predicate, values) |p, value| {
+        if (p != 0) sum += value;
+    }
+    return sum;
+}
+
+fn filteredAvgI16(predicate: []const i16, values: []const i16) f64 {
+    var sum: i64 = 0;
+    var count: u64 = 0;
+    for (predicate, values) |p, value| if (p != 0) {
+        sum += value;
+        count += 1;
+    };
+    if (count == 0) return 0;
+    return @as(f64, @floatFromInt(sum)) / @as(f64, @floatFromInt(count));
+}
+
+fn filteredAvgI32(predicate: []const i16, values: []const i32) f64 {
+    var sum: i64 = 0;
+    var count: u64 = 0;
+    for (predicate, values) |p, value| if (p != 0) {
+        sum += value;
+        count += 1;
+    };
+    if (count == 0) return 0;
+    return @as(f64, @floatFromInt(sum)) / @as(f64, @floatFromInt(count));
+}
+
+fn filteredAvgI64(predicate: []const i16, values: []const i64) f64 {
+    var sum: f64 = 0;
+    var count: u64 = 0;
+    for (predicate, values) |p, value| if (p != 0) {
+        sum += @floatFromInt(value);
+        count += 1;
+    };
+    if (count == 0) return 0;
+    return sum / @as(f64, @floatFromInt(count));
+}
+
+fn filteredMinI16(predicate: []const i16, values: []const i16) i16 {
+    var result: i16 = std.math.maxInt(i16);
+    for (predicate, values) |p, value| {
+        if (p != 0) result = @min(result, value);
+    }
+    return result;
+}
+
+fn filteredMaxI16(predicate: []const i16, values: []const i16) i16 {
+    var result: i16 = std.math.minInt(i16);
+    for (predicate, values) |p, value| {
+        if (p != 0) result = @max(result, value);
+    }
+    return result;
+}
+
+fn filteredMinI32(predicate: []const i16, values: []const i32) i32 {
+    var result: i32 = std.math.maxInt(i32);
+    for (predicate, values) |p, value| {
+        if (p != 0) result = @min(result, value);
+    }
+    return result;
+}
+
+fn filteredMaxI32(predicate: []const i16, values: []const i32) i32 {
+    var result: i32 = std.math.minInt(i32);
+    for (predicate, values) |p, value| {
+        if (p != 0) result = @max(result, value);
+    }
+    return result;
+}
+
 fn genericAvgI64(values: []const i64) f64 {
     if (values.len == 0) return 0;
     var sum: i128 = 0;
@@ -5669,6 +5754,37 @@ fn executeGenericProjection(expr: generic_sql.Expr, hot: *const HotColumns) !Gen
             .i16 => |values| .{ .int = maxI16(values) },
             .i32 => |values| .{ .int = maxI32(values) },
             .date => |values| .{ .date = maxI32(values) },
+            .i64 => error.UnsupportedGenericQuery,
+        },
+    };
+}
+
+fn executeGenericFilteredProjection(expr: generic_sql.Expr, hot: *const HotColumns, predicate: []const i16) !GenericValue {
+    if (expr.func == .count_star) return .{ .int = @intCast(simd.countNonZeroI16(predicate)) };
+    const column = bindGenericColumn(hot, expr.column orelse return error.UnsupportedGenericQuery) catch return error.UnsupportedGenericQuery;
+    return switch (expr.func) {
+        .count_star => unreachable,
+        .sum => switch (column) {
+            .i16 => |values| .{ .int = filteredSumI16(predicate, values) },
+            .i32 => |values| .{ .int = filteredSumI32(predicate, values) },
+            .date, .i64 => error.UnsupportedGenericQuery,
+        },
+        .avg => switch (column) {
+            .i16 => |values| .{ .float = filteredAvgI16(predicate, values) },
+            .i32 => |values| .{ .float = filteredAvgI32(predicate, values) },
+            .i64 => |values| .{ .float = filteredAvgI64(predicate, values) },
+            .date => error.UnsupportedGenericQuery,
+        },
+        .min => switch (column) {
+            .i16 => |values| .{ .int = filteredMinI16(predicate, values) },
+            .i32 => |values| .{ .int = filteredMinI32(predicate, values) },
+            .date => |values| .{ .date = filteredMinI32(predicate, values) },
+            .i64 => error.UnsupportedGenericQuery,
+        },
+        .max => switch (column) {
+            .i16 => |values| .{ .int = filteredMaxI16(predicate, values) },
+            .i32 => |values| .{ .int = filteredMaxI32(predicate, values) },
+            .date => |values| .{ .date = filteredMaxI32(predicate, values) },
             .i64 => error.UnsupportedGenericQuery,
         },
     };
