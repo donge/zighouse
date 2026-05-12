@@ -579,6 +579,27 @@ pub const Native = struct {
             .user_id_search_phrase_count_top => try formatUserIdSearchPhraseCountTopCached(self.allocator, try self.getUserIdEncoding(), try self.getSearchPhraseColumn()),
             .user_id_search_phrase_limit_no_order => try formatUserIdSearchPhraseLimitNoOrderCached(self.allocator, try self.getUserIdEncoding(), try self.getSearchPhraseColumn()),
             .user_id_minute_search_phrase_count_top => try formatUserIdMinuteSearchPhraseCountTopCached(self.allocator, self.io, self.data_dir, try self.getUserIdEncoding(), try self.getSearchPhraseColumn()),
+            .count_url_like_google => blk: {
+                const output = formatCountUrlLikeGoogleRowSidecar(self.allocator, self.io, self.data_dir) catch |err| switch (err) {
+                    error.FileNotFound => try formatCountUrlLikeGoogleCached(self.allocator, self.io, self.data_dir, try self.getUrlColumn(), try self.getUrlGoogleMatches()),
+                    else => return err,
+                };
+                break :blk output;
+            },
+            .search_phrase_min_url_google => blk: {
+                const output = formatSearchPhraseMinUrlGoogleSidecarLateMaterialize(self.allocator, self.io, self.data_dir, try self.getSearchPhraseColumn()) catch |err| switch (err) {
+                    error.FileNotFound => try formatSearchPhraseMinUrlGoogleCached(self.allocator, try self.getUrlColumn(), try self.getSearchPhraseColumn(), try self.getUrlGoogleMatches()),
+                    else => return err,
+                };
+                break :blk output;
+            },
+            .search_phrase_title_google_top => blk: {
+                const output = formatQ23RowSidecarLateMaterialize(self.allocator, self.io, self.data_dir, try self.getSearchPhraseColumn(), try self.getUserIdEncoding()) catch |err| switch (err) {
+                    error.FileNotFound => try formatQ23RowIndexCached(self.allocator, self.io, self.data_dir, try self.getUrlColumn(), try self.getTitleColumn(), try self.getSearchPhraseColumn(), try self.getUserIdEncoding(), try self.getTitleGoogleMatches(), try self.getUrlDotGoogleMatches()),
+                    else => return err,
+                };
+                break :blk output;
+            },
             else => null,
         };
     }
