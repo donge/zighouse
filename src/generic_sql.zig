@@ -33,6 +33,7 @@ pub const Plan = struct {
     order_by_count_desc: bool = false,
     order_by_alias: ?[]const u8 = null,
     limit: ?usize = null,
+    offset: ?usize = null,
 };
 
 pub fn parse(allocator: std.mem.Allocator, sql: []const u8) !?Plan {
@@ -49,7 +50,8 @@ pub fn parse(allocator: std.mem.Allocator, sql: []const u8) !?Plan {
     const group_by_pos = indexOfKeywordPair(after_from, "group", "by");
     const order_by_pos = indexOfKeywordPair(after_from, "order", "by");
     const limit_pos = indexOfKeyword(after_from, "limit");
-    const table_end = minOptionalPos(where_pos, minOptionalPos(group_by_pos, minOptionalPos(order_by_pos, limit_pos))) orelse after_from.len;
+    const offset_pos = indexOfKeyword(after_from, "offset");
+    const table_end = minOptionalPos(where_pos, minOptionalPos(group_by_pos, minOptionalPos(order_by_pos, minOptionalPos(limit_pos, offset_pos)))) orelse after_from.len;
     const table_text = std.mem.trim(u8, after_from[0..table_end], " \t\r\n");
     if (!asciiEqlIgnoreCase(table_text, "hits")) return null;
 
@@ -62,14 +64,14 @@ pub fn parse(allocator: std.mem.Allocator, sql: []const u8) !?Plan {
     if (projections.items.len == 0) return null;
 
     const where_text = if (where_pos) |pos| blk: {
-        const where_end = minOptionalPos(group_by_pos, minOptionalPos(order_by_pos, limit_pos)) orelse after_from.len;
+        const where_end = minOptionalPos(group_by_pos, minOptionalPos(order_by_pos, minOptionalPos(limit_pos, offset_pos))) orelse after_from.len;
         if (where_end <= pos) return null;
         break :blk std.mem.trim(u8, after_from[pos + "where".len .. where_end], " \t\r\n");
     } else null;
     const filter = if (where_text) |body| parseFilter(body) else null;
 
     const group_by = if (group_by_pos) |pos| blk: {
-        const group_by_end = minOptionalPos(order_by_pos, limit_pos) orelse after_from.len;
+        const group_by_end = minOptionalPos(order_by_pos, minOptionalPos(limit_pos, offset_pos)) orelse after_from.len;
         if (group_by_end <= pos) return null;
         const group_body = std.mem.trim(u8, after_from[pos + "group".len + "by".len + 1 .. group_by_end], " \t\r\n");
         if (group_body.len == 0) return null;
@@ -77,7 +79,7 @@ pub fn parse(allocator: std.mem.Allocator, sql: []const u8) !?Plan {
     } else null;
 
     const order_body = if (order_by_pos) |pos| blk: {
-        const order_end = limit_pos orelse after_from.len;
+        const order_end = minOptionalPos(limit_pos, offset_pos) orelse after_from.len;
         break :blk std.mem.trim(u8, after_from[pos + "order".len + "by".len + 1 .. order_end], " \t\r\n");
     } else null;
     const order_by_count_desc = if (order_body) |body| asciiEqlIgnoreCase(body, "COUNT(*) DESC") else false;
@@ -95,12 +97,25 @@ pub fn parse(allocator: std.mem.Allocator, sql: []const u8) !?Plan {
         return null;
     }
     const limit = if (limit_pos) |pos| blk: {
-        const limit_body = std.mem.trim(u8, after_from[pos + "limit".len ..], " \t\r\n");
+        const limit_end = offset_pos orelse after_from.len;
+        if (limit_end <= pos) return null;
+        const limit_body = std.mem.trim(u8, after_from[pos + "limit".len .. limit_end], " \t\r\n");
         if (limit_body.len == 0 or std.mem.indexOfAny(u8, limit_body, " \t\r\n") != null) {
             projections.deinit(allocator);
             return null;
         }
         break :blk std.fmt.parseInt(usize, limit_body, 10) catch {
+            projections.deinit(allocator);
+            return null;
+        };
+    } else null;
+    const offset = if (offset_pos) |pos| blk: {
+        const offset_body = std.mem.trim(u8, after_from[pos + "offset".len ..], " \t\r\n");
+        if (offset_body.len == 0 or std.mem.indexOfAny(u8, offset_body, " \t\r\n") != null) {
+            projections.deinit(allocator);
+            return null;
+        }
+        break :blk std.fmt.parseInt(usize, offset_body, 10) catch {
             projections.deinit(allocator);
             return null;
         };
@@ -120,6 +135,7 @@ pub fn parse(allocator: std.mem.Allocator, sql: []const u8) !?Plan {
         .order_by_count_desc = order_by_count_desc,
         .order_by_alias = order_by_alias,
         .limit = limit,
+        .offset = offset,
     };
 }
 
@@ -162,7 +178,8 @@ fn validDashboardStringTopShape(projections: []const Expr, where_text: ?[]const 
 
 fn dashboardWhere(where: []const u8) bool {
     return asciiEqlIgnoreCase(where, "CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND DontCountHits = 0 AND IsRefresh = 0 AND URL <> ''") or
-        asciiEqlIgnoreCase(where, "CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND DontCountHits = 0 AND IsRefresh = 0 AND Title <> ''");
+        asciiEqlIgnoreCase(where, "CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND DontCountHits = 0 AND IsRefresh = 0 AND Title <> ''") or
+        asciiEqlIgnoreCase(where, "CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND IsRefresh = 0 AND IsLink <> 0 AND IsDownload = 0");
 }
 
 fn validClientIpSubtractTopShape(projections: []const Expr, filter: ?Filter, group_by: []const u8) bool {
@@ -658,7 +675,17 @@ test "parses dashboard string top shapes" {
         try std.testing.expectEqualStrings(case.group_by, plan.group_by.?);
         try std.testing.expectEqualStrings("PageViews", plan.order_by_alias.?);
         try std.testing.expectEqual(@as(?usize, 10), plan.limit);
+        try std.testing.expectEqual(@as(?usize, null), plan.offset);
     }
+
+    const q39 = (try parse(std.testing.allocator, "SELECT URL, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND IsRefresh = 0 AND IsLink <> 0 AND IsDownload = 0 GROUP BY URL ORDER BY PageViews DESC LIMIT 10 OFFSET 1000")).?;
+    defer deinit(std.testing.allocator, q39);
+    try std.testing.expect(q39.filter == null);
+    try std.testing.expect(q39.where_text != null);
+    try std.testing.expectEqualStrings("URL", q39.group_by.?);
+    try std.testing.expectEqualStrings("PageViews", q39.order_by_alias.?);
+    try std.testing.expectEqual(@as(?usize, 10), q39.limit);
+    try std.testing.expectEqual(@as(?usize, 1000), q39.offset);
 }
 
 test "rejects unsupported order by" {

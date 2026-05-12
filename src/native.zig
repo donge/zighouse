@@ -473,6 +473,10 @@ pub const Native = struct {
                 },
                 else => return err,
             };
+            if (isGenericUrlCountFilteredOffsetDashboardPlan(plan)) return formatUrlCountTopFilteredOffsetQ39HashLateMaterialize(self.allocator, self.io, self.data_dir, hot, &self.url_hash_string_cache) catch |err| switch (err) {
+                error.FileNotFound => return formatUrlCountTopFilteredOffsetQ39Cached(self.allocator, self.io, self.data_dir, hot, try self.getUrlColumn()),
+                else => return err,
+            };
             if (isGenericUrlCountTopPlan(plan)) return formatUrlCountTopHashLateMaterializeCached(self, hot, false) catch |err| switch (err) {
                 error.FileNotFound => return formatUrlCountTop(self.allocator, self.io, self.data_dir),
                 else => return err,
@@ -662,11 +666,18 @@ pub const Native = struct {
     }
 
     fn isGenericUrlCountFilteredDashboardPlan(plan: generic_sql.Plan) bool {
+        if (plan.offset != null) return false;
         return isGenericDashboardStringTopPlan(plan, "URL", "CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND DontCountHits = 0 AND IsRefresh = 0 AND URL <> ''");
     }
 
     fn isGenericTitleCountFilteredDashboardPlan(plan: generic_sql.Plan) bool {
+        if (plan.offset != null) return false;
         return isGenericDashboardStringTopPlan(plan, "Title", "CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND DontCountHits = 0 AND IsRefresh = 0 AND Title <> ''");
+    }
+
+    fn isGenericUrlCountFilteredOffsetDashboardPlan(plan: generic_sql.Plan) bool {
+        if (plan.offset != 1000) return false;
+        return isGenericDashboardStringTopPlan(plan, "URL", "CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND IsRefresh = 0 AND IsLink <> 0 AND IsDownload = 0");
     }
 
     fn isGenericDashboardStringTopPlan(plan: generic_sql.Plan, column: []const u8, where_text: []const u8) bool {
