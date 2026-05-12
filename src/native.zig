@@ -5626,6 +5626,14 @@ fn filteredMaxI32(predicate: []const i16, values: []const i32) i32 {
     return simd.filteredMinMaxI32NonZero(predicate, values).max;
 }
 
+fn filteredMinI64(predicate: []const i16, values: []const i64) i64 {
+    return simd.filteredMinMaxI64NonZero(predicate, values).min;
+}
+
+fn filteredMaxI64(predicate: []const i16, values: []const i64) i64 {
+    return simd.filteredMinMaxI64NonZero(predicate, values).max;
+}
+
 fn genericAvgI64(values: []const i64) f64 {
     if (values.len == 0) return 0;
     var sum: i128 = 0;
@@ -5724,13 +5732,13 @@ fn executeGenericProjection(expr: generic_sql.Expr, hot: *const HotColumns) !Gen
             .i16 => |values| .{ .int = minI16(values) },
             .i32 => |values| .{ .int = minI32(values) },
             .date => |values| .{ .date = minI32(values) },
-            .i64 => error.UnsupportedGenericQuery,
+            .i64 => |values| .{ .int = minI64(values) },
         },
         .max => switch (column) {
             .i16 => |values| .{ .int = maxI16(values) },
             .i32 => |values| .{ .int = maxI32(values) },
             .date => |values| .{ .date = maxI32(values) },
-            .i64 => error.UnsupportedGenericQuery,
+            .i64 => |values| .{ .int = maxI64(values) },
         },
     };
 }
@@ -5755,13 +5763,13 @@ fn executeGenericFilteredProjection(expr: generic_sql.Expr, hot: *const HotColum
             .i16 => |values| .{ .int = filteredMinI16(predicate, values) },
             .i32 => |values| .{ .int = filteredMinI32(predicate, values) },
             .date => |values| .{ .date = filteredMinI32(predicate, values) },
-            .i64 => error.UnsupportedGenericQuery,
+            .i64 => |values| .{ .int = filteredMinI64(predicate, values) },
         },
         .max => switch (column) {
             .i16 => |values| .{ .int = filteredMaxI16(predicate, values) },
             .i32 => |values| .{ .int = filteredMaxI32(predicate, values) },
             .date => |values| .{ .date = filteredMaxI32(predicate, values) },
-            .i64 => error.UnsupportedGenericQuery,
+            .i64 => |values| .{ .int = filteredMaxI64(predicate, values) },
         },
     };
 }
@@ -5870,19 +5878,23 @@ fn minI32(values: []const i32) i32 {
 }
 
 fn minI16(values: []const i16) i16 {
-    var min_value: i16 = std.math.maxInt(i16);
-    for (values) |value| min_value = @min(min_value, value);
-    return min_value;
+    return simd.minMaxI16(values).min;
 }
 
 fn maxI32(values: []const i32) i32 {
     return simd.maxI32(values);
 }
 
+fn minI64(values: []const i64) i64 {
+    return simd.minMaxI64(values).min;
+}
+
+fn maxI64(values: []const i64) i64 {
+    return simd.minMaxI64(values).max;
+}
+
 fn maxI16(values: []const i16) i16 {
-    var max_value: i16 = std.math.minInt(i16);
-    for (values) |value| max_value = @max(max_value, value);
-    return max_value;
+    return simd.minMaxI16(values).max;
 }
 
 fn formatOneInt(allocator: std.mem.Allocator, header: []const u8, value: u64) ![]u8 {

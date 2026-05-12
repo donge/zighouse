@@ -80,6 +80,10 @@ pub fn filteredMinMaxI32NonZero(predicate: []const i16, values: []const i32) Min
     return filteredMinMaxNonZero(i32, predicate, values);
 }
 
+pub fn filteredMinMaxI64NonZero(predicate: []const i16, values: []const i64) MinMax(i64) {
+    return filteredMinMaxNonZero(i64, predicate, values);
+}
+
 fn filteredMinMaxNonZero(comptime T: type, predicate: []const i16, values: []const T) MinMax(T) {
     const lanes = lanesFor(T);
     const VP = @Vector(lanes, i16);
@@ -128,40 +132,32 @@ fn sumAccumulator(comptime T: type) type {
 }
 
 pub fn minI32(values: []const i32) i32 {
-    const lanes = 16;
-    const V = @Vector(lanes, i32);
-    var acc: V = @splat(std.math.maxInt(i32));
-    var i: usize = 0;
-    while (i + lanes <= values.len) : (i += lanes) {
-        const v: V = values[i..][0..lanes].*;
-        acc = @min(acc, v);
-    }
-    var result = @reduce(.Min, acc);
-    while (i < values.len) : (i += 1) result = @min(result, values[i]);
-    return result;
+    return minMax(i32, values).min;
 }
 
 pub fn maxI32(values: []const i32) i32 {
-    const lanes = 16;
-    const V = @Vector(lanes, i32);
-    var acc: V = @splat(std.math.minInt(i32));
-    var i: usize = 0;
-    while (i + lanes <= values.len) : (i += lanes) {
-        const v: V = values[i..][0..lanes].*;
-        acc = @max(acc, v);
-    }
-    var result = @reduce(.Max, acc);
-    while (i < values.len) : (i += 1) result = @max(result, values[i]);
-    return result;
+    return minMax(i32, values).max;
 }
 
 /// Fused single-pass min and max over the same column. ~8x scalar; ~2x
 /// vs running minI32 then maxI32 thanks to a single memory traversal.
-pub fn minMaxI32(values: []const i32) struct { min: i32, max: i32 } {
-    const lanes = 16;
-    const V = @Vector(lanes, i32);
-    var lo_acc: V = @splat(std.math.maxInt(i32));
-    var hi_acc: V = @splat(std.math.minInt(i32));
+pub fn minMaxI32(values: []const i32) MinMax(i32) {
+    return minMax(i32, values);
+}
+
+pub fn minMaxI16(values: []const i16) MinMax(i16) {
+    return minMax(i16, values);
+}
+
+pub fn minMaxI64(values: []const i64) MinMax(i64) {
+    return minMax(i64, values);
+}
+
+fn minMax(comptime T: type, values: []const T) MinMax(T) {
+    const lanes = lanesFor(T);
+    const V = @Vector(lanes, T);
+    var lo_acc: V = @splat(std.math.maxInt(T));
+    var hi_acc: V = @splat(std.math.minInt(T));
     var i: usize = 0;
     while (i + lanes <= values.len) : (i += lanes) {
         const v: V = values[i..][0..lanes].*;
@@ -297,19 +293,47 @@ test "filteredMinMaxI32NonZero matches scalar" {
     try std.testing.expectEqual(hi, got.max);
 }
 
-test "minMaxI32 matches scalar" {
-    var data: [123]i32 = undefined;
-    var rng = std.Random.DefaultPrng.init(31);
-    for (&data) |*v| v.* = rng.random().intRangeLessThan(i32, -100000, 100000);
-    var lo: i32 = std.math.maxInt(i32);
-    var hi: i32 = std.math.minInt(i32);
+test "filteredMinMaxI64NonZero matches scalar" {
+    var pred: [257]i16 = undefined;
+    var data: [257]i64 = undefined;
+    var rng = std.Random.DefaultPrng.init(53);
+    var lo: i64 = std.math.maxInt(i64);
+    var hi: i64 = std.math.minInt(i64);
+    for (&pred, &data, 0..) |*p, *v, i| {
+        p.* = if (i == 0 or rng.random().boolean()) 1 else 0;
+        v.* = rng.random().intRangeLessThan(i64, -1000000000000, 1000000000000);
+        if (p.* != 0) {
+            lo = @min(lo, v.*);
+            hi = @max(hi, v.*);
+        }
+    }
+    const got = filteredMinMaxI64NonZero(&pred, &data);
+    try std.testing.expectEqual(lo, got.min);
+    try std.testing.expectEqual(hi, got.max);
+}
+
+fn expectMinMax(comptime T: type, data: []const T, got: MinMax(T)) !void {
+    var lo: T = std.math.maxInt(T);
+    var hi: T = std.math.minInt(T);
     for (data) |v| {
         if (v < lo) lo = v;
         if (v > hi) hi = v;
     }
-    const got = minMaxI32(&data);
     try std.testing.expectEqual(lo, got.min);
     try std.testing.expectEqual(hi, got.max);
+}
+
+test "minMax wrappers match scalar" {
+    var i16_data: [123]i16 = undefined;
+    var i32_data: [123]i32 = undefined;
+    var i64_data: [123]i64 = undefined;
+    var rng = std.Random.DefaultPrng.init(31);
+    for (&i16_data) |*v| v.* = rng.random().intRangeLessThan(i16, -1000, 1000);
+    for (&i32_data) |*v| v.* = rng.random().intRangeLessThan(i32, -100000, 100000);
+    for (&i64_data) |*v| v.* = rng.random().intRangeLessThan(i64, -1000000000000, 1000000000000);
+    try expectMinMax(i16, &i16_data, minMaxI16(&i16_data));
+    try expectMinMax(i32, &i32_data, minMaxI32(&i32_data));
+    try expectMinMax(i64, &i64_data, minMaxI64(&i64_data));
 }
 
 test "countEqI64 matches scalar" {
