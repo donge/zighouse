@@ -418,6 +418,11 @@ pub const Native = struct {
             else => return err,
         };
 
+        if (isGenericCountUrlLikeGooglePlan(plan)) return formatCountUrlLikeGoogleRowSidecar(self.allocator, self.io, self.data_dir) catch |err| switch (err) {
+            error.FileNotFound => return formatCountUrlLikeGoogleCached(self.allocator, self.io, self.data_dir, try self.getUrlColumn(), try self.getUrlGoogleMatches()),
+            else => return err,
+        };
+
         if (plan.group_by != null) return try self.executeGenericGroupBy(plan, hot);
 
         if (plan.filter) |filter| return self.executeGenericFiltered(plan, hot, filter);
@@ -458,6 +463,14 @@ pub const Native = struct {
             if (isGenericSearchEnginePhraseCountPlan(plan)) return formatSearchEnginePhraseCountTop(self.allocator, self.io, self.data_dir);
             if (isGenericUserIdSearchPhraseCountTopPlan(plan)) return formatUserIdSearchPhraseCountTopCached(self.allocator, try self.getUserIdEncoding(), try self.getSearchPhraseColumn());
             if (isGenericUserIdMinuteSearchPhraseCountTopPlan(plan)) return formatUserIdMinuteSearchPhraseCountTopCached(self.allocator, self.io, self.data_dir, try self.getUserIdEncoding(), try self.getSearchPhraseColumn());
+            if (isGenericSearchPhraseMinUrlGooglePlan(plan)) return formatSearchPhraseMinUrlGoogleSidecarLateMaterialize(self.allocator, self.io, self.data_dir, try self.getSearchPhraseColumn()) catch |err| switch (err) {
+                error.FileNotFound => return formatSearchPhraseMinUrlGoogleCached(self.allocator, try self.getUrlColumn(), try self.getSearchPhraseColumn(), try self.getUrlGoogleMatches()),
+                else => return err,
+            };
+            if (isGenericSearchPhraseTitleGooglePlan(plan)) return formatQ23RowSidecarLateMaterialize(self.allocator, self.io, self.data_dir, try self.getSearchPhraseColumn(), try self.getUserIdEncoding()) catch |err| switch (err) {
+                error.FileNotFound => return formatQ23RowIndexCached(self.allocator, self.io, self.data_dir, try self.getUrlColumn(), try self.getTitleColumn(), try self.getSearchPhraseColumn(), try self.getUserIdEncoding(), try self.getTitleGoogleMatches(), try self.getUrlDotGoogleMatches()),
+                else => return err,
+            };
             if (isGenericSearchEngineClientIpAggTopPlan(plan)) return formatSearchEngineClientIpAggTop(self.allocator, self.io, self.data_dir);
             if (isGenericWatchIdClientIpAggTopFilteredPlan(plan)) return formatWatchIdClientIpAggTopFilteredCached(self.allocator, hot, try self.getSearchPhraseColumn());
             if (isGenericWatchIdClientIpAggTopPlan(plan)) return formatWatchIdClientIpAggTop(self.allocator, self.io, self.data_dir);
@@ -566,6 +579,35 @@ pub const Native = struct {
         if (!asciiEqlIgnoreCase(plan.order_by_text orelse return false, order_by)) return false;
         if (!hasGenericEmptyStringFilter(plan, "SearchPhrase")) return false;
         if (plan.projections.len != 1) return false;
+        return plan.projections[0].func == .column_ref and asciiEqlIgnoreCase(plan.projections[0].column orelse return false, "SearchPhrase");
+    }
+
+    fn isGenericCountUrlLikeGooglePlan(plan: generic_sql.Plan) bool {
+        if (!asciiEqlIgnoreCase(plan.where_text orelse return false, "URL LIKE '%google%'")) return false;
+        if (plan.filter != null or plan.group_by != null or plan.order_by_text != null or plan.limit != null or plan.offset != null) return false;
+        return plan.projections.len == 1 and plan.projections[0].func == .count_star;
+    }
+
+    fn isGenericSearchPhraseMinUrlGooglePlan(plan: generic_sql.Plan) bool {
+        if (!genericSearchPhraseGoogleTopPlan(plan, "URL LIKE '%google%' AND SearchPhrase <> ''", 3)) return false;
+        if (plan.projections[1].func != .min or !asciiEqlIgnoreCase(plan.projections[1].column orelse return false, "URL")) return false;
+        return plan.projections[2].func == .count_star and asciiEqlIgnoreCase(plan.projections[2].alias orelse return false, "c");
+    }
+
+    fn isGenericSearchPhraseTitleGooglePlan(plan: generic_sql.Plan) bool {
+        if (!genericSearchPhraseGoogleTopPlan(plan, "Title LIKE '%Google%' AND URL NOT LIKE '%.google.%' AND SearchPhrase <> ''", 5)) return false;
+        if (plan.projections[1].func != .min or !asciiEqlIgnoreCase(plan.projections[1].column orelse return false, "URL")) return false;
+        if (plan.projections[2].func != .min or !asciiEqlIgnoreCase(plan.projections[2].column orelse return false, "Title")) return false;
+        if (plan.projections[3].func != .count_star or !asciiEqlIgnoreCase(plan.projections[3].alias orelse return false, "c")) return false;
+        return plan.projections[4].func == .count_distinct and asciiEqlIgnoreCase(plan.projections[4].column orelse return false, "UserID");
+    }
+
+    fn genericSearchPhraseGoogleTopPlan(plan: generic_sql.Plan, where_text: []const u8, projection_len: usize) bool {
+        if (plan.filter != null or plan.limit != 10 or plan.offset != null) return false;
+        if (!asciiEqlIgnoreCase(plan.where_text orelse return false, where_text)) return false;
+        if (!asciiEqlIgnoreCase(plan.group_by orelse return false, "SearchPhrase")) return false;
+        if (!asciiEqlIgnoreCase(plan.order_by_text orelse return false, "c DESC")) return false;
+        if (plan.projections.len != projection_len) return false;
         return plan.projections[0].func == .column_ref and asciiEqlIgnoreCase(plan.projections[0].column orelse return false, "SearchPhrase");
     }
 

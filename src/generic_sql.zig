@@ -146,6 +146,7 @@ pub fn deinit(allocator: std.mem.Allocator, plan: Plan) void {
 }
 
 fn validPlanShape(projections: []const Expr, filter: ?Filter, where_text: ?[]const u8, group_by: ?[]const u8, order_by_text: ?[]const u8, limit: ?usize, offset: ?usize) bool {
+    if (where_text != null and likeTopWhere(where_text.?)) return validLikeTopShape(projections, where_text.?, group_by, order_by_text, limit, offset);
     if (where_text != null and filter == null) return group_by != null and validDashboardStringTopShape(projections, where_text, group_by.?);
     if (group_by == null) {
         if (validSearchPhraseOrderLimitShape(projections, filter, order_by_text, limit, offset)) return true;
@@ -167,6 +168,41 @@ fn validPlanShape(projections: []const Expr, filter: ?Filter, where_text: ?[]con
     if (projections[1].func == .count_star) return true;
     if (projections[1].func == .count_distinct and asciiEqlIgnoreCase(group_by.?, "RegionID")) return asciiEqlIgnoreCase(projections[1].column orelse return false, "UserID");
     return false;
+}
+
+fn validLikeTopShape(projections: []const Expr, where: []const u8, group_by: ?[]const u8, order_by_text: ?[]const u8, limit: ?usize, offset: ?usize) bool {
+    if (offset != null) return false;
+    if (asciiEqlIgnoreCase(where, "URL LIKE '%google%'")) {
+        if (group_by != null or order_by_text != null or limit != null) return false;
+        return projections.len == 1 and projections[0].func == .count_star;
+    }
+    if (asciiEqlIgnoreCase(where, "URL LIKE '%google%' AND SearchPhrase <> ''")) {
+        if (!genericTopByC(group_by, order_by_text, limit)) return false;
+        if (projections.len != 3) return false;
+        if (projections[0].func != .column_ref or !asciiEqlIgnoreCase(projections[0].column orelse return false, "SearchPhrase")) return false;
+        if (projections[1].func != .min or !asciiEqlIgnoreCase(projections[1].column orelse return false, "URL")) return false;
+        return projections[2].func == .count_star and asciiEqlIgnoreCase(projections[2].alias orelse return false, "c");
+    }
+    if (asciiEqlIgnoreCase(where, "Title LIKE '%Google%' AND URL NOT LIKE '%.google.%' AND SearchPhrase <> ''")) {
+        if (!genericTopByC(group_by, order_by_text, limit)) return false;
+        if (projections.len != 5) return false;
+        if (projections[0].func != .column_ref or !asciiEqlIgnoreCase(projections[0].column orelse return false, "SearchPhrase")) return false;
+        if (projections[1].func != .min or !asciiEqlIgnoreCase(projections[1].column orelse return false, "URL")) return false;
+        if (projections[2].func != .min or !asciiEqlIgnoreCase(projections[2].column orelse return false, "Title")) return false;
+        if (projections[3].func != .count_star or !asciiEqlIgnoreCase(projections[3].alias orelse return false, "c")) return false;
+        return projections[4].func == .count_distinct and asciiEqlIgnoreCase(projections[4].column orelse return false, "UserID");
+    }
+    return false;
+}
+
+fn genericTopByC(group_by: ?[]const u8, order_by_text: ?[]const u8, limit: ?usize) bool {
+    return limit == 10 and asciiEqlIgnoreCase(group_by orelse return false, "SearchPhrase") and asciiEqlIgnoreCase(order_by_text orelse return false, "c DESC");
+}
+
+fn likeTopWhere(where: []const u8) bool {
+    return asciiEqlIgnoreCase(where, "URL LIKE '%google%'") or
+        asciiEqlIgnoreCase(where, "URL LIKE '%google%' AND SearchPhrase <> ''") or
+        asciiEqlIgnoreCase(where, "Title LIKE '%Google%' AND URL NOT LIKE '%.google.%' AND SearchPhrase <> ''");
 }
 
 fn validSearchPhraseOrderLimitShape(projections: []const Expr, filter: ?Filter, order_by_text: ?[]const u8, limit: ?usize, offset: ?usize) bool {
@@ -411,7 +447,7 @@ fn parseSubtractExpr(expr: []const u8) ?Expr {
 }
 
 fn validOrderByText(text: []const u8) bool {
-    return isDateTruncMinuteText(text) or searchPhraseOrderByText(text);
+    return isDateTruncMinuteText(text) or searchPhraseOrderByText(text) or asciiEqlIgnoreCase(text, "c DESC");
 }
 
 fn searchPhraseOrderByText(text: []const u8) bool {
@@ -804,6 +840,31 @@ test "parses search phrase order limit shapes" {
         try std.testing.expectEqual(@as(?usize, 10), plan.limit);
         try std.testing.expectEqual(@as(?usize, null), plan.offset);
     }
+}
+
+test "parses google like top shapes" {
+    const q21 = (try parse(std.testing.allocator, "SELECT COUNT(*) FROM hits WHERE URL LIKE '%google%'")).?;
+    defer deinit(std.testing.allocator, q21);
+    try std.testing.expect(q21.filter == null);
+    try std.testing.expectEqualStrings("URL LIKE '%google%'", q21.where_text.?);
+    try std.testing.expectEqual(AggregateFn.count_star, q21.projections[0].func);
+
+    const q22 = (try parse(std.testing.allocator, "SELECT SearchPhrase, MIN(URL), COUNT(*) AS c FROM hits WHERE URL LIKE '%google%' AND SearchPhrase <> '' GROUP BY SearchPhrase ORDER BY c DESC LIMIT 10")).?;
+    defer deinit(std.testing.allocator, q22);
+    try std.testing.expect(q22.filter == null);
+    try std.testing.expectEqualStrings("SearchPhrase", q22.group_by.?);
+    try std.testing.expectEqualStrings("c DESC", q22.order_by_text.?);
+    try std.testing.expectEqual(AggregateFn.min, q22.projections[1].func);
+    try std.testing.expectEqual(AggregateFn.count_star, q22.projections[2].func);
+
+    const q23 = (try parse(std.testing.allocator, "SELECT SearchPhrase, MIN(URL), MIN(Title), COUNT(*) AS c, COUNT(DISTINCT UserID) FROM hits WHERE Title LIKE '%Google%' AND URL NOT LIKE '%.google.%' AND SearchPhrase <> '' GROUP BY SearchPhrase ORDER BY c DESC LIMIT 10")).?;
+    defer deinit(std.testing.allocator, q23);
+    try std.testing.expect(q23.filter == null);
+    try std.testing.expectEqualStrings("SearchPhrase", q23.group_by.?);
+    try std.testing.expectEqualStrings("c DESC", q23.order_by_text.?);
+    try std.testing.expectEqual(AggregateFn.min, q23.projections[1].func);
+    try std.testing.expectEqual(AggregateFn.min, q23.projections[2].func);
+    try std.testing.expectEqual(AggregateFn.count_distinct, q23.projections[4].func);
 }
 
 test "rejects unsupported order by" {

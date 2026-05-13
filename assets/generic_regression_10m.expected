@@ -150,6 +150,30 @@ UserID,m,SearchPhrase,count_star()
 268830234957867635,36,,75
 5568739309955161395,56,,74
 5216851095034646002,52,,67
+count_star()
+646
+SearchPhrase,min(URL),c
+один инструктура птахани нюши смотреть краси,"http://bdsm_position/2624217,2013-07-01:2013/frl-4/transport.ru/google%2F",2
+строитель верси джейкоциты вычета,http://ru.tv/smsarhiv/num-9/nf-3/csrf-39818/googleBR,2
+комбактерина кабачки в крополь интерном сад тюмень,http://samara.irr.ru/catalog_googleTBR%26ad%3D278885%26bt%3D430001216,2
+как миксетин инструкция общая,http://samara.irr.ru/catalog_googleMBR%26ad%3D90%26pz,2
+зачать онлайн бесплатно,http://tienskaia-moda-brietielkakh-2%2F%2Fwww.google-poyasnuha-petersburg/detail.aspx?sort=newly&trafkey,2
+работа,"http://tienskaia-moda-brilsya-spietsk/googlebsk.biznet.ru/она в кобры 2013&marka",1
+пансии,http://samara.irr.ru/catalog_googleMBR%26ad%3D90%26pz,1
+могилы убилобалонефронтейнер,http://samara.irr.ru/catalog_googleMBR%26ad%3D90%26pz,1
+модекс улицензинова говядина,http://samara.irr.ru/catalog_google-chernyj-9235666657/?date,1
+рио на карточница смотреть онлайн,http://samara.irr.ru/catalog_googleMBR%26ad%3D90%26pz,1
+SearchPhrase,min(URL),min(Title),c,count(DISTINCT UserID)
+"коптимиквиды юриста с роуз рая",https://produkty%2Fpulove.ru/booklyattion-war-sinij-9182/women,"Легко на участные участников., Цены - Стильная парнем. Саганрог догадения : Турции, купить у 10 дне кольные машинки не представки - Новая с избиение спродажа: котята 2014 г.в. Цена: 47500-10ECO060 – -------- купить квартиру Оренбург (России Galantrax Flamiliada Google, Nо 18 фотоконверк Супер Кардиган",45,12
+"ведомосквы вместу",http://mysw.info/newsru.ru/compatible,"Convent-менеджер с Google Players 1.3 кв. м.- Продажа: лет - купить Bisbal Systеms Aparty*",18,12
+"коптимиквиды юрий жд ворожные моем",https://produkty%2Fpulove.ru/booklyattion-war-sinij-9182/women,"Легко на участные участников., Цены - Стильная парнем. Саганрог догадения : Турции, купить у 10 дне кольные машинки не представки - Новая с избиение спродажа: котята 2014 г.в. Цена: 47500-10ECO060 – -------- купить квартиру Оренбург (России Galantrax Flamiliada Google, Nо 18 фотоконверк Супер Кардиган",16,6
+"заделать магнездо",http://auto.ria.ua/search/ab_district=1&cid=577&action&op,"AUTO.ria.ua: продажа | Востов-на-Дону, чашечка Google Cayennection Polo | б.у. и новых. Автопоиска и купить в Омск - IRR.ru - Роддово, ул. Гибочной день цене",13,13
+"вспомидоры,отека обучение стека",https://produkty%2Fpulove.ru/booklyattion-war-sinij-9182/women,"Легко на участные участников., Цены - Стильная парнем. Саганрог догадения : Турции, купить у 10 дне кольные машинки не представки - Новая с избиение спродажа: котята 2014 г.в. Цена: 47500-10ECO060 – -------- купить квартиру Оренбург (России Galantrax Flamiliada Google, Nо 18 фотоконверк Супер Кардиган",10,1
+"авторы для jimm f/4-5.6 dc union arkham текст",http://nn.jobinmoscow.ru/real-estate/rent/Srochnoe-planet.ru/audio.ru/news/animals-platia%2F537,"Google Papa Rapalace Rescu - модной тканика Ассортименте",9,9
+"ведомосквиталия страции",https://produkty%2Fpulove.ru/booklyattion-war-sinij-9182/women,"Легко на участные участников., Цены - Стильная парнем. Саганрог догадения : Турции, купить у 10 дне кольные машинки не представки - Новая с избиение спродажа: котята 2014 г.в. Цена: 47500-10ECO060 – -------- купить квартиру Оренбург (России Galantrax Flamiliada Google, Nо 18 фотоконверк Супер Кардиган",8,3
+"коптимизаностиницы","https://produkty%2Fpulove.ru/booklyattion-war-sinij-9404194,962453/foto-904263/fotokonkurs","Легко на участные участников., Цены - Стильная парнем. Саганрог догадения : Турции, купить у 10 дне кольные машинки не представки - Новая с избиение спродажа: котята 2014 г.в. Цена: 47500-10ECO060 – -------- купить квартиру Оренбург (России Galantrax Flamiliada Google, Nо 18 фотоконверк Супер Кардиган",8,2
+"вспышки нижний эльдар",http://mysw.info/newsru.ru/compatible,"Convent-менеджер с Google Players 1.3 кв. м.- Продажа: лет - купить Bisbal Systеms Aparty*",8,6
+"создать+новосибируюсь песни летние",http://auto.ria.ua/search/ab_district=1&cid=577&action&op,"AUTO.ria.ua: продажа | Востов-на-Дону, чашечка Google Cayennection Polo | б.у. и новых. Автопоиска и купить в Омск - IRR.ru - Роддово, ул. Гибочной день цене",8,1
 SearchEngineID,ClientIP,c,sum(IsRefresh),avg(ResolutionWidth)
 2,-927025522,190,32,1616.0473684210526
 2,-19034471,182,30,1756.8516483516485
