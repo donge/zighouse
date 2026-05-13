@@ -17,7 +17,8 @@ pub const Fallback = union(enum) {
 pub const ClientIpAggTop = enum { search_engine_filtered, watch_id_unfiltered };
 pub const Dashboard = enum { url_filtered, title_filtered, url_filtered_offset, url_hash_date, window_size, time_bucket };
 pub const DistinctTop = enum { region_user, region_stats_user, mobile_phone_model_user, mobile_phone_user, search_phrase_user };
-pub const PhraseCountTop = enum { search_phrase, search_engine_phrase };
+pub const PhraseCountTop = union(enum) { lowcard_text: LowCardTextCountTop, search_engine_phrase };
+pub const LowCardTextCountTop = struct { column: []const u8, count_label: []const u8, limit: usize };
 pub const SearchPhraseOrder = enum { event_time, event_time_phrase, phrase };
 pub const UserPhraseTop = enum { count_ordered, limit_unordered, minute_count_ordered };
 
@@ -54,7 +55,7 @@ fn matchDistinctTop(plan: generic_sql.Plan) ?Fallback {
 }
 
 fn matchPhraseCountTop(plan: generic_sql.Plan) ?Fallback {
-    if (searchPhraseCountPlan(plan)) return .{ .phrase_count_top = .search_phrase };
+    if (lowCardTextCountTopPlan(plan)) |shape| return .{ .phrase_count_top = .{ .lowcard_text = shape } };
     if (searchEnginePhraseCountPlan(plan)) return .{ .phrase_count_top = .search_engine_phrase };
     return null;
 }
@@ -120,12 +121,13 @@ fn mobilePhoneDistinctPlan(plan: generic_sql.Plan) bool {
     return plan.projections[2].func == .count_distinct and asciiEqlIgnoreCase(plan.projections[2].column orelse return false, "UserID");
 }
 
-fn searchPhraseCountPlan(plan: generic_sql.Plan) bool {
-    if (plan.limit != 10 or !hasEmptyStringFilter(plan, "SearchPhrase") or !orderByAlias(plan, "c")) return false;
-    if (!asciiEqlIgnoreCase(plan.group_by orelse return false, "SearchPhrase")) return false;
-    if (plan.projections.len != 2) return false;
-    if (plan.projections[0].func != .column_ref or !asciiEqlIgnoreCase(plan.projections[0].column orelse return false, "SearchPhrase")) return false;
-    return plan.projections[1].func == .count_star;
+fn lowCardTextCountTopPlan(plan: generic_sql.Plan) ?LowCardTextCountTop {
+    if (plan.limit != 10 or !hasEmptyStringFilter(plan, "SearchPhrase") or !orderByAlias(plan, "c")) return null;
+    if (!asciiEqlIgnoreCase(plan.group_by orelse return null, "SearchPhrase")) return null;
+    if (plan.projections.len != 2) return null;
+    if (plan.projections[0].func != .column_ref or !asciiEqlIgnoreCase(plan.projections[0].column orelse return null, "SearchPhrase")) return null;
+    if (plan.projections[1].func != .count_star) return null;
+    return .{ .column = plan.projections[0].column.?, .count_label = plan.projections[1].alias orelse "count_star()", .limit = plan.limit.? };
 }
 
 fn searchPhraseDistinctPlan(plan: generic_sql.Plan) bool {

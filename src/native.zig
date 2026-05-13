@@ -529,9 +529,9 @@ pub const Native = struct {
                 .search_phrase_user => return formatSearchPhraseDistinctUserIdTop(self.allocator, self.io, self.data_dir),
             },
             .phrase_count_top => |shape| switch (shape) {
-                .search_phrase => {
-                    const binding = try self.bindLowCardTextColumn("SearchPhrase");
-                    return native_string_top.formatLowCardTextCountTop(self.allocator, binding.name, "c", binding.column, 10);
+                .lowcard_text => |top| {
+                    const binding = try self.bindLowCardTextColumn(top.column);
+                    return native_string_top.formatLowCardTextCountTop(self.allocator, binding.name, top.count_label, binding.column, top.limit);
                 },
                 .search_engine_phrase => return formatSearchEnginePhraseCountTop(self.allocator, self.io, self.data_dir),
             },
