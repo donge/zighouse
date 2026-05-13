@@ -285,7 +285,9 @@ pub const Native = struct {
             },
             .search_phrase_distinct_user_id_top => {
                 if (!self.experimental) return error.UnsupportedNativeQuery;
-                return formatSearchPhraseDistinctUserIdTop(self.allocator, self.io, self.data_dir);
+                const bound = try self.bindColumn("SearchPhrase");
+                const uid = try self.getUserIdEncoding();
+                return native_string_top.formatLowCardTextDistinctTop(self.allocator, bound.lowcard_text.name, "u", bound.lowcard_text.column, bound.lowcard_text.empty_id, uid.ids.values, uid.dict.values.len, 10, 64);
             },
             .search_engine_phrase_count_top => {
                 if (!self.experimental) return error.UnsupportedNativeQuery;
@@ -534,7 +536,11 @@ pub const Native = struct {
                 .region_stats_user => return formatRegionStatsDistinctUserIdTop(self.allocator, self.io, self.data_dir),
                 .mobile_phone_model_user => return formatMobilePhoneModelDistinctUserIdTop(self.allocator, self.io, self.data_dir),
                 .mobile_phone_user => return formatMobilePhoneDistinctUserIdTop(self.allocator, self.io, self.data_dir),
-                .search_phrase_user => return formatSearchPhraseDistinctUserIdTop(self.allocator, self.io, self.data_dir),
+                .search_phrase_user => {
+                    const bound = try self.bindColumn("SearchPhrase");
+                    const uid = try self.getUserIdEncoding();
+                    return native_string_top.formatLowCardTextDistinctTop(self.allocator, bound.lowcard_text.name, "u", bound.lowcard_text.column, bound.lowcard_text.empty_id, uid.ids.values, uid.dict.values.len, 10, 64);
+                },
             },
             .phrase_count_top => |shape| switch (shape) {
                 .lowcard_text => |top| {
@@ -635,7 +641,11 @@ pub const Native = struct {
                 const bound = try self.bindColumn("SearchPhrase");
                 break :blk try native_string_top.formatLowCardTextCountTop(self.allocator, bound.lowcard_text.name, "c", bound.lowcard_text.column, 10);
             },
-            .search_phrase_distinct_user_id_top => try formatSearchPhraseDistinctUserIdTop(self.allocator, self.io, self.data_dir),
+            .search_phrase_distinct_user_id_top => blk: {
+                const bound = try self.bindColumn("SearchPhrase");
+                const uid = try self.getUserIdEncoding();
+                break :blk try native_string_top.formatLowCardTextDistinctTop(self.allocator, bound.lowcard_text.name, "u", bound.lowcard_text.column, bound.lowcard_text.empty_id, uid.ids.values, uid.dict.values.len, 10, 64);
+            },
             .search_engine_phrase_count_top => try formatSearchEnginePhraseCountTop(self.allocator, self.io, self.data_dir),
             .user_id_search_phrase_count_top => try formatUserIdSearchPhraseCountTopCached(self.allocator, try self.getUserIdEncoding(), try self.getSearchPhraseColumn()),
             .user_id_search_phrase_limit_no_order => try formatUserIdSearchPhraseLimitNoOrderCached(self.allocator, try self.getUserIdEncoding(), try self.getSearchPhraseColumn()),
@@ -7079,140 +7089,6 @@ fn formatSearchPhraseDistinctCountCached(allocator: std.mem.Allocator, phrases: 
         }
     }
     return native_reduce.formatOneInt(allocator, "count(DISTINCT SearchPhrase)", distinct);
-}
-
-fn formatSearchPhraseDistinctUserIdTop(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8) ![]u8 {
-    // Two-pass top-N candidates strategy:
-    //   Pass 1: dense counts[phrase_id]++ over hot_SearchPhrase.id.
-    //   Select top-N candidates by raw row count (excluding phrase_id 0 = empty).
-    //   Pass 2: scan SearchPhrase.id + UserID.id in lockstep; for each row whose
-    //   phrase is a candidate, set bit (uid_id) in that candidate's bitset.
-    //   Then popcount each bitset for distinct-user count, top-10 by distinct.
-    //
-    // Correctness assumption: top-10-by-distinct-UserID phrases are within
-    // top-N-by-row-count, since distinct <= count. Choose N=64 for safety.
-    const n_candidates: usize = 64;
-
-    const phrase_id_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_search_phrase_id_name);
-    defer allocator.free(phrase_id_path);
-    const offsets_path = try storage.hotColumnPath(allocator, data_dir, storage.search_phrase_id_offsets_name);
-    defer allocator.free(offsets_path);
-    const phrases_path = try storage.hotColumnPath(allocator, data_dir, storage.search_phrase_id_phrases_name);
-    defer allocator.free(phrases_path);
-    const uid_id_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_user_id_id_name);
-    defer allocator.free(uid_id_path);
-    const uid_dict_path = try storage.hotColumnPath(allocator, data_dir, storage.user_id_dict_name);
-    defer allocator.free(uid_dict_path);
-
-    const phrase_ids = try io_map.mapColumn(u32, io, phrase_id_path);
-    defer phrase_ids.mapping.unmap();
-    const offsets = try io_map.mapColumn(u32, io, offsets_path);
-    defer offsets.mapping.unmap();
-    const phrases = try io_map.mapFile(io, phrases_path);
-    defer phrases.unmap();
-    const uid_ids = try io_map.mapColumn(u32, io, uid_id_path);
-    defer uid_ids.mapping.unmap();
-    const uid_dict = try io_map.mapColumn(i64, io, uid_dict_path);
-    defer uid_dict.mapping.unmap();
-
-    if (phrase_ids.values.len != uid_ids.values.len) return error.UnsupportedNativeQuery;
-    const phrase_dict_size = offsets.values.len - 1;
-    const uid_dict_size = uid_dict.values.len;
-
-    // Pass 1: dense counts.
-    const counts = try allocator.alloc(u32, phrase_dict_size);
-    defer allocator.free(counts);
-    @memset(counts, 0);
-    for (phrase_ids.values) |id| counts[id] += 1;
-
-    // Pick top-N candidate phrase_ids by row count, excluding phrase_id 0
-    // ("" empty after dict ordering—verify by scanning phrases blob).
-    // We treat the dict entry whose phrase is `""` (2-char DuckDB-quoted empty)
-    // as the empty marker to skip.
-    var empty_phrase_id: ?u32 = null;
-    for (0..phrase_dict_size) |idx| {
-        const start = offsets.values[idx];
-        const end = offsets.values[idx + 1];
-        const phrase = phrases.raw[start..end];
-        if (isStoredEmptyString(phrase)) {
-            empty_phrase_id = @intCast(idx);
-            break;
-        }
-    }
-
-    const Candidate = struct { id: u32, count: u32 };
-    var cand: [64]Candidate = undefined;
-    var cand_len: usize = 0;
-    for (counts, 0..) |c, idx| {
-        if (c == 0) continue;
-        if (empty_phrase_id) |eid| if (idx == eid) continue;
-        const row: Candidate = .{ .id = @intCast(idx), .count = c };
-        // Insert sorted by count desc, id asc.
-        var pos: usize = 0;
-        while (pos < cand_len and (cand[pos].count > row.count or (cand[pos].count == row.count and cand[pos].id < row.id))) : (pos += 1) {}
-        if (pos >= n_candidates) continue;
-        if (cand_len < n_candidates) cand_len += 1;
-        var j = cand_len - 1;
-        while (j > pos) : (j -= 1) cand[j] = cand[j - 1];
-        cand[pos] = row;
-    }
-
-    // Build candidate_idx[phrase_id] -> i8 (-1 = not candidate, else cand slot).
-    const cand_idx = try allocator.alloc(i8, phrase_dict_size);
-    defer allocator.free(cand_idx);
-    @memset(cand_idx, -1);
-    for (cand[0..cand_len], 0..) |c, slot| cand_idx[c.id] = @intCast(slot);
-
-    // Pass 2: per-candidate bitset of UserID ids.
-    const words_per_set = (uid_dict_size + 63) / 64;
-    const bitsets = try allocator.alloc(u64, cand_len * words_per_set);
-    defer allocator.free(bitsets);
-    @memset(bitsets, 0);
-
-    var i: usize = 0;
-    const n = phrase_ids.values.len;
-    while (i < n) : (i += 1) {
-        const pid = phrase_ids.values[i];
-        const slot = cand_idx[pid];
-        if (slot < 0) continue;
-        const uid = uid_ids.values[i];
-        const base = @as(usize, @intCast(slot)) * words_per_set;
-        const word = uid >> 6;
-        const bit = @as(u64, 1) << @intCast(uid & 63);
-        bitsets[base + word] |= bit;
-    }
-
-    // Compute distinct-user count per candidate.
-    const Result = struct { id: u32, distinct: u64 };
-    var results = try allocator.alloc(Result, cand_len);
-    defer allocator.free(results);
-    for (cand[0..cand_len], 0..) |c, slot| {
-        const base = slot * words_per_set;
-        var sum: u64 = 0;
-        for (bitsets[base .. base + words_per_set]) |w| sum += @popCount(w);
-        results[slot] = .{ .id = c.id, .distinct = sum };
-    }
-
-    // Sort top-10 by distinct desc, id asc.
-    std.sort.pdq(Result, results, {}, struct {
-        fn lt(_: void, a: Result, b: Result) bool {
-            if (a.distinct != b.distinct) return a.distinct > b.distinct;
-            return a.id < b.id;
-        }
-    }.lt);
-
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(allocator);
-    try out.appendSlice(allocator, "SearchPhrase,u\n");
-    const top_emit = @min(@as(usize, 10), cand_len);
-    for (results[0..top_emit]) |r| {
-        const start = offsets.values[r.id];
-        const end = offsets.values[r.id + 1];
-        const phrase = phrases.raw[start..end];
-        try writeCsvField(allocator, &out, phrase);
-        try out.print(allocator, ",{d}\n", .{r.distinct});
-    }
-    return out.toOwnedSlice(allocator);
 }
 
 const UrlHashDateKey = struct {
