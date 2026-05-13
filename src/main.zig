@@ -7,6 +7,8 @@ const parquet = @import("parquet.zig");
 const storage = @import("storage.zig");
 const schema = @import("schema.zig");
 const bind = @import("exec/bind.zig");
+const shape = @import("exec/shape.zig");
+const generic_sql = @import("generic_sql.zig");
 
 const usage =
     \\zighouse - minimal ClickBench-oriented analytical database
@@ -856,4 +858,136 @@ test "lookupCapability returns tag for known columns and null for missing" {
         @as(?schema.CapabilityTag, schema.CapabilityTag.fixed_i16),
         bind.lookupCapability(&clickbench_schema.hits, "advengineid"),
     );
+}
+
+fn parseHitsPlan(allocator: std.mem.Allocator, sql: []const u8) !generic_sql.Plan {
+    const plan_opt = try generic_sql.parse(allocator, sql);
+    return plan_opt orelse return error.ParseFailed;
+}
+
+test "inferShape: scalar aggregates with no group_by" {
+    const allocator = std.testing.allocator;
+    const cases = [_]struct { sql: []const u8, want: shape.PlanShape }{
+        .{ .sql = "SELECT COUNT(*) FROM hits", .want = .scalar_aggregate },
+        .{ .sql = "SELECT AVG(UserID) FROM hits", .want = .scalar_aggregate },
+        .{ .sql = "SELECT MIN(EventDate), MAX(EventDate) FROM hits", .want = .scalar_aggregate },
+        .{ .sql = "SELECT SUM(AdvEngineID), COUNT(*), AVG(ResolutionWidth) FROM hits", .want = .scalar_aggregate },
+        // Simple int filter still scalar (plan.filter populated, not where_text alone).
+        .{ .sql = "SELECT COUNT(*) FROM hits WHERE AdvEngineID <> 0", .want = .scalar_aggregate },
+    };
+    for (cases) |c| {
+        const plan = try parseHitsPlan(allocator, c.sql);
+        defer allocator.free(plan.projections);
+        try std.testing.expectEqual(c.want, shape.inferShape(plan, &clickbench_schema.hits));
+    }
+}
+
+test "inferShape: filtered_scalar for LIKE filters" {
+    const allocator = std.testing.allocator;
+    const plan = try parseHitsPlan(allocator, "SELECT COUNT(*) FROM hits WHERE URL LIKE '%google%'");
+    defer allocator.free(plan.projections);
+    try std.testing.expectEqual(shape.PlanShape.filtered_scalar, shape.inferShape(plan, &clickbench_schema.hits));
+}
+
+test "inferShape: lowcard_count_top for q13 SearchPhrase" {
+    const allocator = std.testing.allocator;
+    const plan = try parseHitsPlan(
+        allocator,
+        "SELECT SearchPhrase, COUNT(*) AS c FROM hits WHERE SearchPhrase <> '' GROUP BY SearchPhrase ORDER BY c DESC LIMIT 10",
+    );
+    defer allocator.free(plan.projections);
+    try std.testing.expectEqual(shape.PlanShape.lowcard_count_top, shape.inferShape(plan, &clickbench_schema.hits));
+}
+
+test "inferShape: lowcard_distinct_top for q11/q14" {
+    const allocator = std.testing.allocator;
+    const cases = [_][]const u8{
+        "SELECT MobilePhoneModel, COUNT(DISTINCT UserID) AS u FROM hits WHERE MobilePhoneModel <> '' GROUP BY MobilePhoneModel ORDER BY u DESC LIMIT 10",
+        "SELECT SearchPhrase, COUNT(DISTINCT UserID) AS u FROM hits WHERE SearchPhrase <> '' GROUP BY SearchPhrase ORDER BY u DESC LIMIT 10",
+    };
+    for (cases) |sql| {
+        const plan = try parseHitsPlan(allocator, sql);
+        defer allocator.free(plan.projections);
+        try std.testing.expectEqual(shape.PlanShape.lowcard_distinct_top, shape.inferShape(plan, &clickbench_schema.hits));
+    }
+}
+
+test "inferShape: fixed_distinct_top for q9 RegionID" {
+    const allocator = std.testing.allocator;
+    const plan = try parseHitsPlan(
+        allocator,
+        "SELECT RegionID, COUNT(DISTINCT UserID) AS u FROM hits GROUP BY RegionID ORDER BY u DESC LIMIT 10",
+    );
+    defer allocator.free(plan.projections);
+    try std.testing.expectEqual(shape.PlanShape.fixed_distinct_top, shape.inferShape(plan, &clickbench_schema.hits));
+}
+
+test "inferShape: dense_count_group for q8 AdvEngineID (no LIMIT)" {
+    const allocator = std.testing.allocator;
+    const plan = try parseHitsPlan(
+        allocator,
+        "SELECT AdvEngineID, COUNT(*) FROM hits WHERE AdvEngineID <> 0 GROUP BY AdvEngineID ORDER BY COUNT(*) DESC",
+    );
+    defer allocator.free(plan.projections);
+    try std.testing.expectEqual(shape.PlanShape.dense_count_group, shape.inferShape(plan, &clickbench_schema.hits));
+}
+
+test "inferShape: dense_avg_count_top for q10 RegionID stats" {
+    const allocator = std.testing.allocator;
+    const plan = try parseHitsPlan(
+        allocator,
+        "SELECT RegionID, SUM(AdvEngineID), COUNT(*) AS c, AVG(ResolutionWidth), COUNT(DISTINCT UserID) FROM hits GROUP BY RegionID ORDER BY c DESC LIMIT 10",
+    );
+    defer allocator.free(plan.projections);
+    try std.testing.expectEqual(shape.PlanShape.dense_avg_count_top, shape.inferShape(plan, &clickbench_schema.hits));
+}
+
+test "inferShape: tuple_agg_top for composite group keys" {
+    const allocator = std.testing.allocator;
+    const cases = [_][]const u8{
+        // q12 mobile_phone+model
+        "SELECT MobilePhone, MobilePhoneModel, COUNT(DISTINCT UserID) AS u FROM hits WHERE MobilePhoneModel <> '' GROUP BY MobilePhone, MobilePhoneModel ORDER BY u DESC LIMIT 10",
+        // q15 search_engine+phrase
+        "SELECT SearchEngineID, SearchPhrase, COUNT(*) AS c FROM hits WHERE SearchPhrase <> '' GROUP BY SearchEngineID, SearchPhrase ORDER BY c DESC LIMIT 10",
+        // q16 user_id+search_phrase
+        "SELECT UserID, SearchPhrase, COUNT(*) FROM hits GROUP BY UserID, SearchPhrase ORDER BY COUNT(*) DESC LIMIT 10",
+        // q19 client_ip_agg_top
+        "SELECT SearchEngineID, ClientIP, COUNT(*) AS c, SUM(IsRefresh), AVG(ResolutionWidth) FROM hits WHERE SearchPhrase <> '' GROUP BY SearchEngineID, ClientIP ORDER BY c DESC LIMIT 10",
+    };
+    for (cases) |sql| {
+        const plan = try parseHitsPlan(allocator, sql);
+        defer allocator.free(plan.projections);
+        try std.testing.expectEqual(shape.PlanShape.tuple_agg_top, shape.inferShape(plan, &clickbench_schema.hits));
+    }
+}
+
+test "inferShape: hashed_late_materialize_top for q21 URL" {
+    const allocator = std.testing.allocator;
+    const plan = try parseHitsPlan(
+        allocator,
+        "SELECT URL, COUNT(*) AS c FROM hits GROUP BY URL ORDER BY c DESC LIMIT 10",
+    );
+    defer allocator.free(plan.projections);
+    try std.testing.expectEqual(shape.PlanShape.hashed_late_materialize_top, shape.inferShape(plan, &clickbench_schema.hits));
+}
+
+test "inferShape: offset_count_top for dashboards with OFFSET" {
+    const allocator = std.testing.allocator;
+    // q41 url_count_top_filtered_offset_dashboard (single-column GROUP BY URL with OFFSET)
+    const plan = try parseHitsPlan(
+        allocator,
+        "SELECT URL, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND IsRefresh = 0 AND IsLink <> 0 AND IsDownload = 0 GROUP BY URL ORDER BY PageViews DESC LIMIT 10 OFFSET 1000",
+    );
+    defer allocator.free(plan.projections);
+    try std.testing.expectEqual(shape.PlanShape.offset_count_top, shape.inferShape(plan, &clickbench_schema.hits));
+}
+
+test "inferShape: unknown for projection-only top-N" {
+    const allocator = std.testing.allocator;
+    const plan = try parseHitsPlan(
+        allocator,
+        "SELECT SearchPhrase FROM hits WHERE SearchPhrase <> '' ORDER BY EventTime LIMIT 10",
+    );
+    defer allocator.free(plan.projections);
+    try std.testing.expectEqual(shape.PlanShape.unknown, shape.inferShape(plan, &clickbench_schema.hits));
 }
