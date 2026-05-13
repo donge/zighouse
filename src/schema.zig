@@ -164,6 +164,63 @@ fn asciiLower(c: u8) u8 {
     return c;
 }
 
+/// Capability tag used for (PlanShape, CapabilityTag) dispatch lookup.
+/// Derived from `Column.physical` and `Column.ty` via `capabilityTag`.
+/// First version (PR-A0): single `.derived` tag, not yet split per DerivedExpr.
+pub const CapabilityTag = enum {
+    fixed_i16,
+    fixed_i32,
+    fixed_i64,
+    fixed_date,
+    fixed_timestamp,
+    fixed_char,
+    lowcard_text,
+    hash_text,
+    lazy_text,
+    derived,
+};
+
+/// Derive a single CapabilityTag from a Column definition.
+///
+/// Decision table:
+///   physical = .lowcard_text   -> .lowcard_text
+///   physical = .hash_text      -> .hash_text
+///   physical = .lazy_text      -> .lazy_text
+///   physical = .derived        -> .derived
+///   physical = .fixed -> by ty:
+///     .int16     -> .fixed_i16
+///     .int32     -> .fixed_i32
+///     .int64     -> .fixed_i64
+///     .date      -> .fixed_date
+///     .timestamp -> .fixed_timestamp
+///     .char      -> .fixed_char
+///     .text      -> @panic (fixed should not carry variable text)
+///   physical = .none -> by ty:
+///     .text/.char -> .lazy_text  (schema declared text without explicit
+///                                 physical; defaults to lazy source)
+///     other       -> @panic (numeric column missing physical is a schema bug)
+pub fn capabilityTag(col: Column) CapabilityTag {
+    return switch (col.physical) {
+        .lowcard_text => .lowcard_text,
+        .hash_text => .hash_text,
+        .lazy_text => .lazy_text,
+        .derived => .derived,
+        .fixed => |f| switch (f.ty) {
+            .int16 => .fixed_i16,
+            .int32 => .fixed_i32,
+            .int64 => .fixed_i64,
+            .date => .fixed_date,
+            .timestamp => .fixed_timestamp,
+            .char => .fixed_char,
+            .text => @panic("capabilityTag: fixed physical with text ty is invalid"),
+        },
+        .none => switch (col.ty) {
+            .text, .char => .lazy_text,
+            else => @panic("capabilityTag: numeric column has no physical representation"),
+        },
+    };
+}
+
 test "finds columns case insensitively" {
     const std = @import("std");
     const columns = [_]Column{
@@ -174,4 +231,105 @@ test "finds columns case insensitively" {
     try std.testing.expectEqual(@as(?usize, 0), table.findColumn("id"));
     try std.testing.expectEqual(@as(?usize, 1), table.findColumn("TextValue"));
     try std.testing.expectEqual(@as(?usize, null), table.findColumn("missing"));
+}
+
+test "capabilityTag derives from physical/ty" {
+    const std = @import("std");
+
+    const fixed_i16_col = Column{
+        .name = "X",
+        .ty = .int16,
+        .physical = .{ .fixed = .{ .path_name = "X", .ty = .int16 } },
+    };
+    try std.testing.expectEqual(CapabilityTag.fixed_i16, capabilityTag(fixed_i16_col));
+
+    const fixed_i32_col = Column{
+        .name = "X",
+        .ty = .int32,
+        .physical = .{ .fixed = .{ .path_name = "X", .ty = .int32 } },
+    };
+    try std.testing.expectEqual(CapabilityTag.fixed_i32, capabilityTag(fixed_i32_col));
+
+    const fixed_i64_col = Column{
+        .name = "X",
+        .ty = .int64,
+        .physical = .{ .fixed = .{ .path_name = "X", .ty = .int64 } },
+    };
+    try std.testing.expectEqual(CapabilityTag.fixed_i64, capabilityTag(fixed_i64_col));
+
+    const fixed_date_col = Column{
+        .name = "X",
+        .ty = .date,
+        .physical = .{ .fixed = .{ .path_name = "X", .ty = .date } },
+    };
+    try std.testing.expectEqual(CapabilityTag.fixed_date, capabilityTag(fixed_date_col));
+
+    const fixed_ts_col = Column{
+        .name = "X",
+        .ty = .timestamp,
+        .physical = .{ .fixed = .{ .path_name = "X", .ty = .timestamp } },
+    };
+    try std.testing.expectEqual(CapabilityTag.fixed_timestamp, capabilityTag(fixed_ts_col));
+
+    const lowcard_col = Column{
+        .name = "X",
+        .ty = .text,
+        .physical = .{ .lowcard_text = .{
+            .id_path_name = "x.id",
+            .offsets_path_name = "x.off",
+            .bytes_path_name = "x.bytes",
+        } },
+    };
+    try std.testing.expectEqual(CapabilityTag.lowcard_text, capabilityTag(lowcard_col));
+
+    const hash_col = Column{
+        .name = "X",
+        .ty = .text,
+        .physical = .{ .hash_text = .{ .hash_column = "XHash" } },
+    };
+    try std.testing.expectEqual(CapabilityTag.hash_text, capabilityTag(hash_col));
+
+    const lazy_col = Column{
+        .name = "X",
+        .ty = .text,
+        .physical = .{ .lazy_text = .{ .source_column = "X" } },
+    };
+    try std.testing.expectEqual(CapabilityTag.lazy_text, capabilityTag(lazy_col));
+
+    const derived_col = Column{
+        .name = "X",
+        .ty = .int32,
+        .physical = .{ .derived = .{ .from = "Y", .expr = .length } },
+    };
+    try std.testing.expectEqual(CapabilityTag.derived, capabilityTag(derived_col));
+}
+
+test "capabilityTag covers ClickBench hits 105 columns without panic" {
+    const std = @import("std");
+    const hits_schema = @import("clickbench/schema.zig");
+
+    var counts = [_]usize{0} ** @typeInfo(CapabilityTag).@"enum".fields.len;
+
+    for (hits_schema.hits.columns) |col| {
+        const tag = capabilityTag(col);
+        counts[@intFromEnum(tag)] += 1;
+    }
+
+    // Sanity: total columns processed equals hits column count.
+    var total: usize = 0;
+    for (counts) |c| total += c;
+    try std.testing.expectEqual(hits_schema.hits.columns.len, total);
+
+    // Distribution sanity (per Explore C report):
+    //   fixed_*: ~77, lowcard_text: 2, hash_text: 2, lazy_text: 1, derived: 0
+    // We assert non-zero counts on expected non-empty buckets and exact zero on `derived`.
+    const fixed_total = counts[@intFromEnum(CapabilityTag.fixed_i16)] +
+        counts[@intFromEnum(CapabilityTag.fixed_i32)] +
+        counts[@intFromEnum(CapabilityTag.fixed_i64)] +
+        counts[@intFromEnum(CapabilityTag.fixed_date)] +
+        counts[@intFromEnum(CapabilityTag.fixed_timestamp)];
+    try std.testing.expect(fixed_total > 0);
+    try std.testing.expect(counts[@intFromEnum(CapabilityTag.lowcard_text)] >= 2);
+    try std.testing.expect(counts[@intFromEnum(CapabilityTag.hash_text)] >= 2);
+    try std.testing.expect(counts[@intFromEnum(CapabilityTag.lazy_text)] >= 1);
 }

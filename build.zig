@@ -136,6 +136,15 @@ pub fn build(b: *std.Build) void {
     });
     const parquet_test_cmd = b.addRunArtifact(parquet_tests);
 
+    const schema_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/schema.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const schema_test_cmd = b.addRunArtifact(schema_tests);
+
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&test_cmd.step);
     test_step.dependOn(&simd_test_cmd.step);
@@ -146,6 +155,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&generic_sql_test_cmd.step);
     test_step.dependOn(&lowcard_test_cmd.step);
     test_step.dependOn(&parquet_test_cmd.step);
+    test_step.dependOn(&schema_test_cmd.step);
 
     if (!install_bench_tools) return;
 
