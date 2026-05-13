@@ -167,11 +167,11 @@ fn asciiLower(c: u8) u8 {
 test "finds columns case insensitively" {
     const std = @import("std");
     const columns = [_]Column{
-        .{ .name = "WatchID", .ty = .int64 },
-        .{ .name = "SearchPhrase", .ty = .text },
+        .{ .name = "Id", .ty = .int64 },
+        .{ .name = "TextValue", .ty = .text },
     };
     const table = Table{ .name = "test", .columns = &columns };
-    try std.testing.expectEqual(@as(?usize, 0), table.findColumn("watchid"));
-    try std.testing.expectEqual(@as(?usize, 1), table.findColumn("SearchPhrase"));
+    try std.testing.expectEqual(@as(?usize, 0), table.findColumn("id"));
+    try std.testing.expectEqual(@as(?usize, 1), table.findColumn("TextValue"));
     try std.testing.expectEqual(@as(?usize, null), table.findColumn("missing"));
 }

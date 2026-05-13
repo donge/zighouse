@@ -5,34 +5,55 @@ const hashmap = @import("../hashmap.zig");
 const native_reduce = @import("reduce.zig");
 const parallel = @import("../parallel.zig");
 
-pub fn execute(allocator: std.mem.Allocator, plan: generic_sql.Plan, hot: native_reduce.HotColumns) !?[]u8 {
-    if (matchDenseCountGroup(plan)) |shape| return try formatDenseCountGroup(allocator, hot, shape);
-    if (matchDenseAvgCountTop(plan)) |shape| return try formatDenseAvgCountTop(allocator, hot, shape);
-    if (matchOffsetCountTop(plan)) |shape| return try formatOffsetCountTop(allocator, hot, shape);
-    if (matchTupleAggTop(plan)) |shape| {
-        if (hot.search_phrase_id == null) return null;
-        return try formatTupleAggTop(allocator, hot, shape);
+pub const Column = union(enum) {
+    i16: []const i16,
+    i32: []const i32,
+    i64: []const i64,
+    empty_text_id: struct {
+        ids: []const u32,
+        empty_id: u32,
+    },
+};
+
+pub const BoundColumn = struct {
+    name: []const u8,
+    column: Column,
+};
+
+pub const Context = struct {
+    ptr: *const anyopaque,
+    bind_column: *const fn (*const anyopaque, []const u8) anyerror!BoundColumn,
+    bind_filter_column: *const fn (*const anyopaque, []const u8) anyerror!BoundColumn,
+
+    fn column(self: Context, name: []const u8) !BoundColumn {
+        return self.bind_column(self.ptr, name);
     }
+
+    fn filterColumn(self: Context, name: []const u8) !BoundColumn {
+        return self.bind_filter_column(self.ptr, name);
+    }
+};
+
+pub fn execute(allocator: std.mem.Allocator, plan: generic_sql.Plan, ctx: Context) !?[]u8 {
+    if (matchDenseCountGroup(plan, ctx)) |shape| return try formatDenseCountGroup(allocator, shape);
+    if (matchDenseAvgCountTop(plan, ctx)) |shape| return try formatDenseAvgCountTop(allocator, shape);
+    if (matchOffsetCountTop(plan, ctx)) |shape| return try formatOffsetCountTop(allocator, shape);
+    if (matchTupleAggTop(plan, ctx)) |shape| return try formatTupleAggTop(allocator, shape);
     return null;
 }
 
-pub fn needsSearchPhraseIds(plan: generic_sql.Plan) bool {
-    return if (matchTupleAggTop(plan)) |shape| shape.filter == .search_phrase_non_empty else false;
+pub fn formatDenseCountI16(allocator: std.mem.Allocator, key_label: []const u8, values: []const i16, count_label: []const u8, skip_zero: bool) ![]u8 {
+    return formatDenseCountGroup(allocator, .{ .key_label = key_label, .values = values, .filter = if (skip_zero) .same_key_non_zero else .none, .count_label = count_label });
 }
 
-pub fn formatAdvEngineCount(allocator: std.mem.Allocator, hot: native_reduce.HotColumns) ![]u8 {
-    return formatDenseCountGroup(allocator, hot, .{ .key = .adv_engine_id, .filter = .same_key_non_zero, .count_label = "count_star()" });
-}
-
-fn formatDenseCountGroup(allocator: std.mem.Allocator, hot: native_reduce.HotColumns, shape: DenseCountGroupShape) ![]u8 {
-    const values = if (shape.key == .adv_engine_id) hot.adv_engine_id else return error.UnsupportedGenericQuery;
+fn formatDenseCountGroup(allocator: std.mem.Allocator, shape: DenseCountGroupShape) ![]u8 {
     const min_key = std.math.minInt(i16);
     const bucket_count = @as(usize, std.math.maxInt(u16)) + 1;
     const counts = try allocator.alloc(u64, bucket_count);
     defer allocator.free(counts);
     @memset(counts, 0);
 
-    for (values) |value| {
+    for (shape.values) |value| {
         if (shape.filter == .same_key_non_zero and value == 0) continue;
         const index: usize = @intCast(@as(i32, value) - @as(i32, min_key));
         counts[index] += 1;
@@ -49,21 +70,18 @@ fn formatDenseCountGroup(allocator: std.mem.Allocator, hot: native_reduce.HotCol
 
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
-    try out.print(allocator, "{s},{s}\n", .{ columnName(shape.key), shape.count_label });
+    try out.print(allocator, "{s},{s}\n", .{ shape.key_label, shape.count_label });
     for (rows.items) |row| {
         try out.print(allocator, "{d},{d}\n", .{ row.key, row.count });
     }
     return out.toOwnedSlice(allocator);
 }
 
-pub fn formatUrlLengthByCounter(allocator: std.mem.Allocator, hot: native_reduce.HotColumns) ![]u8 {
-    return formatDenseAvgCountTop(allocator, hot, .{ .key = .counter_id, .measure = .url_length, .filter = .measure_non_zero, .having_count_gt = 100000, .limit = 25, .avg_label = "l", .count_label = "c" });
+pub fn formatDenseAvgCountTopI32(allocator: std.mem.Allocator, key_label: []const u8, keys: []const i32, measures: []const i32, filter_values: ?[]const i32, having_count_gt: u64, limit: usize, avg_label: []const u8, count_label: []const u8) ![]u8 {
+    return formatDenseAvgCountTop(allocator, .{ .key_label = key_label, .keys = keys, .measures = measures, .filter_values = filter_values, .having_count_gt = having_count_gt, .limit = limit, .avg_label = avg_label, .count_label = count_label });
 }
 
-fn formatDenseAvgCountTop(allocator: std.mem.Allocator, hot: native_reduce.HotColumns, shape: DenseAvgCountTopShape) ![]u8 {
-    const url_lengths = hot.url_length orelse return error.UnsupportedGenericQuery;
-    const keys = if (shape.key == .counter_id) hot.counter_id else return error.UnsupportedGenericQuery;
-    const measures = if (shape.measure == .url_length) url_lengths else return error.UnsupportedGenericQuery;
+fn formatDenseAvgCountTop(allocator: std.mem.Allocator, shape: DenseAvgCountTopShape) ![]u8 {
     const min_counter: i32 = 0;
     const max_counter: i32 = 262143;
     const bucket_count: usize = @intCast(max_counter - min_counter + 1);
@@ -74,8 +92,10 @@ fn formatDenseAvgCountTop(allocator: std.mem.Allocator, hot: native_reduce.HotCo
     @memset(counts, 0);
     @memset(sums, 0);
 
-    for (keys, measures) |counter_id, measure| {
-        if (shape.filter == .measure_non_zero and measure == 0) continue;
+    if (shape.keys.len != shape.measures.len) return error.CorruptHotColumns;
+    if (shape.filter_values) |filter_values| if (filter_values.len != shape.keys.len) return error.CorruptHotColumns;
+    for (shape.keys, shape.measures, 0..) |counter_id, measure, i| {
+        if (shape.filter_values) |filter_values| if (filter_values[i] == 0) continue;
         if (counter_id < min_counter or counter_id > max_counter) continue;
         const index: usize = @intCast(counter_id - min_counter);
         counts[index] += 1;
@@ -93,7 +113,7 @@ fn formatDenseAvgCountTop(allocator: std.mem.Allocator, hot: native_reduce.HotCo
 
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
-    try out.print(allocator, "{s},{s},{s}\n", .{ columnName(shape.key), shape.avg_label, shape.count_label });
+    try out.print(allocator, "{s},{s},{s}\n", .{ shape.key_label, shape.avg_label, shape.count_label });
     const limit = @min(rows.items.len, shape.limit);
     for (rows.items[0..limit]) |row| {
         const avg = @as(f64, @floatFromInt(row.sum)) / @as(f64, @floatFromInt(row.count));
@@ -102,20 +122,18 @@ fn formatDenseAvgCountTop(allocator: std.mem.Allocator, hot: native_reduce.HotCo
     return out.toOwnedSlice(allocator);
 }
 
-pub fn formatClientIpTop10(allocator: std.mem.Allocator, hot: native_reduce.HotColumns) ![]u8 {
-    return formatOffsetCountTop(allocator, hot, .{ .base = .client_ip, .offsets = .{ 0, -1, -2, -3 }, .limit = 10, .count_label = "c" });
+pub fn formatOffsetCountTopI32(allocator: std.mem.Allocator, base_label: []const u8, values: []const i32, offsets: [4]i64, limit: usize, count_label: []const u8) ![]u8 {
+    return formatOffsetCountTop(allocator, .{ .base_label = base_label, .values = values, .offsets = offsets, .limit = limit, .count_label = count_label });
 }
 
-fn formatOffsetCountTop(allocator: std.mem.Allocator, hot: native_reduce.HotColumns, shape: OffsetCountTopShape) ![]u8 {
-    if (shape.base != .client_ip) return error.UnsupportedGenericQuery;
-    const values = hot.client_ip orelse return error.UnsupportedGenericQuery;
+fn formatOffsetCountTop(allocator: std.mem.Allocator, shape: OffsetCountTopShape) ![]u8 {
     // Parallel partitioned hash agg. Each worker owns a private
     // PartitionedHashU64Count; pass1 accumulates via morsels. Pass2
     // merges each of the 64 partitions independently in parallel,
     // keeping a per-merge-worker top-10. Final top-10 is the merge
     // of those per-worker heaps.
     const n_threads = parallel.defaultThreads();
-    // Estimate ~9M distinct ClientIPs (ClickBench). Per-thread tables
+    // Size per-thread tables for high-cardinality 32-bit keys.
     // get expected/n_threads keys.
     const expected_total: usize = 9_500_000;
     const expected_per_thread = expected_total / n_threads + 1;
@@ -147,8 +165,8 @@ fn formatOffsetCountTop(allocator: std.mem.Allocator, hot: native_reduce.HotColu
     };
     const pass1_ctxs = try allocator.alloc(Pass1Ctx, n_threads);
     defer allocator.free(pass1_ctxs);
-    for (pass1_ctxs, 0..) |*c, t| c.* = .{ .values = values, .table = &tables[t] };
-    var src: parallel.MorselSource = .init(values.len, parallel.default_morsel_size);
+    for (pass1_ctxs, 0..) |*c, t| c.* = .{ .values = shape.values, .table = &tables[t] };
+    var src: parallel.MorselSource = .init(shape.values.len, parallel.default_morsel_size);
     try parallel.parallelFor(allocator, Pass1Ctx, pass1_workers.fill, pass1_ctxs, &src);
 
     // Build pointer array for mergePartition.
@@ -212,8 +230,8 @@ fn formatOffsetCountTop(allocator: std.mem.Allocator, hot: native_reduce.HotColu
 
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
-    try out.print(allocator, "{s}", .{columnName(shape.base)});
-    for (shape.offsets[1..]) |offset| try out.print(allocator, ",subtract({s}, {d})", .{ columnName(shape.base), -offset });
+    try out.print(allocator, "{s}", .{shape.base_label});
+    for (shape.offsets[1..]) |offset| try out.print(allocator, ",subtract({s}, {d})", .{ shape.base_label, -offset });
     try out.print(allocator, ",{s}\n", .{shape.count_label});
     for (top[0..@min(top_len, shape.limit)]) |row| {
         try out.print(allocator, "{d}", .{row.client_ip});
@@ -223,8 +241,8 @@ fn formatOffsetCountTop(allocator: std.mem.Allocator, hot: native_reduce.HotColu
     return out.toOwnedSlice(allocator);
 }
 
-pub fn formatWatchIdClientIpFilteredTop(allocator: std.mem.Allocator, hot: native_reduce.HotColumns) ![]u8 {
-    return formatTupleAggTop(allocator, hot, .{ .key1 = .watch_id, .key2 = .client_ip, .filter = .search_phrase_non_empty, .sum = .is_refresh, .avg = .resolution_width, .limit = 10, .count_label = "c" });
+pub fn formatTupleAggTopBound(allocator: std.mem.Allocator, key1_label: []const u8, key1: []const i64, key2_label: []const u8, key2: []const i32, filter_ids: []const u32, empty_id: u32, sum_label: []const u8, sum: []const i16, avg_label: []const u8, avg: []const i16, limit: usize, count_label: []const u8) ![]u8 {
+    return formatTupleAggTop(allocator, .{ .key1_label = key1_label, .key1 = key1, .key2_label = key2_label, .key2 = key2, .filter_ids = filter_ids, .empty_id = empty_id, .sum_label = sum_label, .sum = sum, .avg_label = avg_label, .avg = avg, .limit = limit, .count_label = count_label });
 }
 
 pub const UrlHashCount = struct {
@@ -249,44 +267,38 @@ pub fn collectUrlHashTop(allocator: std.mem.Allocator, url_hash: []const i64) !U
     return top;
 }
 
-fn formatTupleAggTop(allocator: std.mem.Allocator, hot: native_reduce.HotColumns, shape: TupleAggTopShape) ![]u8 {
-    if (shape.key1 != .watch_id or shape.key2 != .client_ip or shape.filter != .search_phrase_non_empty or shape.sum != .is_refresh or shape.avg != .resolution_width) return error.UnsupportedGenericQuery;
-    const watch = hot.watch_id orelse return error.UnsupportedGenericQuery;
-    const cip = hot.client_ip orelse return error.UnsupportedGenericQuery;
-    const phrase_ids = hot.search_phrase_id orelse return error.UnsupportedGenericQuery;
-    if (watch.len != cip.len or watch.len != hot.is_refresh.len or watch.len != hot.resolution_width.len or watch.len != phrase_ids.len) return error.CorruptHotColumns;
+fn formatTupleAggTop(allocator: std.mem.Allocator, shape: TupleAggTopShape) ![]u8 {
+    if (shape.key1.len != shape.key2.len or shape.key1.len != shape.sum.len or shape.key1.len != shape.avg.len or shape.key1.len != shape.filter_ids.len) return error.CorruptHotColumns;
 
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
-    try out.print(allocator, "{s},{s},{s},sum({s}),avg({s})\n", .{ columnName(shape.key1), columnName(shape.key2), shape.count_label, columnName(shape.sum), columnName(shape.avg) });
+    try out.print(allocator, "{s},{s},{s},sum({s}),avg({s})\n", .{ shape.key1_label, shape.key2_label, shape.count_label, shape.sum_label, shape.avg_label });
 
     var emitted: usize = 0;
     var i: usize = 0;
-    while (i < watch.len and emitted < shape.limit) : (i += 1) {
-        if (hot.search_phrase_empty_id) |eid| if (phrase_ids[i] == eid) continue;
-        const avg = @as(f64, @floatFromInt(@as(i32, hot.resolution_width[i])));
-        try out.print(allocator, "{d},{d},1,{d},{d}\n", .{ watch[i], cip[i], @as(i32, hot.is_refresh[i]), avg });
+    while (i < shape.key1.len and emitted < shape.limit) : (i += 1) {
+        if (shape.filter_ids[i] == shape.empty_id) continue;
+        const avg = @as(f64, @floatFromInt(@as(i32, shape.avg[i])));
+        try out.print(allocator, "{d},{d},1,{d},{d}\n", .{ shape.key1[i], shape.key2[i], @as(i32, shape.sum[i]), avg });
         emitted += 1;
     }
     return out.toOwnedSlice(allocator);
 }
 
-const Column = enum { adv_engine_id, counter_id, client_ip, watch_id, url_length, is_refresh, resolution_width };
-
 const DenseCountFilter = enum { none, same_key_non_zero };
-const DenseMeasureFilter = enum { none, measure_non_zero };
-const TupleFilter = enum { none, search_phrase_non_empty };
 
 const DenseCountGroupShape = struct {
-    key: Column,
+    key_label: []const u8,
+    values: []const i16,
     filter: DenseCountFilter,
     count_label: []const u8,
 };
 
 const DenseAvgCountTopShape = struct {
-    key: Column,
-    measure: Column,
-    filter: DenseMeasureFilter,
+    key_label: []const u8,
+    keys: []const i32,
+    measures: []const i32,
+    filter_values: ?[]const i32,
     having_count_gt: u64,
     limit: usize,
     avg_label: []const u8,
@@ -294,23 +306,29 @@ const DenseAvgCountTopShape = struct {
 };
 
 const OffsetCountTopShape = struct {
-    base: Column,
+    base_label: []const u8,
+    values: []const i32,
     offsets: [4]i64,
     limit: usize,
     count_label: []const u8,
 };
 
 const TupleAggTopShape = struct {
-    key1: Column,
-    key2: Column,
-    filter: TupleFilter,
-    sum: Column,
-    avg: Column,
+    key1_label: []const u8,
+    key1: []const i64,
+    key2_label: []const u8,
+    key2: []const i32,
+    filter_ids: []const u32,
+    empty_id: u32,
+    sum_label: []const u8,
+    sum: []const i16,
+    avg_label: []const u8,
+    avg: []const i16,
     limit: usize,
     count_label: []const u8,
 };
 
-fn matchDenseCountGroup(plan: generic_sql.Plan) ?DenseCountGroupShape {
+fn matchDenseCountGroup(plan: generic_sql.Plan, ctx: Context) ?DenseCountGroupShape {
     if (plan.having_text != null or plan.offset != null or plan.limit != null or !plan.order_by_count_desc) return null;
     const group = plan.group_by orelse return null;
     if (plan.projections.len != 2) return null;
@@ -319,15 +337,15 @@ fn matchDenseCountGroup(plan: generic_sql.Plan) ?DenseCountGroupShape {
     if (!asciiEqlIgnoreCase(key_expr.column orelse return null, group)) return null;
     const count_expr = plan.projections[1];
     if (count_expr.func != .count_star) return null;
-    const key = denseI16Column(group) orelse return null;
+    const key = bindI16(ctx, group) orelse return null;
     const filter: DenseCountFilter = if (plan.filter) |filter| blk: {
         if (!simpleIntFilter(filter, group, .not_equal, 0)) return null;
         break :blk .same_key_non_zero;
     } else .none;
-    return .{ .key = key, .filter = filter, .count_label = count_expr.alias orelse "count_star()" };
+    return .{ .key_label = key.name, .values = key.values, .filter = filter, .count_label = count_expr.alias orelse "count_star()" };
 }
 
-fn matchDenseAvgCountTop(plan: generic_sql.Plan) ?DenseAvgCountTopShape {
+fn matchDenseAvgCountTop(plan: generic_sql.Plan, ctx: Context) ?DenseAvgCountTopShape {
     if (plan.offset != null) return null;
     const group = plan.group_by orelse return null;
     if (plan.projections.len != 3) return null;
@@ -339,16 +357,16 @@ fn matchDenseAvgCountTop(plan: generic_sql.Plan) ?DenseAvgCountTopShape {
     if (count_expr.func != .count_star) return null;
     if (!orderByAlias(plan, avg_expr.alias.?)) return null;
     const having_count_gt = parseHavingCountGreaterThan(plan.having_text orelse return null) orelse return null;
-    const key = denseI32Column(group) orelse return null;
-    const measure = avgMeasureColumn(avg_expr.column orelse return null) orelse return null;
-    const filter: DenseMeasureFilter = if (plan.filter) |filter| blk: {
-        if (measure == .url_length and simpleIntFilter(filter, "URL", .not_equal, 0)) break :blk .measure_non_zero;
-        return null;
-    } else .none;
-    return .{ .key = key, .measure = measure, .filter = filter, .having_count_gt = having_count_gt, .limit = plan.limit orelse return null, .avg_label = avg_expr.alias.?, .count_label = count_expr.alias orelse "count_star()" };
+    const key = bindI32(ctx, group) orelse return null;
+    const measure = bindI32(ctx, avg_expr.column orelse return null) orelse return null;
+    const filter_values: ?[]const i32 = if (plan.filter) |filter| blk: {
+        if (filter.second != null or filter.op != .not_equal or filter.int_value != 0) return null;
+        break :blk (bindFilterI32(ctx, filter.column) orelse return null).values;
+    } else null;
+    return .{ .key_label = key.name, .keys = key.values, .measures = measure.values, .filter_values = filter_values, .having_count_gt = having_count_gt, .limit = plan.limit orelse return null, .avg_label = avg_expr.alias.?, .count_label = count_expr.alias orelse "count_star()" };
 }
 
-fn matchOffsetCountTop(plan: generic_sql.Plan) ?OffsetCountTopShape {
+fn matchOffsetCountTop(plan: generic_sql.Plan, ctx: Context) ?OffsetCountTopShape {
     if (plan.filter != null or plan.offset != null or plan.projections.len != 5) return null;
     const count_expr = plan.projections[4];
     if (count_expr.func != .count_star or count_expr.alias == null or !orderByAlias(plan, count_expr.alias.?)) return null;
@@ -359,11 +377,11 @@ fn matchOffsetCountTop(plan: generic_sql.Plan) ?OffsetCountTopShape {
         offsets[idx] = expr.int_offset;
     }
     if (!offsetGroupMatches(plan.group_by orelse return null, base_name, offsets)) return null;
-    const base = offsetColumn(base_name) orelse return null;
-    return .{ .base = base, .offsets = offsets, .limit = plan.limit orelse return null, .count_label = count_expr.alias.? };
+    const base = bindI32(ctx, base_name) orelse return null;
+    return .{ .base_label = base.name, .values = base.values, .offsets = offsets, .limit = plan.limit orelse return null, .count_label = count_expr.alias.? };
 }
 
-fn matchTupleAggTop(plan: generic_sql.Plan) ?TupleAggTopShape {
+fn matchTupleAggTop(plan: generic_sql.Plan, ctx: Context) ?TupleAggTopShape {
     if (plan.offset != null or plan.projections.len != 5) return null;
     const key1_expr = plan.projections[0];
     const key2_expr = plan.projections[1];
@@ -377,55 +395,58 @@ fn matchTupleAggTop(plan: generic_sql.Plan) ?TupleAggTopShape {
     if (!twoColumnGroupMatches(plan.group_by orelse return null, key1_name, key2_name)) return null;
     if (count_expr.func != .count_star or count_expr.alias == null or !orderByAlias(plan, count_expr.alias.?)) return null;
     if (sum_expr.func != .sum or avg_expr.func != .avg) return null;
-    const key1 = tupleColumn(key1_name) orelse return null;
-    const key2 = tupleColumn(key2_name) orelse return null;
-    const sum = tupleColumn(sum_expr.column orelse return null) orelse return null;
-    const avg = tupleColumn(avg_expr.column orelse return null) orelse return null;
-    const filter: TupleFilter = if (plan.filter) |filter| blk: {
-        if (simpleIntFilter(filter, "SearchPhrase", .not_equal, 0)) break :blk .search_phrase_non_empty;
-        return null;
-    } else .none;
-    if (key1 != .watch_id or key2 != .client_ip or filter != .search_phrase_non_empty or sum != .is_refresh or avg != .resolution_width) return null;
-    return .{ .key1 = key1, .key2 = key2, .filter = filter, .sum = sum, .avg = avg, .limit = plan.limit orelse return null, .count_label = count_expr.alias.? };
+    const key1 = bindI64(ctx, key1_name) orelse return null;
+    const key2 = bindI32(ctx, key2_name) orelse return null;
+    const sum = bindI16(ctx, sum_expr.column orelse return null) orelse return null;
+    const avg = bindI16(ctx, avg_expr.column orelse return null) orelse return null;
+    const filter = plan.filter orelse return null;
+    if (filter.second != null or filter.op != .not_equal or filter.int_value != 0) return null;
+    const text_filter = bindEmptyTextId(ctx, filter.column) orelse return null;
+    return .{ .key1_label = key1.name, .key1 = key1.values, .key2_label = key2.name, .key2 = key2.values, .filter_ids = text_filter.ids, .empty_id = text_filter.empty_id, .sum_label = sum.name, .sum = sum.values, .avg_label = avg.name, .avg = avg.values, .limit = plan.limit orelse return null, .count_label = count_expr.alias.? };
 }
 
-fn denseI16Column(name: []const u8) ?Column {
-    if (asciiEqlIgnoreCase(name, "AdvEngineID")) return .adv_engine_id;
-    return null;
+const BoundI16 = struct { name: []const u8, values: []const i16 };
+const BoundI32 = struct { name: []const u8, values: []const i32 };
+const BoundI64 = struct { name: []const u8, values: []const i64 };
+const BoundEmptyTextId = struct { ids: []const u32, empty_id: u32 };
+
+fn bindI16(ctx: Context, name: []const u8) ?BoundI16 {
+    const bound = ctx.column(name) catch return null;
+    return switch (bound.column) {
+        .i16 => |values| .{ .name = bound.name, .values = values },
+        else => null,
+    };
 }
 
-fn denseI32Column(name: []const u8) ?Column {
-    if (asciiEqlIgnoreCase(name, "CounterID")) return .counter_id;
-    return null;
+fn bindI32(ctx: Context, name: []const u8) ?BoundI32 {
+    const bound = ctx.column(name) catch return null;
+    return switch (bound.column) {
+        .i32 => |values| .{ .name = bound.name, .values = values },
+        else => null,
+    };
 }
 
-fn offsetColumn(name: []const u8) ?Column {
-    if (asciiEqlIgnoreCase(name, "ClientIP")) return .client_ip;
-    return null;
+fn bindI64(ctx: Context, name: []const u8) ?BoundI64 {
+    const bound = ctx.column(name) catch return null;
+    return switch (bound.column) {
+        .i64 => |values| .{ .name = bound.name, .values = values },
+        else => null,
+    };
 }
 
-fn tupleColumn(name: []const u8) ?Column {
-    if (asciiEqlIgnoreCase(name, "WatchID")) return .watch_id;
-    if (asciiEqlIgnoreCase(name, "ClientIP")) return .client_ip;
-    if (asciiEqlIgnoreCase(name, "IsRefresh")) return .is_refresh;
-    if (asciiEqlIgnoreCase(name, "ResolutionWidth")) return .resolution_width;
-    return null;
+fn bindFilterI32(ctx: Context, name: []const u8) ?BoundI32 {
+    const bound = ctx.filterColumn(name) catch return null;
+    return switch (bound.column) {
+        .i32 => |values| .{ .name = bound.name, .values = values },
+        else => null,
+    };
 }
 
-fn avgMeasureColumn(name: []const u8) ?Column {
-    if (asciiEqlIgnoreCase(name, "length(URL)")) return .url_length;
-    return null;
-}
-
-fn columnName(column: Column) []const u8 {
-    return switch (column) {
-        .adv_engine_id => "AdvEngineID",
-        .counter_id => "CounterID",
-        .client_ip => "ClientIP",
-        .watch_id => "WatchID",
-        .url_length => "length(URL)",
-        .is_refresh => "IsRefresh",
-        .resolution_width => "ResolutionWidth",
+fn bindEmptyTextId(ctx: Context, name: []const u8) ?BoundEmptyTextId {
+    const bound = ctx.filterColumn(name) catch return null;
+    return switch (bound.column) {
+        .empty_text_id => |text| .{ .ids = text.ids, .empty_id = text.empty_id },
+        else => null,
     };
 }
 

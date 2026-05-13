@@ -297,16 +297,16 @@ pub const Native = struct {
 
         if (clickbench_query) |query_kind| switch (query_kind) {
             .count_adv_engine_non_zero => return native_reduce.formatCountNonZeroI16(self.allocator, "count_star()", hot.adv_engine_id),
-            .sum_count_avg => return native_reduce.formatSumCountAvg(self.allocator, hot.adv_engine_id, hot.resolution_width),
-            .avg_user_id => return native_reduce.formatAvgUserId(self.allocator, hot.user_id),
-            .min_max_event_date => return native_reduce.formatMinMaxEventDate(self.allocator, hot.event_date),
-            .wide_resolution_sums => return native_reduce.formatWideResolutionSums(self.allocator, hot.resolution_width),
-            .adv_engine_group_by => return native_group.formatAdvEngineCount(self.allocator, reduceHot(hot)),
+            .sum_count_avg => return native_reduce.formatSumCountAvg(self.allocator, "sum(AdvEngineID)", "count_star()", "avg(ResolutionWidth)", hot.adv_engine_id, hot.resolution_width),
+            .avg_user_id => return native_reduce.formatAvgI64(self.allocator, "avg(UserID)", hot.user_id),
+            .min_max_event_date => return native_reduce.formatMinMaxDate(self.allocator, "min(EventDate)", "max(EventDate)", hot.event_date),
+            .wide_resolution_sums => return native_reduce.formatWideSums(self.allocator, "ResolutionWidth", hot.resolution_width),
+            .adv_engine_group_by => return native_group.formatDenseCountI16(self.allocator, "AdvEngineID", hot.adv_engine_id, "count_star()", true),
             .user_id_point_lookup => return formatUserIdPointLookup(self.allocator, hot.user_id, 435090932899640449),
-            .url_length_by_counter => return native_group.formatUrlLengthByCounter(self.allocator, reduceHot(hot)),
+            .url_length_by_counter => return native_group.formatDenseAvgCountTopI32(self.allocator, "CounterID", hot.counter_id, hot.url_length orelse return error.UnsupportedNativeQuery, hot.url_length orelse return error.UnsupportedNativeQuery, 100000, 25, "l", "c"),
             .url_hash_date_dashboard => return formatUrlHashDateDashboard(self, hot, hot.trafic_source_id orelse return error.UnsupportedNativeQuery, hot.referer_hash orelse return error.UnsupportedNativeQuery),
             .time_bucket_dashboard => return formatTimeBucketDashboard(self, hot, hot.event_minute orelse return error.UnsupportedNativeQuery),
-            .client_ip_top10 => if (self.experimental) return native_group.formatClientIpTop10(self.allocator, reduceHot(hot)),
+            .client_ip_top10 => if (self.experimental) return native_group.formatOffsetCountTopI32(self.allocator, "ClientIP", hot.client_ip orelse return error.UnsupportedNativeQuery, .{ 0, -1, -2, -3 }, 10, "c"),
             .user_id_count_top10 => if (self.experimental) return formatUserIdCountTop10DenseCached(self.allocator, try self.getUserIdEncoding()),
             .window_size_dashboard => return formatWindowSizeDashboard(self, hot),
             else => {},
@@ -317,7 +317,10 @@ pub const Native = struct {
             .user_id_minute_search_phrase_count_top => return formatUserIdMinuteSearchPhraseCountTopCached(self.allocator, self.io, self.data_dir, try self.getUserIdEncoding(), try self.getSearchPhraseColumn()),
             .search_engine_client_ip_agg_top => return formatSearchEngineClientIpAggTop(self.allocator, self.io, self.data_dir),
             .watch_id_client_ip_agg_top => return formatWatchIdClientIpAggTop(self.allocator, self.io, self.data_dir),
-            .watch_id_client_ip_agg_top_filtered => return native_group.formatWatchIdClientIpFilteredTop(self.allocator, reduceHotWithSearchPhrase(hot, try self.getSearchPhraseColumn())),
+            .watch_id_client_ip_agg_top_filtered => {
+                const phrases = try self.getSearchPhraseColumn();
+                return native_group.formatTupleAggTopBound(self.allocator, "WatchID", hot.watch_id orelse return error.UnsupportedNativeQuery, "ClientIP", hot.client_ip orelse return error.UnsupportedNativeQuery, phrases.ids.values, phrases.emptyId() orelse return error.UnsupportedNativeQuery, "IsRefresh", hot.is_refresh, "ResolutionWidth", hot.resolution_width, 10, "c");
+            },
             .url_count_top => return formatUrlCountTopHashLateMaterializeCached(self, hot, false) catch |err| switch (err) {
                 error.FileNotFound => return formatUrlCountTop(self.allocator, self.io, self.data_dir),
                 else => return err,
@@ -420,7 +423,7 @@ pub const Native = struct {
             else => return err,
         };
 
-        if (try native_reduce.executeScalar(self.allocator, plan, reduceHot(hot))) |output| return output;
+        if (try native_reduce.executeScalar(self.allocator, plan, reduceScalarContext(hot))) |output| return output;
 
         if (clickbench_dispatch.matchGenericFallback(plan)) |fallback| return self.executeClickBenchGenericFallback(fallback, hot);
 
@@ -445,10 +448,12 @@ pub const Native = struct {
 
     fn executeGenericGroupBy(self: *Native, plan: generic_sql.Plan, hot: *const HotColumns) anyerror![]u8 {
         const group_col = plan.group_by orelse return error.UnsupportedGenericQuery;
-        if (try native_group.execute(self.allocator, plan, reduceHot(hot))) |output| return output;
-        if (native_group.needsSearchPhraseIds(plan)) {
-            if (try native_group.execute(self.allocator, plan, reduceHotWithSearchPhrase(hot, try self.getSearchPhraseColumn()))) |output| return output;
-        }
+        var group_data = GroupContextData{ .hot = hot };
+        if (try native_group.execute(self.allocator, plan, groupContext(&group_data))) |output| return output;
+        if (plan.filter) |filter| if (asciiEqlIgnoreCase(filter.column, "SearchPhrase")) {
+            group_data.search_phrase = try self.getSearchPhraseColumn();
+            if (try native_group.execute(self.allocator, plan, groupContext(&group_data))) |output| return output;
+        };
         if (clickbench_dispatch.matchGenericFallback(plan)) |fallback| return self.executeClickBenchGenericFallback(fallback, hot);
         if (!plan.order_by_count_desc) return error.UnsupportedGenericQuery;
         if (plan.projections.len != 2) return error.UnsupportedGenericQuery;
@@ -617,10 +622,10 @@ pub const Native = struct {
         return switch (query_kind) {
             .count_star => try native_reduce.formatOneInt(self.allocator, "count_star()", hot.rowCount()),
             .count_adv_engine_non_zero => try native_reduce.formatCountNonZeroI16(self.allocator, "count_star()", hot.adv_engine_id),
-            .sum_count_avg => try native_reduce.formatSumCountAvg(self.allocator, hot.adv_engine_id, hot.resolution_width),
-            .avg_user_id => try native_reduce.formatAvgUserId(self.allocator, hot.user_id),
+            .sum_count_avg => try native_reduce.formatSumCountAvg(self.allocator, "sum(AdvEngineID)", "count_star()", "avg(ResolutionWidth)", hot.adv_engine_id, hot.resolution_width),
+            .avg_user_id => try native_reduce.formatAvgI64(self.allocator, "avg(UserID)", hot.user_id),
             .count_distinct_search_phrase => try formatSearchPhraseDistinctCountCached(self.allocator, try self.getSearchPhraseColumn()),
-            .min_max_event_date => try native_reduce.formatMinMaxEventDate(self.allocator, hot.event_date),
+            .min_max_event_date => try native_reduce.formatMinMaxDate(self.allocator, "min(EventDate)", "max(EventDate)", hot.event_date),
             .mobile_phone_model_distinct_user_id_top => try formatMobilePhoneModelDistinctUserIdTop(self.allocator, self.io, self.data_dir),
             .mobile_phone_distinct_user_id_top => try formatMobilePhoneDistinctUserIdTop(self.allocator, self.io, self.data_dir),
             .search_phrase_count_top => blk: {
@@ -656,12 +661,15 @@ pub const Native = struct {
             .search_phrase_event_time_top => try formatSearchPhraseEventTimeCandidatesCached(self.allocator, self.io, self.data_dir, try self.getSearchPhraseColumn(), false),
             .search_phrase_event_time_phrase_top => try formatSearchPhraseEventTimeCandidatesCached(self.allocator, self.io, self.data_dir, try self.getSearchPhraseColumn(), true),
             .search_phrase_order_by_phrase_top => try formatSearchPhraseOrderByPhraseTopCached(self.allocator, try self.getSearchPhraseColumn()),
-            .url_length_by_counter => try native_group.formatUrlLengthByCounter(self.allocator, reduceHot(hot)),
+            .url_length_by_counter => try native_group.formatDenseAvgCountTopI32(self.allocator, "CounterID", hot.counter_id, hot.url_length orelse return error.UnsupportedNativeQuery, hot.url_length orelse return error.UnsupportedNativeQuery, 100000, 25, "l", "c"),
             .referer_domain_stats_top => try formatQ29(self.allocator, self.io, self.data_dir),
             .url_like_google_order_by_event_time => if (submitMode()) try formatQ24(self.allocator, self.io, self.data_dir, hot) else null,
             .search_engine_client_ip_agg_top => try formatSearchEngineClientIpAggTop(self.allocator, self.io, self.data_dir),
             .watch_id_client_ip_agg_top => try formatWatchIdClientIpAggTop(self.allocator, self.io, self.data_dir),
-            .watch_id_client_ip_agg_top_filtered => try native_group.formatWatchIdClientIpFilteredTop(self.allocator, reduceHotWithSearchPhrase(hot, try self.getSearchPhraseColumn())),
+            .watch_id_client_ip_agg_top_filtered => blk: {
+                const phrases = try self.getSearchPhraseColumn();
+                break :blk try native_group.formatTupleAggTopBound(self.allocator, "WatchID", hot.watch_id orelse return error.UnsupportedNativeQuery, "ClientIP", hot.client_ip orelse return error.UnsupportedNativeQuery, phrases.ids.values, phrases.emptyId() orelse return error.UnsupportedNativeQuery, "IsRefresh", hot.is_refresh, "ResolutionWidth", hot.resolution_width, 10, "c");
+            },
             .url_count_top => blk: {
                 const output = formatUrlCountTopHashLateMaterializeCached(self, hot, false) catch |err| switch (err) {
                     error.FileNotFound => try formatUrlCountTop(self.allocator, self.io, self.data_dir),
@@ -676,7 +684,7 @@ pub const Native = struct {
                 };
                 break :blk output;
             },
-            .client_ip_top10 => try native_group.formatClientIpTop10(self.allocator, reduceHot(hot)),
+            .client_ip_top10 => try native_group.formatOffsetCountTopI32(self.allocator, "ClientIP", hot.client_ip orelse return error.UnsupportedNativeQuery, .{ 0, -1, -2, -3 }, 10, "c"),
             .window_size_dashboard => try formatWindowSizeDashboard(self, hot),
             .time_bucket_dashboard => try formatTimeBucketDashboard(self, hot, hot.event_minute orelse return error.UnsupportedNativeQuery),
             .url_hash_date_dashboard => try formatUrlHashDateDashboard(self, hot, hot.trafic_source_id orelse return error.UnsupportedNativeQuery, hot.referer_hash orelse return error.UnsupportedNativeQuery),
@@ -5581,11 +5589,68 @@ fn reduceHot(hot: *const HotColumns) native_reduce.HotColumns {
     };
 }
 
-fn reduceHotWithSearchPhrase(hot: *const HotColumns, phrases: *const lowcard.StringColumn) native_reduce.HotColumns {
-    var reduced = reduceHot(hot);
-    reduced.search_phrase_id = phrases.ids.values;
-    reduced.search_phrase_empty_id = phrases.emptyId();
-    return reduced;
+const GroupContextData = struct {
+    hot: *const HotColumns,
+    search_phrase: ?*const lowcard.StringColumn = null,
+};
+
+fn groupContext(data: *const GroupContextData) native_group.Context {
+    return .{
+        .ptr = data,
+        .bind_column = bindClickBenchGroupColumn,
+        .bind_filter_column = bindClickBenchGroupFilterColumn,
+    };
+}
+
+fn bindClickBenchGroupColumn(ptr: *const anyopaque, name: []const u8) anyerror!native_group.BoundColumn {
+    const data: *const GroupContextData = @ptrCast(@alignCast(ptr));
+    const hot = data.hot;
+    if (asciiEqlIgnoreCase(name, "AdvEngineID")) return .{ .name = "AdvEngineID", .column = .{ .i16 = hot.adv_engine_id } };
+    if (asciiEqlIgnoreCase(name, "CounterID")) return .{ .name = "CounterID", .column = .{ .i32 = hot.counter_id } };
+    if (asciiEqlIgnoreCase(name, "ClientIP")) return .{ .name = "ClientIP", .column = .{ .i32 = hot.client_ip orelse return error.UnsupportedGenericColumn } };
+    if (asciiEqlIgnoreCase(name, "WatchID")) return .{ .name = "WatchID", .column = .{ .i64 = hot.watch_id orelse return error.UnsupportedGenericColumn } };
+    if (asciiEqlIgnoreCase(name, "IsRefresh")) return .{ .name = "IsRefresh", .column = .{ .i16 = hot.is_refresh } };
+    if (asciiEqlIgnoreCase(name, "ResolutionWidth")) return .{ .name = "ResolutionWidth", .column = .{ .i16 = hot.resolution_width } };
+    if (asciiEqlIgnoreCase(name, "length(URL)")) return .{ .name = "length(URL)", .column = .{ .i32 = hot.url_length orelse return error.UnsupportedGenericColumn } };
+    return error.UnsupportedGenericColumn;
+}
+
+fn bindClickBenchGroupFilterColumn(ptr: *const anyopaque, name: []const u8) anyerror!native_group.BoundColumn {
+    const data: *const GroupContextData = @ptrCast(@alignCast(ptr));
+    if (asciiEqlIgnoreCase(name, "URL")) return .{ .name = "URL", .column = .{ .i32 = data.hot.url_length orelse return error.UnsupportedGenericColumn } };
+    if (asciiEqlIgnoreCase(name, "SearchPhrase")) {
+        const phrase = data.search_phrase orelse return error.UnsupportedGenericColumn;
+        return .{ .name = "SearchPhrase", .column = .{ .empty_text_id = .{ .ids = phrase.ids.values, .empty_id = phrase.emptyId() orelse return error.UnsupportedGenericColumn } } };
+    }
+    return bindClickBenchGroupColumn(ptr, name);
+}
+
+fn reduceScalarContext(hot: *const HotColumns) native_reduce.ScalarContext {
+    return .{
+        .ptr = hot,
+        .row_count = hot.rowCount(),
+        .bind_column = bindClickBenchReduceColumn,
+        .bind_filter_column = bindClickBenchReduceFilterColumn,
+    };
+}
+
+fn bindClickBenchReduceColumn(ptr: *const anyopaque, name: []const u8) anyerror!native_reduce.Column {
+    const hot: *const HotColumns = @ptrCast(@alignCast(ptr));
+    if (asciiEqlIgnoreCase(name, "AdvEngineID")) return .{ .i16 = hot.adv_engine_id };
+    if (asciiEqlIgnoreCase(name, "ResolutionWidth")) return .{ .i16 = hot.resolution_width };
+    if (asciiEqlIgnoreCase(name, "UserID")) return .{ .i64 = hot.user_id };
+    if (asciiEqlIgnoreCase(name, "EventDate")) return .{ .date = hot.event_date };
+    if (asciiEqlIgnoreCase(name, "CounterID")) return .{ .i32 = hot.counter_id };
+    if (asciiEqlIgnoreCase(name, "IsRefresh")) return .{ .i16 = hot.is_refresh };
+    if (asciiEqlIgnoreCase(name, "DontCountHits")) return .{ .i16 = hot.dont_count_hits };
+    if (asciiEqlIgnoreCase(name, "length(URL)")) return .{ .i32 = hot.url_length orelse return error.UnsupportedGenericColumn };
+    return error.UnsupportedGenericColumn;
+}
+
+fn bindClickBenchReduceFilterColumn(ptr: *const anyopaque, name: []const u8) anyerror!native_reduce.Column {
+    const hot: *const HotColumns = @ptrCast(@alignCast(ptr));
+    if (asciiEqlIgnoreCase(name, "URL")) return .{ .i32 = hot.url_length orelse return error.UnsupportedGenericColumn };
+    return bindClickBenchReduceColumn(ptr, name);
 }
 
 const UserIdEncoding = struct {

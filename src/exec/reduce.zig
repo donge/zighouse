@@ -27,41 +27,56 @@ const Value = union(enum) {
     date: i32,
 };
 
-const Column = union(enum) {
+pub const Column = union(enum) {
     i16: []const i16,
     i32: []const i32,
     date: []const i32,
     i64: []const i64,
 };
 
-pub fn executeScalar(allocator: std.mem.Allocator, plan: generic_sql.Plan, hot: HotColumns) !?[]u8 {
+pub const ScalarContext = struct {
+    ptr: *const anyopaque,
+    row_count: usize,
+    bind_column: *const fn (*const anyopaque, []const u8) anyerror!Column,
+    bind_filter_column: *const fn (*const anyopaque, []const u8) anyerror!Column,
+
+    fn column(self: ScalarContext, name: []const u8) !Column {
+        return self.bind_column(self.ptr, name);
+    }
+
+    fn filterColumn(self: ScalarContext, name: []const u8) !Column {
+        return self.bind_filter_column(self.ptr, name);
+    }
+};
+
+pub fn executeScalar(allocator: std.mem.Allocator, plan: generic_sql.Plan, ctx: ScalarContext) !?[]u8 {
     if (plan.group_by != null or plan.having_text != null or plan.order_by_text != null or plan.limit != null or plan.offset != null) return null;
     if (plan.where_text != null and plan.filter == null) return null;
     for (plan.projections) |expr| {
         if (expr.func == .column_ref or expr.func == .count_distinct) return null;
     }
 
-    if (try executeFastCountStar(allocator, plan, hot)) |output| return output;
+    if (try executeFastCountStar(allocator, plan, ctx)) |output| return output;
 
-    const predicate = if (plan.filter) |filter| try materializePlanFilter(allocator, hot, filter) else null;
+    const predicate = if (plan.filter) |filter| try materializePlanFilter(allocator, ctx, filter) else null;
     defer if (predicate) |p| allocator.free(p);
 
-    if (try executeFusedSumOffsets(allocator, plan, hot, predicate)) |output| return output;
-    if (try executeFusedMinMax(allocator, plan, hot, predicate)) |output| return output;
+    if (try executeFusedSumOffsets(allocator, plan, ctx, predicate)) |output| return output;
+    if (try executeFusedMinMax(allocator, plan, ctx, predicate)) |output| return output;
 
     const values = try allocator.alloc(Value, plan.projections.len);
     defer allocator.free(values);
     for (plan.projections, 0..) |expr, i| {
-        values[i] = try executeProjection(expr, hot, predicate);
+        values[i] = try executeProjection(expr, ctx, predicate);
     }
     return try formatValues(allocator, plan, values);
 }
 
-fn executeFastCountStar(allocator: std.mem.Allocator, plan: generic_sql.Plan, hot: HotColumns) !?[]u8 {
+fn executeFastCountStar(allocator: std.mem.Allocator, plan: generic_sql.Plan, ctx: ScalarContext) !?[]u8 {
     if (plan.projections.len != 1 or plan.projections[0].func != .count_star) return null;
     const filter = plan.filter orelse return null;
     if (filter.second != null) return null;
-    const column = bindFilterColumn(hot, filter.column) catch return error.UnsupportedGenericQuery;
+    const column = ctx.filterColumn(filter.column) catch return error.UnsupportedGenericQuery;
     const count = try countMatches(column, filter.op, filter.int_value);
     return try formatOneInt(allocator, "count_star()", count);
 }
@@ -91,24 +106,24 @@ pub fn formatCountNonZeroI16(allocator: std.mem.Allocator, header: []const u8, v
     return formatOneInt(allocator, header, simd.countNonZero(i16, values));
 }
 
-pub fn formatSumCountAvg(allocator: std.mem.Allocator, adv_engine_id: []const i16, resolution_width: []const i16) ![]u8 {
+pub fn formatSumCountAvg(allocator: std.mem.Allocator, sum_label: []const u8, count_label: []const u8, avg_label: []const u8, adv_engine_id: []const i16, resolution_width: []const i16) ![]u8 {
     const adv_sum = simd.sum(i16, adv_engine_id);
     const width_sum = simd.sum(i16, resolution_width);
-    return std.fmt.allocPrint(allocator, "sum(AdvEngineID),count_star(),avg(ResolutionWidth)\n{d},{d},{d}\n", .{ adv_sum, adv_engine_id.len, avgFromSum(width_sum, resolution_width.len) });
+    return std.fmt.allocPrint(allocator, "{s},{s},{s}\n{d},{d},{d}\n", .{ sum_label, count_label, avg_label, adv_sum, adv_engine_id.len, avgFromSum(width_sum, resolution_width.len) });
 }
 
-pub fn formatAvgUserId(allocator: std.mem.Allocator, values: []const i64) ![]u8 {
-    return std.fmt.allocPrint(allocator, "avg(UserID)\n{d}\n", .{simd.avg(i64, values)});
+pub fn formatAvgI64(allocator: std.mem.Allocator, header: []const u8, values: []const i64) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{s}\n{d}\n", .{ header, simd.avg(i64, values) });
 }
 
-pub fn formatMinMaxEventDate(allocator: std.mem.Allocator, values: []const i32) ![]u8 {
+pub fn formatMinMaxDate(allocator: std.mem.Allocator, min_header: []const u8, max_header: []const u8, values: []const i32) ![]u8 {
     const mm = simd.minMax(i32, values);
     const min_date = dateString(@intCast(mm.min));
     const max_date = dateString(@intCast(mm.max));
-    return std.fmt.allocPrint(allocator, "min(EventDate),max(EventDate)\n{s},{s}\n", .{ min_date, max_date });
+    return std.fmt.allocPrint(allocator, "{s},{s}\n{s},{s}\n", .{ min_header, max_header, min_date, max_date });
 }
 
-pub fn formatWideResolutionSums(allocator: std.mem.Allocator, values: []const i16) ![]u8 {
+pub fn formatWideSums(allocator: std.mem.Allocator, column_label: []const u8, values: []const i16) ![]u8 {
     const base_sum = simd.sum(i16, values);
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
@@ -116,9 +131,9 @@ pub fn formatWideResolutionSums(allocator: std.mem.Allocator, values: []const i1
     for (0..90) |i| {
         if (i != 0) try out.append(allocator, ',');
         if (i == 0) {
-            try out.appendSlice(allocator, "sum(ResolutionWidth)");
+            try out.print(allocator, "sum({s})", .{column_label});
         } else {
-            try out.print(allocator, "sum((ResolutionWidth + {d}))", .{i});
+            try out.print(allocator, "sum(({s} + {d}))", .{ column_label, i });
         }
     }
     try out.append(allocator, '\n');
@@ -133,7 +148,7 @@ pub fn formatWideResolutionSums(allocator: std.mem.Allocator, values: []const i1
     return out.toOwnedSlice(allocator);
 }
 
-fn executeFusedSumOffsets(allocator: std.mem.Allocator, plan: generic_sql.Plan, hot: HotColumns, predicate: ?[]const i16) !?[]u8 {
+fn executeFusedSumOffsets(allocator: std.mem.Allocator, plan: generic_sql.Plan, ctx: ScalarContext, predicate: ?[]const i16) !?[]u8 {
     if (plan.projections.len < 2) return null;
     const first_col = plan.projections[0].column orelse return null;
     for (plan.projections) |expr| {
@@ -142,7 +157,7 @@ fn executeFusedSumOffsets(allocator: std.mem.Allocator, plan: generic_sql.Plan, 
         if (!asciiEqlIgnoreCase(col, first_col)) return null;
     }
 
-    const column = bindColumn(hot, first_col) catch return error.UnsupportedGenericQuery;
+    const column = ctx.column(first_col) catch return error.UnsupportedGenericQuery;
     const sum_count: simd.SumCount = switch (column) {
         .i16 => |values| if (predicate) |p| simd.filteredSumCountNonZero(i16, p, values) else .{ .sum = simd.sum(i16, values), .count = @intCast(values.len) },
         .i32 => |values| if (predicate) |p| simd.filteredSumCountNonZero(i32, p, values) else .{ .sum = simd.sum(i32, values), .count = @intCast(values.len) },
@@ -157,7 +172,7 @@ fn executeFusedSumOffsets(allocator: std.mem.Allocator, plan: generic_sql.Plan, 
     return try formatValues(allocator, plan, values);
 }
 
-fn executeFusedMinMax(allocator: std.mem.Allocator, plan: generic_sql.Plan, hot: HotColumns, predicate: ?[]const i16) !?[]u8 {
+fn executeFusedMinMax(allocator: std.mem.Allocator, plan: generic_sql.Plan, ctx: ScalarContext, predicate: ?[]const i16) !?[]u8 {
     if (plan.projections.len != 2) return null;
     const first = plan.projections[0];
     const second = plan.projections[1];
@@ -165,7 +180,7 @@ fn executeFusedMinMax(allocator: std.mem.Allocator, plan: generic_sql.Plan, hot:
     const first_col = first.column orelse return error.UnsupportedGenericQuery;
     const second_col = second.column orelse return error.UnsupportedGenericQuery;
     if (!asciiEqlIgnoreCase(first_col, second_col)) return null;
-    return switch (bindColumn(hot, first_col) catch return error.UnsupportedGenericQuery) {
+    return switch (ctx.column(first_col) catch return error.UnsupportedGenericQuery) {
         .i16 => |values| blk: {
             const mm = if (predicate) |p| simd.filteredMinMaxNonZero(i16, p, values) else simd.minMax(i16, values);
             break :blk try formatValues(allocator, plan, &.{ .{ .int = mm.min }, .{ .int = mm.max } });
@@ -185,10 +200,10 @@ fn executeFusedMinMax(allocator: std.mem.Allocator, plan: generic_sql.Plan, hot:
     };
 }
 
-fn executeProjection(expr: generic_sql.Expr, hot: HotColumns, predicate: ?[]const i16) !Value {
-    if (expr.func == .count_star) return .{ .int = if (predicate) |p| @intCast(simd.countNonZero(i16, p)) else @intCast(hot.rowCount()) };
+fn executeProjection(expr: generic_sql.Expr, ctx: ScalarContext, predicate: ?[]const i16) !Value {
+    if (expr.func == .count_star) return .{ .int = if (predicate) |p| @intCast(simd.countNonZero(i16, p)) else @intCast(ctx.row_count) };
     if (expr.func == .int_literal) return .{ .int = expr.int_offset };
-    const column = bindColumn(hot, expr.column orelse return error.UnsupportedGenericQuery) catch return error.UnsupportedGenericQuery;
+    const column = ctx.column(expr.column orelse return error.UnsupportedGenericQuery) catch return error.UnsupportedGenericQuery;
     return switch (expr.func) {
         .column_ref => error.UnsupportedGenericQuery,
         .int_literal => unreachable,
@@ -240,14 +255,14 @@ fn aggregateMax(column: Column, predicate: ?[]const i16) !Value {
     };
 }
 
-fn materializePlanFilter(allocator: std.mem.Allocator, hot: HotColumns, filter: generic_sql.Filter) ![]i16 {
+fn materializePlanFilter(allocator: std.mem.Allocator, ctx: ScalarContext, filter: generic_sql.Filter) ![]i16 {
     if (filter.second) |second| {
-        const left_column = bindFilterColumn(hot, filter.column) catch return error.UnsupportedGenericQuery;
-        const right_column = bindFilterColumn(hot, second.column) catch return error.UnsupportedGenericQuery;
+        const left_column = ctx.filterColumn(filter.column) catch return error.UnsupportedGenericQuery;
+        const right_column = ctx.filterColumn(second.column) catch return error.UnsupportedGenericQuery;
         const left = generic_sql.Predicate{ .column = filter.column, .op = filter.op, .int_value = filter.int_value };
         return materializeAndPredicate(allocator, left_column, left, right_column, second);
     }
-    const column = bindFilterColumn(hot, filter.column) catch return error.UnsupportedGenericQuery;
+    const column = ctx.filterColumn(filter.column) catch return error.UnsupportedGenericQuery;
     return materializePredicate(allocator, column, .{ .column = filter.column, .op = filter.op, .int_value = filter.int_value });
 }
 
@@ -301,23 +316,6 @@ fn predicateMatches(comptime T: type, value: T, target: T, op: generic_sql.Filte
         .less => value < target,
         .less_equal => value <= target,
     };
-}
-
-fn bindColumn(hot: HotColumns, name: []const u8) !Column {
-    if (asciiEqlIgnoreCase(name, "AdvEngineID")) return .{ .i16 = hot.adv_engine_id };
-    if (asciiEqlIgnoreCase(name, "ResolutionWidth")) return .{ .i16 = hot.resolution_width };
-    if (asciiEqlIgnoreCase(name, "UserID")) return .{ .i64 = hot.user_id };
-    if (asciiEqlIgnoreCase(name, "EventDate")) return .{ .date = hot.event_date };
-    if (asciiEqlIgnoreCase(name, "CounterID")) return .{ .i32 = hot.counter_id };
-    if (asciiEqlIgnoreCase(name, "IsRefresh")) return .{ .i16 = hot.is_refresh };
-    if (asciiEqlIgnoreCase(name, "DontCountHits")) return .{ .i16 = hot.dont_count_hits };
-    if (asciiEqlIgnoreCase(name, "length(URL)")) return .{ .i32 = hot.url_length orelse return error.UnsupportedGenericColumn };
-    return error.UnsupportedGenericColumn;
-}
-
-fn bindFilterColumn(hot: HotColumns, name: []const u8) !Column {
-    if (asciiEqlIgnoreCase(name, "URL")) return .{ .i32 = hot.url_length orelse return error.UnsupportedGenericColumn };
-    return bindColumn(hot, name);
 }
 
 fn formatValues(allocator: std.mem.Allocator, plan: generic_sql.Plan, values: []const Value) ![]u8 {
