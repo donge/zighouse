@@ -21,6 +21,9 @@ const reader = @import("reader.zig");
 const storage = @import("storage.zig");
 const hashmap = @import("hashmap.zig");
 const parallel = @import("parallel.zig");
+const schema = @import("schema.zig");
+const bind = @import("exec/bind.zig");
+const exec_shape = @import("exec/shape.zig");
 
 fn fairMode() bool {
     return std.c.getenv("ZIGHOUSE_FAIR") != null;
@@ -277,8 +280,8 @@ pub const Native = struct {
             },
             .search_phrase_count_top => {
                 if (!self.experimental) return error.UnsupportedNativeQuery;
-                const binding = try self.bindLowCardTextColumn("SearchPhrase");
-                return native_string_top.formatLowCardTextCountTop(self.allocator, binding.name, "c", binding.column, 10);
+                const bound = try self.bindColumn("SearchPhrase");
+                return native_string_top.formatLowCardTextCountTop(self.allocator, bound.lowcard_text.name, "c", bound.lowcard_text.column, 10);
             },
             .search_phrase_distinct_user_id_top => {
                 if (!self.experimental) return error.UnsupportedNativeQuery;
@@ -535,8 +538,8 @@ pub const Native = struct {
             },
             .phrase_count_top => |shape| switch (shape) {
                 .lowcard_text => |top| {
-                    const binding = try self.bindLowCardTextColumn(top.column);
-                    return native_string_top.formatLowCardTextCountTop(self.allocator, binding.name, top.count_label, binding.column, top.limit);
+                    const bound = try self.bindColumn(top.column);
+                    return native_string_top.formatLowCardTextCountTop(self.allocator, bound.lowcard_text.name, top.count_label, bound.lowcard_text.column, top.limit);
                 },
                 .search_engine_phrase => return formatSearchEnginePhraseCountTop(self.allocator, self.io, self.data_dir),
             },
@@ -629,8 +632,8 @@ pub const Native = struct {
             .mobile_phone_model_distinct_user_id_top => try formatMobilePhoneModelDistinctUserIdTop(self.allocator, self.io, self.data_dir),
             .mobile_phone_distinct_user_id_top => try formatMobilePhoneDistinctUserIdTop(self.allocator, self.io, self.data_dir),
             .search_phrase_count_top => blk: {
-                const binding = try self.bindLowCardTextColumn("SearchPhrase");
-                break :blk try native_string_top.formatLowCardTextCountTop(self.allocator, binding.name, "c", binding.column, 10);
+                const bound = try self.bindColumn("SearchPhrase");
+                break :blk try native_string_top.formatLowCardTextCountTop(self.allocator, bound.lowcard_text.name, "c", bound.lowcard_text.column, 10);
             },
             .search_phrase_distinct_user_id_top => try formatSearchPhraseDistinctUserIdTop(self.allocator, self.io, self.data_dir),
             .search_engine_phrase_count_top => try formatSearchEnginePhraseCountTop(self.allocator, self.io, self.data_dir),
@@ -983,17 +986,37 @@ pub const Native = struct {
         return &self.search_phrase_cache.?;
     }
 
-    const LowCardTextBinding = struct {
-        name: []const u8,
-        column: *const lowcard.StringColumn,
-    };
-
-    fn bindLowCardTextColumn(self: *Native, name: []const u8) !LowCardTextBinding {
-        const index = clickbench_schema.findColumn(name) orelse return error.UnsupportedGenericQuery;
+    /// Schema-driven column binding (PR-A3).
+    ///
+    /// Returns a `BoundColumn` for any hits column known to the schema and
+    /// backed by an existing Native getter. Falls back to
+    /// `error.UnsupportedNativeQuery` when the column has no runtime data
+    /// source yet (PR-A4+ will extend coverage to URL/Title/MobilePhoneModel).
+    ///
+    /// This is the dispatch primitive consumed by (PlanShape, CapabilityTag)
+    /// lookup. It must remain a thin facade over the existing getters; any
+    /// caching/IO already lives behind those getters.
+    fn bindColumn(self: *Native, name: []const u8) !bind.BoundColumn {
+        const index = clickbench_schema.findColumn(name) orelse return error.UnsupportedNativeQuery;
         const column = clickbench_schema.hits.columns[index];
-        if (column.ty != .text or !column.capabilities.group_count_top) return error.UnsupportedGenericQuery;
-        if (asciiEqlIgnoreCase(column.name, "SearchPhrase")) return .{ .name = column.name, .column = try self.getSearchPhraseColumn() };
-        return error.UnsupportedGenericQuery;
+        const tag = schema.capabilityTag(column);
+        return switch (tag) {
+            .lowcard_text => blk: {
+                if (asciiEqlIgnoreCase(column.name, "SearchPhrase")) {
+                    const col = try self.getSearchPhraseColumn();
+                    break :blk bind.BoundColumn{ .lowcard_text = .{
+                        .name = column.name,
+                        .column = col,
+                        .empty_id = col.emptyId(),
+                        .hash = null,
+                        .capabilities = column.capabilities,
+                    } };
+                }
+                break :blk error.UnsupportedNativeQuery;
+            },
+            // Other tags fall through until PR-A4+.
+            else => error.UnsupportedNativeQuery,
+        };
     }
 
     fn getUrlColumn(self: *Native) !*const lowcard.StringColumn {
@@ -7050,66 +7073,6 @@ fn formatSearchPhraseDistinctCountCached(allocator: std.mem.Allocator, phrases: 
         }
     }
     return native_reduce.formatOneInt(allocator, "count(DISTINCT SearchPhrase)", distinct);
-}
-
-fn formatSearchPhraseCountTop(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8) ![]u8 {
-    // (1) mmap u32 id column + offsets + phrases blob.
-    const id_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_search_phrase_id_name);
-    defer allocator.free(id_path);
-    const offsets_path = try storage.hotColumnPath(allocator, data_dir, storage.search_phrase_id_offsets_name);
-    defer allocator.free(offsets_path);
-    const phrases_path = try storage.hotColumnPath(allocator, data_dir, storage.search_phrase_id_phrases_name);
-    defer allocator.free(phrases_path);
-
-    const id_col = try io_map.mapColumn(u32, io, id_path);
-    defer id_col.mapping.unmap();
-    const off_col = try io_map.mapColumn(u32, io, offsets_path);
-    defer off_col.mapping.unmap();
-    const phrases_map = try io_map.mapFile(io, phrases_path);
-    defer phrases_map.unmap();
-
-    const dict_size = off_col.values.len - 1;
-
-    // (2) Dense aggregation: counts[id]++ over the entire id column.
-    const counts = try allocator.alloc(u32, dict_size);
-    defer allocator.free(counts);
-    @memset(counts, 0);
-    for (id_col.values) |id| counts[id] += 1;
-
-    // (3) Pick top-11 ids (one extra for empty filter).
-    const top_capacity: usize = 11;
-    const TopRow = struct { id: u32, count: u32 };
-    var top: [top_capacity]TopRow = undefined;
-    var top_len: usize = 0;
-    for (counts, 0..) |c, idx| {
-        if (c == 0) continue;
-        const row: TopRow = .{ .id = @intCast(idx), .count = c };
-        // Insert into top sorted by count desc, id asc.
-        var pos: usize = 0;
-        while (pos < top_len and (top[pos].count > row.count or (top[pos].count == row.count and top[pos].id < row.id))) : (pos += 1) {}
-        if (pos >= top_capacity) continue;
-        if (top_len < top_capacity) top_len += 1;
-        var j = top_len - 1;
-        while (j > pos) : (j -= 1) top[j] = top[j - 1];
-        top[pos] = row;
-    }
-
-    // (4) Format output, filter empty SearchPhrase ('""' two-char encoding).
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(allocator);
-    try out.appendSlice(allocator, "SearchPhrase,c\n");
-    var emitted: usize = 0;
-    for (top[0..top_len]) |row| {
-        if (emitted == 10) break;
-        const start = off_col.values[row.id];
-        const end = off_col.values[row.id + 1];
-        const phrase = phrases_map.raw[start..end];
-        if (isStoredEmptyString(phrase)) continue;
-        try writeCsvField(allocator, &out, phrase);
-        try out.print(allocator, ",{d}\n", .{row.count});
-        emitted += 1;
-    }
-    return out.toOwnedSlice(allocator);
 }
 
 fn formatSearchPhraseDistinctUserIdTop(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8) ![]u8 {
