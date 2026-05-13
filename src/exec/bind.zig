@@ -69,7 +69,10 @@ pub const BoundColumn = union(schema.CapabilityTag) {
         name: []const u8,
         column: *const lowcard.StringColumn,
         empty_id: ?u32,
-        hash: ?[]const u64,
+        /// Optional parallel hash sidecar slice (e.g. URLHash/TitleHash).
+        /// Element type is i64 to match the on-disk fixed-column layout used
+        /// by ClickBench (see `clickbench/schema.zig` URL/Title definitions).
+        hash: ?[]const i64,
         capabilities: schema.StringCapabilities,
     },
     hash_text: struct {

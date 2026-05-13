@@ -2,25 +2,6 @@ const std = @import("std");
 const generic_sql = @import("../generic_sql.zig");
 const simd = @import("../simd.zig");
 
-pub const HotColumns = struct {
-    adv_engine_id: []const i16,
-    resolution_width: []const i16,
-    user_id: []const i64,
-    event_date: []const i32,
-    counter_id: []const i32,
-    watch_id: ?[]const i64,
-    client_ip: ?[]const i32,
-    search_phrase_id: ?[]const u32,
-    search_phrase_empty_id: ?u32,
-    is_refresh: []const i16,
-    dont_count_hits: []const i16,
-    url_length: ?[]const i32,
-
-    fn rowCount(self: HotColumns) usize {
-        return self.adv_engine_id.len;
-    }
-};
-
 const Value = union(enum) {
     int: i64,
     float: f64,

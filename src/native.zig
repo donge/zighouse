@@ -5618,23 +5618,6 @@ const HotColumns = struct {
     }
 };
 
-fn reduceHot(hot: *const HotColumns) native_reduce.HotColumns {
-    return .{
-        .adv_engine_id = hot.adv_engine_id,
-        .resolution_width = hot.resolution_width,
-        .user_id = hot.user_id,
-        .event_date = hot.event_date,
-        .counter_id = hot.counter_id,
-        .watch_id = hot.watch_id,
-        .client_ip = hot.client_ip,
-        .search_phrase_id = null,
-        .search_phrase_empty_id = null,
-        .is_refresh = hot.is_refresh,
-        .dont_count_hits = hot.dont_count_hits,
-        .url_length = hot.url_length,
-    };
-}
-
 const GroupContextData = struct {
     hot: *const HotColumns,
     search_phrase: ?*const lowcard.StringColumn = null,
