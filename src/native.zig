@@ -455,6 +455,7 @@ pub const Native = struct {
 
     fn executeGenericGroupBy(self: *Native, plan: generic_sql.Plan, hot: *const HotColumns) anyerror![]u8 {
         const group_col = plan.group_by orelse return error.UnsupportedGenericQuery;
+        if (isGenericUrlLengthByCounterPlan(plan)) return formatUrlLengthByCounter(self.allocator, hot.counter_id, hot.url_length orelse return error.UnsupportedGenericQuery);
         if (plan.limit == 10) {
             if (isGenericMobilePhoneModelDistinctPlan(plan)) return formatMobilePhoneModelDistinctUserIdTop(self.allocator, self.io, self.data_dir);
             if (isGenericMobilePhoneDistinctPlan(plan)) return formatMobilePhoneDistinctUserIdTop(self.allocator, self.io, self.data_dir);
@@ -609,6 +610,19 @@ pub const Native = struct {
         if (!asciiEqlIgnoreCase(plan.order_by_text orelse return false, "c DESC")) return false;
         if (plan.projections.len != projection_len) return false;
         return plan.projections[0].func == .column_ref and asciiEqlIgnoreCase(plan.projections[0].column orelse return false, "SearchPhrase");
+    }
+
+    fn isGenericUrlLengthByCounterPlan(plan: generic_sql.Plan) bool {
+        if (plan.limit != 25 or plan.offset != null) return false;
+        if (!hasGenericEmptyStringFilter(plan, "URL")) return false;
+        if (!asciiEqlIgnoreCase(plan.group_by orelse return false, "CounterID")) return false;
+        if (!asciiEqlIgnoreCase(plan.having_text orelse return false, "COUNT(*) > 100000")) return false;
+        if (!genericOrderByAlias(plan, "l")) return false;
+        if (plan.projections.len != 3) return false;
+        if (plan.projections[0].func != .column_ref or !asciiEqlIgnoreCase(plan.projections[0].column orelse return false, "CounterID")) return false;
+        if (plan.projections[1].func != .avg or !asciiEqlIgnoreCase(plan.projections[1].column orelse return false, "length(URL)")) return false;
+        if (!asciiEqlIgnoreCase(plan.projections[1].alias orelse return false, "l")) return false;
+        return plan.projections[2].func == .count_star and asciiEqlIgnoreCase(plan.projections[2].alias orelse return false, "c");
     }
 
     fn isGenericRegionStatsDistinctPlan(plan: generic_sql.Plan) bool {

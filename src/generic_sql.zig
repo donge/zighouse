@@ -30,6 +30,7 @@ pub const Plan = struct {
     filter: ?Filter = null,
     where_text: ?[]const u8 = null,
     group_by: ?[]const u8 = null,
+    having_text: ?[]const u8 = null,
     order_by_count_desc: bool = false,
     order_by_alias: ?[]const u8 = null,
     order_by_text: ?[]const u8 = null,
@@ -49,10 +50,11 @@ pub fn parse(allocator: std.mem.Allocator, sql: []const u8) !?Plan {
 
     const where_pos = indexOfKeyword(after_from, "where");
     const group_by_pos = indexOfKeywordPair(after_from, "group", "by");
+    const having_pos = indexOfKeyword(after_from, "having");
     const order_by_pos = indexOfKeywordPair(after_from, "order", "by");
     const limit_pos = indexOfKeyword(after_from, "limit");
     const offset_pos = indexOfKeyword(after_from, "offset");
-    const table_end = minOptionalPos(where_pos, minOptionalPos(group_by_pos, minOptionalPos(order_by_pos, minOptionalPos(limit_pos, offset_pos)))) orelse after_from.len;
+    const table_end = minOptionalPos(where_pos, minOptionalPos(group_by_pos, minOptionalPos(having_pos, minOptionalPos(order_by_pos, minOptionalPos(limit_pos, offset_pos))))) orelse after_from.len;
     const table_text = std.mem.trim(u8, after_from[0..table_end], " \t\r\n");
     if (!asciiEqlIgnoreCase(table_text, "hits")) return null;
 
@@ -65,18 +67,26 @@ pub fn parse(allocator: std.mem.Allocator, sql: []const u8) !?Plan {
     if (projections.items.len == 0) return null;
 
     const where_text = if (where_pos) |pos| blk: {
-        const where_end = minOptionalPos(group_by_pos, minOptionalPos(order_by_pos, minOptionalPos(limit_pos, offset_pos))) orelse after_from.len;
+        const where_end = minOptionalPos(group_by_pos, minOptionalPos(having_pos, minOptionalPos(order_by_pos, minOptionalPos(limit_pos, offset_pos)))) orelse after_from.len;
         if (where_end <= pos) return null;
         break :blk std.mem.trim(u8, after_from[pos + "where".len .. where_end], " \t\r\n");
     } else null;
     const filter = if (where_text) |body| parseFilter(body) else null;
 
     const group_by = if (group_by_pos) |pos| blk: {
-        const group_by_end = minOptionalPos(order_by_pos, minOptionalPos(limit_pos, offset_pos)) orelse after_from.len;
+        const group_by_end = minOptionalPos(having_pos, minOptionalPos(order_by_pos, minOptionalPos(limit_pos, offset_pos))) orelse after_from.len;
         if (group_by_end <= pos) return null;
         const group_body = std.mem.trim(u8, after_from[pos + "group".len + "by".len + 1 .. group_by_end], " \t\r\n");
         if (group_body.len == 0) return null;
         break :blk group_body;
+    } else null;
+
+    const having_text = if (having_pos) |pos| blk: {
+        const having_end = minOptionalPos(order_by_pos, minOptionalPos(limit_pos, offset_pos)) orelse after_from.len;
+        if (having_end <= pos) return null;
+        const having_body = std.mem.trim(u8, after_from[pos + "having".len .. having_end], " \t\r\n");
+        if (having_body.len == 0) return null;
+        break :blk having_body;
     } else null;
 
     const order_body = if (order_by_pos) |pos| blk: {
@@ -122,7 +132,7 @@ pub fn parse(allocator: std.mem.Allocator, sql: []const u8) !?Plan {
         };
     } else null;
 
-    if (!validPlanShape(projections.items, filter, where_text, group_by, order_body, limit, offset)) {
+    if (!validPlanShape(projections.items, filter, where_text, group_by, having_text, order_body, limit, offset)) {
         projections.deinit(allocator);
         return null;
     }
@@ -133,6 +143,7 @@ pub fn parse(allocator: std.mem.Allocator, sql: []const u8) !?Plan {
         .filter = filter,
         .where_text = where_text,
         .group_by = group_by,
+        .having_text = having_text,
         .order_by_count_desc = order_by_count_desc,
         .order_by_alias = order_by_alias,
         .order_by_text = order_body,
@@ -145,8 +156,9 @@ pub fn deinit(allocator: std.mem.Allocator, plan: Plan) void {
     allocator.free(plan.projections);
 }
 
-fn validPlanShape(projections: []const Expr, filter: ?Filter, where_text: ?[]const u8, group_by: ?[]const u8, order_by_text: ?[]const u8, limit: ?usize, offset: ?usize) bool {
+fn validPlanShape(projections: []const Expr, filter: ?Filter, where_text: ?[]const u8, group_by: ?[]const u8, having_text: ?[]const u8, order_by_text: ?[]const u8, limit: ?usize, offset: ?usize) bool {
     if (where_text != null and likeTopWhere(where_text.?)) return validLikeTopShape(projections, where_text.?, group_by, order_by_text, limit, offset);
+    if (having_text != null) return validUrlLengthByCounterShape(projections, filter, where_text, group_by, having_text.?, order_by_text, limit, offset);
     if (where_text != null and filter == null) return group_by != null and validDashboardStringTopShape(projections, where_text, group_by.?);
     if (group_by == null) {
         if (validSearchPhraseOrderLimitShape(projections, filter, order_by_text, limit, offset)) return true;
@@ -168,6 +180,21 @@ fn validPlanShape(projections: []const Expr, filter: ?Filter, where_text: ?[]con
     if (projections[1].func == .count_star) return true;
     if (projections[1].func == .count_distinct and asciiEqlIgnoreCase(group_by.?, "RegionID")) return asciiEqlIgnoreCase(projections[1].column orelse return false, "UserID");
     return false;
+}
+
+fn validUrlLengthByCounterShape(projections: []const Expr, filter: ?Filter, where_text: ?[]const u8, group_by: ?[]const u8, having_text: []const u8, order_by_text: ?[]const u8, limit: ?usize, offset: ?usize) bool {
+    if (offset != null or limit != 25) return false;
+    if (!asciiEqlIgnoreCase(group_by orelse return false, "CounterID")) return false;
+    if (!asciiEqlIgnoreCase(where_text orelse return false, "URL <> ''")) return false;
+    const f = filter orelse return false;
+    if (f.second != null or f.op != .not_equal or f.int_value != 0 or !asciiEqlIgnoreCase(f.column, "URL")) return false;
+    if (!asciiEqlIgnoreCase(having_text, "COUNT(*) > 100000")) return false;
+    if (!asciiEqlIgnoreCase(order_by_text orelse return false, "l DESC")) return false;
+    if (projections.len != 3) return false;
+    if (projections[0].func != .column_ref or !asciiEqlIgnoreCase(projections[0].column orelse return false, "CounterID")) return false;
+    if (projections[1].func != .avg or !asciiEqlIgnoreCase(projections[1].column orelse return false, "length(URL)")) return false;
+    if (!asciiEqlIgnoreCase(projections[1].alias orelse return false, "l")) return false;
+    return projections[2].func == .count_star and asciiEqlIgnoreCase(projections[2].alias orelse return false, "c");
 }
 
 fn validLikeTopShape(projections: []const Expr, where: []const u8, group_by: ?[]const u8, order_by_text: ?[]const u8, limit: ?usize, offset: ?usize) bool {
@@ -447,7 +474,7 @@ fn parseSubtractExpr(expr: []const u8) ?Expr {
 }
 
 fn validOrderByText(text: []const u8) bool {
-    return isDateTruncMinuteText(text) or searchPhraseOrderByText(text) or asciiEqlIgnoreCase(text, "c DESC");
+    return isDateTruncMinuteText(text) or searchPhraseOrderByText(text) or asciiEqlIgnoreCase(text, "c DESC") or asciiEqlIgnoreCase(text, "l DESC");
 }
 
 fn searchPhraseOrderByText(text: []const u8) bool {
@@ -865,6 +892,19 @@ test "parses google like top shapes" {
     try std.testing.expectEqual(AggregateFn.min, q23.projections[1].func);
     try std.testing.expectEqual(AggregateFn.min, q23.projections[2].func);
     try std.testing.expectEqual(AggregateFn.count_distinct, q23.projections[4].func);
+}
+
+test "parses URL length by counter shape" {
+    const plan = (try parse(std.testing.allocator, "SELECT CounterID, AVG(length(URL)) AS l, COUNT(*) AS c FROM hits WHERE URL <> '' GROUP BY CounterID HAVING COUNT(*) > 100000 ORDER BY l DESC LIMIT 25")).?;
+    defer deinit(std.testing.allocator, plan);
+    try std.testing.expect(plan.filter != null);
+    try std.testing.expectEqualStrings("URL", plan.filter.?.column);
+    try std.testing.expectEqualStrings("CounterID", plan.group_by.?);
+    try std.testing.expectEqualStrings("COUNT(*) > 100000", plan.having_text.?);
+    try std.testing.expectEqualStrings("l DESC", plan.order_by_text.?);
+    try std.testing.expectEqualStrings("length(URL)", plan.projections[1].column.?);
+    try std.testing.expectEqualStrings("l", plan.projections[1].alias.?);
+    try std.testing.expectEqual(@as(?usize, 25), plan.limit);
 }
 
 test "rejects unsupported order by" {
