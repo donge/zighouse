@@ -1010,6 +1010,15 @@ pub const Native = struct {
     /// lookup. It must remain a thin facade over the existing getters; any
     /// caching/IO already lives behind those getters.
     fn bindColumn(self: *Native, name: []const u8) !bind.BoundColumn {
+        // Synthetic computed column: SQL `length(URL)` is materialized at
+        // import time as the i32 sidecar `hot.url_length`, so expose it
+        // here as a regular fixed_i32 BoundColumn to keep group/reduce
+        // binders schema-driven (no per-call-site special cases).
+        if (asciiEqlIgnoreCase(name, "length(URL)")) {
+            const hot = try self.getHotColumns();
+            const values = hot.url_length orelse return error.UnsupportedNativeQuery;
+            return .{ .fixed_i32 = .{ .name = "length(URL)", .values = values } };
+        }
         const index = clickbench_schema.findColumn(name) orelse return error.UnsupportedNativeQuery;
         const column = clickbench_schema.hits.columns[index];
         const tag = schema.capabilityTag(column);
@@ -5683,18 +5692,12 @@ fn groupContext(data: *const GroupContextData) native_group.Context {
 
 fn bindClickBenchGroupColumn(ptr: *const anyopaque, name: []const u8) anyerror!native_group.BoundColumn {
     const data: *const GroupContextData = @ptrCast(@alignCast(ptr));
-    // Schema-driven path: try the unified Native.bindColumn first; map the
-    // resulting BoundColumn into a group.BoundColumn via the adapter. This
-    // covers all int columns from HotColumns. Fall through to legacy
-    // handling for shapes the adapter rejects (e.g. lowcard_text not yet
-    // wired here as a group key).
+    // Schema-driven path: Native.bindColumn handles all real schema
+    // columns plus the synthetic "length(URL)" computed column; the
+    // adapter maps the resulting BoundColumn into a group.BoundColumn.
     if (data.native.bindColumn(name)) |bound| {
         if (binder.asGroupColumn(bound)) |group_col| return group_col else |_| {}
     } else |_| {}
-    // Legacy entries the adapter doesn't yet cover (derived names like
-    // "length(URL)" lack a schema entry).
-    const hot = data.hot;
-    if (asciiEqlIgnoreCase(name, "length(URL)")) return .{ .name = "length(URL)", .column = .{ .i32 = hot.url_length orelse return error.UnsupportedGenericColumn } };
     return error.UnsupportedGenericColumn;
 }
 
@@ -5728,14 +5731,14 @@ fn bindClickBenchReduceColumn(ptr: *const anyopaque, name: []const u8) anyerror!
 }
 
 /// Single source of truth for reduce/generic column binding: routes
-/// through the schema-driven Native.bindColumn + adapter, with a
-/// fallback for the synthetic "length(URL)" column that lives only in
-/// HotColumns (not in the schema).
+/// through the schema-driven Native.bindColumn + adapter. Native.bindColumn
+/// handles real schema columns plus the synthetic "length(URL)" computed
+/// column, so no extra fallbacks are needed here.
 fn bindClickBenchReduceColumnImpl(native: *Native, hot: *const HotColumns, name: []const u8) !native_reduce.Column {
+    _ = hot;
     if (native.bindColumn(name)) |bound| {
         if (binder.asReduceColumn(bound)) |col| return col else |_| {}
     } else |_| {}
-    if (asciiEqlIgnoreCase(name, "length(URL)")) return .{ .i32 = hot.url_length orelse return error.UnsupportedGenericColumn };
     return error.UnsupportedGenericColumn;
 }
 
