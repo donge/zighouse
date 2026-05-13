@@ -2,6 +2,7 @@ const std = @import("std");
 const agg = @import("agg.zig");
 const chdb = @import("chdb.zig");
 const clickbench_import = @import("clickbench_import.zig");
+const clickbench_dispatch = @import("clickbench/dispatch.zig");
 const clickbench_queries = @import("clickbench_queries.zig");
 const build_options = @import("build_options");
 const duckdb = if (build_options.duckdb) @import("duckdb.zig") else @import("duckdb_stub.zig");
@@ -485,14 +486,7 @@ pub const Native = struct {
             if (isGenericUrlHashDateDashboardPlan(plan)) return formatUrlHashDateDashboard(self, hot, hot.trafic_source_id orelse return error.UnsupportedGenericQuery, hot.referer_hash orelse return error.UnsupportedGenericQuery);
             if (isGenericWindowSizeDashboardPlan(plan)) return formatWindowSizeDashboard(self, hot);
             if (isGenericTimeBucketDashboardPlan(plan)) return formatTimeBucketDashboard(self, hot, hot.event_minute orelse return error.UnsupportedGenericQuery);
-            if (isGenericUrlCountTopPlan(plan)) return formatUrlCountTopHashLateMaterializeCached(self, hot, false) catch |err| switch (err) {
-                error.FileNotFound => return formatUrlCountTop(self.allocator, self.io, self.data_dir),
-                else => return err,
-            };
-            if (isGenericOneUrlCountTopPlan(plan)) return formatUrlCountTopHashLateMaterializeCached(self, hot, true) catch |err| switch (err) {
-                error.FileNotFound => return formatOneUrlCountTop(self.allocator, self.io, self.data_dir),
-                else => return err,
-            };
+            if (clickbench_dispatch.matchGenericFallback(plan)) |fallback| return self.executeClickBenchGenericFallback(fallback, hot);
         }
         if (isGenericUserIdSearchPhraseLimitPlan(plan)) {
             return formatUserIdSearchPhraseLimitNoOrderCached(self.allocator, try self.getUserIdEncoding(), try self.getSearchPhraseColumn());
@@ -761,21 +755,19 @@ pub const Native = struct {
         return plan.projections[1].func == .count_star and asciiEqlIgnoreCase(plan.projections[1].alias orelse return false, "PageViews");
     }
 
-    fn isGenericUrlCountTopPlan(plan: generic_sql.Plan) bool {
-        if (plan.filter != null or plan.limit != 10 or !genericOrderByAlias(plan, "c")) return false;
-        if (!asciiEqlIgnoreCase(plan.group_by orelse return false, "URL")) return false;
-        if (plan.projections.len != 2) return false;
-        if (plan.projections[0].func != .column_ref or !asciiEqlIgnoreCase(plan.projections[0].column orelse return false, "URL")) return false;
-        return plan.projections[1].func == .count_star and asciiEqlIgnoreCase(plan.projections[1].alias orelse return false, "c");
-    }
-
-    fn isGenericOneUrlCountTopPlan(plan: generic_sql.Plan) bool {
-        if (plan.filter != null or plan.limit != 10 or !genericOrderByAlias(plan, "c")) return false;
-        if (!asciiEqlIgnoreCase(plan.group_by orelse return false, "1, URL")) return false;
-        if (plan.projections.len != 3) return false;
-        if (plan.projections[0].func != .int_literal or plan.projections[0].int_offset != 1) return false;
-        if (plan.projections[1].func != .column_ref or !asciiEqlIgnoreCase(plan.projections[1].column orelse return false, "URL")) return false;
-        return plan.projections[2].func == .count_star and asciiEqlIgnoreCase(plan.projections[2].alias orelse return false, "c");
+    fn executeClickBenchGenericFallback(self: *Native, fallback: clickbench_dispatch.Fallback, hot: *const HotColumns) anyerror![]u8 {
+        return switch (fallback) {
+            .url_count_top => |shape| if (shape.include_constant)
+                formatUrlCountTopHashLateMaterializeCached(self, hot, true) catch |err| switch (err) {
+                    error.FileNotFound => return formatOneUrlCountTop(self.allocator, self.io, self.data_dir),
+                    else => return err,
+                }
+            else
+                formatUrlCountTopHashLateMaterializeCached(self, hot, false) catch |err| switch (err) {
+                    error.FileNotFound => return formatUrlCountTop(self.allocator, self.io, self.data_dir),
+                    else => return err,
+                },
+        };
     }
 
     const GenericPredicateMask = struct { values: []const i16, owned: bool };
