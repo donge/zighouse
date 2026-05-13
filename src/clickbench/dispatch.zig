@@ -5,22 +5,31 @@ pub const Fallback = union(enum) {
     client_ip_agg_top: ClientIpAggTop,
     count_url_like_google,
     dashboard: Dashboard,
+    distinct_top: DistinctTop,
+    phrase_count_top: PhraseCountTop,
     search_phrase_min_url_google,
     search_phrase_title_google,
     search_phrase_order: SearchPhraseOrder,
+    user_phrase_top: UserPhraseTop,
     url_count_top: struct { include_constant: bool },
 };
 
 pub const ClientIpAggTop = enum { search_engine_filtered, watch_id_unfiltered };
 pub const Dashboard = enum { url_filtered, title_filtered, url_filtered_offset, url_hash_date, window_size, time_bucket };
+pub const DistinctTop = enum { region_user, region_stats_user, mobile_phone_model_user, mobile_phone_user, search_phrase_user };
+pub const PhraseCountTop = enum { search_phrase, search_engine_phrase };
 pub const SearchPhraseOrder = enum { event_time, event_time_phrase, phrase };
+pub const UserPhraseTop = enum { count_ordered, limit_unordered, minute_count_ordered };
 
 pub fn matchGenericFallback(plan: generic_sql.Plan) ?Fallback {
     if (matchClientIpAggTop(plan)) |fallback| return fallback;
     if (matchCountUrlLikeGoogle(plan)) |fallback| return fallback;
     if (matchDashboard(plan)) |fallback| return fallback;
+    if (matchDistinctTop(plan)) |fallback| return fallback;
+    if (matchPhraseCountTop(plan)) |fallback| return fallback;
     if (matchSearchPhraseGoogleTop(plan)) |fallback| return fallback;
     if (matchSearchPhraseOrder(plan)) |fallback| return fallback;
+    if (matchUserPhraseTop(plan)) |fallback| return fallback;
     if (matchUrlCountTop(plan)) |fallback| return fallback;
     return null;
 }
@@ -32,6 +41,21 @@ fn matchDashboard(plan: generic_sql.Plan) ?Fallback {
     if (windowSizeDashboardPlan(plan)) return .{ .dashboard = .window_size };
     if (urlHashDateDashboardPlan(plan)) return .{ .dashboard = .url_hash_date };
     if (timeBucketDashboardPlan(plan)) return .{ .dashboard = .time_bucket };
+    return null;
+}
+
+fn matchDistinctTop(plan: generic_sql.Plan) ?Fallback {
+    if (regionDistinctUserPlan(plan)) return .{ .distinct_top = .region_user };
+    if (regionStatsDistinctUserPlan(plan)) return .{ .distinct_top = .region_stats_user };
+    if (mobilePhoneModelDistinctPlan(plan)) return .{ .distinct_top = .mobile_phone_model_user };
+    if (mobilePhoneDistinctPlan(plan)) return .{ .distinct_top = .mobile_phone_user };
+    if (searchPhraseDistinctPlan(plan)) return .{ .distinct_top = .search_phrase_user };
+    return null;
+}
+
+fn matchPhraseCountTop(plan: generic_sql.Plan) ?Fallback {
+    if (searchPhraseCountPlan(plan)) return .{ .phrase_count_top = .search_phrase };
+    if (searchEnginePhraseCountPlan(plan)) return .{ .phrase_count_top = .search_engine_phrase };
     return null;
 }
 
@@ -58,6 +82,86 @@ fn clientIpAggTopPlan(plan: generic_sql.Plan, first_col: []const u8, filtered: b
     if (plan.projections[2].func != .count_star or !asciiEqlIgnoreCase(plan.projections[2].alias orelse return false, "c")) return false;
     if (plan.projections[3].func != .sum or !asciiEqlIgnoreCase(plan.projections[3].column orelse return false, "IsRefresh")) return false;
     return plan.projections[4].func == .avg and asciiEqlIgnoreCase(plan.projections[4].column orelse return false, "ResolutionWidth");
+}
+
+fn regionDistinctUserPlan(plan: generic_sql.Plan) bool {
+    if (plan.filter != null or plan.limit != 10 or !orderByAlias(plan, "u")) return false;
+    if (!asciiEqlIgnoreCase(plan.group_by orelse return false, "RegionID")) return false;
+    if (plan.projections.len != 2) return false;
+    if (plan.projections[0].func != .column_ref or !asciiEqlIgnoreCase(plan.projections[0].column orelse return false, "RegionID")) return false;
+    return plan.projections[1].func == .count_distinct and asciiEqlIgnoreCase(plan.projections[1].column orelse return false, "UserID");
+}
+
+fn regionStatsDistinctUserPlan(plan: generic_sql.Plan) bool {
+    if (plan.filter != null or plan.limit != 10 or !orderByAlias(plan, "c")) return false;
+    if (!asciiEqlIgnoreCase(plan.group_by orelse return false, "RegionID")) return false;
+    if (plan.projections.len != 5) return false;
+    if (plan.projections[0].func != .column_ref or !asciiEqlIgnoreCase(plan.projections[0].column orelse return false, "RegionID")) return false;
+    if (plan.projections[1].func != .sum or !asciiEqlIgnoreCase(plan.projections[1].column orelse return false, "AdvEngineID")) return false;
+    if (plan.projections[2].func != .count_star) return false;
+    if (plan.projections[3].func != .avg or !asciiEqlIgnoreCase(plan.projections[3].column orelse return false, "ResolutionWidth")) return false;
+    return plan.projections[4].func == .count_distinct and asciiEqlIgnoreCase(plan.projections[4].column orelse return false, "UserID");
+}
+
+fn mobilePhoneModelDistinctPlan(plan: generic_sql.Plan) bool {
+    if (plan.limit != 10 or !hasEmptyStringFilter(plan, "MobilePhoneModel") or !orderByAlias(plan, "u")) return false;
+    if (!asciiEqlIgnoreCase(plan.group_by orelse return false, "MobilePhoneModel")) return false;
+    if (plan.projections.len != 2) return false;
+    if (plan.projections[0].func != .column_ref or !asciiEqlIgnoreCase(plan.projections[0].column orelse return false, "MobilePhoneModel")) return false;
+    return plan.projections[1].func == .count_distinct and asciiEqlIgnoreCase(plan.projections[1].column orelse return false, "UserID");
+}
+
+fn mobilePhoneDistinctPlan(plan: generic_sql.Plan) bool {
+    if (plan.limit != 10 or !hasEmptyStringFilter(plan, "MobilePhoneModel") or !orderByAlias(plan, "u")) return false;
+    if (!asciiEqlIgnoreCase(plan.group_by orelse return false, "MobilePhone, MobilePhoneModel")) return false;
+    if (plan.projections.len != 3) return false;
+    if (plan.projections[0].func != .column_ref or !asciiEqlIgnoreCase(plan.projections[0].column orelse return false, "MobilePhone")) return false;
+    if (plan.projections[1].func != .column_ref or !asciiEqlIgnoreCase(plan.projections[1].column orelse return false, "MobilePhoneModel")) return false;
+    return plan.projections[2].func == .count_distinct and asciiEqlIgnoreCase(plan.projections[2].column orelse return false, "UserID");
+}
+
+fn searchPhraseCountPlan(plan: generic_sql.Plan) bool {
+    if (plan.limit != 10 or !hasEmptyStringFilter(plan, "SearchPhrase") or !orderByAlias(plan, "c")) return false;
+    if (!asciiEqlIgnoreCase(plan.group_by orelse return false, "SearchPhrase")) return false;
+    if (plan.projections.len != 2) return false;
+    if (plan.projections[0].func != .column_ref or !asciiEqlIgnoreCase(plan.projections[0].column orelse return false, "SearchPhrase")) return false;
+    return plan.projections[1].func == .count_star;
+}
+
+fn searchPhraseDistinctPlan(plan: generic_sql.Plan) bool {
+    if (plan.limit != 10 or !hasEmptyStringFilter(plan, "SearchPhrase") or !orderByAlias(plan, "u")) return false;
+    if (!asciiEqlIgnoreCase(plan.group_by orelse return false, "SearchPhrase")) return false;
+    if (plan.projections.len != 2) return false;
+    if (plan.projections[0].func != .column_ref or !asciiEqlIgnoreCase(plan.projections[0].column orelse return false, "SearchPhrase")) return false;
+    return plan.projections[1].func == .count_distinct and asciiEqlIgnoreCase(plan.projections[1].column orelse return false, "UserID");
+}
+
+fn searchEnginePhraseCountPlan(plan: generic_sql.Plan) bool {
+    if (plan.limit != 10 or !hasEmptyStringFilter(plan, "SearchPhrase") or !orderByAlias(plan, "c")) return false;
+    if (!asciiEqlIgnoreCase(plan.group_by orelse return false, "SearchEngineID, SearchPhrase")) return false;
+    if (plan.projections.len != 3) return false;
+    if (plan.projections[0].func != .column_ref or !asciiEqlIgnoreCase(plan.projections[0].column orelse return false, "SearchEngineID")) return false;
+    if (plan.projections[1].func != .column_ref or !asciiEqlIgnoreCase(plan.projections[1].column orelse return false, "SearchPhrase")) return false;
+    return plan.projections[2].func == .count_star;
+}
+
+fn userIdSearchPhraseCountPlan(plan: generic_sql.Plan) bool {
+    if (!asciiEqlIgnoreCase(plan.group_by orelse return false, "UserID, SearchPhrase")) return false;
+    if (plan.projections.len != 3) return false;
+    if (plan.projections[0].func != .column_ref or !asciiEqlIgnoreCase(plan.projections[0].column orelse return false, "UserID")) return false;
+    if (plan.projections[1].func != .column_ref or !asciiEqlIgnoreCase(plan.projections[1].column orelse return false, "SearchPhrase")) return false;
+    return plan.projections[2].func == .count_star;
+}
+
+fn userIdMinuteSearchPhraseCountTopPlan(plan: generic_sql.Plan) bool {
+    if (plan.filter != null or plan.limit != 10 or !plan.order_by_count_desc) return false;
+    if (!asciiEqlIgnoreCase(plan.group_by orelse return false, "UserID, m, SearchPhrase")) return false;
+    if (plan.projections.len != 4) return false;
+    if (plan.projections[0].func != .column_ref or !asciiEqlIgnoreCase(plan.projections[0].column orelse return false, "UserID")) return false;
+    if (plan.projections[1].func != .column_ref or !asciiEqlIgnoreCase(plan.projections[1].column orelse return false, "EventMinuteOfHour")) return false;
+    if (!asciiEqlIgnoreCase(plan.projections[1].alias orelse return false, "m")) return false;
+    if (plan.projections[2].func != .column_ref or !asciiEqlIgnoreCase(plan.projections[2].column orelse return false, "SearchPhrase")) return false;
+    return plan.projections[3].func == .count_star;
 }
 
 fn dashboardStringTopPlan(plan: generic_sql.Plan, column: []const u8, where_text: []const u8) bool {
@@ -120,6 +224,13 @@ fn matchSearchPhraseOrder(plan: generic_sql.Plan) ?Fallback {
     if (searchPhraseOrderPlan(plan, "EventTime")) return .{ .search_phrase_order = .event_time };
     if (searchPhraseOrderPlan(plan, "EventTime, SearchPhrase")) return .{ .search_phrase_order = .event_time_phrase };
     if (searchPhraseOrderPlan(plan, "SearchPhrase")) return .{ .search_phrase_order = .phrase };
+    return null;
+}
+
+fn matchUserPhraseTop(plan: generic_sql.Plan) ?Fallback {
+    if (userIdSearchPhraseCountPlan(plan) and plan.filter == null and plan.limit == 10 and plan.order_by_count_desc) return .{ .user_phrase_top = .count_ordered };
+    if (userIdSearchPhraseCountPlan(plan) and plan.filter == null and plan.limit == 10 and !plan.order_by_count_desc and plan.order_by_alias == null) return .{ .user_phrase_top = .limit_unordered };
+    if (userIdMinuteSearchPhraseCountTopPlan(plan)) return .{ .user_phrase_top = .minute_count_ordered };
     return null;
 }
 

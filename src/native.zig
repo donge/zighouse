@@ -448,29 +448,9 @@ pub const Native = struct {
             if (try native_group.execute(self.allocator, plan, reduceHotWithSearchPhrase(hot, try self.getSearchPhraseColumn()))) |output| return output;
         }
         if (plan.limit == 10) {
-            if (isGenericMobilePhoneModelDistinctPlan(plan)) return formatMobilePhoneModelDistinctUserIdTop(self.allocator, self.io, self.data_dir);
-            if (isGenericMobilePhoneDistinctPlan(plan)) return formatMobilePhoneDistinctUserIdTop(self.allocator, self.io, self.data_dir);
-            if (isGenericSearchPhraseCountPlan(plan)) return formatSearchPhraseCountTopCached(self.allocator, try self.getSearchPhraseColumn());
-            if (isGenericSearchPhraseDistinctPlan(plan)) return formatSearchPhraseDistinctUserIdTop(self.allocator, self.io, self.data_dir);
-            if (isGenericSearchEnginePhraseCountPlan(plan)) return formatSearchEnginePhraseCountTop(self.allocator, self.io, self.data_dir);
-            if (isGenericUserIdSearchPhraseCountTopPlan(plan)) return formatUserIdSearchPhraseCountTopCached(self.allocator, try self.getUserIdEncoding(), try self.getSearchPhraseColumn());
-            if (isGenericUserIdMinuteSearchPhraseCountTopPlan(plan)) return formatUserIdMinuteSearchPhraseCountTopCached(self.allocator, self.io, self.data_dir, try self.getUserIdEncoding(), try self.getSearchPhraseColumn());
-            if (clickbench_dispatch.matchGenericFallback(plan)) |fallback| return self.executeClickBenchGenericFallback(fallback, hot);
             if (clickbench_dispatch.matchGenericFallback(plan)) |fallback| return self.executeClickBenchGenericFallback(fallback, hot);
         }
-        if (isGenericUserIdSearchPhraseLimitPlan(plan)) {
-            return formatUserIdSearchPhraseLimitNoOrderCached(self.allocator, try self.getUserIdEncoding(), try self.getSearchPhraseColumn());
-        }
-        if (asciiEqlIgnoreCase(group_col, "RegionID") and plan.limit == 10) {
-            if (plan.projections.len == 2 and plan.projections[1].func == .count_distinct and asciiEqlIgnoreCase(plan.projections[1].column orelse return error.UnsupportedGenericQuery, "UserID")) {
-                if (plan.filter != null or !genericOrderByAlias(plan, "u")) return error.UnsupportedGenericQuery;
-                return formatRegionDistinctUserIdTop(self.allocator, self.io, self.data_dir);
-            }
-            if (isGenericRegionStatsDistinctPlan(plan)) {
-                if (plan.filter != null or !genericOrderByAlias(plan, "c")) return error.UnsupportedGenericQuery;
-                return formatRegionStatsDistinctUserIdTop(self.allocator, self.io, self.data_dir);
-            }
-        }
+        if (clickbench_dispatch.matchGenericFallback(plan)) |fallback| return self.executeClickBenchGenericFallback(fallback, hot);
         if (!plan.order_by_count_desc) return error.UnsupportedGenericQuery;
         if (plan.projections.len != 2) return error.UnsupportedGenericQuery;
         if (plan.projections[0].func != .column_ref or plan.projections[1].func != .count_star) return error.UnsupportedGenericQuery;
@@ -516,89 +496,10 @@ pub const Native = struct {
         return if (plan.order_by_alias) |got| asciiEqlIgnoreCase(got, alias) else false;
     }
 
-    fn isGenericRegionStatsDistinctPlan(plan: generic_sql.Plan) bool {
-        if (plan.projections.len != 5) return false;
-        if (plan.projections[0].func != .column_ref or !asciiEqlIgnoreCase(plan.projections[0].column orelse return false, "RegionID")) return false;
-        if (plan.projections[1].func != .sum or !asciiEqlIgnoreCase(plan.projections[1].column orelse return false, "AdvEngineID")) return false;
-        if (plan.projections[2].func != .count_star) return false;
-        if (plan.projections[3].func != .avg or !asciiEqlIgnoreCase(plan.projections[3].column orelse return false, "ResolutionWidth")) return false;
-        return plan.projections[4].func == .count_distinct and asciiEqlIgnoreCase(plan.projections[4].column orelse return false, "UserID");
-    }
-
     fn hasGenericEmptyStringFilter(plan: generic_sql.Plan, column: []const u8) bool {
         const filter = plan.filter orelse return false;
         return filter.second == null and filter.op == .not_equal and filter.int_value == 0 and asciiEqlIgnoreCase(filter.column, column);
     }
-
-    fn isGenericMobilePhoneModelDistinctPlan(plan: generic_sql.Plan) bool {
-        if (!hasGenericEmptyStringFilter(plan, "MobilePhoneModel") or !genericOrderByAlias(plan, "u")) return false;
-        if (!asciiEqlIgnoreCase(plan.group_by orelse return false, "MobilePhoneModel")) return false;
-        if (plan.projections.len != 2) return false;
-        if (plan.projections[0].func != .column_ref or !asciiEqlIgnoreCase(plan.projections[0].column orelse return false, "MobilePhoneModel")) return false;
-        return plan.projections[1].func == .count_distinct and asciiEqlIgnoreCase(plan.projections[1].column orelse return false, "UserID");
-    }
-
-    fn isGenericMobilePhoneDistinctPlan(plan: generic_sql.Plan) bool {
-        if (!hasGenericEmptyStringFilter(plan, "MobilePhoneModel") or !genericOrderByAlias(plan, "u")) return false;
-        if (!asciiEqlIgnoreCase(plan.group_by orelse return false, "MobilePhone, MobilePhoneModel")) return false;
-        if (plan.projections.len != 3) return false;
-        if (plan.projections[0].func != .column_ref or !asciiEqlIgnoreCase(plan.projections[0].column orelse return false, "MobilePhone")) return false;
-        if (plan.projections[1].func != .column_ref or !asciiEqlIgnoreCase(plan.projections[1].column orelse return false, "MobilePhoneModel")) return false;
-        return plan.projections[2].func == .count_distinct and asciiEqlIgnoreCase(plan.projections[2].column orelse return false, "UserID");
-    }
-
-    fn isGenericSearchPhraseCountPlan(plan: generic_sql.Plan) bool {
-        if (!hasGenericEmptyStringFilter(plan, "SearchPhrase") or !genericOrderByAlias(plan, "c")) return false;
-        if (!asciiEqlIgnoreCase(plan.group_by orelse return false, "SearchPhrase")) return false;
-        if (plan.projections.len != 2) return false;
-        if (plan.projections[0].func != .column_ref or !asciiEqlIgnoreCase(plan.projections[0].column orelse return false, "SearchPhrase")) return false;
-        return plan.projections[1].func == .count_star;
-    }
-
-    fn isGenericSearchPhraseDistinctPlan(plan: generic_sql.Plan) bool {
-        if (!hasGenericEmptyStringFilter(plan, "SearchPhrase") or !genericOrderByAlias(plan, "u")) return false;
-        if (!asciiEqlIgnoreCase(plan.group_by orelse return false, "SearchPhrase")) return false;
-        if (plan.projections.len != 2) return false;
-        if (plan.projections[0].func != .column_ref or !asciiEqlIgnoreCase(plan.projections[0].column orelse return false, "SearchPhrase")) return false;
-        return plan.projections[1].func == .count_distinct and asciiEqlIgnoreCase(plan.projections[1].column orelse return false, "UserID");
-    }
-
-    fn isGenericSearchEnginePhraseCountPlan(plan: generic_sql.Plan) bool {
-        if (!hasGenericEmptyStringFilter(plan, "SearchPhrase") or !genericOrderByAlias(plan, "c")) return false;
-        if (!asciiEqlIgnoreCase(plan.group_by orelse return false, "SearchEngineID, SearchPhrase")) return false;
-        if (plan.projections.len != 3) return false;
-        if (plan.projections[0].func != .column_ref or !asciiEqlIgnoreCase(plan.projections[0].column orelse return false, "SearchEngineID")) return false;
-        if (plan.projections[1].func != .column_ref or !asciiEqlIgnoreCase(plan.projections[1].column orelse return false, "SearchPhrase")) return false;
-        return plan.projections[2].func == .count_star;
-    }
-
-    fn isGenericUserIdSearchPhraseCountTopPlan(plan: generic_sql.Plan) bool {
-        return isGenericUserIdSearchPhraseCountPlan(plan) and plan.filter == null and plan.limit == 10 and plan.order_by_count_desc;
-    }
-
-    fn isGenericUserIdSearchPhraseLimitPlan(plan: generic_sql.Plan) bool {
-        return isGenericUserIdSearchPhraseCountPlan(plan) and plan.filter == null and plan.limit == 10 and !plan.order_by_count_desc and plan.order_by_alias == null;
-    }
-
-    fn isGenericUserIdSearchPhraseCountPlan(plan: generic_sql.Plan) bool {
-        if (!asciiEqlIgnoreCase(plan.group_by orelse return false, "UserID, SearchPhrase")) return false;
-        if (plan.projections.len != 3) return false;
-        if (plan.projections[0].func != .column_ref or !asciiEqlIgnoreCase(plan.projections[0].column orelse return false, "UserID")) return false;
-        if (plan.projections[1].func != .column_ref or !asciiEqlIgnoreCase(plan.projections[1].column orelse return false, "SearchPhrase")) return false;
-        return plan.projections[2].func == .count_star;
-    }
-
-    fn isGenericUserIdMinuteSearchPhraseCountTopPlan(plan: generic_sql.Plan) bool {
-        if (plan.filter != null or plan.limit != 10 or !plan.order_by_count_desc) return false;
-        if (!asciiEqlIgnoreCase(plan.group_by orelse return false, "UserID, m, SearchPhrase")) return false;
-        if (plan.projections.len != 4) return false;
-        if (plan.projections[0].func != .column_ref or !asciiEqlIgnoreCase(plan.projections[0].column orelse return false, "UserID")) return false;
-        if (plan.projections[1].func != .column_ref or !asciiEqlIgnoreCase(plan.projections[1].column orelse return false, "EventMinuteOfHour")) return false;
-        if (!asciiEqlIgnoreCase(plan.projections[1].alias orelse return false, "m")) return false;
-        if (plan.projections[2].func != .column_ref or !asciiEqlIgnoreCase(plan.projections[2].column orelse return false, "SearchPhrase")) return false;
-        return plan.projections[3].func == .count_star;
-    }
-
     fn executeClickBenchGenericFallback(self: *Native, fallback: clickbench_dispatch.Fallback, hot: *const HotColumns) anyerror![]u8 {
         return switch (fallback) {
             .client_ip_agg_top => |shape| switch (shape) {
@@ -629,6 +530,17 @@ pub const Native = struct {
                 .window_size => return formatWindowSizeDashboard(self, hot),
                 .time_bucket => return formatTimeBucketDashboard(self, hot, hot.event_minute orelse return error.UnsupportedGenericQuery),
             },
+            .distinct_top => |shape| switch (shape) {
+                .region_user => return formatRegionDistinctUserIdTop(self.allocator, self.io, self.data_dir),
+                .region_stats_user => return formatRegionStatsDistinctUserIdTop(self.allocator, self.io, self.data_dir),
+                .mobile_phone_model_user => return formatMobilePhoneModelDistinctUserIdTop(self.allocator, self.io, self.data_dir),
+                .mobile_phone_user => return formatMobilePhoneDistinctUserIdTop(self.allocator, self.io, self.data_dir),
+                .search_phrase_user => return formatSearchPhraseDistinctUserIdTop(self.allocator, self.io, self.data_dir),
+            },
+            .phrase_count_top => |shape| switch (shape) {
+                .search_phrase => return formatSearchPhraseCountTopCached(self.allocator, try self.getSearchPhraseColumn()),
+                .search_engine_phrase => return formatSearchEnginePhraseCountTop(self.allocator, self.io, self.data_dir),
+            },
             .search_phrase_min_url_google => formatSearchPhraseMinUrlGoogleSidecarLateMaterialize(self.allocator, self.io, self.data_dir, try self.getSearchPhraseColumn()) catch |err| switch (err) {
                 error.FileNotFound => return formatSearchPhraseMinUrlGoogleCached(self.allocator, try self.getUrlColumn(), try self.getSearchPhraseColumn(), try self.getUrlGoogleMatches()),
                 else => return err,
@@ -641,6 +553,11 @@ pub const Native = struct {
                 .event_time => return formatSearchPhraseEventTimeCandidatesCached(self.allocator, self.io, self.data_dir, try self.getSearchPhraseColumn(), false),
                 .event_time_phrase => return formatSearchPhraseEventTimeCandidatesCached(self.allocator, self.io, self.data_dir, try self.getSearchPhraseColumn(), true),
                 .phrase => return formatSearchPhraseOrderByPhraseTopCached(self.allocator, try self.getSearchPhraseColumn()),
+            },
+            .user_phrase_top => |shape| switch (shape) {
+                .count_ordered => return formatUserIdSearchPhraseCountTopCached(self.allocator, try self.getUserIdEncoding(), try self.getSearchPhraseColumn()),
+                .limit_unordered => return formatUserIdSearchPhraseLimitNoOrderCached(self.allocator, try self.getUserIdEncoding(), try self.getSearchPhraseColumn()),
+                .minute_count_ordered => return formatUserIdMinuteSearchPhraseCountTopCached(self.allocator, self.io, self.data_dir, try self.getUserIdEncoding(), try self.getSearchPhraseColumn()),
             },
             .url_count_top => |shape| if (shape.include_constant)
                 formatUrlCountTopHashLateMaterializeCached(self, hot, true) catch |err| switch (err) {
