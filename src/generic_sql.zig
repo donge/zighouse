@@ -122,7 +122,7 @@ pub fn parse(allocator: std.mem.Allocator, sql: []const u8) !?Plan {
         };
     } else null;
 
-    if (!validPlanShape(projections.items, filter, where_text, group_by)) {
+    if (!validPlanShape(projections.items, filter, where_text, group_by, order_body, limit, offset)) {
         projections.deinit(allocator);
         return null;
     }
@@ -145,9 +145,11 @@ pub fn deinit(allocator: std.mem.Allocator, plan: Plan) void {
     allocator.free(plan.projections);
 }
 
-fn validPlanShape(projections: []const Expr, filter: ?Filter, where_text: ?[]const u8, group_by: ?[]const u8) bool {
+fn validPlanShape(projections: []const Expr, filter: ?Filter, where_text: ?[]const u8, group_by: ?[]const u8, order_by_text: ?[]const u8, limit: ?usize, offset: ?usize) bool {
     if (where_text != null and filter == null) return group_by != null and validDashboardStringTopShape(projections, where_text, group_by.?);
     if (group_by == null) {
+        if (validSearchPhraseOrderLimitShape(projections, filter, order_by_text, limit, offset)) return true;
+        if (order_by_text != null or limit != null or offset != null) return false;
         if (projections.len == 1 and projections[0].func == .column_ref) return filter != null;
         for (projections) |expr| if (expr.func == .column_ref) return false;
         return true;
@@ -165,6 +167,16 @@ fn validPlanShape(projections: []const Expr, filter: ?Filter, where_text: ?[]con
     if (projections[1].func == .count_star) return true;
     if (projections[1].func == .count_distinct and asciiEqlIgnoreCase(group_by.?, "RegionID")) return asciiEqlIgnoreCase(projections[1].column orelse return false, "UserID");
     return false;
+}
+
+fn validSearchPhraseOrderLimitShape(projections: []const Expr, filter: ?Filter, order_by_text: ?[]const u8, limit: ?usize, offset: ?usize) bool {
+    if (limit != 10 or offset != null) return false;
+    const order = order_by_text orelse return false;
+    if (!searchPhraseOrderByText(order)) return false;
+    const f = filter orelse return false;
+    if (f.second != null or f.op != .not_equal or f.int_value != 0 or !asciiEqlIgnoreCase(f.column, "SearchPhrase")) return false;
+    if (projections.len != 1) return false;
+    return projections[0].func == .column_ref and asciiEqlIgnoreCase(projections[0].column orelse return false, "SearchPhrase");
 }
 
 fn validDashboardStringTopShape(projections: []const Expr, where_text: ?[]const u8, group_by: []const u8) bool {
@@ -399,7 +411,13 @@ fn parseSubtractExpr(expr: []const u8) ?Expr {
 }
 
 fn validOrderByText(text: []const u8) bool {
-    return isDateTruncMinuteText(text);
+    return isDateTruncMinuteText(text) or searchPhraseOrderByText(text);
+}
+
+fn searchPhraseOrderByText(text: []const u8) bool {
+    return asciiEqlIgnoreCase(text, "EventTime") or
+        asciiEqlIgnoreCase(text, "EventTime, SearchPhrase") or
+        asciiEqlIgnoreCase(text, "SearchPhrase");
 }
 
 fn parseDateTruncMinute(expr: []const u8) bool {
@@ -769,6 +787,23 @@ test "parses dashboard string top shapes" {
     try std.testing.expect(q43.order_by_alias == null);
     try std.testing.expectEqual(@as(?usize, 10), q43.limit);
     try std.testing.expectEqual(@as(?usize, 1000), q43.offset);
+}
+
+test "parses search phrase order limit shapes" {
+    const cases = [_][]const u8{
+        "SELECT SearchPhrase FROM hits WHERE SearchPhrase <> '' ORDER BY EventTime LIMIT 10",
+        "SELECT SearchPhrase FROM hits WHERE SearchPhrase <> '' ORDER BY SearchPhrase LIMIT 10",
+        "SELECT SearchPhrase FROM hits WHERE SearchPhrase <> '' ORDER BY EventTime, SearchPhrase LIMIT 10",
+    };
+    for (cases) |sql| {
+        const plan = (try parse(std.testing.allocator, sql)).?;
+        defer deinit(std.testing.allocator, plan);
+        try std.testing.expect(plan.filter != null);
+        try std.testing.expectEqualStrings("SearchPhrase", plan.projections[0].column.?);
+        try std.testing.expect(plan.order_by_text != null);
+        try std.testing.expectEqual(@as(?usize, 10), plan.limit);
+        try std.testing.expectEqual(@as(?usize, null), plan.offset);
+    }
 }
 
 test "rejects unsupported order by" {

@@ -522,6 +522,9 @@ pub const Native = struct {
     }
 
     fn executeGenericFiltered(self: *Native, plan: generic_sql.Plan, hot: *const HotColumns, filter: generic_sql.Filter) anyerror![]u8 {
+        if (isGenericSearchPhraseEventTimePlan(plan)) return formatSearchPhraseEventTimeCandidatesCached(self.allocator, self.io, self.data_dir, try self.getSearchPhraseColumn(), false);
+        if (isGenericSearchPhraseEventTimePhrasePlan(plan)) return formatSearchPhraseEventTimeCandidatesCached(self.allocator, self.io, self.data_dir, try self.getSearchPhraseColumn(), true);
+        if (isGenericSearchPhraseOrderByPhrasePlan(plan)) return formatSearchPhraseOrderByPhraseTopCached(self.allocator, try self.getSearchPhraseColumn());
         if (plan.projections.len == 1 and plan.projections[0].func == .column_ref) {
             const column_name = plan.projections[0].column orelse return error.UnsupportedGenericQuery;
             const column = bindGenericColumn(hot, column_name) catch return error.UnsupportedGenericQuery;
@@ -544,6 +547,26 @@ pub const Native = struct {
 
     fn genericOrderByAlias(plan: generic_sql.Plan, alias: []const u8) bool {
         return if (plan.order_by_alias) |got| asciiEqlIgnoreCase(got, alias) else false;
+    }
+
+    fn isGenericSearchPhraseEventTimePlan(plan: generic_sql.Plan) bool {
+        return isGenericSearchPhraseOrderPlan(plan, "EventTime");
+    }
+
+    fn isGenericSearchPhraseEventTimePhrasePlan(plan: generic_sql.Plan) bool {
+        return isGenericSearchPhraseOrderPlan(plan, "EventTime, SearchPhrase");
+    }
+
+    fn isGenericSearchPhraseOrderByPhrasePlan(plan: generic_sql.Plan) bool {
+        return isGenericSearchPhraseOrderPlan(plan, "SearchPhrase");
+    }
+
+    fn isGenericSearchPhraseOrderPlan(plan: generic_sql.Plan, order_by: []const u8) bool {
+        if (plan.group_by != null or plan.limit != 10 or plan.offset != null) return false;
+        if (!asciiEqlIgnoreCase(plan.order_by_text orelse return false, order_by)) return false;
+        if (!hasGenericEmptyStringFilter(plan, "SearchPhrase")) return false;
+        if (plan.projections.len != 1) return false;
+        return plan.projections[0].func == .column_ref and asciiEqlIgnoreCase(plan.projections[0].column orelse return false, "SearchPhrase");
     }
 
     fn isGenericRegionStatsDistinctPlan(plan: generic_sql.Plan) bool {
