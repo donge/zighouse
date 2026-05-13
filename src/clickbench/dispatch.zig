@@ -4,6 +4,7 @@ const generic_sql = @import("../generic_sql.zig");
 pub const Fallback = union(enum) {
     client_ip_agg_top: ClientIpAggTop,
     count_url_like_google,
+    dashboard: Dashboard,
     search_phrase_min_url_google,
     search_phrase_title_google,
     search_phrase_order: SearchPhraseOrder,
@@ -11,14 +12,26 @@ pub const Fallback = union(enum) {
 };
 
 pub const ClientIpAggTop = enum { search_engine_filtered, watch_id_unfiltered };
+pub const Dashboard = enum { url_filtered, title_filtered, url_filtered_offset, url_hash_date, window_size, time_bucket };
 pub const SearchPhraseOrder = enum { event_time, event_time_phrase, phrase };
 
 pub fn matchGenericFallback(plan: generic_sql.Plan) ?Fallback {
     if (matchClientIpAggTop(plan)) |fallback| return fallback;
     if (matchCountUrlLikeGoogle(plan)) |fallback| return fallback;
+    if (matchDashboard(plan)) |fallback| return fallback;
     if (matchSearchPhraseGoogleTop(plan)) |fallback| return fallback;
     if (matchSearchPhraseOrder(plan)) |fallback| return fallback;
     if (matchUrlCountTop(plan)) |fallback| return fallback;
+    return null;
+}
+
+fn matchDashboard(plan: generic_sql.Plan) ?Fallback {
+    if (dashboardStringTopPlan(plan, "URL", "CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND DontCountHits = 0 AND IsRefresh = 0 AND URL <> ''") and plan.offset == null) return .{ .dashboard = .url_filtered };
+    if (dashboardStringTopPlan(plan, "Title", "CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND DontCountHits = 0 AND IsRefresh = 0 AND Title <> ''") and plan.offset == null) return .{ .dashboard = .title_filtered };
+    if (dashboardStringTopPlan(plan, "URL", "CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND IsRefresh = 0 AND IsLink <> 0 AND IsDownload = 0") and plan.offset == 1000) return .{ .dashboard = .url_filtered_offset };
+    if (windowSizeDashboardPlan(plan)) return .{ .dashboard = .window_size };
+    if (urlHashDateDashboardPlan(plan)) return .{ .dashboard = .url_hash_date };
+    if (timeBucketDashboardPlan(plan)) return .{ .dashboard = .time_bucket };
     return null;
 }
 
@@ -45,6 +58,46 @@ fn clientIpAggTopPlan(plan: generic_sql.Plan, first_col: []const u8, filtered: b
     if (plan.projections[2].func != .count_star or !asciiEqlIgnoreCase(plan.projections[2].alias orelse return false, "c")) return false;
     if (plan.projections[3].func != .sum or !asciiEqlIgnoreCase(plan.projections[3].column orelse return false, "IsRefresh")) return false;
     return plan.projections[4].func == .avg and asciiEqlIgnoreCase(plan.projections[4].column orelse return false, "ResolutionWidth");
+}
+
+fn dashboardStringTopPlan(plan: generic_sql.Plan, column: []const u8, where_text: []const u8) bool {
+    if (plan.filter != null or plan.limit != 10 or !orderByAlias(plan, "PageViews")) return false;
+    if (!asciiEqlIgnoreCase(plan.where_text orelse return false, where_text)) return false;
+    if (!asciiEqlIgnoreCase(plan.group_by orelse return false, column)) return false;
+    if (plan.projections.len != 2) return false;
+    if (plan.projections[0].func != .column_ref or !asciiEqlIgnoreCase(plan.projections[0].column orelse return false, column)) return false;
+    return plan.projections[1].func == .count_star and asciiEqlIgnoreCase(plan.projections[1].alias orelse return false, "PageViews");
+}
+
+fn windowSizeDashboardPlan(plan: generic_sql.Plan) bool {
+    if (plan.filter != null or plan.limit != 10 or plan.offset != 10000 or !orderByAlias(plan, "PageViews")) return false;
+    if (!asciiEqlIgnoreCase(plan.where_text orelse return false, "CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND IsRefresh = 0 AND DontCountHits = 0 AND URLHash = 2868770270353813622")) return false;
+    if (!asciiEqlIgnoreCase(plan.group_by orelse return false, "WindowClientWidth, WindowClientHeight")) return false;
+    if (plan.projections.len != 3) return false;
+    if (plan.projections[0].func != .column_ref or !asciiEqlIgnoreCase(plan.projections[0].column orelse return false, "WindowClientWidth")) return false;
+    if (plan.projections[1].func != .column_ref or !asciiEqlIgnoreCase(plan.projections[1].column orelse return false, "WindowClientHeight")) return false;
+    return plan.projections[2].func == .count_star and asciiEqlIgnoreCase(plan.projections[2].alias orelse return false, "PageViews");
+}
+
+fn urlHashDateDashboardPlan(plan: generic_sql.Plan) bool {
+    if (plan.filter != null or plan.limit != 10 or plan.offset != 100 or !orderByAlias(plan, "PageViews")) return false;
+    if (!asciiEqlIgnoreCase(plan.where_text orelse return false, "CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND IsRefresh = 0 AND TraficSourceID IN (-1, 6) AND RefererHash = 3594120000172545465")) return false;
+    if (!asciiEqlIgnoreCase(plan.group_by orelse return false, "URLHash, EventDate")) return false;
+    if (plan.projections.len != 3) return false;
+    if (plan.projections[0].func != .column_ref or !asciiEqlIgnoreCase(plan.projections[0].column orelse return false, "URLHash")) return false;
+    if (plan.projections[1].func != .column_ref or !asciiEqlIgnoreCase(plan.projections[1].column orelse return false, "EventDate")) return false;
+    return plan.projections[2].func == .count_star and asciiEqlIgnoreCase(plan.projections[2].alias orelse return false, "PageViews");
+}
+
+fn timeBucketDashboardPlan(plan: generic_sql.Plan) bool {
+    if (plan.filter != null or plan.limit != 10 or plan.offset != 1000) return false;
+    if (!asciiEqlIgnoreCase(plan.order_by_text orelse return false, "DATE_TRUNC('minute', EventTime)")) return false;
+    if (!asciiEqlIgnoreCase(plan.where_text orelse return false, "CounterID = 62 AND EventDate >= '2013-07-14' AND EventDate <= '2013-07-15' AND IsRefresh = 0 AND DontCountHits = 0")) return false;
+    if (!asciiEqlIgnoreCase(plan.group_by orelse return false, "DATE_TRUNC('minute', EventTime)")) return false;
+    if (plan.projections.len != 2) return false;
+    if (plan.projections[0].func != .column_ref or !asciiEqlIgnoreCase(plan.projections[0].column orelse return false, "EventMinute")) return false;
+    if (!asciiEqlIgnoreCase(plan.projections[0].alias orelse return false, "M")) return false;
+    return plan.projections[1].func == .count_star and asciiEqlIgnoreCase(plan.projections[1].alias orelse return false, "PageViews");
 }
 
 fn matchSearchPhraseGoogleTop(plan: generic_sql.Plan) ?Fallback {

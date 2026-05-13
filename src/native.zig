@@ -456,24 +456,7 @@ pub const Native = struct {
             if (isGenericUserIdSearchPhraseCountTopPlan(plan)) return formatUserIdSearchPhraseCountTopCached(self.allocator, try self.getUserIdEncoding(), try self.getSearchPhraseColumn());
             if (isGenericUserIdMinuteSearchPhraseCountTopPlan(plan)) return formatUserIdMinuteSearchPhraseCountTopCached(self.allocator, self.io, self.data_dir, try self.getUserIdEncoding(), try self.getSearchPhraseColumn());
             if (clickbench_dispatch.matchGenericFallback(plan)) |fallback| return self.executeClickBenchGenericFallback(fallback, hot);
-            if (isGenericUrlCountFilteredDashboardPlan(plan)) return formatUrlCountTopFilteredQ37HashLateMaterialize(self.allocator, self.io, self.data_dir, hot, &self.url_hash_string_cache) catch |err| switch (err) {
-                error.FileNotFound => return formatUrlCountTopFilteredQ37Cached(self.allocator, hot, try self.getUrlColumn()),
-                else => return err,
-            };
-            if (isGenericTitleCountFilteredDashboardPlan(plan)) return formatTitleCountTopFilteredQ38HashLateMaterialize(self.allocator, self.io, self.data_dir, hot, &self.title_hash_string_cache) catch |err| switch (err) {
-                error.FileNotFound => return formatTitleCountTopFilteredQ38ParquetScan(self.allocator, self.io, self.data_dir, hot) catch |scan_err| switch (scan_err) {
-                    error.FileNotFound => return formatTitleCountTopFilteredQ38Cached(self.allocator, hot, try self.getTitleColumn()),
-                    else => return scan_err,
-                },
-                else => return err,
-            };
-            if (isGenericUrlCountFilteredOffsetDashboardPlan(plan)) return formatUrlCountTopFilteredOffsetQ39HashLateMaterialize(self.allocator, self.io, self.data_dir, hot, &self.url_hash_string_cache) catch |err| switch (err) {
-                error.FileNotFound => return formatUrlCountTopFilteredOffsetQ39Cached(self.allocator, self.io, self.data_dir, hot, try self.getUrlColumn()),
-                else => return err,
-            };
-            if (isGenericUrlHashDateDashboardPlan(plan)) return formatUrlHashDateDashboard(self, hot, hot.trafic_source_id orelse return error.UnsupportedGenericQuery, hot.referer_hash orelse return error.UnsupportedGenericQuery);
-            if (isGenericWindowSizeDashboardPlan(plan)) return formatWindowSizeDashboard(self, hot);
-            if (isGenericTimeBucketDashboardPlan(plan)) return formatTimeBucketDashboard(self, hot, hot.event_minute orelse return error.UnsupportedGenericQuery);
+            if (clickbench_dispatch.matchGenericFallback(plan)) |fallback| return self.executeClickBenchGenericFallback(fallback, hot);
         }
         if (isGenericUserIdSearchPhraseLimitPlan(plan)) {
             return formatUserIdSearchPhraseLimitNoOrderCached(self.allocator, try self.getUserIdEncoding(), try self.getSearchPhraseColumn());
@@ -616,61 +599,6 @@ pub const Native = struct {
         return plan.projections[3].func == .count_star;
     }
 
-    fn isGenericUrlCountFilteredDashboardPlan(plan: generic_sql.Plan) bool {
-        if (plan.offset != null) return false;
-        return isGenericDashboardStringTopPlan(plan, "URL", "CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND DontCountHits = 0 AND IsRefresh = 0 AND URL <> ''");
-    }
-
-    fn isGenericTitleCountFilteredDashboardPlan(plan: generic_sql.Plan) bool {
-        if (plan.offset != null) return false;
-        return isGenericDashboardStringTopPlan(plan, "Title", "CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND DontCountHits = 0 AND IsRefresh = 0 AND Title <> ''");
-    }
-
-    fn isGenericUrlCountFilteredOffsetDashboardPlan(plan: generic_sql.Plan) bool {
-        if (plan.offset != 1000) return false;
-        return isGenericDashboardStringTopPlan(plan, "URL", "CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND IsRefresh = 0 AND IsLink <> 0 AND IsDownload = 0");
-    }
-
-    fn isGenericWindowSizeDashboardPlan(plan: generic_sql.Plan) bool {
-        if (plan.filter != null or plan.limit != 10 or plan.offset != 10000 or !genericOrderByAlias(plan, "PageViews")) return false;
-        if (!asciiEqlIgnoreCase(plan.where_text orelse return false, "CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND IsRefresh = 0 AND DontCountHits = 0 AND URLHash = 2868770270353813622")) return false;
-        if (!asciiEqlIgnoreCase(plan.group_by orelse return false, "WindowClientWidth, WindowClientHeight")) return false;
-        if (plan.projections.len != 3) return false;
-        if (plan.projections[0].func != .column_ref or !asciiEqlIgnoreCase(plan.projections[0].column orelse return false, "WindowClientWidth")) return false;
-        if (plan.projections[1].func != .column_ref or !asciiEqlIgnoreCase(plan.projections[1].column orelse return false, "WindowClientHeight")) return false;
-        return plan.projections[2].func == .count_star and asciiEqlIgnoreCase(plan.projections[2].alias orelse return false, "PageViews");
-    }
-
-    fn isGenericUrlHashDateDashboardPlan(plan: generic_sql.Plan) bool {
-        if (plan.filter != null or plan.limit != 10 or plan.offset != 100 or !genericOrderByAlias(plan, "PageViews")) return false;
-        if (!asciiEqlIgnoreCase(plan.where_text orelse return false, "CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND IsRefresh = 0 AND TraficSourceID IN (-1, 6) AND RefererHash = 3594120000172545465")) return false;
-        if (!asciiEqlIgnoreCase(plan.group_by orelse return false, "URLHash, EventDate")) return false;
-        if (plan.projections.len != 3) return false;
-        if (plan.projections[0].func != .column_ref or !asciiEqlIgnoreCase(plan.projections[0].column orelse return false, "URLHash")) return false;
-        if (plan.projections[1].func != .column_ref or !asciiEqlIgnoreCase(plan.projections[1].column orelse return false, "EventDate")) return false;
-        return plan.projections[2].func == .count_star and asciiEqlIgnoreCase(plan.projections[2].alias orelse return false, "PageViews");
-    }
-
-    fn isGenericTimeBucketDashboardPlan(plan: generic_sql.Plan) bool {
-        if (plan.filter != null or plan.limit != 10 or plan.offset != 1000) return false;
-        if (!asciiEqlIgnoreCase(plan.order_by_text orelse return false, "DATE_TRUNC('minute', EventTime)")) return false;
-        if (!asciiEqlIgnoreCase(plan.where_text orelse return false, "CounterID = 62 AND EventDate >= '2013-07-14' AND EventDate <= '2013-07-15' AND IsRefresh = 0 AND DontCountHits = 0")) return false;
-        if (!asciiEqlIgnoreCase(plan.group_by orelse return false, "DATE_TRUNC('minute', EventTime)")) return false;
-        if (plan.projections.len != 2) return false;
-        if (plan.projections[0].func != .column_ref or !asciiEqlIgnoreCase(plan.projections[0].column orelse return false, "EventMinute")) return false;
-        if (!asciiEqlIgnoreCase(plan.projections[0].alias orelse return false, "M")) return false;
-        return plan.projections[1].func == .count_star and asciiEqlIgnoreCase(plan.projections[1].alias orelse return false, "PageViews");
-    }
-
-    fn isGenericDashboardStringTopPlan(plan: generic_sql.Plan, column: []const u8, where_text: []const u8) bool {
-        if (plan.filter != null or plan.limit != 10 or !genericOrderByAlias(plan, "PageViews")) return false;
-        if (!asciiEqlIgnoreCase(plan.where_text orelse return false, where_text)) return false;
-        if (!asciiEqlIgnoreCase(plan.group_by orelse return false, column)) return false;
-        if (plan.projections.len != 2) return false;
-        if (plan.projections[0].func != .column_ref or !asciiEqlIgnoreCase(plan.projections[0].column orelse return false, column)) return false;
-        return plan.projections[1].func == .count_star and asciiEqlIgnoreCase(plan.projections[1].alias orelse return false, "PageViews");
-    }
-
     fn executeClickBenchGenericFallback(self: *Native, fallback: clickbench_dispatch.Fallback, hot: *const HotColumns) anyerror![]u8 {
         return switch (fallback) {
             .client_ip_agg_top => |shape| switch (shape) {
@@ -680,6 +608,26 @@ pub const Native = struct {
             .count_url_like_google => formatCountUrlLikeGoogleRowSidecar(self.allocator, self.io, self.data_dir) catch |err| switch (err) {
                 error.FileNotFound => return formatCountUrlLikeGoogleCached(self.allocator, self.io, self.data_dir, try self.getUrlColumn(), try self.getUrlGoogleMatches()),
                 else => return err,
+            },
+            .dashboard => |shape| switch (shape) {
+                .url_filtered => return formatUrlCountTopFilteredQ37HashLateMaterialize(self.allocator, self.io, self.data_dir, hot, &self.url_hash_string_cache) catch |err| switch (err) {
+                    error.FileNotFound => return formatUrlCountTopFilteredQ37Cached(self.allocator, hot, try self.getUrlColumn()),
+                    else => return err,
+                },
+                .title_filtered => return formatTitleCountTopFilteredQ38HashLateMaterialize(self.allocator, self.io, self.data_dir, hot, &self.title_hash_string_cache) catch |err| switch (err) {
+                    error.FileNotFound => return formatTitleCountTopFilteredQ38ParquetScan(self.allocator, self.io, self.data_dir, hot) catch |scan_err| switch (scan_err) {
+                        error.FileNotFound => return formatTitleCountTopFilteredQ38Cached(self.allocator, hot, try self.getTitleColumn()),
+                        else => return scan_err,
+                    },
+                    else => return err,
+                },
+                .url_filtered_offset => return formatUrlCountTopFilteredOffsetQ39HashLateMaterialize(self.allocator, self.io, self.data_dir, hot, &self.url_hash_string_cache) catch |err| switch (err) {
+                    error.FileNotFound => return formatUrlCountTopFilteredOffsetQ39Cached(self.allocator, self.io, self.data_dir, hot, try self.getUrlColumn()),
+                    else => return err,
+                },
+                .url_hash_date => return formatUrlHashDateDashboard(self, hot, hot.trafic_source_id orelse return error.UnsupportedGenericQuery, hot.referer_hash orelse return error.UnsupportedGenericQuery),
+                .window_size => return formatWindowSizeDashboard(self, hot),
+                .time_bucket => return formatTimeBucketDashboard(self, hot, hot.event_minute orelse return error.UnsupportedGenericQuery),
             },
             .search_phrase_min_url_google => formatSearchPhraseMinUrlGoogleSidecarLateMaterialize(self.allocator, self.io, self.data_dir, try self.getSearchPhraseColumn()) catch |err| switch (err) {
                 error.FileNotFound => return formatSearchPhraseMinUrlGoogleCached(self.allocator, try self.getUrlColumn(), try self.getSearchPhraseColumn(), try self.getUrlGoogleMatches()),
