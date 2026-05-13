@@ -5,6 +5,8 @@ const clickbench_schema = @import("clickbench/schema.zig");
 const duckdb = if (build_options.duckdb) @import("duckdb.zig") else @import("duckdb_stub.zig");
 const parquet = @import("parquet.zig");
 const storage = @import("storage.zig");
+const schema = @import("schema.zig");
+const bind = @import("exec/bind.zig");
 
 const usage =
     \\zighouse - minimal ClickBench-oriented analytical database
@@ -795,4 +797,63 @@ fn printErr(io: std.Io, comptime fmt: []const u8, args: anytype) !void {
 
 test "schema has ClickBench column count" {
     try std.testing.expectEqual(@as(usize, 105), clickbench_schema.hits.columns.len);
+}
+
+test "BoundColumn name returns variant name" {
+    const c1 = bind.BoundColumn{ .fixed_i16 = .{ .name = "AdvEngineID", .values = &.{} } };
+    try std.testing.expectEqualStrings("AdvEngineID", c1.name());
+
+    const c2 = bind.BoundColumn{ .fixed_date = .{ .name = "EventDate", .values = &.{} } };
+    try std.testing.expectEqualStrings("EventDate", c2.name());
+
+    const c3 = bind.BoundColumn{ .derived = .{ .name = "URLLength", .expr = .length } };
+    try std.testing.expectEqualStrings("URLLength", c3.name());
+}
+
+test "BoundColumn tag matches active variant" {
+    const c1 = bind.BoundColumn{ .fixed_i16 = .{ .name = "X", .values = &.{} } };
+    try std.testing.expectEqual(schema.CapabilityTag.fixed_i16, c1.tag());
+
+    const c2 = bind.BoundColumn{ .fixed_i64 = .{ .name = "X", .values = &.{} } };
+    try std.testing.expectEqual(schema.CapabilityTag.fixed_i64, c2.tag());
+
+    const c3 = bind.BoundColumn{ .lazy_text = .{
+        .name = "X",
+        .source = .{ .column_name = "X" },
+        .capabilities = .{},
+    } };
+    try std.testing.expectEqual(schema.CapabilityTag.lazy_text, c3.tag());
+}
+
+test "lookupCapability returns tag for known columns and null for missing" {
+    // Known fixed numeric column.
+    try std.testing.expectEqual(
+        @as(?schema.CapabilityTag, schema.CapabilityTag.fixed_i16),
+        bind.lookupCapability(&clickbench_schema.hits, "AdvEngineID"),
+    );
+    // Known date column.
+    try std.testing.expectEqual(
+        @as(?schema.CapabilityTag, schema.CapabilityTag.fixed_date),
+        bind.lookupCapability(&clickbench_schema.hits, "EventDate"),
+    );
+    // Known lowcard column.
+    try std.testing.expectEqual(
+        @as(?schema.CapabilityTag, schema.CapabilityTag.lowcard_text),
+        bind.lookupCapability(&clickbench_schema.hits, "MobilePhoneModel"),
+    );
+    // Known hash_text column.
+    try std.testing.expectEqual(
+        @as(?schema.CapabilityTag, schema.CapabilityTag.hash_text),
+        bind.lookupCapability(&clickbench_schema.hits, "URL"),
+    );
+    // Missing column returns null.
+    try std.testing.expectEqual(
+        @as(?schema.CapabilityTag, null),
+        bind.lookupCapability(&clickbench_schema.hits, "NoSuchColumn"),
+    );
+    // Case-insensitive match.
+    try std.testing.expectEqual(
+        @as(?schema.CapabilityTag, schema.CapabilityTag.fixed_i16),
+        bind.lookupCapability(&clickbench_schema.hits, "advengineid"),
+    );
 }
