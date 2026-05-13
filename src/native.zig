@@ -5675,6 +5675,10 @@ fn reduceScalarContext(hot: *const HotColumns) native_reduce.ScalarContext {
 
 fn bindClickBenchReduceColumn(ptr: *const anyopaque, name: []const u8) anyerror!native_reduce.Column {
     const hot: *const HotColumns = @ptrCast(@alignCast(ptr));
+    return bindClickBenchReduceColumnImpl(hot, name);
+}
+
+fn bindClickBenchReduceColumnImpl(hot: *const HotColumns, name: []const u8) !native_reduce.Column {
     if (asciiEqlIgnoreCase(name, "AdvEngineID")) return .{ .i16 = hot.adv_engine_id };
     if (asciiEqlIgnoreCase(name, "ResolutionWidth")) return .{ .i16 = hot.resolution_width };
     if (asciiEqlIgnoreCase(name, "UserID")) return .{ .i64 = hot.user_id };
@@ -5932,12 +5936,12 @@ const GenericValue = union(enum) {
     date: i32,
 };
 
-const GenericColumn = union(enum) {
-    i16: []const i16,
-    i32: []const i32,
-    date: []const i32,
-    i64: []const i64,
-};
+/// Generic numeric column handle used by the schema-agnostic group/filter
+/// fast paths. Aliased to native_reduce.Column so the same physical column
+/// description flows through both reduce and group code paths without an
+/// adapter shim. Keeping the alias (rather than re-exporting the type) lets
+/// existing call sites stay terse.
+const GenericColumn = native_reduce.Column;
 
 const GenericGroupRow = struct {
     key: i64,
@@ -5945,14 +5949,11 @@ const GenericGroupRow = struct {
 };
 
 fn bindGenericColumn(hot: *const HotColumns, name: []const u8) !GenericColumn {
-    if (asciiEqlIgnoreCase(name, "AdvEngineID")) return .{ .i16 = hot.adv_engine_id };
-    if (asciiEqlIgnoreCase(name, "ResolutionWidth")) return .{ .i16 = hot.resolution_width };
-    if (asciiEqlIgnoreCase(name, "UserID")) return .{ .i64 = hot.user_id };
-    if (asciiEqlIgnoreCase(name, "EventDate")) return .{ .date = hot.event_date };
-    if (asciiEqlIgnoreCase(name, "CounterID")) return .{ .i32 = hot.counter_id };
-    if (asciiEqlIgnoreCase(name, "IsRefresh")) return .{ .i16 = hot.is_refresh };
-    if (asciiEqlIgnoreCase(name, "DontCountHits")) return .{ .i16 = hot.dont_count_hits };
-    return error.UnsupportedGenericColumn;
+    // bindClickBenchReduceColumnImpl covers a strict superset of the columns
+    // generic group/filter paths reach for; the only extra case (length(URL))
+    // is harmless to expose here. Routing through one binder eliminates
+    // duplicated lookup tables that drifted in lockstep.
+    return bindClickBenchReduceColumnImpl(hot, name);
 }
 
 fn materializeGenericPredicate(allocator: std.mem.Allocator, column: GenericColumn, filter: generic_sql.Filter) ![]i16 {
