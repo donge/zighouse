@@ -25,6 +25,7 @@ const schema = @import("schema.zig");
 const bind = @import("exec/bind.zig");
 const binder = @import("exec/binder.zig");
 const exec_shape = @import("exec/shape.zig");
+const late_mat = @import("clickbench/late_materialize.zig");
 
 fn fairMode() bool {
     return std.c.getenv("ZIGHOUSE_FAIR") != null;
@@ -327,11 +328,11 @@ pub const Native = struct {
                 const phrases = try self.getSearchPhraseColumn();
                 return native_group.formatTupleAggTopBound(self.allocator, "WatchID", hot.watch_id orelse return error.UnsupportedNativeQuery, "ClientIP", hot.client_ip orelse return error.UnsupportedNativeQuery, phrases.ids.values, phrases.emptyId() orelse return error.UnsupportedNativeQuery, "IsRefresh", hot.is_refresh, "ResolutionWidth", hot.resolution_width, 10, "c");
             },
-            .url_count_top => return formatUrlCountTopHashLateMaterializeCached(self, hot, false) catch |err| switch (err) {
+            .url_count_top => return late_mat.formatUrlCountTopHashLateMaterializeCached(self.allocator, self.io, self.data_dir, hot, &self.url_hash_string_cache, &self.q34_url_top_cache, false) catch |err| switch (err) {
                 error.FileNotFound => return formatUrlCountTop(self.allocator, self.io, self.data_dir),
                 else => return err,
             },
-            .one_url_count_top => return formatUrlCountTopHashLateMaterializeCached(self, hot, true) catch |err| switch (err) {
+            .one_url_count_top => return late_mat.formatUrlCountTopHashLateMaterializeCached(self.allocator, self.io, self.data_dir, hot, &self.url_hash_string_cache, &self.q34_url_top_cache, true) catch |err| switch (err) {
                 error.FileNotFound => return formatOneUrlCountTop(self.allocator, self.io, self.data_dir),
                 else => return err,
             },
@@ -570,12 +571,12 @@ pub const Native = struct {
                 .minute_count_ordered => return formatUserIdMinuteSearchPhraseCountTopCached(self.allocator, self.io, self.data_dir, try self.getUserIdEncoding(), try self.getSearchPhraseColumn()),
             },
             .url_count_top => |shape| if (shape.include_constant)
-                formatUrlCountTopHashLateMaterializeCached(self, hot, true) catch |err| switch (err) {
+                late_mat.formatUrlCountTopHashLateMaterializeCached(self.allocator, self.io, self.data_dir, hot, &self.url_hash_string_cache, &self.q34_url_top_cache, true) catch |err| switch (err) {
                     error.FileNotFound => return formatOneUrlCountTop(self.allocator, self.io, self.data_dir),
                     else => return err,
                 }
             else
-                formatUrlCountTopHashLateMaterializeCached(self, hot, false) catch |err| switch (err) {
+                late_mat.formatUrlCountTopHashLateMaterializeCached(self.allocator, self.io, self.data_dir, hot, &self.url_hash_string_cache, &self.q34_url_top_cache, false) catch |err| switch (err) {
                     error.FileNotFound => return formatUrlCountTop(self.allocator, self.io, self.data_dir),
                     else => return err,
                 },
@@ -686,14 +687,14 @@ pub const Native = struct {
                 break :blk try native_group.formatTupleAggTopBound(self.allocator, "WatchID", hot.watch_id orelse return error.UnsupportedNativeQuery, "ClientIP", hot.client_ip orelse return error.UnsupportedNativeQuery, phrases.ids.values, phrases.emptyId() orelse return error.UnsupportedNativeQuery, "IsRefresh", hot.is_refresh, "ResolutionWidth", hot.resolution_width, 10, "c");
             },
             .url_count_top => blk: {
-                const output = formatUrlCountTopHashLateMaterializeCached(self, hot, false) catch |err| switch (err) {
+                const output = late_mat.formatUrlCountTopHashLateMaterializeCached(self.allocator, self.io, self.data_dir, hot, &self.url_hash_string_cache, &self.q34_url_top_cache, false) catch |err| switch (err) {
                     error.FileNotFound => try formatUrlCountTop(self.allocator, self.io, self.data_dir),
                     else => return err,
                 };
                 break :blk output;
             },
             .one_url_count_top => blk: {
-                const output = formatUrlCountTopHashLateMaterializeCached(self, hot, true) catch |err| switch (err) {
+                const output = late_mat.formatUrlCountTopHashLateMaterializeCached(self.allocator, self.io, self.data_dir, hot, &self.url_hash_string_cache, &self.q34_url_top_cache, true) catch |err| switch (err) {
                     error.FileNotFound => try formatOneUrlCountTop(self.allocator, self.io, self.data_dir),
                     else => return err,
                 };
@@ -6928,82 +6929,14 @@ fn formatUrlDashboardTop(self: *Native, hot: *const HotColumns, url_length: []co
 const UrlHashCount = native_group.UrlHashCount;
 const UrlTopCache = native_group.UrlTopCache;
 
-const HashStringCache = struct {
-    allocator: std.mem.Allocator,
-    map: std.AutoHashMap(i64, Span),
-    blob: std.ArrayList(u8),
-
-    const Span = struct { start: usize, end: usize };
-
-    fn init(allocator: std.mem.Allocator) HashStringCache {
-        return .{ .allocator = allocator, .map = std.AutoHashMap(i64, Span).init(allocator), .blob = .empty };
-    }
-
-    fn deinit(self: *HashStringCache) void {
-        self.map.deinit();
-        self.blob.deinit(self.allocator);
-    }
-
-    fn get(self: *const HashStringCache, hash: i64) ?[]const u8 {
-        const span = self.map.get(hash) orelse return null;
-        return self.blob.items[span.start..span.end];
-    }
-
-    fn put(self: *HashStringCache, hash: i64, value: []const u8) !void {
-        if (self.map.contains(hash)) return;
-        const start = self.blob.items.len;
-        try self.blob.appendSlice(self.allocator, value);
-        try self.map.put(hash, .{ .start = start, .end = self.blob.items.len });
-    }
-};
-
-fn formatUrlCountTopHashLateMaterialize(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8, hot: *const HotColumns, cache: *HashStringCache, comptime include_constant: bool) ![]u8 {
-    const top = try native_group.collectUrlHashTop(allocator, hot.url_hash);
-
-    try resolveUrlHashesFromParquet(allocator, io, data_dir, cache, top.rows[0..top.len]);
-
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(allocator);
-    try out.appendSlice(allocator, if (include_constant) "1,URL,c\n" else "URL,c\n");
-    for (top.rows[0..top.len]) |row| {
-        if (include_constant) try out.appendSlice(allocator, "1,");
-        try writeCsvField(allocator, &out, cache.get(row.url_hash) orelse return error.CorruptHotColumns);
-        try out.print(allocator, ",{d}\n", .{row.count});
-    }
-    return out.toOwnedSlice(allocator);
-}
-
-fn formatUrlCountTopHashLateMaterializeCached(self: *Native, hot: *const HotColumns, comptime include_constant: bool) ![]u8 {
-    if (self.q34_url_top_cache == null) {
-        self.q34_url_top_cache = try native_group.collectUrlHashTop(self.allocator, hot.url_hash);
-    }
-    const top = self.q34_url_top_cache.?;
-    try resolveUrlHashesFromParquet(self.allocator, self.io, self.data_dir, &self.url_hash_string_cache, top.rows[0..top.len]);
-
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(self.allocator);
-    try out.appendSlice(self.allocator, if (include_constant) "1,URL,c\n" else "URL,c\n");
-    for (top.rows[0..top.len]) |row| {
-        if (include_constant) try out.appendSlice(self.allocator, "1,");
-        try writeCsvField(self.allocator, &out, self.url_hash_string_cache.get(row.url_hash) orelse return error.CorruptHotColumns);
-        try out.print(self.allocator, ",{d}\n", .{row.count});
-    }
-    return out.toOwnedSlice(self.allocator);
-}
+const HashStringCache = late_mat.HashStringCache;
 
 fn insertUrlHashTop10(top: *[10]UrlHashCount, top_len: *usize, row: UrlHashCount) void {
-    var pos: usize = 0;
-    while (pos < top_len.* and urlHashBefore(top[pos], row)) : (pos += 1) {}
-    if (pos >= 10) return;
-    if (top_len.* < 10) top_len.* += 1;
-    var i = top_len.* - 1;
-    while (i > pos) : (i -= 1) top[i] = top[i - 1];
-    top[pos] = row;
+    late_mat.insertUrlHashTop10(top, top_len, row);
 }
 
 fn urlHashBefore(a: UrlHashCount, b: UrlHashCount) bool {
-    if (a.count == b.count) return a.url_hash < b.url_hash;
-    return a.count > b.count;
+    return late_mat.urlHashBefore(a, b);
 }
 
 const Q37UrlDict = struct {
@@ -10297,170 +10230,13 @@ fn formatUrlCountTopFilteredOffsetQ39HashLateMaterialize(allocator: std.mem.Allo
     return formatUrlHashCountRows(allocator, cache, rows, "URL,PageViews");
 }
 
-fn formatUrlHashCountRows(allocator: std.mem.Allocator, cache: *HashStringCache, rows: []const UrlHashCount, header: []const u8) ![]u8 {
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(allocator);
-    try out.appendSlice(allocator, header);
-    try out.append(allocator, '\n');
-    for (rows) |row| {
-        try writeCsvField(allocator, &out, cache.get(row.url_hash) orelse return error.CorruptHotColumns);
-        try out.print(allocator, ",{d}\n", .{row.count});
-    }
-    return out.toOwnedSlice(allocator);
-}
-
-fn q39UrlHashHeapLess(_: void, a: UrlHashCount, b: UrlHashCount) std.math.Order {
-    const a_worse = if (a.count != b.count) a.count < b.count else a.url_hash > b.url_hash;
-    const b_worse = if (a.count != b.count) b.count < a.count else b.url_hash > a.url_hash;
-    if (a_worse) return .lt;
-    if (b_worse) return .gt;
-    return .eq;
-}
-
-fn resolveUrlHashesFromParquet(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8, cache: *HashStringCache, rows: []const UrlHashCount) !void {
-    try resolveHashesFromParquet(allocator, io, data_dir, cache, rows, .url);
-}
-
-fn resolveTitleHashesFromParquet(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8, cache: *HashStringCache, rows: []const UrlHashCount) !void {
-    try resolveHashesFromParquet(allocator, io, data_dir, cache, rows, .title);
-}
-
-fn resolveRefererHashesFromParquet(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8, cache: *HashStringCache, rows: []const UrlHashCount) !void {
-    try resolveHashesFromParquet(allocator, io, data_dir, cache, rows, .referer);
-}
-
-const HashStringKind = enum { url, title, referer };
-
-fn resolveHashesFromParquet(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8, cache: *HashStringCache, rows: []const UrlHashCount, kind: HashStringKind) !void {
-    var missing: std.ArrayList(i64) = .empty;
-    defer missing.deinit(allocator);
-    for (rows) |row| {
-        if (cache.get(row.url_hash) == null) try missing.append(allocator, row.url_hash);
-    }
-    if (missing.items.len == 0) return;
-    if (kind == .url or kind == .referer) {
-        try resolveStoredHashesFromParquet(allocator, io, data_dir, cache, missing.items, kind);
-        return;
-    }
-    if (submitMode() or !build_options.duckdb) return error.UnsupportedNativeQuery;
-
-    const parquet_path = try storage.readImportSource(io, allocator, data_dir);
-    defer allocator.free(parquet_path);
-    const parquet_literal = try duckdb.sqlStringLiteral(allocator, parquet_path);
-    defer allocator.free(parquet_literal);
-
-    var hash_list: std.ArrayList(u8) = .empty;
-    defer hash_list.deinit(allocator);
-    for (missing.items, 0..) |hash, i| {
-        if (i != 0) try hash_list.appendSlice(allocator, ",");
-        try hash_list.print(allocator, "{d}", .{hash});
-    }
-
-    const limit_filter = if (try importRowLimit(allocator, io, data_dir)) |limit_rows|
-        try std.fmt.allocPrint(allocator, " AND file_row_number < {d}", .{limit_rows})
-    else
-        try allocator.dupe(u8, "");
-    defer allocator.free(limit_filter);
-
-    const sql = switch (kind) {
-        .url => try std.fmt.allocPrint(allocator,
-            \\COPY (
-            \\SELECT URLHash AS h, hex(URL) AS x
-            \\FROM read_parquet({s}, binary_as_string=True, file_row_number=True)
-            \\WHERE URLHash IN ({s}){s}
-            \\GROUP BY URLHash, URL
-            \\) TO STDOUT (FORMAT csv, HEADER true);
-        , .{ parquet_literal, hash_list.items, limit_filter }),
-        .title => try std.fmt.allocPrint(allocator,
-            \\COPY (
-            \\SELECT CAST(hash(CAST(Title AS VARCHAR)) & 9223372036854775807 AS BIGINT) AS h, hex(Title) AS x
-            \\FROM read_parquet({s}, binary_as_string=True, file_row_number=True)
-            \\WHERE CAST(hash(CAST(Title AS VARCHAR)) & 9223372036854775807 AS BIGINT) IN ({s}){s}
-            \\GROUP BY h, Title
-            \\) TO STDOUT (FORMAT csv, HEADER true);
-        , .{ parquet_literal, hash_list.items, limit_filter }),
-        .referer => try std.fmt.allocPrint(allocator,
-            \\COPY (
-            \\SELECT RefererHash AS h, hex(Referer) AS x
-            \\FROM read_parquet({s}, binary_as_string=True, file_row_number=True)
-            \\WHERE RefererHash IN ({s}){s}
-            \\GROUP BY RefererHash, Referer
-            \\) TO STDOUT (FORMAT csv, HEADER true);
-        , .{ parquet_literal, hash_list.items, limit_filter }),
-    };
-    defer allocator.free(sql);
-
-    var ddb = duckdb.DuckDb.init(allocator, io, data_dir);
-    defer ddb.deinit();
-    const raw = try ddb.runRawSql(sql);
-    defer allocator.free(raw);
-    try parseHashHexRowsIntoCache(allocator, cache, raw);
-}
-
-const NativeHashResolveContext = struct {
-    allocator: std.mem.Allocator,
-    cache: *HashStringCache,
-    targets: std.AutoHashMap(i64, void),
-    hashes: []const i64,
-    row_index: usize = 0,
-
-    fn observe(self: *NativeHashResolveContext, value: []const u8) !void {
-        defer self.row_index += 1;
-        if (self.row_index >= self.hashes.len) return error.CorruptHotColumns;
-        const hash = self.hashes[self.row_index];
-        if (!self.targets.contains(hash)) return;
-        if (self.cache.get(hash) != null) return;
-        try self.cache.put(hash, value);
-    }
-};
-
-fn resolveStoredHashesFromParquet(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8, cache: *HashStringCache, missing: []const i64, kind: HashStringKind) !void {
-    var targets = std.AutoHashMap(i64, void).init(allocator);
-    defer targets.deinit();
-    try targets.ensureTotalCapacity(@intCast(missing.len));
-    for (missing) |hash| try targets.put(hash, {});
-
-    const hash_file = switch (kind) {
-        .url => storage.hot_url_hash_name,
-        .referer => storage.hot_referer_hash_name,
-        .title => return error.UnsupportedNativeQuery,
-    };
-    const parquet_column: usize = switch (kind) {
-        .url => 13,
-        .referer => 14,
-        .title => return error.UnsupportedNativeQuery,
-    };
-    const hash_path = try storage.hotColumnPath(allocator, data_dir, hash_file);
-    defer allocator.free(hash_path);
-    const hash_col = try io_map.mapColumn(i64, io, hash_path);
-    defer hash_col.mapping.unmap();
-    const parquet_path = try storage.readImportSource(io, allocator, data_dir);
-    defer allocator.free(parquet_path);
-    const limit_rows = try importRowLimit(allocator, io, data_dir);
-    const limit_usize: ?usize = if (limit_rows) |n| @intCast(n) else null;
-    if (limit_usize) |n| if (n != hash_col.values.len) return error.CorruptHotColumns;
-    var ctx = NativeHashResolveContext{ .allocator = allocator, .cache = cache, .targets = targets, .hashes = hash_col.values };
-    const scanned = try parquet.streamByteArrayColumnPath(allocator, io, parquet_path, parquet_column, limit_usize, &ctx, NativeHashResolveContext.observe);
-    if (scanned != hash_col.values.len) return error.CorruptHotColumns;
-    for (missing) |hash| if (cache.get(hash) == null) return error.CorruptHotColumns;
-}
-
-fn parseHashHexRowsIntoCache(allocator: std.mem.Allocator, cache: *HashStringCache, raw: []const u8) !void {
-    var lines = std.mem.splitScalar(u8, raw, '\n');
-    _ = lines.next();
-    var decoded: std.ArrayList(u8) = .empty;
-    defer decoded.deinit(allocator);
-    while (lines.next()) |line_raw| {
-        const line = std.mem.trim(u8, line_raw, "\r");
-        if (line.len == 0) continue;
-        const comma = std.mem.indexOfScalar(u8, line, ',') orelse continue;
-        const hash = try std.fmt.parseInt(i64, line[0..comma], 10);
-        const hex = line[comma + 1 ..];
-        try decoded.resize(allocator, hex.len / 2);
-        _ = try std.fmt.hexToBytes(decoded.items, hex);
-        try cache.put(hash, decoded.items);
-    }
-}
+const formatUrlHashCountRows = late_mat.formatHashCountRows;
+const q39UrlHashHeapLess = late_mat.q39UrlHashHeapLess;
+const HashStringKind = late_mat.HashStringKind;
+const resolveUrlHashesFromParquet = late_mat.resolveUrlHashesFromParquet;
+const resolveTitleHashesFromParquet = late_mat.resolveTitleHashesFromParquet;
+const resolveRefererHashesFromParquet = late_mat.resolveRefererHashesFromParquet;
+const resolveHashesFromParquet = late_mat.resolveHashesFromParquet;
 
 fn appendPhraseInListSql(allocator: std.mem.Allocator, out: *std.ArrayList(u8), phrases: *const lowcard.StringColumn, phrase_ids: []const u32) !void {
     for (phrase_ids, 0..) |pid, i| {
