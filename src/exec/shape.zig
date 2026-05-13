@@ -115,13 +115,18 @@ pub fn inferShape(plan: generic_sql.Plan, table: *const schema.Table) PlanShape 
 
     // Single-column group: classify by capability of the group column.
     const tag = bind.lookupCapability(table, gb) orelse return .unknown;
+    const col_idx = table.findColumn(gb) orelse return .unknown;
+    const col_caps = table.columns[col_idx].capabilities;
 
     // Detect projection signature: count_star vs count_distinct vs mixed.
     const proj_kind = classifyProjections(plan.projections);
 
     return switch (tag) {
         .lowcard_text => switch (proj_kind) {
-            .single_count_star => .lowcard_count_top,
+            .single_count_star => if (col_caps.hash_sidecar)
+                .hashed_late_materialize_top
+            else
+                .lowcard_count_top,
             .single_count_distinct => .lowcard_distinct_top,
             .mixed_aggregates => .dense_avg_count_top,
             .unknown => .unknown,

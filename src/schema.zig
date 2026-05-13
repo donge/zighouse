@@ -79,6 +79,10 @@ pub const PhysicalColumn = union(enum) {
         bytes_path_name: []const u8,
         id_type: ColumnType = .int32,
         empty: EmptySemantics = .stored_empty_string,
+        /// Optional parallel hash sidecar column (e.g. URLHash/TitleHash).
+        /// When set together with `capabilities.hash_sidecar`, dispatch may
+        /// choose the hashed_late_materialize_top operator.
+        hash_column: ?[]const u8 = null,
     },
     hash_text: struct {
         hash_column: []const u8,
@@ -126,6 +130,11 @@ pub const StringCapabilities = struct {
     late_materialize: bool = false,
     domain_extract: bool = false,
     conditional_materialize: bool = false,
+    /// Column has a parallel hash sidecar (e.g. URLHash/TitleHash) suitable
+    /// for late-materialization GROUP BY. Set on lowcard_text columns whose
+    /// physical layout is dictionary-encoded but whose preferred dispatch
+    /// path is hashed_late_materialize_top (PR-A4).
+    hash_sidecar: bool = false,
 };
 
 pub const Column = struct {
@@ -320,16 +329,18 @@ test "capabilityTag covers ClickBench hits 105 columns without panic" {
     for (counts) |c| total += c;
     try std.testing.expectEqual(hits_schema.hits.columns.len, total);
 
-    // Distribution sanity (per Explore C report):
-    //   fixed_*: ~77, lowcard_text: 2, hash_text: 2, lazy_text: 1, derived: 0
-    // We assert non-zero counts on expected non-empty buckets and exact zero on `derived`.
+    // Distribution sanity (per Explore C report, updated PR-A4):
+    //   fixed_*: ~77, lowcard_text: 4 (SearchPhrase, MobilePhoneModel, URL,
+    //     Title — URL/Title now lowcard_text with hash_sidecar capability),
+    //   hash_text: 0 (no pure hash-only columns left), lazy_text: 1 (Referer),
+    //   derived: 0
+    // We assert non-zero counts on expected non-empty buckets.
     const fixed_total = counts[@intFromEnum(CapabilityTag.fixed_i16)] +
         counts[@intFromEnum(CapabilityTag.fixed_i32)] +
         counts[@intFromEnum(CapabilityTag.fixed_i64)] +
         counts[@intFromEnum(CapabilityTag.fixed_date)] +
         counts[@intFromEnum(CapabilityTag.fixed_timestamp)];
     try std.testing.expect(fixed_total > 0);
-    try std.testing.expect(counts[@intFromEnum(CapabilityTag.lowcard_text)] >= 2);
-    try std.testing.expect(counts[@intFromEnum(CapabilityTag.hash_text)] >= 2);
+    try std.testing.expect(counts[@intFromEnum(CapabilityTag.lowcard_text)] >= 4);
     try std.testing.expect(counts[@intFromEnum(CapabilityTag.lazy_text)] >= 1);
 }

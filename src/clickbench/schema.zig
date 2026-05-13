@@ -42,6 +42,39 @@ fn lowcardText(
     };
 }
 
+/// Highcard dictionary-encoded text with parallel hash sidecar
+/// (URL/Title). Physical layout matches `lowcardText` but dispatch
+/// prefers hashed_late_materialize_top via `capabilities.hash_sidecar`.
+fn lowcardTextWithHash(
+    name: []const u8,
+    cardinality: schema.CardinalityHint,
+    storage: schema.StorageHint,
+    hash_column: []const u8,
+    id_path_name: []const u8,
+    offsets_path_name: []const u8,
+    bytes_path_name: []const u8,
+    capabilities: schema.StringCapabilities,
+) Column {
+    var caps = capabilities;
+    caps.hash_sidecar = true;
+    return .{
+        .name = name,
+        .ty = .text,
+        .cardinality = cardinality,
+        .storage = storage,
+        .string_encoding = .highcard_dict,
+        .physical = .{ .lowcard_text = .{
+            .id_path_name = id_path_name,
+            .offsets_path_name = offsets_path_name,
+            .bytes_path_name = bytes_path_name,
+            .empty = .stored_empty_string,
+            .hash_column = hash_column,
+        } },
+        .materialize = &.{ .lowcard_dictionary, .hash_column },
+        .capabilities = caps,
+    };
+}
+
 fn hashText(
     name: []const u8,
     cardinality: schema.CardinalityHint,
@@ -93,7 +126,7 @@ fn lazyText(name: []const u8, cardinality: schema.CardinalityHint, hash_column: 
 pub const hits_columns = [_]Column{
     fixed("WatchID", .int64),
     fixed("JavaEnable", .int16),
-    hashText("Title", .high, .highcard_dict, "TitleHash", "Title.dict.tsv", "hot_Title.id", "Title.id_offsets.bin", "Title.id_strings.bin", .{ .contains_index = true, .min_value = true, .late_materialize = true }),
+    lowcardTextWithHash("Title", .high, .highcard_dict, "TitleHash", "hot_Title.id", "Title.id_offsets.bin", "Title.id_strings.bin", .{ .contains_index = true, .min_value = true, .late_materialize = true }),
     fixed("GoodEvent", .int16),
     fixed("EventTime", .timestamp),
     fixed("EventDate", .date),
@@ -104,7 +137,7 @@ pub const hits_columns = [_]Column{
     fixed("CounterClass", .int16),
     fixed("OS", .int16),
     fixed("UserAgent", .int16),
-    hashText("URL", .high, .highcard_dict, "URLHash", "URL.dict.tsv", "hot_URL.id", "URL.id_offsets.bin", "URL.id_strings.bin", .{ .group_count_top = true, .contains_index = true, .min_value = true, .length = true, .late_materialize = true }),
+    lowcardTextWithHash("URL", .high, .highcard_dict, "URLHash", "hot_URL.id", "URL.id_offsets.bin", "URL.id_strings.bin", .{ .group_count_top = true, .contains_index = true, .min_value = true, .length = true, .late_materialize = true }),
     lazyText("Referer", .mostly_unique, "RefererHash", "Referer.sidecar", .{ .min_value = true, .length = true, .late_materialize = true, .domain_extract = true, .conditional_materialize = true }),
     fixed("IsRefresh", .int16),
     fixed("RefererCategoryID", .int16),

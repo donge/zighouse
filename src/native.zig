@@ -986,12 +986,12 @@ pub const Native = struct {
         return &self.search_phrase_cache.?;
     }
 
-    /// Schema-driven column binding (PR-A3).
+    /// Schema-driven column binding (PR-A3, extended PR-A4).
     ///
     /// Returns a `BoundColumn` for any hits column known to the schema and
     /// backed by an existing Native getter. Falls back to
     /// `error.UnsupportedNativeQuery` when the column has no runtime data
-    /// source yet (PR-A4+ will extend coverage to URL/Title/MobilePhoneModel).
+    /// source yet (MobilePhoneModel and others land in PR-A5+).
     ///
     /// This is the dispatch primitive consumed by (PlanShape, CapabilityTag)
     /// lookup. It must remain a thin facade over the existing getters; any
@@ -1012,9 +1012,32 @@ pub const Native = struct {
                         .capabilities = column.capabilities,
                     } };
                 }
+                if (asciiEqlIgnoreCase(column.name, "URL")) {
+                    const col = try self.getUrlColumn();
+                    break :blk bind.BoundColumn{ .lowcard_text = .{
+                        .name = column.name,
+                        .column = col,
+                        .empty_id = col.emptyId(),
+                        // Hash sidecar slice is mmapped on demand by the
+                        // operator that needs it; binding stays cheap.
+                        .hash = null,
+                        .capabilities = column.capabilities,
+                    } };
+                }
+                if (asciiEqlIgnoreCase(column.name, "Title")) {
+                    const col = try self.getTitleColumn();
+                    break :blk bind.BoundColumn{ .lowcard_text = .{
+                        .name = column.name,
+                        .column = col,
+                        .empty_id = col.emptyId(),
+                        .hash = null,
+                        .capabilities = column.capabilities,
+                    } };
+                }
+                // MobilePhoneModel/others: no runtime getter yet.
                 break :blk error.UnsupportedNativeQuery;
             },
-            // Other tags fall through until PR-A4+.
+            // Other tags fall through until PR-A5+.
             else => error.UnsupportedNativeQuery,
         };
     }

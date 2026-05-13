@@ -843,9 +843,9 @@ test "lookupCapability returns tag for known columns and null for missing" {
         @as(?schema.CapabilityTag, schema.CapabilityTag.lowcard_text),
         bind.lookupCapability(&clickbench_schema.hits, "MobilePhoneModel"),
     );
-    // Known hash_text column.
+    // URL is lowcard_text with hash_sidecar capability (PR-A4).
     try std.testing.expectEqual(
-        @as(?schema.CapabilityTag, schema.CapabilityTag.hash_text),
+        @as(?schema.CapabilityTag, schema.CapabilityTag.lowcard_text),
         bind.lookupCapability(&clickbench_schema.hits, "URL"),
     );
     // Missing column returns null.
@@ -990,4 +990,14 @@ test "inferShape: unknown for projection-only top-N" {
     );
     defer allocator.free(plan.projections);
     try std.testing.expectEqual(shape.PlanShape.unknown, shape.inferShape(plan, &clickbench_schema.hits));
+}
+
+test "URL and Title carry hash_sidecar capability after PR-A4" {
+    const url_idx = clickbench_schema.hits.findColumn("URL").?;
+    const title_idx = clickbench_schema.hits.findColumn("Title").?;
+    try std.testing.expect(clickbench_schema.hits.columns[url_idx].capabilities.hash_sidecar);
+    try std.testing.expect(clickbench_schema.hits.columns[title_idx].capabilities.hash_sidecar);
+    // SearchPhrase must NOT carry hash_sidecar.
+    const sp_idx = clickbench_schema.hits.findColumn("SearchPhrase").?;
+    try std.testing.expect(!clickbench_schema.hits.columns[sp_idx].capabilities.hash_sidecar);
 }
