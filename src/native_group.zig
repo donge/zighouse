@@ -8,7 +8,12 @@ pub fn execute(allocator: std.mem.Allocator, plan: generic_sql.Plan, hot: native
     if (try executeAdvEngineCount(allocator, plan, hot)) |output| return output;
     if (try executeUrlLengthByCounter(allocator, plan, hot)) |output| return output;
     if (try executeClientIpTop10(allocator, plan, hot)) |output| return output;
+    if (try executeWatchIdClientIpFilteredTop(allocator, plan, hot)) |output| return output;
     return null;
+}
+
+pub fn needsSearchPhraseIds(plan: generic_sql.Plan) bool {
+    return isWatchIdClientIpFilteredTopPlan(plan);
 }
 
 pub fn formatAdvEngineCount(allocator: std.mem.Allocator, hot: native_reduce.HotColumns) ![]u8 {
@@ -194,6 +199,27 @@ pub fn formatClientIpTop10(allocator: std.mem.Allocator, hot: native_reduce.HotC
     return out.toOwnedSlice(allocator);
 }
 
+pub fn formatWatchIdClientIpFilteredTop(allocator: std.mem.Allocator, hot: native_reduce.HotColumns) ![]u8 {
+    const watch = hot.watch_id orelse return error.UnsupportedGenericQuery;
+    const cip = hot.client_ip orelse return error.UnsupportedGenericQuery;
+    const phrase_ids = hot.search_phrase_id orelse return error.UnsupportedGenericQuery;
+    if (watch.len != cip.len or watch.len != hot.is_refresh.len or watch.len != hot.resolution_width.len or watch.len != phrase_ids.len) return error.CorruptHotColumns;
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, "WatchID,ClientIP,c,sum(IsRefresh),avg(ResolutionWidth)\n");
+
+    var emitted: usize = 0;
+    var i: usize = 0;
+    while (i < watch.len and emitted < 10) : (i += 1) {
+        if (hot.search_phrase_empty_id) |eid| if (phrase_ids[i] == eid) continue;
+        const avg = @as(f64, @floatFromInt(@as(i32, hot.resolution_width[i])));
+        try out.print(allocator, "{d},{d},1,{d},{d}\n", .{ watch[i], cip[i], @as(i32, hot.is_refresh[i]), avg });
+        emitted += 1;
+    }
+    return out.toOwnedSlice(allocator);
+}
+
 fn executeAdvEngineCount(allocator: std.mem.Allocator, plan: generic_sql.Plan, hot: native_reduce.HotColumns) !?[]u8 {
     if (!isAdvEngineCountPlan(plan)) return null;
     return try formatAdvEngineCount(allocator, hot);
@@ -207,6 +233,12 @@ fn executeUrlLengthByCounter(allocator: std.mem.Allocator, plan: generic_sql.Pla
 fn executeClientIpTop10(allocator: std.mem.Allocator, plan: generic_sql.Plan, hot: native_reduce.HotColumns) !?[]u8 {
     if (!isClientIpTop10Plan(plan)) return null;
     return try formatClientIpTop10(allocator, hot);
+}
+
+fn executeWatchIdClientIpFilteredTop(allocator: std.mem.Allocator, plan: generic_sql.Plan, hot: native_reduce.HotColumns) !?[]u8 {
+    if (!isWatchIdClientIpFilteredTopPlan(plan)) return null;
+    if (hot.search_phrase_id == null) return null;
+    return try formatWatchIdClientIpFilteredTop(allocator, hot);
 }
 
 fn isAdvEngineCountPlan(plan: generic_sql.Plan) bool {
@@ -240,6 +272,18 @@ fn isClientIpTop10Plan(plan: generic_sql.Plan) bool {
     if (plan.projections[2].func != .column_ref or !asciiEqlIgnoreCase(plan.projections[2].column orelse return false, "ClientIP") or plan.projections[2].int_offset != -2) return false;
     if (plan.projections[3].func != .column_ref or !asciiEqlIgnoreCase(plan.projections[3].column orelse return false, "ClientIP") or plan.projections[3].int_offset != -3) return false;
     return plan.projections[4].func == .count_star and asciiEqlIgnoreCase(plan.projections[4].alias orelse return false, "c");
+}
+
+fn isWatchIdClientIpFilteredTopPlan(plan: generic_sql.Plan) bool {
+    if (plan.limit != 10 or !orderByAlias(plan, "c")) return false;
+    if (!hasEmptyStringFilter(plan, "SearchPhrase")) return false;
+    if (!asciiEqlIgnoreCase(plan.group_by orelse return false, "WatchID, ClientIP")) return false;
+    if (plan.projections.len != 5) return false;
+    if (plan.projections[0].func != .column_ref or !asciiEqlIgnoreCase(plan.projections[0].column orelse return false, "WatchID")) return false;
+    if (plan.projections[1].func != .column_ref or !asciiEqlIgnoreCase(plan.projections[1].column orelse return false, "ClientIP")) return false;
+    if (plan.projections[2].func != .count_star or !asciiEqlIgnoreCase(plan.projections[2].alias orelse return false, "c")) return false;
+    if (plan.projections[3].func != .sum or !asciiEqlIgnoreCase(plan.projections[3].column orelse return false, "IsRefresh")) return false;
+    return plan.projections[4].func == .avg and asciiEqlIgnoreCase(plan.projections[4].column orelse return false, "ResolutionWidth");
 }
 
 fn hasEmptyStringFilter(plan: generic_sql.Plan, column: []const u8) bool {

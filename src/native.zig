@@ -314,7 +314,7 @@ pub const Native = struct {
             .user_id_minute_search_phrase_count_top => return formatUserIdMinuteSearchPhraseCountTopCached(self.allocator, self.io, self.data_dir, try self.getUserIdEncoding(), try self.getSearchPhraseColumn()),
             .search_engine_client_ip_agg_top => return formatSearchEngineClientIpAggTop(self.allocator, self.io, self.data_dir),
             .watch_id_client_ip_agg_top => return formatWatchIdClientIpAggTop(self.allocator, self.io, self.data_dir),
-            .watch_id_client_ip_agg_top_filtered => return formatWatchIdClientIpAggTopFilteredCached(self.allocator, hot, try self.getSearchPhraseColumn()),
+            .watch_id_client_ip_agg_top_filtered => return native_group.formatWatchIdClientIpFilteredTop(self.allocator, reduceHotWithSearchPhrase(hot, try self.getSearchPhraseColumn())),
             .url_count_top => return formatUrlCountTopHashLateMaterializeCached(self, hot, false) catch |err| switch (err) {
                 error.FileNotFound => return formatUrlCountTop(self.allocator, self.io, self.data_dir),
                 else => return err,
@@ -446,6 +446,9 @@ pub const Native = struct {
     fn executeGenericGroupBy(self: *Native, plan: generic_sql.Plan, hot: *const HotColumns) anyerror![]u8 {
         const group_col = plan.group_by orelse return error.UnsupportedGenericQuery;
         if (try native_group.execute(self.allocator, plan, reduceHot(hot))) |output| return output;
+        if (native_group.needsSearchPhraseIds(plan)) {
+            if (try native_group.execute(self.allocator, plan, reduceHotWithSearchPhrase(hot, try self.getSearchPhraseColumn()))) |output| return output;
+        }
         if (plan.limit == 10) {
             if (isGenericMobilePhoneModelDistinctPlan(plan)) return formatMobilePhoneModelDistinctUserIdTop(self.allocator, self.io, self.data_dir);
             if (isGenericMobilePhoneDistinctPlan(plan)) return formatMobilePhoneDistinctUserIdTop(self.allocator, self.io, self.data_dir);
@@ -463,7 +466,6 @@ pub const Native = struct {
                 else => return err,
             };
             if (isGenericSearchEngineClientIpAggTopPlan(plan)) return formatSearchEngineClientIpAggTop(self.allocator, self.io, self.data_dir);
-            if (isGenericWatchIdClientIpAggTopFilteredPlan(plan)) return formatWatchIdClientIpAggTopFilteredCached(self.allocator, hot, try self.getSearchPhraseColumn());
             if (isGenericWatchIdClientIpAggTopPlan(plan)) return formatWatchIdClientIpAggTop(self.allocator, self.io, self.data_dir);
             if (isGenericUrlCountFilteredDashboardPlan(plan)) return formatUrlCountTopFilteredQ37HashLateMaterialize(self.allocator, self.io, self.data_dir, hot, &self.url_hash_string_cache) catch |err| switch (err) {
                 error.FileNotFound => return formatUrlCountTopFilteredQ37Cached(self.allocator, hot, try self.getUrlColumn()),
@@ -688,10 +690,6 @@ pub const Native = struct {
         return isGenericClientIpAggTopPlan(plan, "SearchEngineID", true);
     }
 
-    fn isGenericWatchIdClientIpAggTopFilteredPlan(plan: generic_sql.Plan) bool {
-        return isGenericClientIpAggTopPlan(plan, "WatchID", true);
-    }
-
     fn isGenericWatchIdClientIpAggTopPlan(plan: generic_sql.Plan) bool {
         return isGenericClientIpAggTopPlan(plan, "WatchID", false);
     }
@@ -872,7 +870,7 @@ pub const Native = struct {
             .url_like_google_order_by_event_time => if (submitMode()) try formatQ24(self.allocator, self.io, self.data_dir, hot) else null,
             .search_engine_client_ip_agg_top => try formatSearchEngineClientIpAggTop(self.allocator, self.io, self.data_dir),
             .watch_id_client_ip_agg_top => try formatWatchIdClientIpAggTop(self.allocator, self.io, self.data_dir),
-            .watch_id_client_ip_agg_top_filtered => try formatWatchIdClientIpAggTopFilteredCached(self.allocator, hot, try self.getSearchPhraseColumn()),
+            .watch_id_client_ip_agg_top_filtered => try native_group.formatWatchIdClientIpFilteredTop(self.allocator, reduceHotWithSearchPhrase(hot, try self.getSearchPhraseColumn())),
             .url_count_top => blk: {
                 const output = formatUrlCountTopHashLateMaterializeCached(self, hot, false) catch |err| switch (err) {
                     error.FileNotFound => try formatUrlCountTop(self.allocator, self.io, self.data_dir),
@@ -5769,11 +5767,21 @@ fn reduceHot(hot: *const HotColumns) native_reduce.HotColumns {
         .user_id = hot.user_id,
         .event_date = hot.event_date,
         .counter_id = hot.counter_id,
+        .watch_id = hot.watch_id,
         .client_ip = hot.client_ip,
+        .search_phrase_id = null,
+        .search_phrase_empty_id = null,
         .is_refresh = hot.is_refresh,
         .dont_count_hits = hot.dont_count_hits,
         .url_length = hot.url_length,
     };
+}
+
+fn reduceHotWithSearchPhrase(hot: *const HotColumns, phrases: *const lowcard.StringColumn) native_reduce.HotColumns {
+    var reduced = reduceHot(hot);
+    reduced.search_phrase_id = phrases.ids.values;
+    reduced.search_phrase_empty_id = phrases.emptyId();
+    return reduced;
 }
 
 const UserIdEncoding = struct {
@@ -10094,104 +10102,6 @@ fn formatWatchIdClientIpAggTopScan(allocator: std.mem.Allocator, io: std.Io, dat
             try out.print(allocator, "{d},{d},1,{d},{d}\n", .{ watch.values[i], cip.values[i], @as(i32, refresh.values[i]), avg });
             emitted += 1;
         }
-    }
-    return out.toOwnedSlice(allocator);
-}
-
-// ============================================================================
-// Q32: SELECT WatchID, ClientIP, COUNT(*) AS c, SUM(IsRefresh),
-//             AVG(ResolutionWidth)
-//      FROM hits
-//      WHERE SearchPhrase <> ''
-//      GROUP BY WatchID, ClientIP
-//      ORDER BY c DESC LIMIT 10;
-//
-// Filter shrinks the row set from ~99.99M to ~13M. Empirically the filtered
-// (WatchID, ClientIP) groups have ZERO duplicates (verified vs DuckDB), so
-// every group has count=1 and the LIMIT 10 with no tiebreaker can pick any
-// 10 filtered rows. We stream the columns, skip rows where the SearchPhrase
-// id matches the empty-phrase id, and emit the first 10 survivors.
-// ============================================================================
-
-fn formatWatchIdClientIpAggTopFiltered(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8) ![]u8 {
-    const watch_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_watch_id_name);
-    defer allocator.free(watch_path);
-    const cip_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_client_ip_name);
-    defer allocator.free(cip_path);
-    const refresh_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_is_refresh_name);
-    defer allocator.free(refresh_path);
-    const res_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_resolution_width_name);
-    defer allocator.free(res_path);
-    const phrase_id_path = try storage.hotColumnPath(allocator, data_dir, storage.hot_search_phrase_id_name);
-    defer allocator.free(phrase_id_path);
-    const offsets_path = try storage.hotColumnPath(allocator, data_dir, storage.search_phrase_id_offsets_name);
-    defer allocator.free(offsets_path);
-    const phrases_path = try storage.hotColumnPath(allocator, data_dir, storage.search_phrase_id_phrases_name);
-    defer allocator.free(phrases_path);
-
-    const watch = try io_map.mapColumn(i64, io, watch_path);
-    defer watch.mapping.unmap();
-    const cip = try io_map.mapColumn(i32, io, cip_path);
-    defer cip.mapping.unmap();
-    const refresh = try io_map.mapColumn(i16, io, refresh_path);
-    defer refresh.mapping.unmap();
-    const res = try io_map.mapColumn(i16, io, res_path);
-    defer res.mapping.unmap();
-    const phrase_ids = try io_map.mapColumn(u32, io, phrase_id_path);
-    defer phrase_ids.mapping.unmap();
-    const offsets = try io_map.mapColumn(u32, io, offsets_path);
-    defer offsets.mapping.unmap();
-    const phrases = try io_map.mapFile(io, phrases_path);
-    defer phrases.unmap();
-
-    const n = watch.values.len;
-    if (n != cip.values.len or n != phrase_ids.values.len) return error.UnsupportedNativeQuery;
-
-    // Identify empty-phrase id (DuckDB encodes empty as `""` 2-char in dict).
-    const phrase_dict_size = offsets.values.len - 1;
-    var empty_phrase_id: ?u32 = null;
-    for (0..phrase_dict_size) |idx| {
-        const start = offsets.values[idx];
-        const end = offsets.values[idx + 1];
-        const phrase = phrases.raw[start..end];
-        if (isStoredEmptyString(phrase)) {
-            empty_phrase_id = @intCast(idx);
-            break;
-        }
-    }
-
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(allocator);
-    try out.appendSlice(allocator, "WatchID,ClientIP,c,sum(IsRefresh),avg(ResolutionWidth)\n");
-
-    var emitted: usize = 0;
-    var i: usize = 0;
-    while (i < n and emitted < 10) : (i += 1) {
-        if (empty_phrase_id) |eid| if (phrase_ids.values[i] == eid) continue;
-        const avg = @as(f64, @floatFromInt(@as(i32, res.values[i])));
-        try out.print(allocator, "{d},{d},1,{d},{d}\n", .{ watch.values[i], cip.values[i], @as(i32, refresh.values[i]), avg });
-        emitted += 1;
-    }
-    return out.toOwnedSlice(allocator);
-}
-
-fn formatWatchIdClientIpAggTopFilteredCached(allocator: std.mem.Allocator, hot: *const HotColumns, phrases: *const lowcard.StringColumn) ![]u8 {
-    const watch = hot.watch_id orelse return error.UnsupportedNativeQuery;
-    const cip = hot.client_ip orelse return error.UnsupportedNativeQuery;
-    if (watch.len != cip.len or watch.len != hot.is_refresh.len or watch.len != hot.resolution_width.len or watch.len != phrases.ids.values.len) return error.CorruptHotColumns;
-    const empty_phrase_id = phrases.emptyId();
-
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(allocator);
-    try out.appendSlice(allocator, "WatchID,ClientIP,c,sum(IsRefresh),avg(ResolutionWidth)\n");
-
-    var emitted: usize = 0;
-    var i: usize = 0;
-    while (i < watch.len and emitted < 10) : (i += 1) {
-        if (empty_phrase_id) |eid| if (phrases.ids.values[i] == eid) continue;
-        const avg = @as(f64, @floatFromInt(@as(i32, hot.resolution_width[i])));
-        try out.print(allocator, "{d},{d},1,{d},{d}\n", .{ watch[i], cip[i], @as(i32, hot.is_refresh[i]), avg });
-        emitted += 1;
     }
     return out.toOwnedSlice(allocator);
 }
