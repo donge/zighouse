@@ -7,6 +7,7 @@ const build_options = @import("build_options");
 const duckdb = if (build_options.duckdb) @import("duckdb.zig") else @import("duckdb_stub.zig");
 const executor = @import("executor.zig");
 const generic_sql = @import("generic_sql.zig");
+const native_group = @import("native_group.zig");
 const native_reduce = @import("native_reduce.zig");
 const schema = @import("schema.zig");
 const simd = @import("simd.zig");
@@ -297,9 +298,9 @@ pub const Native = struct {
             .avg_user_id => return native_reduce.formatAvgUserId(self.allocator, hot.user_id),
             .min_max_event_date => return native_reduce.formatMinMaxEventDate(self.allocator, hot.event_date),
             .wide_resolution_sums => return native_reduce.formatWideResolutionSums(self.allocator, hot.resolution_width),
-            .adv_engine_group_by => return formatAdvEngineGroupBy(self.allocator, hot.adv_engine_id),
+            .adv_engine_group_by => return native_group.formatAdvEngineCount(self.allocator, reduceHot(hot)),
             .user_id_point_lookup => return formatUserIdPointLookup(self.allocator, hot.user_id, 435090932899640449),
-            .url_length_by_counter => return formatUrlLengthByCounter(self.allocator, hot.counter_id, hot.url_length orelse return error.UnsupportedNativeQuery),
+            .url_length_by_counter => return native_group.formatUrlLengthByCounter(self.allocator, reduceHot(hot)),
             .url_hash_date_dashboard => return formatUrlHashDateDashboard(self, hot, hot.trafic_source_id orelse return error.UnsupportedNativeQuery, hot.referer_hash orelse return error.UnsupportedNativeQuery),
             .time_bucket_dashboard => return formatTimeBucketDashboard(self, hot, hot.event_minute orelse return error.UnsupportedNativeQuery),
             .client_ip_top10 => if (self.experimental) return formatClientIpTop10(self.allocator, hot.client_ip orelse return error.UnsupportedNativeQuery),
@@ -444,7 +445,7 @@ pub const Native = struct {
 
     fn executeGenericGroupBy(self: *Native, plan: generic_sql.Plan, hot: *const HotColumns) anyerror![]u8 {
         const group_col = plan.group_by orelse return error.UnsupportedGenericQuery;
-        if (isGenericUrlLengthByCounterPlan(plan)) return formatUrlLengthByCounter(self.allocator, hot.counter_id, hot.url_length orelse return error.UnsupportedGenericQuery);
+        if (try native_group.execute(self.allocator, plan, reduceHot(hot))) |output| return output;
         if (plan.limit == 10) {
             if (isGenericMobilePhoneModelDistinctPlan(plan)) return formatMobilePhoneModelDistinctUserIdTop(self.allocator, self.io, self.data_dir);
             if (isGenericMobilePhoneDistinctPlan(plan)) return formatMobilePhoneDistinctUserIdTop(self.allocator, self.io, self.data_dir);
@@ -599,19 +600,6 @@ pub const Native = struct {
         if (!asciiEqlIgnoreCase(plan.order_by_text orelse return false, "c DESC")) return false;
         if (plan.projections.len != projection_len) return false;
         return plan.projections[0].func == .column_ref and asciiEqlIgnoreCase(plan.projections[0].column orelse return false, "SearchPhrase");
-    }
-
-    fn isGenericUrlLengthByCounterPlan(plan: generic_sql.Plan) bool {
-        if (plan.limit != 25 or plan.offset != null) return false;
-        if (!hasGenericEmptyStringFilter(plan, "URL")) return false;
-        if (!asciiEqlIgnoreCase(plan.group_by orelse return false, "CounterID")) return false;
-        if (!asciiEqlIgnoreCase(plan.having_text orelse return false, "COUNT(*) > 100000")) return false;
-        if (!genericOrderByAlias(plan, "l")) return false;
-        if (plan.projections.len != 3) return false;
-        if (plan.projections[0].func != .column_ref or !asciiEqlIgnoreCase(plan.projections[0].column orelse return false, "CounterID")) return false;
-        if (plan.projections[1].func != .avg or !asciiEqlIgnoreCase(plan.projections[1].column orelse return false, "length(URL)")) return false;
-        if (!asciiEqlIgnoreCase(plan.projections[1].alias orelse return false, "l")) return false;
-        return plan.projections[2].func == .count_star and asciiEqlIgnoreCase(plan.projections[2].alias orelse return false, "c");
     }
 
     fn isGenericRegionStatsDistinctPlan(plan: generic_sql.Plan) bool {
@@ -895,7 +883,7 @@ pub const Native = struct {
             .search_phrase_event_time_top => try formatSearchPhraseEventTimeCandidatesCached(self.allocator, self.io, self.data_dir, try self.getSearchPhraseColumn(), false),
             .search_phrase_event_time_phrase_top => try formatSearchPhraseEventTimeCandidatesCached(self.allocator, self.io, self.data_dir, try self.getSearchPhraseColumn(), true),
             .search_phrase_order_by_phrase_top => try formatSearchPhraseOrderByPhraseTopCached(self.allocator, try self.getSearchPhraseColumn()),
-            .url_length_by_counter => try formatUrlLengthByCounter(self.allocator, hot.counter_id, hot.url_length orelse return error.UnsupportedNativeQuery),
+            .url_length_by_counter => try native_group.formatUrlLengthByCounter(self.allocator, reduceHot(hot)),
             .referer_domain_stats_top => try formatQ29(self.allocator, self.io, self.data_dir),
             .url_like_google_order_by_event_time => if (submitMode()) try formatQ24(self.allocator, self.io, self.data_dir, hot) else null,
             .search_engine_client_ip_agg_top => try formatSearchEngineClientIpAggTop(self.allocator, self.io, self.data_dir),
@@ -6366,47 +6354,6 @@ fn asciiEqlIgnoreCase(a: []const u8, b: []const u8) bool {
     return true;
 }
 
-fn formatAdvEngineGroupBy(allocator: std.mem.Allocator, values: []const i16) ![]u8 {
-    const min_key = std.math.minInt(i16);
-    const bucket_count = @as(usize, std.math.maxInt(u16)) + 1;
-    const counts = try allocator.alloc(u64, bucket_count);
-    defer allocator.free(counts);
-    @memset(counts, 0);
-
-    for (values) |value| {
-        if (value == 0) continue;
-        const index: usize = @intCast(@as(i32, value) - @as(i32, min_key));
-        counts[index] += 1;
-    }
-
-    var rows: std.ArrayList(GroupRow) = .empty;
-    defer rows.deinit(allocator);
-    for (counts, 0..) |count, index| {
-        if (count == 0) continue;
-        const key: i16 = @intCast(@as(i32, @intCast(index)) + @as(i32, min_key));
-        try rows.append(allocator, .{ .key = key, .count = count });
-    }
-    std.mem.sort(GroupRow, rows.items, {}, groupRowDesc);
-
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(allocator);
-    try out.appendSlice(allocator, "AdvEngineID,count_star()\n");
-    for (rows.items) |row| {
-        try out.print(allocator, "{d},{d}\n", .{ row.key, row.count });
-    }
-    return out.toOwnedSlice(allocator);
-}
-
-const GroupRow = struct {
-    key: i16,
-    count: u64,
-};
-
-fn groupRowDesc(_: void, a: GroupRow, b: GroupRow) bool {
-    if (a.count == b.count) return a.key < b.key;
-    return a.count > b.count;
-}
-
 fn formatUserIdPointLookup(allocator: std.mem.Allocator, values: []const i64, target: i64) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
@@ -6428,58 +6375,6 @@ fn formatUserIdPointLookup(allocator: std.mem.Allocator, values: []const i64, ta
         if (values[i] == target) try out.print(allocator, "{d}\n", .{values[i]});
     }
     return out.toOwnedSlice(allocator);
-}
-
-fn formatUrlLengthByCounter(allocator: std.mem.Allocator, counter_ids: []const i32, url_lengths: []const i32) ![]u8 {
-    const min_counter: i32 = 0;
-    const max_counter: i32 = 262143;
-    const bucket_count: usize = @intCast(max_counter - min_counter + 1);
-    const counts = try allocator.alloc(u64, bucket_count);
-    defer allocator.free(counts);
-    const sums = try allocator.alloc(u64, bucket_count);
-    defer allocator.free(sums);
-    @memset(counts, 0);
-    @memset(sums, 0);
-
-    for (counter_ids, url_lengths) |counter_id, url_length| {
-        if (url_length == 0) continue;
-        if (counter_id < min_counter or counter_id > max_counter) continue;
-        const index: usize = @intCast(counter_id - min_counter);
-        counts[index] += 1;
-        sums[index] += @intCast(url_length);
-    }
-
-    var rows: std.ArrayList(UrlLengthCounterRow) = .empty;
-    defer rows.deinit(allocator);
-    for (counts, 0..) |count, index| {
-        if (count <= 100000) continue;
-        const counter_id: i32 = @intCast(@as(i64, min_counter) + @as(i64, @intCast(index)));
-        try rows.append(allocator, .{ .counter_id = counter_id, .sum = sums[index], .count = count });
-    }
-    std.mem.sort(UrlLengthCounterRow, rows.items, {}, urlLengthCounterDesc);
-
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(allocator);
-    try out.appendSlice(allocator, "CounterID,l,c\n");
-    const limit = @min(rows.items.len, 25);
-    for (rows.items[0..limit]) |row| {
-        const avg = @as(f64, @floatFromInt(row.sum)) / @as(f64, @floatFromInt(row.count));
-        try out.print(allocator, "{d},{d},{d}\n", .{ row.counter_id, avg, row.count });
-    }
-    return out.toOwnedSlice(allocator);
-}
-
-const UrlLengthCounterRow = struct {
-    counter_id: i32,
-    sum: u64,
-    count: u64,
-};
-
-fn urlLengthCounterDesc(_: void, a: UrlLengthCounterRow, b: UrlLengthCounterRow) bool {
-    const left = @as(u128, a.sum) * @as(u128, b.count);
-    const right = @as(u128, b.sum) * @as(u128, a.count);
-    if (left != right) return left > right;
-    return a.counter_id < b.counter_id;
 }
 
 fn formatClientIpTop10(allocator: std.mem.Allocator, values: []const i32) ![]u8 {
