@@ -7,6 +7,7 @@ const build_options = @import("build_options");
 const duckdb = if (build_options.duckdb) @import("duckdb.zig") else @import("duckdb_stub.zig");
 const executor = @import("executor.zig");
 const generic_sql = @import("generic_sql.zig");
+const native_reduce = @import("native_reduce.zig");
 const schema = @import("schema.zig");
 const simd = @import("simd.zig");
 const io_map = @import("io_map.zig");
@@ -291,14 +292,11 @@ pub const Native = struct {
         };
 
         if (clickbench_query) |query_kind| switch (query_kind) {
-            .count_adv_engine_non_zero => return formatOneInt(self.allocator, "count_star()", simd.countNonZero(i16, hot.adv_engine_id)),
-            .sum_count_avg => return formatSumCountAvg(self.allocator, simd.sum(i16, hot.adv_engine_id), hot.rowCount(), avgFromSum(simd.sum(i16, hot.resolution_width), hot.resolution_width.len)),
-            .avg_user_id => return formatOneFloat(self.allocator, "avg(UserID)", simd.avg(i64, hot.user_id)),
-            .min_max_event_date => {
-                const mm = simd.minMax(i32, hot.event_date);
-                return formatMinMaxDate(self.allocator, mm.min, mm.max);
-            },
-            .wide_resolution_sums => return formatWideResolutionSums(self.allocator, simd.sum(i16, hot.resolution_width), hot.rowCount()),
+            .count_adv_engine_non_zero => return native_reduce.formatCountNonZeroI16(self.allocator, "count_star()", hot.adv_engine_id),
+            .sum_count_avg => return native_reduce.formatSumCountAvg(self.allocator, hot.adv_engine_id, hot.resolution_width),
+            .avg_user_id => return native_reduce.formatAvgUserId(self.allocator, hot.user_id),
+            .min_max_event_date => return native_reduce.formatMinMaxEventDate(self.allocator, hot.event_date),
+            .wide_resolution_sums => return native_reduce.formatWideResolutionSums(self.allocator, hot.resolution_width),
             .adv_engine_group_by => return formatAdvEngineGroupBy(self.allocator, hot.adv_engine_id),
             .user_id_point_lookup => return formatUserIdPointLookup(self.allocator, hot.user_id, 435090932899640449),
             .url_length_by_counter => return formatUrlLengthByCounter(self.allocator, hot.counter_id, hot.url_length orelse return error.UnsupportedNativeQuery),
@@ -418,6 +416,8 @@ pub const Native = struct {
             else => return err,
         };
 
+        if (try native_reduce.executeScalar(self.allocator, plan, reduceHot(hot))) |output| return output;
+
         if (isGenericCountUrlLikeGooglePlan(plan)) return formatCountUrlLikeGoogleRowSidecar(self.allocator, self.io, self.data_dir) catch |err| switch (err) {
             error.FileNotFound => return formatCountUrlLikeGoogleCached(self.allocator, self.io, self.data_dir, try self.getUrlColumn(), try self.getUrlGoogleMatches()),
             else => return err,
@@ -430,18 +430,7 @@ pub const Native = struct {
         const distinct_count = try self.executeGenericDistinctCount(plan);
         if (distinct_count) |output| return output;
 
-        const fused_sum_offsets = try executeGenericFusedSumOffsets(self.allocator, plan, hot);
-        if (fused_sum_offsets) |output| return output;
-
-        const fused_minmax = try executeGenericFusedMinMax(self.allocator, plan, hot);
-        if (fused_minmax) |output| return output;
-
-        const values = try self.allocator.alloc(GenericValue, plan.projections.len);
-        defer self.allocator.free(values);
-        for (plan.projections, 0..) |expr, i| {
-            values[i] = try executeGenericProjection(expr, hot);
-        }
-        return formatGenericValues(self.allocator, plan, values);
+        return error.UnsupportedGenericQuery;
     }
 
     fn executeGenericDistinctCount(self: *Native, plan: generic_sql.Plan) !?[]u8 {
@@ -868,15 +857,12 @@ pub const Native = struct {
             else => return err,
         };
         return switch (query_kind) {
-            .count_star => try formatOneInt(self.allocator, "count_star()", hot.rowCount()),
-            .count_adv_engine_non_zero => try formatOneInt(self.allocator, "count_star()", genericCountNonZeroI16(hot.adv_engine_id)),
-            .sum_count_avg => try formatSumCountAvg(self.allocator, genericSumI16(hot.adv_engine_id), hot.rowCount(), genericAvgI16(hot.resolution_width)),
-            .avg_user_id => try formatOneFloat(self.allocator, "avg(UserID)", genericAvgI64(hot.user_id)),
+            .count_star => try native_reduce.formatOneInt(self.allocator, "count_star()", hot.rowCount()),
+            .count_adv_engine_non_zero => try native_reduce.formatCountNonZeroI16(self.allocator, "count_star()", hot.adv_engine_id),
+            .sum_count_avg => try native_reduce.formatSumCountAvg(self.allocator, hot.adv_engine_id, hot.resolution_width),
+            .avg_user_id => try native_reduce.formatAvgUserId(self.allocator, hot.user_id),
             .count_distinct_search_phrase => try formatSearchPhraseDistinctCountCached(self.allocator, try self.getSearchPhraseColumn()),
-            .min_max_event_date => blk: {
-                const mm = genericMinMaxI32(hot.event_date);
-                break :blk try formatMinMaxDate(self.allocator, mm.min, mm.max);
-            },
+            .min_max_event_date => try native_reduce.formatMinMaxEventDate(self.allocator, hot.event_date),
             .mobile_phone_model_distinct_user_id_top => try formatMobilePhoneModelDistinctUserIdTop(self.allocator, self.io, self.data_dir),
             .mobile_phone_distinct_user_id_top => try formatMobilePhoneDistinctUserIdTop(self.allocator, self.io, self.data_dir),
             .search_phrase_count_top => try formatSearchPhraseCountTopCached(self.allocator, try self.getSearchPhraseColumn()),
@@ -5804,6 +5790,19 @@ const HotColumns = struct {
     }
 };
 
+fn reduceHot(hot: *const HotColumns) native_reduce.HotColumns {
+    return .{
+        .adv_engine_id = hot.adv_engine_id,
+        .resolution_width = hot.resolution_width,
+        .user_id = hot.user_id,
+        .event_date = hot.event_date,
+        .counter_id = hot.counter_id,
+        .is_refresh = hot.is_refresh,
+        .dont_count_hits = hot.dont_count_hits,
+        .url_length = hot.url_length,
+    };
+}
+
 const UserIdEncoding = struct {
     ids: io_map.MappedColumn(u32),
     dict: io_map.MappedColumn(i64),
@@ -5999,46 +5998,9 @@ fn readI64Column(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8,
     return out;
 }
 
-fn genericCountNonZeroI16(values: []const i16) u64 {
-    var count: u64 = 0;
-    for (values) |value| count += @intFromBool(value != 0);
-    return count;
-}
-
-fn genericSumI16(values: []const i16) i64 {
-    var sum: i64 = 0;
-    for (values) |value| sum += value;
-    return sum;
-}
-
-fn genericAvgI16(values: []const i16) f64 {
-    if (values.len == 0) return 0;
-    return @as(f64, @floatFromInt(genericSumI16(values))) / @as(f64, @floatFromInt(values.len));
-}
-
-fn genericAvgI64(values: []const i64) f64 {
-    if (values.len == 0) return 0;
-    var sum: i128 = 0;
-    for (values) |value| sum += value;
-    return @as(f64, @floatFromInt(sum)) / @as(f64, @floatFromInt(values.len));
-}
-
 fn avgFromSum(sum: i64, count: usize) f64 {
     if (count == 0) return 0;
     return @as(f64, @floatFromInt(sum)) / @as(f64, @floatFromInt(count));
-}
-
-const MinMaxI32 = struct { min: i32, max: i32 };
-
-fn genericMinMaxI32(values: []const i32) MinMaxI32 {
-    if (values.len == 0) return .{ .min = 0, .max = 0 };
-    var min_value = values[0];
-    var max_value = values[0];
-    for (values[1..]) |value| {
-        if (value < min_value) min_value = value;
-        if (value > max_value) max_value = value;
-    }
-    return .{ .min = min_value, .max = max_value };
 }
 
 fn queryOutputsEquivalent(query_kind: clickbench_queries.Query, a: []const u8, b: []const u8) bool {
@@ -6268,47 +6230,6 @@ fn writeFilteredDateValues(out: *std.ArrayList(u8), allocator: std.mem.Allocator
     }
 }
 
-fn executeGenericFusedSumOffsets(allocator: std.mem.Allocator, plan: generic_sql.Plan, hot: *const HotColumns) !?[]u8 {
-    if (plan.projections.len < 2) return null;
-    const first_col = plan.projections[0].column orelse return null;
-    for (plan.projections) |expr| {
-        if (expr.func != .sum) return null;
-        const col = expr.column orelse return null;
-        if (!asciiEqlIgnoreCase(col, first_col)) return null;
-    }
-
-    const column = bindGenericColumn(hot, first_col) catch return error.UnsupportedGenericQuery;
-    const base_sum: i64 = switch (column) {
-        .i16 => |values| simd.sum(i16, values),
-        .i32 => |values| simd.sum(i32, values),
-        .date, .i64 => return error.UnsupportedGenericQuery,
-    };
-    const row_count: i64 = @intCast(hot.rowCount());
-
-    const values = try allocator.alloc(GenericValue, plan.projections.len);
-    defer allocator.free(values);
-    for (plan.projections, values) |expr, *out| {
-        out.* = .{ .int = base_sum + expr.int_offset * row_count };
-    }
-    return try formatGenericValues(allocator, plan, values);
-}
-
-fn executeGenericProjection(expr: generic_sql.Expr, hot: *const HotColumns) !GenericValue {
-    if (expr.func == .count_star) return .{ .int = @intCast(hot.rowCount()) };
-    if (expr.func == .int_literal) return .{ .int = expr.int_offset };
-    const column = bindGenericColumn(hot, expr.column orelse return error.UnsupportedGenericQuery) catch return error.UnsupportedGenericQuery;
-    return switch (expr.func) {
-        .column_ref => error.UnsupportedGenericQuery,
-        .int_literal => unreachable,
-        .count_distinct => error.UnsupportedGenericQuery,
-        .count_star => unreachable,
-        .sum => aggregateSum(column, null, expr.int_offset),
-        .avg => aggregateAvg(column, null),
-        .min => aggregateMin(column, null),
-        .max => aggregateMax(column, null),
-    };
-}
-
 fn executeGenericFilteredProjection(expr: generic_sql.Expr, hot: *const HotColumns, predicate: []const i16) !GenericValue {
     if (expr.func == .count_star) return .{ .int = @intCast(simd.countNonZero(i16, predicate)) };
     if (expr.func == .int_literal) return .{ .int = expr.int_offset };
@@ -6361,34 +6282,6 @@ fn aggregateMax(column: GenericColumn, predicate: ?[]const i16) !GenericValue {
         .i32 => |values| .{ .int = if (predicate) |p| simd.filteredMinMaxNonZero(i32, p, values).max else simd.minMax(i32, values).max },
         .date => |values| .{ .date = if (predicate) |p| simd.filteredMinMaxNonZero(i32, p, values).max else simd.minMax(i32, values).max },
         .i64 => |values| .{ .int = if (predicate) |p| simd.filteredMinMaxNonZero(i64, p, values).max else simd.minMax(i64, values).max },
-    };
-}
-
-fn executeGenericFusedMinMax(allocator: std.mem.Allocator, plan: generic_sql.Plan, hot: *const HotColumns) !?[]u8 {
-    if (plan.projections.len != 2) return null;
-    const first = plan.projections[0];
-    const second = plan.projections[1];
-    if (first.func != .min or second.func != .max) return null;
-    const first_col = first.column orelse return error.UnsupportedGenericQuery;
-    const second_col = second.column orelse return error.UnsupportedGenericQuery;
-    if (!asciiEqlIgnoreCase(first_col, second_col)) return null;
-    return switch (bindGenericColumn(hot, first_col) catch return error.UnsupportedGenericQuery) {
-        .i16 => |values| blk: {
-            const mm = simd.minMax(i16, values);
-            break :blk try formatGenericValues(allocator, plan, &.{ .{ .int = mm.min }, .{ .int = mm.max } });
-        },
-        .i32 => |values| blk: {
-            const mm = simd.minMax(i32, values);
-            break :blk try formatGenericValues(allocator, plan, &.{ .{ .int = mm.min }, .{ .int = mm.max } });
-        },
-        .date => |values| blk: {
-            const mm = simd.minMax(i32, values);
-            break :blk try formatGenericValues(allocator, plan, &.{ .{ .date = mm.min }, .{ .date = mm.max } });
-        },
-        .i64 => |values| blk: {
-            const mm = simd.minMax(i64, values);
-            break :blk try formatGenericValues(allocator, plan, &.{ .{ .int = mm.min }, .{ .int = mm.max } });
-        },
     };
 }
 
@@ -6471,48 +6364,6 @@ fn asciiEqlIgnoreCase(a: []const u8, b: []const u8) bool {
     if (a.len != b.len) return false;
     for (a, b) |ac, bc| if (std.ascii.toLower(ac) != std.ascii.toLower(bc)) return false;
     return true;
-}
-
-fn formatOneInt(allocator: std.mem.Allocator, header: []const u8, value: u64) ![]u8 {
-    return std.fmt.allocPrint(allocator, "{s}\n{d}\n", .{ header, value });
-}
-
-fn formatOneFloat(allocator: std.mem.Allocator, header: []const u8, value: f64) ![]u8 {
-    return std.fmt.allocPrint(allocator, "{s}\n{d}\n", .{ header, value });
-}
-
-fn formatSumCountAvg(allocator: std.mem.Allocator, sum: i64, count: usize, avg: f64) ![]u8 {
-    return std.fmt.allocPrint(allocator, "sum(AdvEngineID),count_star(),avg(ResolutionWidth)\n{d},{d},{d}\n", .{ sum, count, avg });
-}
-
-fn formatMinMaxDate(allocator: std.mem.Allocator, min_days: i32, max_days: i32) ![]u8 {
-    const min_date = dateString(@intCast(min_days));
-    const max_date = dateString(@intCast(max_days));
-    return std.fmt.allocPrint(allocator, "min(EventDate),max(EventDate)\n{s},{s}\n", .{ min_date, max_date });
-}
-
-fn formatWideResolutionSums(allocator: std.mem.Allocator, base_sum: i64, count: usize) ![]u8 {
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(allocator);
-
-    for (0..90) |i| {
-        if (i != 0) try out.append(allocator, ',');
-        if (i == 0) {
-            try out.appendSlice(allocator, "sum(ResolutionWidth)");
-        } else {
-            try out.print(allocator, "sum((ResolutionWidth + {d}))", .{i});
-        }
-    }
-    try out.append(allocator, '\n');
-
-    const row_count: i64 = @intCast(count);
-    for (0..90) |i| {
-        if (i != 0) try out.append(allocator, ',');
-        const value = base_sum + @as(i64, @intCast(i)) * row_count;
-        try out.print(allocator, "{d}", .{value});
-    }
-    try out.append(allocator, '\n');
-    return out.toOwnedSlice(allocator);
 }
 
 fn formatAdvEngineGroupBy(allocator: std.mem.Allocator, values: []const i16) ![]u8 {
@@ -7526,7 +7377,7 @@ fn formatUserIdDistinctCount(allocator: std.mem.Allocator, io: std.Io, data_dir:
             distinct += 1;
         }
     }
-    return formatOneInt(allocator, "count(DISTINCT UserID)", distinct);
+    return native_reduce.formatOneInt(allocator, "count(DISTINCT UserID)", distinct);
 }
 
 fn formatUserIdDistinctCountCached(allocator: std.mem.Allocator, enc: *const UserIdEncoding) ![]u8 {
@@ -7544,7 +7395,7 @@ fn formatUserIdDistinctCountCached(allocator: std.mem.Allocator, enc: *const Use
             distinct += 1;
         }
     }
-    return formatOneInt(allocator, "count(DISTINCT UserID)", distinct);
+    return native_reduce.formatOneInt(allocator, "count(DISTINCT UserID)", distinct);
 }
 
 fn formatSearchPhraseDistinctCount(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8) ![]u8 {
@@ -7576,7 +7427,7 @@ fn formatSearchPhraseDistinctCount(allocator: std.mem.Allocator, io: std.Io, dat
             distinct += 1;
         }
     }
-    return formatOneInt(allocator, "count(DISTINCT SearchPhrase)", distinct);
+    return native_reduce.formatOneInt(allocator, "count(DISTINCT SearchPhrase)", distinct);
 }
 
 fn formatSearchPhraseDistinctCountCached(allocator: std.mem.Allocator, phrases: *const lowcard.StringColumn) ![]u8 {
@@ -7594,7 +7445,7 @@ fn formatSearchPhraseDistinctCountCached(allocator: std.mem.Allocator, phrases: 
             distinct += 1;
         }
     }
-    return formatOneInt(allocator, "count(DISTINCT SearchPhrase)", distinct);
+    return native_reduce.formatOneInt(allocator, "count(DISTINCT SearchPhrase)", distinct);
 }
 
 fn formatSearchPhraseCountTop(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8) ![]u8 {
