@@ -303,7 +303,7 @@ pub const Native = struct {
             .url_length_by_counter => return native_group.formatUrlLengthByCounter(self.allocator, reduceHot(hot)),
             .url_hash_date_dashboard => return formatUrlHashDateDashboard(self, hot, hot.trafic_source_id orelse return error.UnsupportedNativeQuery, hot.referer_hash orelse return error.UnsupportedNativeQuery),
             .time_bucket_dashboard => return formatTimeBucketDashboard(self, hot, hot.event_minute orelse return error.UnsupportedNativeQuery),
-            .client_ip_top10 => if (self.experimental) return formatClientIpTop10(self.allocator, hot.client_ip orelse return error.UnsupportedNativeQuery),
+            .client_ip_top10 => if (self.experimental) return native_group.formatClientIpTop10(self.allocator, reduceHot(hot)),
             .user_id_count_top10 => if (self.experimental) return formatUserIdCountTop10DenseCached(self.allocator, try self.getUserIdEncoding()),
             .window_size_dashboard => return formatWindowSizeDashboard(self, hot),
             else => {},
@@ -465,7 +465,6 @@ pub const Native = struct {
             if (isGenericSearchEngineClientIpAggTopPlan(plan)) return formatSearchEngineClientIpAggTop(self.allocator, self.io, self.data_dir);
             if (isGenericWatchIdClientIpAggTopFilteredPlan(plan)) return formatWatchIdClientIpAggTopFilteredCached(self.allocator, hot, try self.getSearchPhraseColumn());
             if (isGenericWatchIdClientIpAggTopPlan(plan)) return formatWatchIdClientIpAggTop(self.allocator, self.io, self.data_dir);
-            if (isGenericClientIpSubtractTopPlan(plan)) return formatClientIpTop10(self.allocator, hot.client_ip orelse return error.UnsupportedGenericQuery);
             if (isGenericUrlCountFilteredDashboardPlan(plan)) return formatUrlCountTopFilteredQ37HashLateMaterialize(self.allocator, self.io, self.data_dir, hot, &self.url_hash_string_cache) catch |err| switch (err) {
                 error.FileNotFound => return formatUrlCountTopFilteredQ37Cached(self.allocator, hot, try self.getUrlColumn()),
                 else => return err,
@@ -709,21 +708,6 @@ pub const Native = struct {
         return plan.projections[4].func == .avg and asciiEqlIgnoreCase(plan.projections[4].column orelse return false, "ResolutionWidth");
     }
 
-    fn isGenericClientIpSubtractTopPlan(plan: generic_sql.Plan) bool {
-        if (plan.filter != null or plan.limit != 10 or !genericOrderByAlias(plan, "c")) return false;
-        if (!asciiEqlIgnoreCase(plan.group_by orelse return false, "ClientIP, ClientIP - 1, ClientIP - 2, ClientIP - 3")) return false;
-        if (plan.projections.len != 5) return false;
-        if (!genericClientIpOffsetExpr(plan.projections[0], 0)) return false;
-        if (!genericClientIpOffsetExpr(plan.projections[1], -1)) return false;
-        if (!genericClientIpOffsetExpr(plan.projections[2], -2)) return false;
-        if (!genericClientIpOffsetExpr(plan.projections[3], -3)) return false;
-        return plan.projections[4].func == .count_star and asciiEqlIgnoreCase(plan.projections[4].alias orelse return false, "c");
-    }
-
-    fn genericClientIpOffsetExpr(expr: generic_sql.Expr, offset: i64) bool {
-        return expr.func == .column_ref and asciiEqlIgnoreCase(expr.column orelse return false, "ClientIP") and expr.int_offset == offset;
-    }
-
     fn isGenericUrlCountFilteredDashboardPlan(plan: generic_sql.Plan) bool {
         if (plan.offset != null) return false;
         return isGenericDashboardStringTopPlan(plan, "URL", "CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND DontCountHits = 0 AND IsRefresh = 0 AND URL <> ''");
@@ -903,7 +887,7 @@ pub const Native = struct {
                 };
                 break :blk output;
             },
-            .client_ip_top10 => try formatClientIpTop10(self.allocator, hot.client_ip orelse return error.UnsupportedNativeQuery),
+            .client_ip_top10 => try native_group.formatClientIpTop10(self.allocator, reduceHot(hot)),
             .window_size_dashboard => try formatWindowSizeDashboard(self, hot),
             .time_bucket_dashboard => try formatTimeBucketDashboard(self, hot, hot.event_minute orelse return error.UnsupportedNativeQuery),
             .url_hash_date_dashboard => try formatUrlHashDateDashboard(self, hot, hot.trafic_source_id orelse return error.UnsupportedNativeQuery, hot.referer_hash orelse return error.UnsupportedNativeQuery),
@@ -5785,6 +5769,7 @@ fn reduceHot(hot: *const HotColumns) native_reduce.HotColumns {
         .user_id = hot.user_id,
         .event_date = hot.event_date,
         .counter_id = hot.counter_id,
+        .client_ip = hot.client_ip,
         .is_refresh = hot.is_refresh,
         .dont_count_hits = hot.dont_count_hits,
         .url_length = hot.url_length,
@@ -6375,137 +6360,6 @@ fn formatUserIdPointLookup(allocator: std.mem.Allocator, values: []const i64, ta
         if (values[i] == target) try out.print(allocator, "{d}\n", .{values[i]});
     }
     return out.toOwnedSlice(allocator);
-}
-
-fn formatClientIpTop10(allocator: std.mem.Allocator, values: []const i32) ![]u8 {
-    // Parallel partitioned hash agg. Each worker owns a private
-    // PartitionedHashU64Count; pass1 accumulates via morsels. Pass2
-    // merges each of the 64 partitions independently in parallel,
-    // keeping a per-merge-worker top-10. Final top-10 is the merge
-    // of those per-worker heaps.
-    const n_threads = parallel.defaultThreads();
-    // Estimate ~9M distinct ClientIPs (ClickBench). Per-thread tables
-    // get expected/n_threads keys.
-    const expected_total: usize = 9_500_000;
-    const expected_per_thread = expected_total / n_threads + 1;
-
-    const tables = try allocator.alloc(hashmap.PartitionedHashU64Count, n_threads);
-    var inited: usize = 0;
-    defer {
-        for (tables[0..inited]) |*t| t.deinit();
-        allocator.free(tables);
-    }
-    for (tables) |*t| {
-        t.* = try hashmap.PartitionedHashU64Count.init(allocator, expected_per_thread);
-        inited += 1;
-    }
-
-    const Pass1Ctx = struct {
-        values: []const i32,
-        table: *hashmap.PartitionedHashU64Count,
-    };
-    const pass1_workers = struct {
-        fn fill(ctx: *Pass1Ctx, source: *parallel.MorselSource) void {
-            while (source.next()) |m| {
-                var r = m.start;
-                while (r < m.end) : (r += 1) {
-                    ctx.table.bump(@as(u64, @bitCast(@as(i64, ctx.values[r]))));
-                }
-            }
-        }
-    };
-    const pass1_ctxs = try allocator.alloc(Pass1Ctx, n_threads);
-    defer allocator.free(pass1_ctxs);
-    for (pass1_ctxs, 0..) |*c, t| c.* = .{ .values = values, .table = &tables[t] };
-    var src: parallel.MorselSource = .init(values.len, parallel.default_morsel_size);
-    try parallel.parallelFor(allocator, Pass1Ctx, pass1_workers.fill, pass1_ctxs, &src);
-
-    // Build pointer array for mergePartition.
-    const local_ptrs = try allocator.alloc(*hashmap.PartitionedHashU64Count, n_threads);
-    defer allocator.free(local_ptrs);
-    for (tables, 0..) |*t, i| local_ptrs[i] = t;
-
-    // Per-merge-worker top-10. We use one worker per partition rebalanced
-    // across n_threads physical workers. Since partition_count = 64,
-    // each worker handles ~64/n_threads partitions.
-    const n_workers = @min(n_threads, hashmap.partition_count);
-    const worker_tops = try allocator.alloc([10]ClientIpCount, n_workers);
-    defer allocator.free(worker_tops);
-    const worker_top_lens = try allocator.alloc(usize, n_workers);
-    defer allocator.free(worker_top_lens);
-    @memset(worker_top_lens, 0);
-
-    const MergeCtx = struct {
-        allocator: std.mem.Allocator,
-        local_ptrs: []*hashmap.PartitionedHashU64Count,
-        worker_tops: [][10]ClientIpCount,
-        worker_top_lens: []usize,
-        n_workers: usize,
-    };
-    const merge_workers = struct {
-        fn run(ctx: *MergeCtx, worker_id: usize) void {
-            var p = worker_id;
-            while (p < hashmap.partition_count) : (p += ctx.n_workers) {
-                // Estimate output size = sum of per-thread part lens.
-                var expected_p: usize = 0;
-                for (ctx.local_ptrs) |lp| expected_p += lp.parts[p].len;
-                if (expected_p == 0) continue;
-                var merged = hashmap.mergePartition(ctx.allocator, ctx.local_ptrs, p, expected_p) catch return;
-                defer merged.deinit();
-                var it = merged.iterator();
-                while (it.next()) |e| {
-                    insertClientIpTop10(
-                        &ctx.worker_tops[worker_id],
-                        &ctx.worker_top_lens[worker_id],
-                        .{ .client_ip = @as(i32, @truncate(@as(i64, @bitCast(e.key)))), .count = e.value },
-                    );
-                }
-            }
-        }
-    };
-    var merge_ctx: MergeCtx = .{
-        .allocator = allocator,
-        .local_ptrs = local_ptrs,
-        .worker_tops = worker_tops,
-        .worker_top_lens = worker_top_lens,
-        .n_workers = n_workers,
-    };
-    try parallel.parallelIndices(allocator, MergeCtx, merge_workers.run, &merge_ctx, n_workers);
-
-    // Final reduce: merge per-worker top-10 lists into a global top-10.
-    var top: [10]ClientIpCount = undefined;
-    var top_len: usize = 0;
-    for (worker_tops, 0..) |*wt, w| {
-        for (wt[0..worker_top_lens[w]]) |row| insertClientIpTop10(&top, &top_len, row);
-    }
-
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(allocator);
-    try out.appendSlice(allocator, "ClientIP,subtract(ClientIP, 1),subtract(ClientIP, 2),subtract(ClientIP, 3),c\n");
-    for (top[0..top_len]) |row| {
-        try out.print(allocator, "{d},{d},{d},{d},{d}\n", .{ row.client_ip, row.client_ip - 1, row.client_ip - 2, row.client_ip - 3, row.count });
-    }
-    return out.toOwnedSlice(allocator);
-}
-
-const ClientIpCount = struct {
-    client_ip: i32,
-    count: u32,
-};
-
-fn insertClientIpTop10(top: *[10]ClientIpCount, top_len: *usize, row: ClientIpCount) void {
-    var pos: usize = 0;
-    while (pos < top_len.* and clientIpBefore(top[pos], row)) : (pos += 1) {}
-    if (pos >= 10) return;
-    if (top_len.* < 10) top_len.* += 1;
-    var i = top_len.* - 1;
-    while (i > pos) : (i -= 1) top[i] = top[i - 1];
-    top[pos] = row;
-}
-
-fn clientIpBefore(a: ClientIpCount, b: ClientIpCount) bool {
-    if (a.count == b.count) return a.client_ip < b.client_ip;
-    return a.count > b.count;
 }
 
 const i32_empty_key = std.math.minInt(i32);

@@ -8,6 +8,7 @@ pub const HotColumns = struct {
     user_id: []const i64,
     event_date: []const i32,
     counter_id: []const i32,
+    client_ip: ?[]const i32,
     is_refresh: []const i16,
     dont_count_hits: []const i16,
     url_length: ?[]const i32,
