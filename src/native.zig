@@ -6753,15 +6753,8 @@ fn formatUrlDashboardTop(self: *Native, hot: *const HotColumns, url_length: []co
     return out.toOwnedSlice(allocator);
 }
 
-const UrlHashCount = struct {
-    url_hash: i64,
-    count: u32,
-};
-
-const UrlTopCache = struct {
-    rows: [10]UrlHashCount = undefined,
-    len: usize = 0,
-};
+const UrlHashCount = native_group.UrlHashCount;
+const UrlTopCache = native_group.UrlTopCache;
 
 const HashStringCache = struct {
     allocator: std.mem.Allocator,
@@ -6793,22 +6786,14 @@ const HashStringCache = struct {
 };
 
 fn formatUrlCountTopHashLateMaterialize(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8, hot: *const HotColumns, cache: *HashStringCache, comptime include_constant: bool) ![]u8 {
-    var counts = try agg.I64CountTable.init(allocator, 1024 * 1024);
-    defer counts.deinit(allocator);
-    for (hot.url_hash) |hash| try counts.add(allocator, hash);
+    const top = try native_group.collectUrlHashTop(allocator, hot.url_hash);
 
-    var top: [10]UrlHashCount = undefined;
-    var top_len: usize = 0;
-    for (counts.occupied[0..counts.len]) |index| {
-        insertUrlHashTop10(&top, &top_len, .{ .url_hash = counts.keys[index], .count = counts.counts[index] });
-    }
-
-    try resolveUrlHashesFromParquet(allocator, io, data_dir, cache, top[0..top_len]);
+    try resolveUrlHashesFromParquet(allocator, io, data_dir, cache, top.rows[0..top.len]);
 
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     try out.appendSlice(allocator, if (include_constant) "1,URL,c\n" else "URL,c\n");
-    for (top[0..top_len]) |row| {
+    for (top.rows[0..top.len]) |row| {
         if (include_constant) try out.appendSlice(allocator, "1,");
         try writeCsvField(allocator, &out, cache.get(row.url_hash) orelse return error.CorruptHotColumns);
         try out.print(allocator, ",{d}\n", .{row.count});
@@ -6818,14 +6803,7 @@ fn formatUrlCountTopHashLateMaterialize(allocator: std.mem.Allocator, io: std.Io
 
 fn formatUrlCountTopHashLateMaterializeCached(self: *Native, hot: *const HotColumns, comptime include_constant: bool) ![]u8 {
     if (self.q34_url_top_cache == null) {
-        var counts = try agg.I64CountTable.init(self.allocator, 1024 * 1024);
-        defer counts.deinit(self.allocator);
-        for (hot.url_hash) |hash| try counts.add(self.allocator, hash);
-        var top = UrlTopCache{};
-        for (counts.occupied[0..counts.len]) |index| {
-            insertUrlHashTop10(&top.rows, &top.len, .{ .url_hash = counts.keys[index], .count = counts.counts[index] });
-        }
-        self.q34_url_top_cache = top;
+        self.q34_url_top_cache = try native_group.collectUrlHashTop(self.allocator, hot.url_hash);
     }
     const top = self.q34_url_top_cache.?;
     try resolveUrlHashesFromParquet(self.allocator, self.io, self.data_dir, &self.url_hash_string_cache, top.rows[0..top.len]);

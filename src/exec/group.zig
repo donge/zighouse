@@ -1,4 +1,5 @@
 const std = @import("std");
+const agg = @import("../agg.zig");
 const generic_sql = @import("../generic_sql.zig");
 const hashmap = @import("../hashmap.zig");
 const native_reduce = @import("reduce.zig");
@@ -224,6 +225,28 @@ fn formatOffsetCountTop(allocator: std.mem.Allocator, hot: native_reduce.HotColu
 
 pub fn formatWatchIdClientIpFilteredTop(allocator: std.mem.Allocator, hot: native_reduce.HotColumns) ![]u8 {
     return formatTupleAggTop(allocator, hot, .{ .key1 = .watch_id, .key2 = .client_ip, .filter = .search_phrase_non_empty, .sum = .is_refresh, .avg = .resolution_width, .limit = 10, .count_label = "c" });
+}
+
+pub const UrlHashCount = struct {
+    url_hash: i64,
+    count: u32,
+};
+
+pub const UrlTopCache = struct {
+    rows: [10]UrlHashCount = undefined,
+    len: usize = 0,
+};
+
+pub fn collectUrlHashTop(allocator: std.mem.Allocator, url_hash: []const i64) !UrlTopCache {
+    var counts = try agg.I64CountTable.init(allocator, 1024 * 1024);
+    defer counts.deinit(allocator);
+    for (url_hash) |hash| try counts.add(allocator, hash);
+
+    var top = UrlTopCache{};
+    for (counts.occupied[0..counts.len]) |index| {
+        insertUrlHashTop10(&top.rows, &top.len, .{ .url_hash = counts.keys[index], .count = counts.counts[index] });
+    }
+    return top;
 }
 
 fn formatTupleAggTop(allocator: std.mem.Allocator, hot: native_reduce.HotColumns, shape: TupleAggTopShape) ![]u8 {
@@ -477,6 +500,21 @@ fn insertClientIpTop10(top: *[10]ClientIpCount, top_len: *usize, row: ClientIpCo
 
 fn clientIpBefore(a: ClientIpCount, b: ClientIpCount) bool {
     if (a.count == b.count) return a.client_ip < b.client_ip;
+    return a.count > b.count;
+}
+
+fn insertUrlHashTop10(top: *[10]UrlHashCount, top_len: *usize, row: UrlHashCount) void {
+    var pos: usize = 0;
+    while (pos < top_len.* and urlHashBefore(top[pos], row)) : (pos += 1) {}
+    if (pos >= 10) return;
+    if (top_len.* < 10) top_len.* += 1;
+    var i = top_len.* - 1;
+    while (i > pos) : (i -= 1) top[i] = top[i - 1];
+    top[pos] = row;
+}
+
+fn urlHashBefore(a: UrlHashCount, b: UrlHashCount) bool {
+    if (a.count == b.count) return a.url_hash < b.url_hash;
     return a.count > b.count;
 }
 
