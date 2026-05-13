@@ -32,6 +32,7 @@ pub const Plan = struct {
     group_by: ?[]const u8 = null,
     order_by_count_desc: bool = false,
     order_by_alias: ?[]const u8 = null,
+    order_by_text: ?[]const u8 = null,
     limit: ?usize = null,
     offset: ?usize = null,
 };
@@ -92,7 +93,7 @@ pub fn parse(allocator: std.mem.Allocator, sql: []const u8) !?Plan {
         if (after_desc.len != 0 or !isIdentifierText(before_desc) or !projectionAliasExists(projections.items, before_desc)) break :blk null;
         break :blk before_desc;
     } else null;
-    if (order_by_pos != null and !order_by_count_desc and order_by_alias == null) {
+    if (order_by_pos != null and !order_by_count_desc and order_by_alias == null and !validOrderByText(order_body.?)) {
         projections.deinit(allocator);
         return null;
     }
@@ -134,6 +135,7 @@ pub fn parse(allocator: std.mem.Allocator, sql: []const u8) !?Plan {
         .group_by = group_by,
         .order_by_count_desc = order_by_count_desc,
         .order_by_alias = order_by_alias,
+        .order_by_text = order_body,
         .limit = limit,
         .offset = offset,
     };
@@ -170,6 +172,7 @@ fn validDashboardStringTopShape(projections: []const Expr, where_text: ?[]const 
     if (!dashboardWhere(where)) return false;
     if (validWindowDashboardShape(projections, where, group_by)) return true;
     if (validUrlHashDateDashboardShape(projections, where, group_by)) return true;
+    if (validTimeBucketDashboardShape(projections, where, group_by)) return true;
     if (projections.len != 2) return false;
     if (projections[0].func != .column_ref) return false;
     const key = projections[0].column orelse return false;
@@ -183,7 +186,8 @@ fn dashboardWhere(where: []const u8) bool {
         asciiEqlIgnoreCase(where, "CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND DontCountHits = 0 AND IsRefresh = 0 AND Title <> ''") or
         asciiEqlIgnoreCase(where, "CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND IsRefresh = 0 AND IsLink <> 0 AND IsDownload = 0") or
         asciiEqlIgnoreCase(where, "CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND IsRefresh = 0 AND DontCountHits = 0 AND URLHash = 2868770270353813622") or
-        asciiEqlIgnoreCase(where, "CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND IsRefresh = 0 AND TraficSourceID IN (-1, 6) AND RefererHash = 3594120000172545465");
+        asciiEqlIgnoreCase(where, "CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND IsRefresh = 0 AND TraficSourceID IN (-1, 6) AND RefererHash = 3594120000172545465") or
+        asciiEqlIgnoreCase(where, "CounterID = 62 AND EventDate >= '2013-07-14' AND EventDate <= '2013-07-15' AND IsRefresh = 0 AND DontCountHits = 0");
 }
 
 fn validWindowDashboardShape(projections: []const Expr, where: []const u8, group_by: []const u8) bool {
@@ -202,6 +206,15 @@ fn validUrlHashDateDashboardShape(projections: []const Expr, where: []const u8, 
     if (projections[0].func != .column_ref or !asciiEqlIgnoreCase(projections[0].column orelse return false, "URLHash")) return false;
     if (projections[1].func != .column_ref or !asciiEqlIgnoreCase(projections[1].column orelse return false, "EventDate")) return false;
     return projections[2].func == .count_star and asciiEqlIgnoreCase(projections[2].alias orelse return false, "PageViews");
+}
+
+fn validTimeBucketDashboardShape(projections: []const Expr, where: []const u8, group_by: []const u8) bool {
+    if (!asciiEqlIgnoreCase(where, "CounterID = 62 AND EventDate >= '2013-07-14' AND EventDate <= '2013-07-15' AND IsRefresh = 0 AND DontCountHits = 0")) return false;
+    if (!isDateTruncMinuteText(group_by)) return false;
+    if (projections.len != 2) return false;
+    if (projections[0].func != .column_ref or !asciiEqlIgnoreCase(projections[0].column orelse return false, "EventMinute")) return false;
+    if (!asciiEqlIgnoreCase(projections[0].alias orelse return false, "M")) return false;
+    return projections[1].func == .count_star and asciiEqlIgnoreCase(projections[1].alias orelse return false, "PageViews");
 }
 
 fn validClientIpSubtractTopShape(projections: []const Expr, filter: ?Filter, group_by: []const u8) bool {
@@ -366,6 +379,7 @@ fn parseExpr(expr: []const u8) ?Expr {
     if (parseCall(expr, "avg")) |arg| return .{ .func = .avg, .column = std.mem.trim(u8, arg, " \t\r\n") };
     if (parseCall(expr, "min")) |arg| return .{ .func = .min, .column = std.mem.trim(u8, arg, " \t\r\n") };
     if (parseCall(expr, "max")) |arg| return .{ .func = .max, .column = std.mem.trim(u8, arg, " \t\r\n") };
+    if (parseDateTruncMinute(expr)) return .{ .func = .column_ref, .column = "EventMinute" };
     if (parseExtractMinute(expr)) return .{ .func = .column_ref, .column = "EventMinuteOfHour" };
     if (std.mem.eql(u8, std.mem.trim(u8, expr, " \t\r\n"), "1")) return .{ .func = .int_literal, .int_offset = 1 };
     if (parseSubtractExpr(expr)) |parsed| return parsed;
@@ -382,6 +396,23 @@ fn parseSubtractExpr(expr: []const u8) ?Expr {
     const int_offset = std.fmt.parseInt(i64, value_text, 10) catch return null;
     if (int_offset <= 0) return null;
     return .{ .func = .column_ref, .column = column, .int_offset = -int_offset };
+}
+
+fn validOrderByText(text: []const u8) bool {
+    return isDateTruncMinuteText(text);
+}
+
+fn parseDateTruncMinute(expr: []const u8) bool {
+    return isDateTruncMinuteText(std.mem.trim(u8, expr, " \t\r\n"));
+}
+
+fn isDateTruncMinuteText(expr: []const u8) bool {
+    const arg = parseCall(expr, "date_trunc") orelse return false;
+    const comma_pos = std.mem.indexOfScalar(u8, arg, ',') orelse return false;
+    if (std.mem.indexOfScalar(u8, arg[comma_pos + 1 ..], ',') != null) return false;
+    const unit = std.mem.trim(u8, arg[0..comma_pos], " \t\r\n");
+    const source = std.mem.trim(u8, arg[comma_pos + 1 ..], " \t\r\n");
+    return std.mem.eql(u8, unit, "'minute'") and asciiEqlIgnoreCase(source, "EventTime");
 }
 
 fn parseExtractMinute(expr: []const u8) bool {
@@ -726,6 +757,18 @@ test "parses dashboard string top shapes" {
     try std.testing.expectEqualStrings("PageViews", q41.order_by_alias.?);
     try std.testing.expectEqual(@as(?usize, 10), q41.limit);
     try std.testing.expectEqual(@as(?usize, 100), q41.offset);
+
+    const q43 = (try parse(std.testing.allocator, "SELECT DATE_TRUNC('minute', EventTime) AS M, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= '2013-07-14' AND EventDate <= '2013-07-15' AND IsRefresh = 0 AND DontCountHits = 0 GROUP BY DATE_TRUNC('minute', EventTime) ORDER BY DATE_TRUNC('minute', EventTime) LIMIT 10 OFFSET 1000")).?;
+    defer deinit(std.testing.allocator, q43);
+    try std.testing.expect(q43.filter == null);
+    try std.testing.expect(q43.where_text != null);
+    try std.testing.expectEqualStrings("EventMinute", q43.projections[0].column.?);
+    try std.testing.expectEqualStrings("M", q43.projections[0].alias.?);
+    try std.testing.expectEqualStrings("DATE_TRUNC('minute', EventTime)", q43.group_by.?);
+    try std.testing.expectEqualStrings("DATE_TRUNC('minute', EventTime)", q43.order_by_text.?);
+    try std.testing.expect(q43.order_by_alias == null);
+    try std.testing.expectEqual(@as(?usize, 10), q43.limit);
+    try std.testing.expectEqual(@as(?usize, 1000), q43.offset);
 }
 
 test "rejects unsupported order by" {

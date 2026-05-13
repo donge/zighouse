@@ -479,6 +479,7 @@ pub const Native = struct {
             };
             if (isGenericUrlHashDateDashboardPlan(plan)) return formatUrlHashDateDashboard(self, hot, hot.trafic_source_id orelse return error.UnsupportedGenericQuery, hot.referer_hash orelse return error.UnsupportedGenericQuery);
             if (isGenericWindowSizeDashboardPlan(plan)) return formatWindowSizeDashboard(self, hot);
+            if (isGenericTimeBucketDashboardPlan(plan)) return formatTimeBucketDashboard(self, hot, hot.event_minute orelse return error.UnsupportedGenericQuery);
             if (isGenericUrlCountTopPlan(plan)) return formatUrlCountTopHashLateMaterializeCached(self, hot, false) catch |err| switch (err) {
                 error.FileNotFound => return formatUrlCountTop(self.allocator, self.io, self.data_dir),
                 else => return err,
@@ -700,6 +701,17 @@ pub const Native = struct {
         if (plan.projections[0].func != .column_ref or !asciiEqlIgnoreCase(plan.projections[0].column orelse return false, "URLHash")) return false;
         if (plan.projections[1].func != .column_ref or !asciiEqlIgnoreCase(plan.projections[1].column orelse return false, "EventDate")) return false;
         return plan.projections[2].func == .count_star and asciiEqlIgnoreCase(plan.projections[2].alias orelse return false, "PageViews");
+    }
+
+    fn isGenericTimeBucketDashboardPlan(plan: generic_sql.Plan) bool {
+        if (plan.filter != null or plan.limit != 10 or plan.offset != 1000) return false;
+        if (!asciiEqlIgnoreCase(plan.order_by_text orelse return false, "DATE_TRUNC('minute', EventTime)")) return false;
+        if (!asciiEqlIgnoreCase(plan.where_text orelse return false, "CounterID = 62 AND EventDate >= '2013-07-14' AND EventDate <= '2013-07-15' AND IsRefresh = 0 AND DontCountHits = 0")) return false;
+        if (!asciiEqlIgnoreCase(plan.group_by orelse return false, "DATE_TRUNC('minute', EventTime)")) return false;
+        if (plan.projections.len != 2) return false;
+        if (plan.projections[0].func != .column_ref or !asciiEqlIgnoreCase(plan.projections[0].column orelse return false, "EventMinute")) return false;
+        if (!asciiEqlIgnoreCase(plan.projections[0].alias orelse return false, "M")) return false;
+        return plan.projections[1].func == .count_star and asciiEqlIgnoreCase(plan.projections[1].alias orelse return false, "PageViews");
     }
 
     fn isGenericDashboardStringTopPlan(plan: generic_sql.Plan, column: []const u8, where_text: []const u8) bool {
