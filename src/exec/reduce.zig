@@ -1,6 +1,6 @@
 const std = @import("std");
-const generic_sql = @import("generic_sql.zig");
-const simd = @import("simd.zig");
+const generic_sql = @import("../generic_sql.zig");
+const simd = @import("../simd.zig");
 
 pub const HotColumns = struct {
     adv_engine_id: []const i16,
