@@ -10,6 +10,7 @@ const executor = @import("executor.zig");
 const generic_sql = @import("generic_sql.zig");
 const native_group = @import("exec/group.zig");
 const native_reduce = @import("exec/reduce.zig");
+const native_string_top = @import("exec/string_top.zig");
 const schema = @import("schema.zig");
 const simd = @import("simd.zig");
 const io_map = @import("io_map.zig");
@@ -276,7 +277,8 @@ pub const Native = struct {
             },
             .search_phrase_count_top => {
                 if (!self.experimental) return error.UnsupportedNativeQuery;
-                return formatSearchPhraseCountTopCached(self.allocator, try self.getSearchPhraseColumn());
+                const binding = try self.bindLowCardTextColumn("SearchPhrase");
+                return native_string_top.formatLowCardTextCountTop(self.allocator, binding.name, "c", binding.column, 10);
             },
             .search_phrase_distinct_user_id_top => {
                 if (!self.experimental) return error.UnsupportedNativeQuery;
@@ -527,7 +529,10 @@ pub const Native = struct {
                 .search_phrase_user => return formatSearchPhraseDistinctUserIdTop(self.allocator, self.io, self.data_dir),
             },
             .phrase_count_top => |shape| switch (shape) {
-                .search_phrase => return formatSearchPhraseCountTopCached(self.allocator, try self.getSearchPhraseColumn()),
+                .search_phrase => {
+                    const binding = try self.bindLowCardTextColumn("SearchPhrase");
+                    return native_string_top.formatLowCardTextCountTop(self.allocator, binding.name, "c", binding.column, 10);
+                },
                 .search_engine_phrase => return formatSearchEnginePhraseCountTop(self.allocator, self.io, self.data_dir),
             },
             .search_phrase_min_url_google => formatSearchPhraseMinUrlGoogleSidecarLateMaterialize(self.allocator, self.io, self.data_dir, try self.getSearchPhraseColumn()) catch |err| switch (err) {
@@ -618,7 +623,10 @@ pub const Native = struct {
             .min_max_event_date => try native_reduce.formatMinMaxEventDate(self.allocator, hot.event_date),
             .mobile_phone_model_distinct_user_id_top => try formatMobilePhoneModelDistinctUserIdTop(self.allocator, self.io, self.data_dir),
             .mobile_phone_distinct_user_id_top => try formatMobilePhoneDistinctUserIdTop(self.allocator, self.io, self.data_dir),
-            .search_phrase_count_top => try formatSearchPhraseCountTopCached(self.allocator, try self.getSearchPhraseColumn()),
+            .search_phrase_count_top => blk: {
+                const binding = try self.bindLowCardTextColumn("SearchPhrase");
+                break :blk try native_string_top.formatLowCardTextCountTop(self.allocator, binding.name, "c", binding.column, 10);
+            },
             .search_phrase_distinct_user_id_top => try formatSearchPhraseDistinctUserIdTop(self.allocator, self.io, self.data_dir),
             .search_engine_phrase_count_top => try formatSearchEnginePhraseCountTop(self.allocator, self.io, self.data_dir),
             .user_id_search_phrase_count_top => try formatUserIdSearchPhraseCountTopCached(self.allocator, try self.getUserIdEncoding(), try self.getSearchPhraseColumn()),
@@ -965,6 +973,19 @@ pub const Native = struct {
             self.search_phrase_cache = try lowcard.StringColumn.map(self.io, id_path, offsets_path, phrases_path);
         }
         return &self.search_phrase_cache.?;
+    }
+
+    const LowCardTextBinding = struct {
+        name: []const u8,
+        column: *const lowcard.StringColumn,
+    };
+
+    fn bindLowCardTextColumn(self: *Native, name: []const u8) !LowCardTextBinding {
+        const index = schema.findColumn(name) orelse return error.UnsupportedGenericQuery;
+        const column = schema.hits.columns[index];
+        if (column.ty != .text or column.storage != .medium_dict) return error.UnsupportedGenericQuery;
+        if (asciiEqlIgnoreCase(column.name, "SearchPhrase")) return .{ .name = column.name, .column = try self.getSearchPhraseColumn() };
+        return error.UnsupportedGenericQuery;
     }
 
     fn getUrlColumn(self: *Native) !*const lowcard.StringColumn {
@@ -7018,44 +7039,6 @@ fn formatSearchPhraseCountTop(allocator: std.mem.Allocator, io: std.Io, data_dir
         const start = off_col.values[row.id];
         const end = off_col.values[row.id + 1];
         const phrase = phrases_map.raw[start..end];
-        if (isStoredEmptyString(phrase)) continue;
-        try writeCsvField(allocator, &out, phrase);
-        try out.print(allocator, ",{d}\n", .{row.count});
-        emitted += 1;
-    }
-    return out.toOwnedSlice(allocator);
-}
-
-fn formatSearchPhraseCountTopCached(allocator: std.mem.Allocator, phrases: *const lowcard.StringColumn) ![]u8 {
-    const dict_size = phrases.dictSize();
-    const counts = try allocator.alloc(u32, dict_size);
-    defer allocator.free(counts);
-    @memset(counts, 0);
-    for (phrases.ids.values) |id| counts[id] += 1;
-
-    const top_capacity: usize = 11;
-    const TopRow = struct { id: u32, count: u32 };
-    var top: [top_capacity]TopRow = undefined;
-    var top_len: usize = 0;
-    for (counts, 0..) |c, idx| {
-        if (c == 0) continue;
-        const row: TopRow = .{ .id = @intCast(idx), .count = c };
-        var pos: usize = 0;
-        while (pos < top_len and (top[pos].count > row.count or (top[pos].count == row.count and top[pos].id < row.id))) : (pos += 1) {}
-        if (pos >= top_capacity) continue;
-        if (top_len < top_capacity) top_len += 1;
-        var j = top_len - 1;
-        while (j > pos) : (j -= 1) top[j] = top[j - 1];
-        top[pos] = row;
-    }
-
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(allocator);
-    try out.appendSlice(allocator, "SearchPhrase,c\n");
-    var emitted: usize = 0;
-    for (top[0..top_len]) |row| {
-        if (emitted == 10) break;
-        const phrase = phrases.value(row.id);
         if (isStoredEmptyString(phrase)) continue;
         try writeCsvField(allocator, &out, phrase);
         try out.print(allocator, ",{d}\n", .{row.count});
