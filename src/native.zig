@@ -447,9 +447,6 @@ pub const Native = struct {
         if (native_group.needsSearchPhraseIds(plan)) {
             if (try native_group.execute(self.allocator, plan, reduceHotWithSearchPhrase(hot, try self.getSearchPhraseColumn()))) |output| return output;
         }
-        if (plan.limit == 10) {
-            if (clickbench_dispatch.matchGenericFallback(plan)) |fallback| return self.executeClickBenchGenericFallback(fallback, hot);
-        }
         if (clickbench_dispatch.matchGenericFallback(plan)) |fallback| return self.executeClickBenchGenericFallback(fallback, hot);
         if (!plan.order_by_count_desc) return error.UnsupportedGenericQuery;
         if (plan.projections.len != 2) return error.UnsupportedGenericQuery;
@@ -492,14 +489,6 @@ pub const Native = struct {
         return formatGenericValues(self.allocator, plan, values);
     }
 
-    fn genericOrderByAlias(plan: generic_sql.Plan, alias: []const u8) bool {
-        return if (plan.order_by_alias) |got| asciiEqlIgnoreCase(got, alias) else false;
-    }
-
-    fn hasGenericEmptyStringFilter(plan: generic_sql.Plan, column: []const u8) bool {
-        const filter = plan.filter orelse return false;
-        return filter.second == null and filter.op == .not_equal and filter.int_value == 0 and asciiEqlIgnoreCase(filter.column, column);
-    }
     fn executeClickBenchGenericFallback(self: *Native, fallback: clickbench_dispatch.Fallback, hot: *const HotColumns) anyerror![]u8 {
         return switch (fallback) {
             .client_ip_agg_top => |shape| switch (shape) {
