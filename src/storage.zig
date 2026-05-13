@@ -1,4 +1,5 @@
 const std = @import("std");
+const clickbench_schema = @import("clickbench/schema.zig");
 const schema = @import("schema.zig");
 
 pub const segment_rows = 64 * 1024;
@@ -63,7 +64,7 @@ pub const hot_segment_stats_name = "hot_segments.stats";
 pub const q37_url_dict_name = "q37_url_dict.tsv";
 
 pub fn initStore(io: std.Io, data_dir: []const u8) !void {
-    try initStoreWithSchema(io, data_dir, schema.hits);
+    try initStoreWithSchema(io, data_dir, clickbench_schema.hits);
 }
 
 pub fn initStoreWithSchema(io: std.Io, data_dir: []const u8, table: schema.Table) !void {

@@ -3,6 +3,7 @@ const agg = @import("agg.zig");
 const chdb = @import("chdb.zig");
 const clickbench_import = @import("clickbench_import.zig");
 const clickbench_dispatch = @import("clickbench/dispatch.zig");
+const clickbench_schema = @import("clickbench/schema.zig");
 const clickbench_queries = @import("clickbench_queries.zig");
 const build_options = @import("build_options");
 const duckdb = if (build_options.duckdb) @import("duckdb.zig") else @import("duckdb_stub.zig");
@@ -11,7 +12,6 @@ const generic_sql = @import("generic_sql.zig");
 const native_group = @import("exec/group.zig");
 const native_reduce = @import("exec/reduce.zig");
 const native_string_top = @import("exec/string_top.zig");
-const schema = @import("schema.zig");
 const simd = @import("simd.zig");
 const io_map = @import("io_map.zig");
 const lowcard = @import("lowcard.zig");
@@ -981,9 +981,9 @@ pub const Native = struct {
     };
 
     fn bindLowCardTextColumn(self: *Native, name: []const u8) !LowCardTextBinding {
-        const index = schema.findColumn(name) orelse return error.UnsupportedGenericQuery;
-        const column = schema.hits.columns[index];
-        if (column.ty != .text or column.storage != .medium_dict) return error.UnsupportedGenericQuery;
+        const index = clickbench_schema.findColumn(name) orelse return error.UnsupportedGenericQuery;
+        const column = clickbench_schema.hits.columns[index];
+        if (column.ty != .text or !column.capabilities.group_count_top) return error.UnsupportedGenericQuery;
         if (asciiEqlIgnoreCase(column.name, "SearchPhrase")) return .{ .name = column.name, .column = try self.getSearchPhraseColumn() };
         return error.UnsupportedGenericQuery;
     }
@@ -3394,7 +3394,7 @@ const Q24ImportBuilder = struct {
         defer allocator.free(path);
         var out: std.ArrayList(u8) = .empty;
         defer out.deinit(allocator);
-        for (schema.hits.columns, 0..) |col, i| {
+        for (clickbench_schema.hits.columns, 0..) |col, i| {
             if (i != 0) try out.append(allocator, ',');
             try out.appendSlice(allocator, col.name);
         }
@@ -3526,8 +3526,8 @@ const Q24NativeMaterializeContext = struct {
     row_count: usize,
 
     fn observe(self: *Q24NativeMaterializeContext, scan_row_index: usize, column_index: usize, value: parquet.SelectedValue) !void {
-        if (scan_row_index >= self.row_count or column_index >= schema.hits.columns.len) return error.InvalidParquetMetadata;
-        const idx = scan_row_index * schema.hits.columns.len + column_index;
+        if (scan_row_index >= self.row_count or column_index >= clickbench_schema.hits.columns.len) return error.InvalidParquetMetadata;
+        const idx = scan_row_index * clickbench_schema.hits.columns.len + column_index;
         switch (value) {
             .int32 => |v| self.cells[idx] = .{ .int32 = v },
             .int64 => |v| self.cells[idx] = .{ .int64 = v },
@@ -3547,7 +3547,7 @@ fn q24MaterializeRowsNative(allocator: std.mem.Allocator, io: std.Io, data_dir: 
         fn lt(_: void, a: u32, b: u32) bool { return a < b; }
     }.lt);
 
-    var cells = try allocator.alloc(Q24Cell, rows.len * schema.hits.columns.len);
+    var cells = try allocator.alloc(Q24Cell, rows.len * clickbench_schema.hits.columns.len);
     defer {
         for (cells) |cell| switch (cell) {
             .bytes => |v| allocator.free(v),
@@ -3565,13 +3565,13 @@ fn q24MaterializeRowsNative(allocator: std.mem.Allocator, io: std.Io, data_dir: 
     try writeQ24Header(allocator, &out);
     for (rows) |row| {
         const scan_index = std.mem.indexOfScalar(u32, scan_rows, row.row_index) orelse return error.CorruptHotColumns;
-        try writeQ24NativeRow(allocator, &out, cells[scan_index * schema.hits.columns.len ..][0..schema.hits.columns.len]);
+        try writeQ24NativeRow(allocator, &out, cells[scan_index * clickbench_schema.hits.columns.len ..][0..clickbench_schema.hits.columns.len]);
     }
     return out.toOwnedSlice(allocator);
 }
 
 fn writeQ24Header(allocator: std.mem.Allocator, out: *std.ArrayList(u8)) !void {
-    for (schema.hits.columns, 0..) |col, i| {
+    for (clickbench_schema.hits.columns, 0..) |col, i| {
         if (i != 0) try out.append(allocator, ',');
         try out.appendSlice(allocator, col.name);
     }
@@ -3579,7 +3579,7 @@ fn writeQ24Header(allocator: std.mem.Allocator, out: *std.ArrayList(u8)) !void {
 }
 
 fn writeQ24NativeRow(allocator: std.mem.Allocator, out: *std.ArrayList(u8), cells: []const Q24Cell) !void {
-    for (schema.hits.columns, 0..) |col, i| {
+    for (clickbench_schema.hits.columns, 0..) |col, i| {
         if (i != 0) try out.append(allocator, ',');
         const cell = cells[i];
         switch (col.ty) {
@@ -4475,8 +4475,8 @@ fn limitRowsToCapacityHint(limit_rows: ?u64) ?ImportDictCapacityHint {
 }
 
 fn importTextColumnHint(name: []const u8, rows: usize) usize {
-    const idx = schema.hits.findColumn(name) orelse return @max(64 * 1024, rows / 4 + 1);
-    const column = schema.hits.columns[idx];
+    const idx = clickbench_schema.hits.findColumn(name) orelse return @max(64 * 1024, rows / 4 + 1);
+    const column = clickbench_schema.hits.columns[idx];
     return switch (column.storage) {
         .lowcard_dict => 256,
         .medium_dict => @max(64 * 1024, @min(rows / 4 + 1, 4 * 1024 * 1024)),

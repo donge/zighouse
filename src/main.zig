@@ -1,9 +1,9 @@
 const std = @import("std");
 const build_options = @import("build_options");
 const backend = @import("backend.zig");
+const clickbench_schema = @import("clickbench/schema.zig");
 const duckdb = if (build_options.duckdb) @import("duckdb.zig") else @import("duckdb_stub.zig");
 const parquet = @import("parquet.zig");
-const schema = @import("schema.zig");
 const storage = @import("storage.zig");
 
 const usage =
@@ -772,7 +772,7 @@ fn printSnippet(io: std.Io, label: []const u8, bytes: []const u8) !void {
 }
 
 fn printSchema(io: std.Io) !void {
-    for (schema.hits.columns, 0..) |column, i| {
+    for (clickbench_schema.hits.columns, 0..) |column, i| {
         try printOut(io, "{d}\t{s}\t{s}\n", .{ i, column.name, @tagName(column.ty) });
     }
 }
@@ -794,5 +794,5 @@ fn printErr(io: std.Io, comptime fmt: []const u8, args: anytype) !void {
 }
 
 test "schema has ClickBench column count" {
-    try std.testing.expectEqual(@as(usize, 105), schema.hits.columns.len);
+    try std.testing.expectEqual(@as(usize, 105), clickbench_schema.hits.columns.len);
 }
