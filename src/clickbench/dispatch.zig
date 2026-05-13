@@ -2,11 +2,50 @@ const std = @import("std");
 const generic_sql = @import("../generic_sql.zig");
 
 pub const Fallback = union(enum) {
+    count_url_like_google,
+    search_phrase_min_url_google,
+    search_phrase_title_google,
+    search_phrase_order: SearchPhraseOrder,
     url_count_top: struct { include_constant: bool },
 };
 
+pub const SearchPhraseOrder = enum { event_time, event_time_phrase, phrase };
+
 pub fn matchGenericFallback(plan: generic_sql.Plan) ?Fallback {
+    if (matchCountUrlLikeGoogle(plan)) |fallback| return fallback;
+    if (matchSearchPhraseGoogleTop(plan)) |fallback| return fallback;
+    if (matchSearchPhraseOrder(plan)) |fallback| return fallback;
     if (matchUrlCountTop(plan)) |fallback| return fallback;
+    return null;
+}
+
+fn matchCountUrlLikeGoogle(plan: generic_sql.Plan) ?Fallback {
+    if (!asciiEqlIgnoreCase(plan.where_text orelse return null, "URL LIKE '%google%'")) return null;
+    if (plan.filter != null or plan.group_by != null or plan.order_by_text != null or plan.limit != null or plan.offset != null) return null;
+    if (plan.projections.len != 1 or plan.projections[0].func != .count_star) return null;
+    return .count_url_like_google;
+}
+
+fn matchSearchPhraseGoogleTop(plan: generic_sql.Plan) ?Fallback {
+    if (genericSearchPhraseGoogleTopPlan(plan, "URL LIKE '%google%' AND SearchPhrase <> ''", 3)) {
+        if (plan.projections[1].func != .min or !asciiEqlIgnoreCase(plan.projections[1].column orelse return null, "URL")) return null;
+        if (plan.projections[2].func != .count_star or !asciiEqlIgnoreCase(plan.projections[2].alias orelse return null, "c")) return null;
+        return .search_phrase_min_url_google;
+    }
+    if (genericSearchPhraseGoogleTopPlan(plan, "Title LIKE '%Google%' AND URL NOT LIKE '%.google.%' AND SearchPhrase <> ''", 5)) {
+        if (plan.projections[1].func != .min or !asciiEqlIgnoreCase(plan.projections[1].column orelse return null, "URL")) return null;
+        if (plan.projections[2].func != .min or !asciiEqlIgnoreCase(plan.projections[2].column orelse return null, "Title")) return null;
+        if (plan.projections[3].func != .count_star or !asciiEqlIgnoreCase(plan.projections[3].alias orelse return null, "c")) return null;
+        if (plan.projections[4].func != .count_distinct or !asciiEqlIgnoreCase(plan.projections[4].column orelse return null, "UserID")) return null;
+        return .search_phrase_title_google;
+    }
+    return null;
+}
+
+fn matchSearchPhraseOrder(plan: generic_sql.Plan) ?Fallback {
+    if (searchPhraseOrderPlan(plan, "EventTime")) return .{ .search_phrase_order = .event_time };
+    if (searchPhraseOrderPlan(plan, "EventTime, SearchPhrase")) return .{ .search_phrase_order = .event_time_phrase };
+    if (searchPhraseOrderPlan(plan, "SearchPhrase")) return .{ .search_phrase_order = .phrase };
     return null;
 }
 
@@ -26,6 +65,28 @@ fn matchUrlCountTop(plan: generic_sql.Plan) ?Fallback {
         return .{ .url_count_top = .{ .include_constant = true } };
     }
     return null;
+}
+
+fn genericSearchPhraseGoogleTopPlan(plan: generic_sql.Plan, where_text: []const u8, projection_len: usize) bool {
+    if (plan.filter != null or plan.limit != 10 or plan.offset != null) return false;
+    if (!asciiEqlIgnoreCase(plan.where_text orelse return false, where_text)) return false;
+    if (!asciiEqlIgnoreCase(plan.group_by orelse return false, "SearchPhrase")) return false;
+    if (!asciiEqlIgnoreCase(plan.order_by_text orelse return false, "c DESC")) return false;
+    if (plan.projections.len != projection_len) return false;
+    return plan.projections[0].func == .column_ref and asciiEqlIgnoreCase(plan.projections[0].column orelse return false, "SearchPhrase");
+}
+
+fn searchPhraseOrderPlan(plan: generic_sql.Plan, order_by: []const u8) bool {
+    if (plan.group_by != null or plan.limit != 10 or plan.offset != null) return false;
+    if (!asciiEqlIgnoreCase(plan.order_by_text orelse return false, order_by)) return false;
+    if (!hasEmptyStringFilter(plan, "SearchPhrase")) return false;
+    if (plan.projections.len != 1) return false;
+    return plan.projections[0].func == .column_ref and asciiEqlIgnoreCase(plan.projections[0].column orelse return false, "SearchPhrase");
+}
+
+fn hasEmptyStringFilter(plan: generic_sql.Plan, column: []const u8) bool {
+    const filter = plan.filter orelse return false;
+    return filter.second == null and filter.op == .not_equal and filter.int_value == 0 and asciiEqlIgnoreCase(filter.column, column);
 }
 
 fn orderByAlias(plan: generic_sql.Plan, alias: []const u8) bool {

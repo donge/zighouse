@@ -420,10 +420,7 @@ pub const Native = struct {
 
         if (try native_reduce.executeScalar(self.allocator, plan, reduceHot(hot))) |output| return output;
 
-        if (isGenericCountUrlLikeGooglePlan(plan)) return formatCountUrlLikeGoogleRowSidecar(self.allocator, self.io, self.data_dir) catch |err| switch (err) {
-            error.FileNotFound => return formatCountUrlLikeGoogleCached(self.allocator, self.io, self.data_dir, try self.getUrlColumn(), try self.getUrlGoogleMatches()),
-            else => return err,
-        };
+        if (clickbench_dispatch.matchGenericFallback(plan)) |fallback| return self.executeClickBenchGenericFallback(fallback, hot);
 
         if (plan.group_by != null) return try self.executeGenericGroupBy(plan, hot);
 
@@ -458,14 +455,7 @@ pub const Native = struct {
             if (isGenericSearchEnginePhraseCountPlan(plan)) return formatSearchEnginePhraseCountTop(self.allocator, self.io, self.data_dir);
             if (isGenericUserIdSearchPhraseCountTopPlan(plan)) return formatUserIdSearchPhraseCountTopCached(self.allocator, try self.getUserIdEncoding(), try self.getSearchPhraseColumn());
             if (isGenericUserIdMinuteSearchPhraseCountTopPlan(plan)) return formatUserIdMinuteSearchPhraseCountTopCached(self.allocator, self.io, self.data_dir, try self.getUserIdEncoding(), try self.getSearchPhraseColumn());
-            if (isGenericSearchPhraseMinUrlGooglePlan(plan)) return formatSearchPhraseMinUrlGoogleSidecarLateMaterialize(self.allocator, self.io, self.data_dir, try self.getSearchPhraseColumn()) catch |err| switch (err) {
-                error.FileNotFound => return formatSearchPhraseMinUrlGoogleCached(self.allocator, try self.getUrlColumn(), try self.getSearchPhraseColumn(), try self.getUrlGoogleMatches()),
-                else => return err,
-            };
-            if (isGenericSearchPhraseTitleGooglePlan(plan)) return formatQ23RowSidecarLateMaterialize(self.allocator, self.io, self.data_dir, try self.getSearchPhraseColumn(), try self.getUserIdEncoding()) catch |err| switch (err) {
-                error.FileNotFound => return formatQ23RowIndexCached(self.allocator, self.io, self.data_dir, try self.getUrlColumn(), try self.getTitleColumn(), try self.getSearchPhraseColumn(), try self.getUserIdEncoding(), try self.getTitleGoogleMatches(), try self.getUrlDotGoogleMatches()),
-                else => return err,
-            };
+            if (clickbench_dispatch.matchGenericFallback(plan)) |fallback| return self.executeClickBenchGenericFallback(fallback, hot);
             if (isGenericSearchEngineClientIpAggTopPlan(plan)) return formatSearchEngineClientIpAggTop(self.allocator, self.io, self.data_dir);
             if (isGenericWatchIdClientIpAggTopPlan(plan)) return formatWatchIdClientIpAggTop(self.allocator, self.io, self.data_dir);
             if (isGenericUrlCountFilteredDashboardPlan(plan)) return formatUrlCountTopFilteredQ37HashLateMaterialize(self.allocator, self.io, self.data_dir, hot, &self.url_hash_string_cache) catch |err| switch (err) {
@@ -486,7 +476,6 @@ pub const Native = struct {
             if (isGenericUrlHashDateDashboardPlan(plan)) return formatUrlHashDateDashboard(self, hot, hot.trafic_source_id orelse return error.UnsupportedGenericQuery, hot.referer_hash orelse return error.UnsupportedGenericQuery);
             if (isGenericWindowSizeDashboardPlan(plan)) return formatWindowSizeDashboard(self, hot);
             if (isGenericTimeBucketDashboardPlan(plan)) return formatTimeBucketDashboard(self, hot, hot.event_minute orelse return error.UnsupportedGenericQuery);
-            if (clickbench_dispatch.matchGenericFallback(plan)) |fallback| return self.executeClickBenchGenericFallback(fallback, hot);
         }
         if (isGenericUserIdSearchPhraseLimitPlan(plan)) {
             return formatUserIdSearchPhraseLimitNoOrderCached(self.allocator, try self.getUserIdEncoding(), try self.getSearchPhraseColumn());
@@ -521,9 +510,7 @@ pub const Native = struct {
     }
 
     fn executeGenericFiltered(self: *Native, plan: generic_sql.Plan, hot: *const HotColumns, filter: generic_sql.Filter) anyerror![]u8 {
-        if (isGenericSearchPhraseEventTimePlan(plan)) return formatSearchPhraseEventTimeCandidatesCached(self.allocator, self.io, self.data_dir, try self.getSearchPhraseColumn(), false);
-        if (isGenericSearchPhraseEventTimePhrasePlan(plan)) return formatSearchPhraseEventTimeCandidatesCached(self.allocator, self.io, self.data_dir, try self.getSearchPhraseColumn(), true);
-        if (isGenericSearchPhraseOrderByPhrasePlan(plan)) return formatSearchPhraseOrderByPhraseTopCached(self.allocator, try self.getSearchPhraseColumn());
+        if (clickbench_dispatch.matchGenericFallback(plan)) |fallback| return self.executeClickBenchGenericFallback(fallback, hot);
         if (plan.projections.len == 1 and plan.projections[0].func == .column_ref) {
             const column_name = plan.projections[0].column orelse return error.UnsupportedGenericQuery;
             const column = bindGenericColumn(hot, column_name) catch return error.UnsupportedGenericQuery;
@@ -546,55 +533,6 @@ pub const Native = struct {
 
     fn genericOrderByAlias(plan: generic_sql.Plan, alias: []const u8) bool {
         return if (plan.order_by_alias) |got| asciiEqlIgnoreCase(got, alias) else false;
-    }
-
-    fn isGenericSearchPhraseEventTimePlan(plan: generic_sql.Plan) bool {
-        return isGenericSearchPhraseOrderPlan(plan, "EventTime");
-    }
-
-    fn isGenericSearchPhraseEventTimePhrasePlan(plan: generic_sql.Plan) bool {
-        return isGenericSearchPhraseOrderPlan(plan, "EventTime, SearchPhrase");
-    }
-
-    fn isGenericSearchPhraseOrderByPhrasePlan(plan: generic_sql.Plan) bool {
-        return isGenericSearchPhraseOrderPlan(plan, "SearchPhrase");
-    }
-
-    fn isGenericSearchPhraseOrderPlan(plan: generic_sql.Plan, order_by: []const u8) bool {
-        if (plan.group_by != null or plan.limit != 10 or plan.offset != null) return false;
-        if (!asciiEqlIgnoreCase(plan.order_by_text orelse return false, order_by)) return false;
-        if (!hasGenericEmptyStringFilter(plan, "SearchPhrase")) return false;
-        if (plan.projections.len != 1) return false;
-        return plan.projections[0].func == .column_ref and asciiEqlIgnoreCase(plan.projections[0].column orelse return false, "SearchPhrase");
-    }
-
-    fn isGenericCountUrlLikeGooglePlan(plan: generic_sql.Plan) bool {
-        if (!asciiEqlIgnoreCase(plan.where_text orelse return false, "URL LIKE '%google%'")) return false;
-        if (plan.filter != null or plan.group_by != null or plan.order_by_text != null or plan.limit != null or plan.offset != null) return false;
-        return plan.projections.len == 1 and plan.projections[0].func == .count_star;
-    }
-
-    fn isGenericSearchPhraseMinUrlGooglePlan(plan: generic_sql.Plan) bool {
-        if (!genericSearchPhraseGoogleTopPlan(plan, "URL LIKE '%google%' AND SearchPhrase <> ''", 3)) return false;
-        if (plan.projections[1].func != .min or !asciiEqlIgnoreCase(plan.projections[1].column orelse return false, "URL")) return false;
-        return plan.projections[2].func == .count_star and asciiEqlIgnoreCase(plan.projections[2].alias orelse return false, "c");
-    }
-
-    fn isGenericSearchPhraseTitleGooglePlan(plan: generic_sql.Plan) bool {
-        if (!genericSearchPhraseGoogleTopPlan(plan, "Title LIKE '%Google%' AND URL NOT LIKE '%.google.%' AND SearchPhrase <> ''", 5)) return false;
-        if (plan.projections[1].func != .min or !asciiEqlIgnoreCase(plan.projections[1].column orelse return false, "URL")) return false;
-        if (plan.projections[2].func != .min or !asciiEqlIgnoreCase(plan.projections[2].column orelse return false, "Title")) return false;
-        if (plan.projections[3].func != .count_star or !asciiEqlIgnoreCase(plan.projections[3].alias orelse return false, "c")) return false;
-        return plan.projections[4].func == .count_distinct and asciiEqlIgnoreCase(plan.projections[4].column orelse return false, "UserID");
-    }
-
-    fn genericSearchPhraseGoogleTopPlan(plan: generic_sql.Plan, where_text: []const u8, projection_len: usize) bool {
-        if (plan.filter != null or plan.limit != 10 or plan.offset != null) return false;
-        if (!asciiEqlIgnoreCase(plan.where_text orelse return false, where_text)) return false;
-        if (!asciiEqlIgnoreCase(plan.group_by orelse return false, "SearchPhrase")) return false;
-        if (!asciiEqlIgnoreCase(plan.order_by_text orelse return false, "c DESC")) return false;
-        if (plan.projections.len != projection_len) return false;
-        return plan.projections[0].func == .column_ref and asciiEqlIgnoreCase(plan.projections[0].column orelse return false, "SearchPhrase");
     }
 
     fn isGenericRegionStatsDistinctPlan(plan: generic_sql.Plan) bool {
@@ -757,6 +695,23 @@ pub const Native = struct {
 
     fn executeClickBenchGenericFallback(self: *Native, fallback: clickbench_dispatch.Fallback, hot: *const HotColumns) anyerror![]u8 {
         return switch (fallback) {
+            .count_url_like_google => formatCountUrlLikeGoogleRowSidecar(self.allocator, self.io, self.data_dir) catch |err| switch (err) {
+                error.FileNotFound => return formatCountUrlLikeGoogleCached(self.allocator, self.io, self.data_dir, try self.getUrlColumn(), try self.getUrlGoogleMatches()),
+                else => return err,
+            },
+            .search_phrase_min_url_google => formatSearchPhraseMinUrlGoogleSidecarLateMaterialize(self.allocator, self.io, self.data_dir, try self.getSearchPhraseColumn()) catch |err| switch (err) {
+                error.FileNotFound => return formatSearchPhraseMinUrlGoogleCached(self.allocator, try self.getUrlColumn(), try self.getSearchPhraseColumn(), try self.getUrlGoogleMatches()),
+                else => return err,
+            },
+            .search_phrase_title_google => formatQ23RowSidecarLateMaterialize(self.allocator, self.io, self.data_dir, try self.getSearchPhraseColumn(), try self.getUserIdEncoding()) catch |err| switch (err) {
+                error.FileNotFound => return formatQ23RowIndexCached(self.allocator, self.io, self.data_dir, try self.getUrlColumn(), try self.getTitleColumn(), try self.getSearchPhraseColumn(), try self.getUserIdEncoding(), try self.getTitleGoogleMatches(), try self.getUrlDotGoogleMatches()),
+                else => return err,
+            },
+            .search_phrase_order => |order| switch (order) {
+                .event_time => return formatSearchPhraseEventTimeCandidatesCached(self.allocator, self.io, self.data_dir, try self.getSearchPhraseColumn(), false),
+                .event_time_phrase => return formatSearchPhraseEventTimeCandidatesCached(self.allocator, self.io, self.data_dir, try self.getSearchPhraseColumn(), true),
+                .phrase => return formatSearchPhraseOrderByPhraseTopCached(self.allocator, try self.getSearchPhraseColumn()),
+            },
             .url_count_top => |shape| if (shape.include_constant)
                 formatUrlCountTopHashLateMaterializeCached(self, hot, true) catch |err| switch (err) {
                     error.FileNotFound => return formatOneUrlCountTop(self.allocator, self.io, self.data_dir),
