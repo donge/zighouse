@@ -2,6 +2,7 @@ const std = @import("std");
 const generic_sql = @import("../generic_sql.zig");
 
 pub const Fallback = union(enum) {
+    client_ip_agg_top: ClientIpAggTop,
     count_url_like_google,
     search_phrase_min_url_google,
     search_phrase_title_google,
@@ -9,13 +10,21 @@ pub const Fallback = union(enum) {
     url_count_top: struct { include_constant: bool },
 };
 
+pub const ClientIpAggTop = enum { search_engine_filtered, watch_id_unfiltered };
 pub const SearchPhraseOrder = enum { event_time, event_time_phrase, phrase };
 
 pub fn matchGenericFallback(plan: generic_sql.Plan) ?Fallback {
+    if (matchClientIpAggTop(plan)) |fallback| return fallback;
     if (matchCountUrlLikeGoogle(plan)) |fallback| return fallback;
     if (matchSearchPhraseGoogleTop(plan)) |fallback| return fallback;
     if (matchSearchPhraseOrder(plan)) |fallback| return fallback;
     if (matchUrlCountTop(plan)) |fallback| return fallback;
+    return null;
+}
+
+fn matchClientIpAggTop(plan: generic_sql.Plan) ?Fallback {
+    if (clientIpAggTopPlan(plan, "SearchEngineID", true)) return .{ .client_ip_agg_top = .search_engine_filtered };
+    if (clientIpAggTopPlan(plan, "WatchID", false)) return .{ .client_ip_agg_top = .watch_id_unfiltered };
     return null;
 }
 
@@ -24,6 +33,18 @@ fn matchCountUrlLikeGoogle(plan: generic_sql.Plan) ?Fallback {
     if (plan.filter != null or plan.group_by != null or plan.order_by_text != null or plan.limit != null or plan.offset != null) return null;
     if (plan.projections.len != 1 or plan.projections[0].func != .count_star) return null;
     return .count_url_like_google;
+}
+
+fn clientIpAggTopPlan(plan: generic_sql.Plan, first_col: []const u8, filtered: bool) bool {
+    if (plan.limit != 10 or !orderByAlias(plan, "c")) return false;
+    if (filtered != hasEmptyStringFilter(plan, "SearchPhrase")) return false;
+    if (!asciiEqlIgnoreCase(plan.group_by orelse return false, if (asciiEqlIgnoreCase(first_col, "SearchEngineID")) "SearchEngineID, ClientIP" else "WatchID, ClientIP")) return false;
+    if (plan.projections.len != 5) return false;
+    if (plan.projections[0].func != .column_ref or !asciiEqlIgnoreCase(plan.projections[0].column orelse return false, first_col)) return false;
+    if (plan.projections[1].func != .column_ref or !asciiEqlIgnoreCase(plan.projections[1].column orelse return false, "ClientIP")) return false;
+    if (plan.projections[2].func != .count_star or !asciiEqlIgnoreCase(plan.projections[2].alias orelse return false, "c")) return false;
+    if (plan.projections[3].func != .sum or !asciiEqlIgnoreCase(plan.projections[3].column orelse return false, "IsRefresh")) return false;
+    return plan.projections[4].func == .avg and asciiEqlIgnoreCase(plan.projections[4].column orelse return false, "ResolutionWidth");
 }
 
 fn matchSearchPhraseGoogleTop(plan: generic_sql.Plan) ?Fallback {

@@ -456,8 +456,6 @@ pub const Native = struct {
             if (isGenericUserIdSearchPhraseCountTopPlan(plan)) return formatUserIdSearchPhraseCountTopCached(self.allocator, try self.getUserIdEncoding(), try self.getSearchPhraseColumn());
             if (isGenericUserIdMinuteSearchPhraseCountTopPlan(plan)) return formatUserIdMinuteSearchPhraseCountTopCached(self.allocator, self.io, self.data_dir, try self.getUserIdEncoding(), try self.getSearchPhraseColumn());
             if (clickbench_dispatch.matchGenericFallback(plan)) |fallback| return self.executeClickBenchGenericFallback(fallback, hot);
-            if (isGenericSearchEngineClientIpAggTopPlan(plan)) return formatSearchEngineClientIpAggTop(self.allocator, self.io, self.data_dir);
-            if (isGenericWatchIdClientIpAggTopPlan(plan)) return formatWatchIdClientIpAggTop(self.allocator, self.io, self.data_dir);
             if (isGenericUrlCountFilteredDashboardPlan(plan)) return formatUrlCountTopFilteredQ37HashLateMaterialize(self.allocator, self.io, self.data_dir, hot, &self.url_hash_string_cache) catch |err| switch (err) {
                 error.FileNotFound => return formatUrlCountTopFilteredQ37Cached(self.allocator, hot, try self.getUrlColumn()),
                 else => return err,
@@ -618,26 +616,6 @@ pub const Native = struct {
         return plan.projections[3].func == .count_star;
     }
 
-    fn isGenericSearchEngineClientIpAggTopPlan(plan: generic_sql.Plan) bool {
-        return isGenericClientIpAggTopPlan(plan, "SearchEngineID", true);
-    }
-
-    fn isGenericWatchIdClientIpAggTopPlan(plan: generic_sql.Plan) bool {
-        return isGenericClientIpAggTopPlan(plan, "WatchID", false);
-    }
-
-    fn isGenericClientIpAggTopPlan(plan: generic_sql.Plan, first_col: []const u8, filtered: bool) bool {
-        if (plan.limit != 10 or !genericOrderByAlias(plan, "c")) return false;
-        if (filtered != hasGenericEmptyStringFilter(plan, "SearchPhrase")) return false;
-        if (!asciiEqlIgnoreCase(plan.group_by orelse return false, if (asciiEqlIgnoreCase(first_col, "SearchEngineID")) "SearchEngineID, ClientIP" else "WatchID, ClientIP")) return false;
-        if (plan.projections.len != 5) return false;
-        if (plan.projections[0].func != .column_ref or !asciiEqlIgnoreCase(plan.projections[0].column orelse return false, first_col)) return false;
-        if (plan.projections[1].func != .column_ref or !asciiEqlIgnoreCase(plan.projections[1].column orelse return false, "ClientIP")) return false;
-        if (plan.projections[2].func != .count_star or !asciiEqlIgnoreCase(plan.projections[2].alias orelse return false, "c")) return false;
-        if (plan.projections[3].func != .sum or !asciiEqlIgnoreCase(plan.projections[3].column orelse return false, "IsRefresh")) return false;
-        return plan.projections[4].func == .avg and asciiEqlIgnoreCase(plan.projections[4].column orelse return false, "ResolutionWidth");
-    }
-
     fn isGenericUrlCountFilteredDashboardPlan(plan: generic_sql.Plan) bool {
         if (plan.offset != null) return false;
         return isGenericDashboardStringTopPlan(plan, "URL", "CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND DontCountHits = 0 AND IsRefresh = 0 AND URL <> ''");
@@ -695,6 +673,10 @@ pub const Native = struct {
 
     fn executeClickBenchGenericFallback(self: *Native, fallback: clickbench_dispatch.Fallback, hot: *const HotColumns) anyerror![]u8 {
         return switch (fallback) {
+            .client_ip_agg_top => |shape| switch (shape) {
+                .search_engine_filtered => return formatSearchEngineClientIpAggTop(self.allocator, self.io, self.data_dir),
+                .watch_id_unfiltered => return formatWatchIdClientIpAggTop(self.allocator, self.io, self.data_dir),
+            },
             .count_url_like_google => formatCountUrlLikeGoogleRowSidecar(self.allocator, self.io, self.data_dir) catch |err| switch (err) {
                 error.FileNotFound => return formatCountUrlLikeGoogleCached(self.allocator, self.io, self.data_dir, try self.getUrlColumn(), try self.getUrlGoogleMatches()),
                 else => return err,
