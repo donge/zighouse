@@ -23,6 +23,7 @@ const hashmap = @import("hashmap.zig");
 const parallel = @import("parallel.zig");
 const schema = @import("schema.zig");
 const bind = @import("exec/bind.zig");
+const binder = @import("exec/binder.zig");
 const exec_shape = @import("exec/shape.zig");
 
 fn fairMode() bool {
@@ -428,7 +429,8 @@ pub const Native = struct {
             else => return err,
         };
 
-        if (try native_reduce.executeScalar(self.allocator, plan, reduceScalarContext(hot))) |output| return output;
+        var reduce_data = ReduceContextData{ .native = self, .hot = hot };
+        if (try native_reduce.executeScalar(self.allocator, plan, reduceScalarContext(&reduce_data))) |output| return output;
 
         if (clickbench_dispatch.matchGenericFallback(plan)) |fallback| return self.executeClickBenchGenericFallback(fallback, hot);
 
@@ -453,7 +455,7 @@ pub const Native = struct {
 
     fn executeGenericGroupBy(self: *Native, plan: generic_sql.Plan, hot: *const HotColumns) anyerror![]u8 {
         const group_col = plan.group_by orelse return error.UnsupportedGenericQuery;
-        var group_data = GroupContextData{ .hot = hot };
+        var group_data = GroupContextData{ .native = self, .hot = hot };
         if (try native_group.execute(self.allocator, plan, groupContext(&group_data))) |output| return output;
         if (plan.filter) |filter| if (asciiEqlIgnoreCase(filter.column, "SearchPhrase")) {
             group_data.search_phrase = try self.getSearchPhraseColumn();
@@ -470,9 +472,9 @@ pub const Native = struct {
             return formatUserIdCountTop10DenseCached(self.allocator, try self.getUserIdEncoding());
         }
 
-        const group_values = bindGenericColumn(hot, group_col) catch return error.UnsupportedGenericQuery;
+        const group_values = bindGenericColumn(self, hot, group_col) catch return error.UnsupportedGenericQuery;
         if (plan.filter) |filter| {
-            const predicate = try materializePlanFilter(self.allocator, hot, filter);
+            const predicate = try self.materializePlanFilter(self.allocator, hot, filter);
             defer if (predicate.owned) self.allocator.free(predicate.values);
             return formatGenericGroupCount(self.allocator, selected_col, group_values, predicate.values);
         }
@@ -483,20 +485,20 @@ pub const Native = struct {
         if (clickbench_dispatch.matchGenericFallback(plan)) |fallback| return self.executeClickBenchGenericFallback(fallback, hot);
         if (plan.projections.len == 1 and plan.projections[0].func == .column_ref) {
             const column_name = plan.projections[0].column orelse return error.UnsupportedGenericQuery;
-            const column = bindGenericColumn(hot, column_name) catch return error.UnsupportedGenericQuery;
+            const column = bindGenericColumn(self, hot, column_name) catch return error.UnsupportedGenericQuery;
             if (filter.second == null and filter.op == .equal and asciiEqlIgnoreCase(column_name, filter.column)) {
                 return formatGenericPointLookupColumn(self.allocator, column_name, column, filter.int_value);
             }
-            const predicate = try materializePlanFilter(self.allocator, hot, filter);
+            const predicate = try self.materializePlanFilter(self.allocator, hot, filter);
             defer if (predicate.owned) self.allocator.free(predicate.values);
             return formatGenericFilteredColumn(self.allocator, column_name, column, predicate.values);
         }
-        const predicate = try materializePlanFilter(self.allocator, hot, filter);
+        const predicate = try self.materializePlanFilter(self.allocator, hot, filter);
         defer if (predicate.owned) self.allocator.free(predicate.values);
         const values = try self.allocator.alloc(GenericValue, plan.projections.len);
         defer self.allocator.free(values);
         for (plan.projections, 0..) |expr, i| {
-            values[i] = try executeGenericFilteredProjection(expr, hot, predicate.values);
+            values[i] = try executeGenericFilteredProjection(self, expr, hot, predicate.values);
         }
         return formatGenericValues(self.allocator, plan, values);
     }
@@ -582,15 +584,15 @@ pub const Native = struct {
 
     const GenericPredicateMask = struct { values: []const i16, owned: bool };
 
-    fn materializePlanFilter(allocator: std.mem.Allocator, hot: *const HotColumns, filter: generic_sql.Filter) !GenericPredicateMask {
+    fn materializePlanFilter(self: *Native, allocator: std.mem.Allocator, hot: *const HotColumns, filter: generic_sql.Filter) !GenericPredicateMask {
         if (filter.second) |second| {
-            const left_column = bindGenericColumn(hot, filter.column) catch return error.UnsupportedGenericQuery;
-            const right_column = bindGenericColumn(hot, second.column) catch return error.UnsupportedGenericQuery;
+            const left_column = bindGenericColumn(self, hot, filter.column) catch return error.UnsupportedGenericQuery;
+            const right_column = bindGenericColumn(self, hot, second.column) catch return error.UnsupportedGenericQuery;
             const left = generic_sql.Predicate{ .column = filter.column, .op = filter.op, .int_value = filter.int_value };
             return .{ .values = try materializeGenericAndPredicate(allocator, left_column, left, right_column, second), .owned = true };
         }
 
-        const predicate = bindGenericColumn(hot, filter.column) catch return error.UnsupportedGenericQuery;
+        const predicate = bindGenericColumn(self, hot, filter.column) catch return error.UnsupportedGenericQuery;
         const predicate_values = if (filter.op == .not_equal and filter.int_value == 0) switch (predicate) {
             .i16 => |values| values,
             else => return .{ .values = try materializeGenericPredicate(allocator, predicate, filter), .owned = true },
@@ -996,7 +998,7 @@ pub const Native = struct {
         return &self.search_phrase_cache.?;
     }
 
-    /// Schema-driven column binding (PR-A3, extended PR-A4).
+    /// Schema-driven column binding (PR-A3, extended PR-A4 / PR-B2b).
     ///
     /// Returns a `BoundColumn` for any hits column known to the schema and
     /// backed by an existing Native getter. Falls back to
@@ -1011,6 +1013,7 @@ pub const Native = struct {
         const column = clickbench_schema.hits.columns[index];
         const tag = schema.capabilityTag(column);
         return switch (tag) {
+            .fixed_i16, .fixed_i32, .fixed_i64, .fixed_date, .fixed_timestamp => self.bindFixedColumn(column, tag),
             .lowcard_text => blk: {
                 if (asciiEqlIgnoreCase(column.name, "SearchPhrase")) {
                     const col = try self.getSearchPhraseColumn();
@@ -1050,6 +1053,41 @@ pub const Native = struct {
             // Other tags fall through until PR-A5+.
             else => error.UnsupportedNativeQuery,
         };
+    }
+
+    /// Bind a fixed-int/date column from the HotColumns mmap. Only the
+    /// subset present in HotColumns is supported; columns not yet
+    /// materialized in hot-store return UnsupportedNativeQuery.
+    fn bindFixedColumn(self: *Native, column: schema.Column, tag: schema.CapabilityTag) !bind.BoundColumn {
+        const hot = try self.getHotColumns();
+        const slice_i16: ?[]const i16 = blk: {
+            if (asciiEqlIgnoreCase(column.name, "AdvEngineID")) break :blk hot.adv_engine_id;
+            if (asciiEqlIgnoreCase(column.name, "ResolutionWidth")) break :blk hot.resolution_width;
+            if (asciiEqlIgnoreCase(column.name, "IsRefresh")) break :blk hot.is_refresh;
+            if (asciiEqlIgnoreCase(column.name, "DontCountHits")) break :blk hot.dont_count_hits;
+            break :blk null;
+        };
+        if (slice_i16) |values| return .{ .fixed_i16 = .{ .name = column.name, .values = values } };
+
+        const slice_i32: ?[]const i32 = blk: {
+            if (asciiEqlIgnoreCase(column.name, "CounterID")) break :blk hot.counter_id;
+            if (asciiEqlIgnoreCase(column.name, "ClientIP")) break :blk hot.client_ip;
+            break :blk null;
+        };
+        if (slice_i32) |values| return .{ .fixed_i32 = .{ .name = column.name, .values = values } };
+
+        if (tag == .fixed_date and asciiEqlIgnoreCase(column.name, "EventDate")) {
+            return .{ .fixed_date = .{ .name = column.name, .values = hot.event_date } };
+        }
+
+        const slice_i64: ?[]const i64 = blk: {
+            if (asciiEqlIgnoreCase(column.name, "UserID")) break :blk hot.user_id;
+            if (asciiEqlIgnoreCase(column.name, "WatchID")) break :blk hot.watch_id;
+            break :blk null;
+        };
+        if (slice_i64) |values| return .{ .fixed_i64 = .{ .name = column.name, .values = values } };
+
+        return error.UnsupportedNativeQuery;
     }
 
     fn getUrlColumn(self: *Native) !*const lowcard.StringColumn {
@@ -5629,6 +5667,7 @@ const HotColumns = struct {
 };
 
 const GroupContextData = struct {
+    native: *Native,
     hot: *const HotColumns,
     search_phrase: ?*const lowcard.StringColumn = null,
 };
@@ -5643,13 +5682,17 @@ fn groupContext(data: *const GroupContextData) native_group.Context {
 
 fn bindClickBenchGroupColumn(ptr: *const anyopaque, name: []const u8) anyerror!native_group.BoundColumn {
     const data: *const GroupContextData = @ptrCast(@alignCast(ptr));
+    // Schema-driven path: try the unified Native.bindColumn first; map the
+    // resulting BoundColumn into a group.BoundColumn via the adapter. This
+    // covers all int columns from HotColumns. Fall through to legacy
+    // handling for shapes the adapter rejects (e.g. lowcard_text not yet
+    // wired here as a group key).
+    if (data.native.bindColumn(name)) |bound| {
+        if (binder.asGroupColumn(bound)) |group_col| return group_col else |_| {}
+    } else |_| {}
+    // Legacy entries the adapter doesn't yet cover (derived names like
+    // "length(URL)" lack a schema entry).
     const hot = data.hot;
-    if (asciiEqlIgnoreCase(name, "AdvEngineID")) return .{ .name = "AdvEngineID", .column = .{ .i16 = hot.adv_engine_id } };
-    if (asciiEqlIgnoreCase(name, "CounterID")) return .{ .name = "CounterID", .column = .{ .i32 = hot.counter_id } };
-    if (asciiEqlIgnoreCase(name, "ClientIP")) return .{ .name = "ClientIP", .column = .{ .i32 = hot.client_ip orelse return error.UnsupportedGenericColumn } };
-    if (asciiEqlIgnoreCase(name, "WatchID")) return .{ .name = "WatchID", .column = .{ .i64 = hot.watch_id orelse return error.UnsupportedGenericColumn } };
-    if (asciiEqlIgnoreCase(name, "IsRefresh")) return .{ .name = "IsRefresh", .column = .{ .i16 = hot.is_refresh } };
-    if (asciiEqlIgnoreCase(name, "ResolutionWidth")) return .{ .name = "ResolutionWidth", .column = .{ .i16 = hot.resolution_width } };
     if (asciiEqlIgnoreCase(name, "length(URL)")) return .{ .name = "length(URL)", .column = .{ .i32 = hot.url_length orelse return error.UnsupportedGenericColumn } };
     return error.UnsupportedGenericColumn;
 }
@@ -5664,35 +5707,40 @@ fn bindClickBenchGroupFilterColumn(ptr: *const anyopaque, name: []const u8) anye
     return bindClickBenchGroupColumn(ptr, name);
 }
 
-fn reduceScalarContext(hot: *const HotColumns) native_reduce.ScalarContext {
+fn reduceScalarContext(data: *const ReduceContextData) native_reduce.ScalarContext {
     return .{
-        .ptr = hot,
-        .row_count = hot.rowCount(),
+        .ptr = data,
+        .row_count = data.hot.rowCount(),
         .bind_column = bindClickBenchReduceColumn,
         .bind_filter_column = bindClickBenchReduceFilterColumn,
     };
 }
 
+const ReduceContextData = struct {
+    native: *Native,
+    hot: *const HotColumns,
+};
+
 fn bindClickBenchReduceColumn(ptr: *const anyopaque, name: []const u8) anyerror!native_reduce.Column {
-    const hot: *const HotColumns = @ptrCast(@alignCast(ptr));
-    return bindClickBenchReduceColumnImpl(hot, name);
+    const data: *const ReduceContextData = @ptrCast(@alignCast(ptr));
+    return bindClickBenchReduceColumnImpl(data.native, data.hot, name);
 }
 
-fn bindClickBenchReduceColumnImpl(hot: *const HotColumns, name: []const u8) !native_reduce.Column {
-    if (asciiEqlIgnoreCase(name, "AdvEngineID")) return .{ .i16 = hot.adv_engine_id };
-    if (asciiEqlIgnoreCase(name, "ResolutionWidth")) return .{ .i16 = hot.resolution_width };
-    if (asciiEqlIgnoreCase(name, "UserID")) return .{ .i64 = hot.user_id };
-    if (asciiEqlIgnoreCase(name, "EventDate")) return .{ .date = hot.event_date };
-    if (asciiEqlIgnoreCase(name, "CounterID")) return .{ .i32 = hot.counter_id };
-    if (asciiEqlIgnoreCase(name, "IsRefresh")) return .{ .i16 = hot.is_refresh };
-    if (asciiEqlIgnoreCase(name, "DontCountHits")) return .{ .i16 = hot.dont_count_hits };
+/// Single source of truth for reduce/generic column binding: routes
+/// through the schema-driven Native.bindColumn + adapter, with a
+/// fallback for the synthetic "length(URL)" column that lives only in
+/// HotColumns (not in the schema).
+fn bindClickBenchReduceColumnImpl(native: *Native, hot: *const HotColumns, name: []const u8) !native_reduce.Column {
+    if (native.bindColumn(name)) |bound| {
+        if (binder.asReduceColumn(bound)) |col| return col else |_| {}
+    } else |_| {}
     if (asciiEqlIgnoreCase(name, "length(URL)")) return .{ .i32 = hot.url_length orelse return error.UnsupportedGenericColumn };
     return error.UnsupportedGenericColumn;
 }
 
 fn bindClickBenchReduceFilterColumn(ptr: *const anyopaque, name: []const u8) anyerror!native_reduce.Column {
-    const hot: *const HotColumns = @ptrCast(@alignCast(ptr));
-    if (asciiEqlIgnoreCase(name, "URL")) return .{ .i32 = hot.url_length orelse return error.UnsupportedGenericColumn };
+    const data: *const ReduceContextData = @ptrCast(@alignCast(ptr));
+    if (asciiEqlIgnoreCase(name, "URL")) return .{ .i32 = data.hot.url_length orelse return error.UnsupportedGenericColumn };
     return bindClickBenchReduceColumn(ptr, name);
 }
 
@@ -5948,12 +5996,10 @@ const GenericGroupRow = struct {
     count: u64,
 };
 
-fn bindGenericColumn(hot: *const HotColumns, name: []const u8) !GenericColumn {
-    // bindClickBenchReduceColumnImpl covers a strict superset of the columns
-    // generic group/filter paths reach for; the only extra case (length(URL))
-    // is harmless to expose here. Routing through one binder eliminates
+fn bindGenericColumn(native: *Native, hot: *const HotColumns, name: []const u8) !GenericColumn {
+    // Routes through the shared schema-driven reduce binder; eliminates
     // duplicated lookup tables that drifted in lockstep.
-    return bindClickBenchReduceColumnImpl(hot, name);
+    return bindClickBenchReduceColumnImpl(native, hot, name);
 }
 
 fn materializeGenericPredicate(allocator: std.mem.Allocator, column: GenericColumn, filter: generic_sql.Filter) ![]i16 {
@@ -6120,10 +6166,10 @@ fn writeFilteredDateValues(out: *std.ArrayList(u8), allocator: std.mem.Allocator
     }
 }
 
-fn executeGenericFilteredProjection(expr: generic_sql.Expr, hot: *const HotColumns, predicate: []const i16) !GenericValue {
+fn executeGenericFilteredProjection(native: *Native, expr: generic_sql.Expr, hot: *const HotColumns, predicate: []const i16) !GenericValue {
     if (expr.func == .count_star) return .{ .int = @intCast(simd.countNonZero(i16, predicate)) };
     if (expr.func == .int_literal) return .{ .int = expr.int_offset };
-    const column = bindGenericColumn(hot, expr.column orelse return error.UnsupportedGenericQuery) catch return error.UnsupportedGenericQuery;
+    const column = bindGenericColumn(native, hot, expr.column orelse return error.UnsupportedGenericQuery) catch return error.UnsupportedGenericQuery;
     return switch (expr.func) {
         .column_ref => error.UnsupportedGenericQuery,
         .int_literal => unreachable,
