@@ -132,9 +132,11 @@ fn mapU32(allocator: std.mem.Allocator, data_dir: []const u8, name: []const u8) 
     const fd = std.c.open(path.ptr, .{ .ACCMODE = .RDONLY });
     if (fd < 0) return error.OpenFailed;
     defer _ = std.c.close(fd);
-    var stat: std.c.Stat = undefined;
-    if (std.c.fstat(fd, &stat) != 0) return error.StatFailed;
-    const size: usize = @intCast(stat.size);
+    // Use lseek to determine file size (avoids std.c.fstat portability issues)
+    const end = std.c.lseek(fd, 0, std.c.SEEK.END);
+    if (end < 0) return error.SeekFailed;
+    _ = std.c.lseek(fd, 0, std.c.SEEK.SET);
+    const size: usize = @intCast(end);
     const mapped = try posix.mmap(null, size, .{ .READ = true }, .{ .TYPE = .PRIVATE }, fd, 0);
     const elem = size / @sizeOf(u32);
     const ptr: [*]const u32 = @ptrCast(@alignCast(mapped.ptr));
