@@ -186,6 +186,35 @@ pub fn build(b: *std.Build) void {
     const generic_executor_test_cmd = b.addRunArtifact(generic_executor_tests);
     generic_executor_test_cmd.setCwd(b.path("."));
 
+    const schema_infer_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/schema_infer.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const schema_infer_test_cmd = b.addRunArtifact(schema_infer_tests);
+
+    const generic_store_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/generic_store.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    generic_store_tests.root_module.link_libc = true;
+    const generic_store_test_cmd = b.addRunArtifact(generic_store_tests);
+
+    const loader_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/loader.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    loader_tests.root_module.link_libc = true;
+    const loader_test_cmd = b.addRunArtifact(loader_tests);
+
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&test_cmd.step);
     test_step.dependOn(&simd_test_cmd.step);
@@ -198,6 +227,9 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&parquet_test_cmd.step);
     test_step.dependOn(&schema_test_cmd.step);
     test_step.dependOn(&generic_executor_test_cmd.step);
+    test_step.dependOn(&schema_infer_test_cmd.step);
+    test_step.dependOn(&generic_store_test_cmd.step);
+    test_step.dependOn(&loader_test_cmd.step);
 
     if (!install_bench_tools) return;
 
