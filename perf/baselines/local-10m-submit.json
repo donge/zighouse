@@ -4,12 +4,12 @@
   "parquet": "data/hits.parquet",
   "limit_rows": 10000000,
   "queries": "assets/queries.sql",
-  "query_path": "compare",
+  "query_path": "specialized",
   "build": {
     "args": [
       "-Dduckdb=false"
     ],
-    "git_commit": "ba60a4f66cc8b596dd7810398e3ae2a905570dd3",
+    "git_commit": "9c058cc36156346a91a1e55bf2cab0ed4eca55ba",
     "git_dirty": true
   },
   "host": {
@@ -19,4921 +19,933 @@
     "platform": "macOS-26.3.1-arm64-arm-64bit"
   },
   "import": {
-    "wall_seconds": 7.08,
-    "total_seconds": 7.07713,
+    "wall_seconds": 7.81,
+    "total_seconds": 7.206766,
     "rss_bytes": 0
   },
   "query": {
     "queries": 43,
     "nulls": 0,
-    "first_sum": 9.013144,
-    "warm_best_sum": 3.69502,
-    "all_runs_sum": 16.502065,
+    "first_sum": 5.988287,
+    "warm_best_sum": 1.263515,
+    "all_runs_sum": 8.524178,
     "timings": [
       [
-        0.003121,
-        1.7e-05,
-        1.5e-05
-      ],
-      [
-        0.001613,
-        0.000684,
-        0.00069
-      ],
-      [
-        0.002012,
-        0.001053,
-        0.000991
-      ],
-      [
-        0.006334,
-        0.002266,
-        0.002467
-      ],
-      [
-        0.024749,
-        0.022528,
-        0.02259
-      ],
-      [
-        0.016997,
-        0.014718,
-        0.014586
-      ],
-      [
-        0.003141,
-        0.001086,
-        0.001001
-      ],
-      [
-        0.006678,
-        0.006588,
-        0.006739
-      ],
-      [
-        0.063987,
-        0.065024,
-        0.064198
-      ],
-      [
-        0.061892,
-        0.061764,
-        0.061337
-      ],
-      [
-        0.016186,
-        0.015262,
-        0.015148
-      ],
-      [
-        0.020849,
-        0.018266,
-        0.018443
-      ],
-      [
-        0.039372,
-        0.03857,
-        0.038287
-      ],
-      [
-        0.077446,
-        0.076902,
-        0.075761
-      ],
-      [
-        0.106243,
-        0.097628,
-        0.098887
-      ],
-      [
-        0.037144,
-        0.036176,
-        0.036243
-      ],
-      [
-        0.102198,
-        0.076672,
-        0.075737
-      ],
-      [
+        2.3e-05,
         1.1e-05,
-        1.2e-05,
-        5e-06
+        1e-05
       ],
       [
-        0.454491,
-        0.352065,
-        0.333998
+        0.004088,
+        0.000317,
+        0.000325
       ],
       [
-        0.005065,
-        0.00511,
-        0.005094
+        0.001419,
+        0.00052,
+        0.000499
       ],
       [
-        0.019055,
-        0.005742,
-        0.005678
+        0.004927,
+        0.001143,
+        0.00107
       ],
       [
-        0.001629,
-        5.9e-05,
-        4.5e-05
+        0.013045,
+        0.011259,
+        0.011281
       ],
       [
-        0.001671,
-        0.000859,
-        0.000835
+        0.009069,
+        0.007302,
+        0.007246
       ],
       [
-        0.665026,
-        0.649315,
-        0.642233
+        0.002553,
+        0.000606,
+        0.000626
       ],
       [
-        0.130421,
-        0.03846,
-        0.037888
+        0.003301,
+        0.003207,
+        0.003174
       ],
       [
-        0.143478,
-        0.072939,
-        0.071375
+        0.031028,
+        0.030764,
+        0.030693
       ],
       [
-        0.03808,
-        0.038666,
-        0.037927
+        0.02989,
+        0.03007,
+        0.029739
       ],
       [
-        0.259149,
-        0.175725,
-        0.175417
+        0.008744,
+        0.007358,
+        0.007481
       ],
       [
-        0.000126,
-        4.9e-05,
-        4.3e-05
+        0.01088,
+        0.00927,
+        0.009156
       ],
       [
-        0.000611,
-        0.000524,
-        0.000483
+        0.019489,
+        0.019271,
+        0.019336
       ],
       [
-        0.126218,
-        0.077993,
-        0.10107
+        0.03533,
+        0.034952,
+        0.035184
       ],
       [
-        0.000686,
+        0.056402,
+        0.046785,
+        0.0459
+      ],
+      [
+        0.018771,
+        0.017692,
+        0.017457
+      ],
+      [
+        0.056384,
+        0.037711,
+        0.037979
+      ],
+      [
         8e-06,
-        6e-06
+        2e-06,
+        2e-06
       ],
       [
-        0.42839,
-        0.270063,
-        0.268853
+        0.251459,
+        0.169602,
+        0.168664
       ],
       [
-        1.211816,
-        2.1e-05,
-        1.5e-05
+        0.002654,
+        0.00263,
+        0.002636
       ],
       [
-        1.5e-05,
-        1.3e-05,
-        1.3e-05
+        0.017334,
+        0.002907,
+        0.002838
       ],
       [
-        0.071885,
-        0.064394,
-        0.064226
+        0.001401,
+        2.6e-05,
+        1.9e-05
       ],
       [
-        0.743046,
-        0.025054,
-        0.025018
+        0.00117,
+        0.000445,
+        0.000422
       ],
       [
-        1.166776,
-        1.138652,
-        1.177425
+        0.321047,
+        0.319672,
+        0.318496
       ],
       [
-        0.711021,
-        0.007205,
-        0.007107
+        0.129913,
+        0.021848,
+        0.02167
       ],
       [
-        2.20694,
-        0.240486,
-        0.241368
+        0.120424,
+        0.036461,
+        0.035503
       ],
       [
-        0.01566,
-        0.015254,
-        0.015334
+        0.019051,
+        0.018701,
+        0.018266
       ],
       [
-        0.015292,
-        0.008931,
-        0.008902
+        0.171582,
+        0.087955,
+        0.087652
       ],
       [
-        0.006626,
-        0.006362,
-        0.006281
+        8.7e-05,
+        2.3e-05,
+        2.1e-05
+      ],
+      [
+        0.000306,
+        0.000272,
+        0.00026
+      ],
+      [
+        0.089382,
+        0.036237,
+        0.036584
+      ],
+      [
+        0.000729,
+        2e-06,
+        1e-06
+      ],
+      [
+        0.247163,
+        0.128279,
+        0.127964
+      ],
+      [
+        1.14736,
+        3e-06,
+        1e-06
+      ],
+      [
+        2e-06,
+        1e-06,
+        1e-06
+      ],
+      [
+        0.030847,
+        0.030364,
+        0.030156
+      ],
+      [
+        0.710844,
+        0.012395,
+        0.011954
+      ],
+      [
+        0.00559,
+        0.005336,
+        0.005376
+      ],
+      [
+        0.707611,
+        0.003919,
+        0.003616
+      ],
+      [
+        1.687265,
+        0.120337,
+        0.120208
+      ],
+      [
+        0.007741,
+        0.007817,
+        0.007517
+      ],
+      [
+        0.008624,
+        0.004526,
+        0.004583
+      ],
+      [
+        0.003349,
+        0.003193,
+        0.003137
       ]
     ],
-    "warm_best_from_rows": 3.6947840000000003,
-    "compare": {
-      "repeats_per_query": 3,
-      "timings": [
-        [
-          {
-            "kind": "generic_sql",
-            "generic_seconds": 0.003084,
-            "specialized_seconds": 1.5e-05,
-            "ratio": 203.906,
-            "equal": true
-          },
-          {
-            "kind": "generic_sql",
-            "generic_seconds": 0.0,
-            "specialized_seconds": 1.1e-05,
-            "ratio": 0.026,
-            "equal": true
-          },
-          {
-            "kind": "generic_sql",
-            "generic_seconds": 0.0,
-            "specialized_seconds": 1e-05,
-            "ratio": 0.02,
-            "equal": true
-          }
-        ],
-        [
-          {
-            "kind": "generic_sql",
-            "generic_seconds": 0.001272,
-            "specialized_seconds": 0.00033,
-            "ratio": 3.853,
-            "equal": true
-          },
-          {
-            "kind": "generic_sql",
-            "generic_seconds": 0.000339,
-            "specialized_seconds": 0.000338,
-            "ratio": 1.004,
-            "equal": true
-          },
-          {
-            "kind": "generic_sql",
-            "generic_seconds": 0.000334,
-            "specialized_seconds": 0.000351,
-            "ratio": 0.952,
-            "equal": true
-          }
-        ],
-        [
-          {
-            "kind": "generic_sql",
-            "generic_seconds": 0.001456,
-            "specialized_seconds": 0.00054,
-            "ratio": 2.693,
-            "equal": true
-          },
-          {
-            "kind": "generic_sql",
-            "generic_seconds": 0.000539,
-            "specialized_seconds": 0.000507,
-            "ratio": 1.061,
-            "equal": true
-          },
-          {
-            "kind": "generic_sql",
-            "generic_seconds": 0.000488,
-            "specialized_seconds": 0.000495,
-            "ratio": 0.986,
-            "equal": true
-          }
-        ],
-        [
-          {
-            "kind": "generic_sql",
-            "generic_seconds": 0.004971,
-            "specialized_seconds": 0.001341,
-            "ratio": 3.707,
-            "equal": true
-          },
-          {
-            "kind": "generic_sql",
-            "generic_seconds": 0.001156,
-            "specialized_seconds": 0.001097,
-            "ratio": 1.054,
-            "equal": true
-          },
-          {
-            "kind": "generic_sql",
-            "generic_seconds": 0.001332,
-            "specialized_seconds": 0.001122,
-            "ratio": 1.187,
-            "equal": true
-          }
-        ],
-        [
-          {
-            "kind": "generic_sql",
-            "generic_seconds": 0.013206,
-            "specialized_seconds": 0.011512,
-            "ratio": 1.147,
-            "equal": true
-          },
-          {
-            "kind": "generic_sql",
-            "generic_seconds": 0.011292,
-            "specialized_seconds": 0.01122,
-            "ratio": 1.006,
-            "equal": true
-          },
-          {
-            "kind": "generic_sql",
-            "generic_seconds": 0.011284,
-            "specialized_seconds": 0.011293,
-            "ratio": 0.999,
-            "equal": true
-          }
-        ],
-        [
-          {
-            "kind": "count_distinct_search_phrase",
-            "generic_seconds": 0.009271,
-            "specialized_seconds": 0.007695,
-            "ratio": 1.205,
-            "equal": true
-          },
-          {
-            "kind": "count_distinct_search_phrase",
-            "generic_seconds": 0.007321,
-            "specialized_seconds": 0.007373,
-            "ratio": 0.993,
-            "equal": true
-          },
-          {
-            "kind": "count_distinct_search_phrase",
-            "generic_seconds": 0.007257,
-            "specialized_seconds": 0.007314,
-            "ratio": 0.992,
-            "equal": true
-          }
-        ],
-        [
-          {
-            "kind": "generic_sql",
-            "generic_seconds": 0.002584,
-            "specialized_seconds": 0.000538,
-            "ratio": 4.804,
-            "equal": true
-          },
-          {
-            "kind": "generic_sql",
-            "generic_seconds": 0.000524,
-            "specialized_seconds": 0.00055,
-            "ratio": 0.953,
-            "equal": true
-          },
-          {
-            "kind": "generic_sql",
-            "generic_seconds": 0.0005,
-            "specialized_seconds": 0.000494,
-            "ratio": 1.012,
-            "equal": true
-          }
-        ],
-        [
-          {
-            "kind": "generic_sql",
-            "generic_seconds": 0.003385,
-            "specialized_seconds": 0.003277,
-            "ratio": 1.033,
-            "equal": true
-          },
-          {
-            "kind": "generic_sql",
-            "generic_seconds": 0.003319,
-            "specialized_seconds": 0.003257,
-            "ratio": 1.019,
-            "equal": true
-          },
-          {
-            "kind": "generic_sql",
-            "generic_seconds": 0.003489,
-            "specialized_seconds": 0.003242,
-            "ratio": 1.076,
-            "equal": true
-          }
-        ],
-        [
-          {
-            "kind": "generic_sql",
-            "generic_seconds": 0.032493,
-            "specialized_seconds": 0.031468,
-            "ratio": 1.033,
-            "equal": true
-          },
-          {
-            "kind": "generic_sql",
-            "generic_seconds": 0.031484,
-            "specialized_seconds": 0.033512,
-            "ratio": 0.939,
-            "equal": true
-          },
-          {
-            "kind": "generic_sql",
-            "generic_seconds": 0.032544,
-            "specialized_seconds": 0.031618,
-            "ratio": 1.029,
-            "equal": true
-          }
-        ],
-        [
-          {
-            "kind": "generic_sql",
-            "generic_seconds": 0.030854,
-            "specialized_seconds": 0.031007,
-            "ratio": 0.995,
-            "equal": true
-          },
-          {
-            "kind": "generic_sql",
-            "generic_seconds": 0.030807,
-            "specialized_seconds": 0.03093,
-            "ratio": 0.996,
-            "equal": true
-          },
-          {
-            "kind": "generic_sql",
-            "generic_seconds": 0.030613,
-            "specialized_seconds": 0.03069,
-            "ratio": 0.997,
-            "equal": true
-          }
-        ],
-        [
-          {
-            "kind": "mobile_phone_model_distinct_user_id_top",
-            "generic_seconds": 0.008722,
-            "specialized_seconds": 0.007436,
-            "ratio": 1.173,
-            "equal": true
-          },
-          {
-            "kind": "mobile_phone_model_distinct_user_id_top",
-            "generic_seconds": 0.007763,
-            "specialized_seconds": 0.007471,
-            "ratio": 1.039,
-            "equal": true
-          },
-          {
-            "kind": "mobile_phone_model_distinct_user_id_top",
-            "generic_seconds": 0.007322,
-            "specialized_seconds": 0.007794,
-            "ratio": 0.939,
-            "equal": true
-          }
-        ],
-        [
-          {
-            "kind": "mobile_phone_distinct_user_id_top",
-            "generic_seconds": 0.011423,
-            "specialized_seconds": 0.009399,
-            "ratio": 1.215,
-            "equal": true
-          },
-          {
-            "kind": "mobile_phone_distinct_user_id_top",
-            "generic_seconds": 0.009122,
-            "specialized_seconds": 0.00912,
-            "ratio": 1.0,
-            "equal": true
-          },
-          {
-            "kind": "mobile_phone_distinct_user_id_top",
-            "generic_seconds": 0.009087,
-            "specialized_seconds": 0.009326,
-            "ratio": 0.974,
-            "equal": true
-          }
-        ],
-        [
-          {
-            "kind": "search_phrase_count_top",
-            "generic_seconds": 0.019909,
-            "specialized_seconds": 0.019442,
-            "ratio": 1.024,
-            "equal": true
-          },
-          {
-            "kind": "search_phrase_count_top",
-            "generic_seconds": 0.019283,
-            "specialized_seconds": 0.019272,
-            "ratio": 1.001,
-            "equal": true
-          },
-          {
-            "kind": "search_phrase_count_top",
-            "generic_seconds": 0.019078,
-            "specialized_seconds": 0.019196,
-            "ratio": 0.994,
-            "equal": true
-          }
-        ],
-        [
-          {
-            "kind": "search_phrase_distinct_user_id_top",
-            "generic_seconds": 0.038861,
-            "specialized_seconds": 0.038566,
-            "ratio": 1.008,
-            "equal": true
-          },
-          {
-            "kind": "search_phrase_distinct_user_id_top",
-            "generic_seconds": 0.038628,
-            "specialized_seconds": 0.038245,
-            "ratio": 1.01,
-            "equal": true
-          },
-          {
-            "kind": "search_phrase_distinct_user_id_top",
-            "generic_seconds": 0.037762,
-            "specialized_seconds": 0.037975,
-            "ratio": 0.994,
-            "equal": true
-          }
-        ],
-        [
-          {
-            "kind": "search_engine_phrase_count_top",
-            "generic_seconds": 0.058196,
-            "specialized_seconds": 0.048016,
-            "ratio": 1.212,
-            "equal": true
-          },
-          {
-            "kind": "search_engine_phrase_count_top",
-            "generic_seconds": 0.04891,
-            "specialized_seconds": 0.048694,
-            "ratio": 1.004,
-            "equal": true
-          },
-          {
-            "kind": "search_engine_phrase_count_top",
-            "generic_seconds": 0.049702,
-            "specialized_seconds": 0.049163,
-            "ratio": 1.011,
-            "equal": true
-          }
-        ],
-        [
-          {
-            "kind": "generic_sql",
-            "generic_seconds": 0.018898,
-            "specialized_seconds": 0.01822,
-            "ratio": 1.037,
-            "equal": true
-          },
-          {
-            "kind": "generic_sql",
-            "generic_seconds": 0.018144,
-            "specialized_seconds": 0.018011,
-            "ratio": 1.007,
-            "equal": true
-          },
-          {
-            "kind": "generic_sql",
-            "generic_seconds": 0.018231,
-            "specialized_seconds": 0.017997,
-            "ratio": 1.013,
-            "equal": true
-          }
-        ],
-        [
-          {
-            "kind": "user_id_search_phrase_count_top",
-            "generic_seconds": 0.064228,
-            "specialized_seconds": 0.037943,
-            "ratio": 1.693,
-            "equal": true
-          },
-          {
-            "kind": "user_id_search_phrase_count_top",
-            "generic_seconds": 0.038616,
-            "specialized_seconds": 0.03803,
-            "ratio": 1.015,
-            "equal": true
-          },
-          {
-            "kind": "user_id_search_phrase_count_top",
-            "generic_seconds": 0.037984,
-            "specialized_seconds": 0.037728,
-            "ratio": 1.007,
-            "equal": true
-          }
-        ],
-        [
-          {
-            "kind": "user_id_search_phrase_limit_no_order",
-            "generic_seconds": 3e-06,
-            "specialized_seconds": 1e-06,
-            "ratio": 2.324,
-            "equal": true
-          },
-          {
-            "kind": "user_id_search_phrase_limit_no_order",
-            "generic_seconds": 7e-06,
-            "specialized_seconds": 1e-06,
-            "ratio": 6.75,
-            "equal": true
-          },
-          {
-            "kind": "user_id_search_phrase_limit_no_order",
-            "generic_seconds": 1e-06,
-            "specialized_seconds": 1e-06,
-            "ratio": 1.105,
-            "equal": true
-          }
-        ],
-        [
-          {
-            "kind": "user_id_minute_search_phrase_count_top",
-            "generic_seconds": 0.291069,
-            "specialized_seconds": 0.162895,
-            "ratio": 1.787,
-            "equal": true
-          },
-          {
-            "kind": "user_id_minute_search_phrase_count_top",
-            "generic_seconds": 0.176667,
-            "specialized_seconds": 0.175363,
-            "ratio": 1.007,
-            "equal": true
-          },
-          {
-            "kind": "user_id_minute_search_phrase_count_top",
-            "generic_seconds": 0.162786,
-            "specialized_seconds": 0.171184,
-            "ratio": 0.951,
-            "equal": true
-          }
-        ],
-        [
-          {
-            "kind": "generic_sql",
-            "generic_seconds": 0.002502,
-            "specialized_seconds": 0.002546,
-            "ratio": 0.982,
-            "equal": true
-          },
-          {
-            "kind": "generic_sql",
-            "generic_seconds": 0.002522,
-            "specialized_seconds": 0.002579,
-            "ratio": 0.978,
-            "equal": true
-          },
-          {
-            "kind": "generic_sql",
-            "generic_seconds": 0.00251,
-            "specialized_seconds": 0.002576,
-            "ratio": 0.975,
-            "equal": true
-          }
-        ],
-        [
-          {
-            "kind": "count_url_like_google",
-            "generic_seconds": 0.016127,
-            "specialized_seconds": 0.002915,
-            "ratio": 5.533,
-            "equal": true
-          },
-          {
-            "kind": "count_url_like_google",
-            "generic_seconds": 0.002877,
-            "specialized_seconds": 0.002848,
-            "ratio": 1.01,
-            "equal": true
-          },
-          {
-            "kind": "count_url_like_google",
-            "generic_seconds": 0.002833,
-            "specialized_seconds": 0.002835,
-            "ratio": 0.999,
-            "equal": true
-          }
-        ],
-        [
-          {
-            "kind": "search_phrase_min_url_google",
-            "generic_seconds": 0.001581,
-            "specialized_seconds": 3.8e-05,
-            "ratio": 41.251,
-            "equal": true
-          },
-          {
-            "kind": "search_phrase_min_url_google",
-            "generic_seconds": 2.2e-05,
-            "specialized_seconds": 3e-05,
-            "ratio": 0.741,
-            "equal": true
-          },
-          {
-            "kind": "search_phrase_min_url_google",
-            "generic_seconds": 2.3e-05,
-            "specialized_seconds": 1.7e-05,
-            "ratio": 1.324,
-            "equal": true
-          }
-        ],
-        [
-          {
-            "kind": "search_phrase_title_google_top",
-            "generic_seconds": 0.001197,
-            "specialized_seconds": 0.000464,
-            "ratio": 2.579,
-            "equal": true
-          },
-          {
-            "kind": "search_phrase_title_google_top",
-            "generic_seconds": 0.000431,
-            "specialized_seconds": 0.00042,
-            "ratio": 1.026,
-            "equal": true
-          },
-          {
-            "kind": "search_phrase_title_google_top",
-            "generic_seconds": 0.00042,
-            "specialized_seconds": 0.000409,
-            "ratio": 1.026,
-            "equal": true
-          }
-        ],
-        [
-          {
-            "kind": "url_like_google_order_by_event_time",
-            "generic_seconds": 0.321926,
-            "specialized_seconds": 0.34307,
-            "ratio": 0.938,
-            "equal": true
-          },
-          {
-            "kind": "url_like_google_order_by_event_time",
-            "generic_seconds": 0.325436,
-            "specialized_seconds": 0.323855,
-            "ratio": 1.005,
-            "equal": true
-          },
-          {
-            "kind": "url_like_google_order_by_event_time",
-            "generic_seconds": 0.321918,
-            "specialized_seconds": 0.320283,
-            "ratio": 1.005,
-            "equal": true
-          }
-        ],
-        [
-          {
-            "kind": "search_phrase_event_time_top",
-            "generic_seconds": 0.11112,
-            "specialized_seconds": 0.019274,
-            "ratio": 5.765,
-            "equal": true
-          },
-          {
-            "kind": "search_phrase_event_time_top",
-            "generic_seconds": 0.019217,
-            "specialized_seconds": 0.019218,
-            "ratio": 1.0,
-            "equal": true
-          },
-          {
-            "kind": "search_phrase_event_time_top",
-            "generic_seconds": 0.019125,
-            "specialized_seconds": 0.018742,
-            "ratio": 1.02,
-            "equal": true
-          }
-        ],
-        [
-          {
-            "kind": "search_phrase_order_by_phrase_top",
-            "generic_seconds": 0.10797,
-            "specialized_seconds": 0.035481,
-            "ratio": 3.043,
-            "equal": true
-          },
-          {
-            "kind": "search_phrase_order_by_phrase_top",
-            "generic_seconds": 0.037347,
-            "specialized_seconds": 0.035573,
-            "ratio": 1.05,
-            "equal": true
-          },
-          {
-            "kind": "search_phrase_order_by_phrase_top",
-            "generic_seconds": 0.035661,
-            "specialized_seconds": 0.035688,
-            "ratio": 0.999,
-            "equal": true
-          }
-        ],
-        [
-          {
-            "kind": "search_phrase_event_time_phrase_top",
-            "generic_seconds": 0.019267,
-            "specialized_seconds": 0.01879,
-            "ratio": 1.025,
-            "equal": true
-          },
-          {
-            "kind": "search_phrase_event_time_phrase_top",
-            "generic_seconds": 0.019217,
-            "specialized_seconds": 0.019429,
-            "ratio": 0.989,
-            "equal": true
-          },
-          {
-            "kind": "search_phrase_event_time_phrase_top",
-            "generic_seconds": 0.019119,
-            "specialized_seconds": 0.01879,
-            "ratio": 1.018,
-            "equal": true
-          }
-        ],
-        [
-          {
-            "kind": "url_length_by_counter",
-            "generic_seconds": 0.171149,
-            "specialized_seconds": 0.087965,
-            "ratio": 1.946,
-            "equal": true
-          },
-          {
-            "kind": "url_length_by_counter",
-            "generic_seconds": 0.087925,
-            "specialized_seconds": 0.08778,
-            "ratio": 1.002,
-            "equal": true
-          },
-          {
-            "kind": "url_length_by_counter",
-            "generic_seconds": 0.087759,
-            "specialized_seconds": 0.087633,
-            "ratio": 1.001,
-            "equal": true
-          }
-        ],
-        [
-          {
-            "kind": "referer_domain_stats_top",
-            "generic_seconds": 8.6e-05,
-            "specialized_seconds": 3.2e-05,
-            "ratio": 2.681,
-            "equal": true
-          },
-          {
-            "kind": "referer_domain_stats_top",
-            "generic_seconds": 2.2e-05,
-            "specialized_seconds": 2.1e-05,
-            "ratio": 1.045,
-            "equal": true
-          },
-          {
-            "kind": "referer_domain_stats_top",
-            "generic_seconds": 1.9e-05,
-            "specialized_seconds": 2e-05,
-            "ratio": 0.985,
-            "equal": true
-          }
-        ],
-        [
-          {
-            "kind": "generic_sql",
-            "generic_seconds": 0.000316,
-            "specialized_seconds": 0.000283,
-            "ratio": 1.115,
-            "equal": true
-          },
-          {
-            "kind": "generic_sql",
-            "generic_seconds": 0.000263,
-            "specialized_seconds": 0.000251,
-            "ratio": 1.046,
-            "equal": true
-          },
-          {
-            "kind": "generic_sql",
-            "generic_seconds": 0.000242,
-            "specialized_seconds": 0.000231,
-            "ratio": 1.049,
-            "equal": true
-          }
-        ],
-        [
-          {
-            "kind": "search_engine_client_ip_agg_top",
-            "generic_seconds": 0.088601,
-            "specialized_seconds": 0.037576,
-            "ratio": 2.358,
-            "equal": true
-          },
-          {
-            "kind": "search_engine_client_ip_agg_top",
-            "generic_seconds": 0.037925,
-            "specialized_seconds": 0.039401,
-            "ratio": 0.963,
-            "equal": true
-          },
-          {
-            "kind": "search_engine_client_ip_agg_top",
-            "generic_seconds": 0.063299,
-            "specialized_seconds": 0.037729,
-            "ratio": 1.678,
-            "equal": true
-          }
-        ],
-        [
-          {
-            "kind": "watch_id_client_ip_agg_top_filtered",
-            "generic_seconds": 0.000669,
-            "specialized_seconds": 2e-06,
-            "ratio": 382.477,
-            "equal": true
-          },
-          {
-            "kind": "watch_id_client_ip_agg_top_filtered",
-            "generic_seconds": 1e-06,
-            "specialized_seconds": 1e-06,
-            "ratio": 0.999,
-            "equal": true
-          },
-          {
-            "kind": "watch_id_client_ip_agg_top_filtered",
-            "generic_seconds": 1e-06,
-            "specialized_seconds": 1e-06,
-            "ratio": 0.948,
-            "equal": true
-          }
-        ],
-        [
-          {
-            "kind": "watch_id_client_ip_agg_top",
-            "generic_seconds": 0.29081,
-            "specialized_seconds": 0.13752,
-            "ratio": 2.115,
-            "equal": true
-          },
-          {
-            "kind": "watch_id_client_ip_agg_top",
-            "generic_seconds": 0.134073,
-            "specialized_seconds": 0.135952,
-            "ratio": 0.986,
-            "equal": true
-          },
-          {
-            "kind": "watch_id_client_ip_agg_top",
-            "generic_seconds": 0.133947,
-            "specialized_seconds": 0.134871,
-            "ratio": 0.993,
-            "equal": true
-          }
-        ],
-        [
-          {
-            "kind": "url_count_top",
-            "generic_seconds": 1.211757,
-            "specialized_seconds": 4e-06,
-            "ratio": 306076.44,
-            "equal": true
-          },
-          {
-            "kind": "url_count_top",
-            "generic_seconds": 2e-06,
-            "specialized_seconds": 2e-06,
-            "ratio": 1.262,
-            "equal": true
-          },
-          {
-            "kind": "url_count_top",
-            "generic_seconds": 2e-06,
-            "specialized_seconds": 2e-06,
-            "ratio": 1.0,
-            "equal": true
-          }
-        ],
-        [
-          {
-            "kind": "one_url_count_top",
-            "generic_seconds": 2e-06,
-            "specialized_seconds": 2e-06,
-            "ratio": 1.143,
-            "equal": true
-          },
-          {
-            "kind": "one_url_count_top",
-            "generic_seconds": 2e-06,
-            "specialized_seconds": 2e-06,
-            "ratio": 0.975,
-            "equal": true
-          },
-          {
-            "kind": "one_url_count_top",
-            "generic_seconds": 2e-06,
-            "specialized_seconds": 2e-06,
-            "ratio": 0.974,
-            "equal": true
-          }
-        ],
-        [
-          {
-            "kind": "client_ip_top10",
-            "generic_seconds": 0.040414,
-            "specialized_seconds": 0.031429,
-            "ratio": 1.286,
-            "equal": true
-          },
-          {
-            "kind": "client_ip_top10",
-            "generic_seconds": 0.032012,
-            "specialized_seconds": 0.032341,
-            "ratio": 0.99,
-            "equal": true
-          },
-          {
-            "kind": "client_ip_top10",
-            "generic_seconds": 0.032447,
-            "specialized_seconds": 0.031736,
-            "ratio": 1.022,
-            "equal": true
-          }
-        ],
-        [
-          {
-            "kind": "url_count_top_filtered_dashboard",
-            "generic_seconds": 0.729646,
-            "specialized_seconds": 0.013362,
-            "ratio": 54.606,
-            "equal": true
-          },
-          {
-            "kind": "url_count_top_filtered_dashboard",
-            "generic_seconds": 0.012739,
-            "specialized_seconds": 0.012288,
-            "ratio": 1.037,
-            "equal": true
-          },
-          {
-            "kind": "url_count_top_filtered_dashboard",
-            "generic_seconds": 0.012581,
-            "specialized_seconds": 0.012414,
-            "ratio": 1.013,
-            "equal": true
-          }
-        ],
-        [
-          {
-            "kind": "title_count_top_filtered_dashboard",
-            "generic_seconds": 1.15956,
-            "specialized_seconds": 0.007183,
-            "ratio": 161.435,
-            "equal": true
-          },
-          {
-            "kind": "title_count_top_filtered_dashboard",
-            "generic_seconds": 1.132825,
-            "specialized_seconds": 0.005799,
-            "ratio": 195.359,
-            "equal": true
-          },
-          {
-            "kind": "title_count_top_filtered_dashboard",
-            "generic_seconds": 1.171461,
-            "specialized_seconds": 0.005691,
-            "ratio": 205.829,
-            "equal": true
-          }
-        ],
-        [
-          {
-            "kind": "url_count_top_filtered_offset_dashboard",
-            "generic_seconds": 0.707098,
-            "specialized_seconds": 0.003893,
-            "ratio": 181.616,
-            "equal": true
-          },
-          {
-            "kind": "url_count_top_filtered_offset_dashboard",
-            "generic_seconds": 0.003602,
-            "specialized_seconds": 0.003581,
-            "ratio": 1.006,
-            "equal": true
-          },
-          {
-            "kind": "url_count_top_filtered_offset_dashboard",
-            "generic_seconds": 0.00359,
-            "specialized_seconds": 0.003497,
-            "ratio": 1.026,
-            "equal": true
-          }
-        ],
-        [
-          {
-            "kind": "traffic_source_dashboard",
-            "generic_seconds": 2.087028,
-            "specialized_seconds": 0.119875,
-            "ratio": 17.41,
-            "equal": true
-          },
-          {
-            "kind": "traffic_source_dashboard",
-            "generic_seconds": 0.120051,
-            "specialized_seconds": 0.120399,
-            "ratio": 0.997,
-            "equal": true
-          },
-          {
-            "kind": "traffic_source_dashboard",
-            "generic_seconds": 0.120667,
-            "specialized_seconds": 0.120655,
-            "ratio": 1.0,
-            "equal": true
-          }
-        ],
-        [
-          {
-            "kind": "url_hash_date_dashboard",
-            "generic_seconds": 0.007947,
-            "specialized_seconds": 0.007688,
-            "ratio": 1.034,
-            "equal": true
-          },
-          {
-            "kind": "url_hash_date_dashboard",
-            "generic_seconds": 0.007588,
-            "specialized_seconds": 0.00765,
-            "ratio": 0.992,
-            "equal": true
-          },
-          {
-            "kind": "url_hash_date_dashboard",
-            "generic_seconds": 0.007735,
-            "specialized_seconds": 0.007586,
-            "ratio": 1.02,
-            "equal": true
-          }
-        ],
-        [
-          {
-            "kind": "window_size_dashboard",
-            "generic_seconds": 0.010595,
-            "specialized_seconds": 0.00467,
-            "ratio": 2.269,
-            "equal": true
-          },
-          {
-            "kind": "window_size_dashboard",
-            "generic_seconds": 0.004496,
-            "specialized_seconds": 0.004422,
-            "ratio": 1.017,
-            "equal": true
-          },
-          {
-            "kind": "window_size_dashboard",
-            "generic_seconds": 0.004444,
-            "specialized_seconds": 0.004439,
-            "ratio": 1.001,
-            "equal": true
-          }
-        ],
-        [
-          {
-            "kind": "time_bucket_dashboard",
-            "generic_seconds": 0.003367,
-            "specialized_seconds": 0.003247,
-            "ratio": 1.037,
-            "equal": true
-          },
-          {
-            "kind": "time_bucket_dashboard",
-            "generic_seconds": 0.003166,
-            "specialized_seconds": 0.003185,
-            "ratio": 0.994,
-            "equal": true
-          },
-          {
-            "kind": "time_bucket_dashboard",
-            "generic_seconds": 0.003138,
-            "specialized_seconds": 0.003133,
-            "ratio": 1.002,
-            "equal": true
-          }
-        ]
-      ],
-      "warm_best_generic_sum": 2.405235,
-      "warm_best_specialized_sum": 1.274084,
-      "all_equal": true
-    }
+    "warm_best_from_rows": 1.2635150000000002
   },
   "runs": [
     {
       "run": 1,
       "import": {
-        "wall_seconds": 8.19,
-        "total_seconds": 8.180414,
+        "wall_seconds": 8.69,
+        "total_seconds": 6.983359,
         "rss_bytes": 0
       },
       "query": {
         "queries": 43,
         "nulls": 0,
-        "first_sum": 9.569216,
-        "warm_best_sum": 3.675167,
-        "all_runs_sum": 16.981191,
+        "first_sum": 7.313012,
+        "warm_best_sum": 1.373974,
+        "all_runs_sum": 10.084591,
         "timings": [
           [
-            0.001327,
-            2.2e-05,
-            1.7e-05
+            4.1e-05,
+            1.2e-05,
+            9e-06
           ],
           [
-            0.025724,
-            0.00066,
-            0.000642
+            0.030795,
+            0.00036,
+            0.000333
           ],
           [
-            0.025469,
-            0.001033,
-            0.000994
+            0.028856,
+            0.000587,
+            0.000537
           ],
           [
-            0.105004,
-            0.002147,
-            0.00211
+            0.125444,
+            0.001145,
+            0.001067
           ],
           [
-            0.062591,
-            0.022675,
-            0.022574
+            0.059945,
+            0.010811,
+            0.010734
           ],
           [
-            0.050828,
-            0.014654,
-            0.014557
+            0.00891,
+            0.007159,
+            0.007105
           ],
           [
-            0.051042,
-            0.001094,
-            0.000971
-          ],
-          [
-            0.006427,
-            0.006302,
-            0.0063
-          ],
-          [
-            0.112037,
-            0.062603,
-            0.061666
-          ],
-          [
-            0.061148,
-            0.060871,
-            0.061471
-          ],
-          [
-            0.02419,
-            0.015139,
-            0.015462
-          ],
-          [
-            0.034531,
-            0.018698,
-            0.018544
-          ],
-          [
-            0.039723,
-            0.037611,
-            0.037433
-          ],
-          [
-            0.07796,
-            0.077059,
-            0.076451
-          ],
-          [
-            0.157719,
-            0.115127,
-            0.099503
-          ],
-          [
-            0.052947,
-            0.035567,
-            0.035781
-          ],
-          [
-            0.119208,
-            0.087675,
-            0.081061
-          ],
-          [
-            1.7e-05,
-            7e-06,
-            5e-06
-          ],
-          [
-            0.57055,
-            0.331787,
-            0.331856
-          ],
-          [
-            0.005087,
-            0.005056,
-            0.00506
-          ],
-          [
-            0.017983,
-            0.005793,
-            0.005683
-          ],
-          [
-            0.001562,
-            4.4e-05,
-            3.8e-05
-          ],
-          [
-            0.001974,
-            0.000849,
-            0.000834
-          ],
-          [
-            0.773103,
-            0.638325,
-            0.647175
-          ],
-          [
-            0.130143,
-            0.038317,
-            0.038608
-          ],
-          [
-            0.152648,
-            0.072174,
-            0.071547
-          ],
-          [
-            0.038299,
-            0.03823,
-            0.038566
-          ],
-          [
-            0.257108,
-            0.17528,
-            0.175249
-          ],
-          [
-            0.000134,
-            5.2e-05,
-            4.7e-05
-          ],
-          [
-            0.000605,
+            0.037136,
             0.000528,
-            0.000495
+            0.000481
           ],
           [
-            0.122411,
-            0.074166,
-            0.074439
+            0.003119,
+            0.003052,
+            0.003256
           ],
           [
-            0.000782,
-            8e-06,
-            6e-06
+            0.065627,
+            0.029866,
+            0.029984
           ],
           [
-            0.398616,
-            0.263155,
-            0.261877
+            0.029806,
+            0.029383,
+            0.029425
           ],
           [
-            1.199305,
-            1.1e-05,
-            6e-06
+            0.008545,
+            0.007713,
+            0.007388
           ],
           [
-            6e-06,
-            5e-06,
-            5e-06
+            0.022038,
+            0.009082,
+            0.009343
           ],
           [
-            0.061347,
-            0.073941,
-            0.060883
+            0.019184,
+            0.019026,
+            0.019027
           ],
           [
-            0.729372,
-            0.025603,
-            0.024959
+            0.034439,
+            0.034198,
+            0.034406
           ],
           [
-            1.364091,
-            1.135542,
-            1.142981
+            0.081229,
+            0.043706,
+            0.04503
           ],
           [
-            0.72604,
-            0.007106,
-            0.006994
+            0.018499,
+            0.017387,
+            0.017707
           ],
           [
-            1.974204,
-            0.242653,
-            0.24007
+            0.062154,
+            0.038543,
+            0.037446
           ],
           [
-            0.015435,
-            0.015453,
-            0.015361
+            7e-06,
+            1e-06,
+            1e-06
           ],
           [
-            0.013684,
-            0.008987,
-            0.008956
+            0.252341,
+            0.161763,
+            0.174271
           ],
           [
-            0.006833,
-            0.0064,
-            0.006333
+            0.002948,
+            0.002941,
+            0.002937
+          ],
+          [
+            0.01683,
+            0.003222,
+            0.003275
+          ],
+          [
+            0.001418,
+            3.7e-05,
+            2.4e-05
+          ],
+          [
+            0.001259,
+            0.000484,
+            0.000472
+          ],
+          [
+            0.346895,
+            0.333042,
+            0.334823
+          ],
+          [
+            0.132304,
+            0.023565,
+            0.023005
+          ],
+          [
+            0.117731,
+            0.036691,
+            0.036933
+          ],
+          [
+            0.019765,
+            0.019053,
+            0.018994
+          ],
+          [
+            0.185512,
+            0.09734,
+            0.097356
+          ],
+          [
+            9e-05,
+            2.5e-05,
+            2.2e-05
+          ],
+          [
+            0.0003,
+            0.000266,
+            0.00025
+          ],
+          [
+            0.096871,
+            0.036549,
+            0.037537
+          ],
+          [
+            0.00067,
+            3e-06,
+            2e-06
+          ],
+          [
+            0.300861,
+            0.19384,
+            0.194938
+          ],
+          [
+            1.366343,
+            3e-06,
+            1e-06
+          ],
+          [
+            2e-06,
+            1e-06,
+            1e-06
+          ],
+          [
+            0.03216,
+            0.032008,
+            0.032765
+          ],
+          [
+            0.900812,
+            0.0151,
+            0.015865
+          ],
+          [
+            0.007416,
+            0.00719,
+            0.007138
+          ],
+          [
+            0.864018,
+            0.004601,
+            0.004347
+          ],
+          [
+            2.002625,
+            0.138652,
+            0.138582
+          ],
+          [
+            0.009043,
+            0.008982,
+            0.008965
+          ],
+          [
+            0.015131,
+            0.005277,
+            0.005221
+          ],
+          [
+            0.003894,
+            0.003725,
+            0.003658
           ]
         ],
-        "warm_best_from_rows": 3.675171,
-        "compare": {
-          "repeats_per_query": 3,
-          "timings": [
-            [
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.000744,
-                "specialized_seconds": 1.5e-05,
-                "ratio": 49.896,
-                "equal": true
-              },
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 1e-06,
-                "specialized_seconds": 1.6e-05,
-                "ratio": 0.032,
-                "equal": true
-              },
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.0,
-                "specialized_seconds": 1.2e-05,
-                "ratio": 0.021,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.025366,
-                "specialized_seconds": 0.00033,
-                "ratio": 76.866,
-                "equal": true
-              },
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.000335,
-                "specialized_seconds": 0.000314,
-                "ratio": 1.069,
-                "equal": true
-              },
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.000313,
-                "specialized_seconds": 0.000323,
-                "ratio": 0.967,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.024831,
-                "specialized_seconds": 0.000614,
-                "ratio": 40.423,
-                "equal": true
-              },
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.000527,
-                "specialized_seconds": 0.000494,
-                "ratio": 1.066,
-                "equal": true
-              },
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.000492,
-                "specialized_seconds": 0.000494,
-                "ratio": 0.995,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.10379,
-                "specialized_seconds": 0.001188,
-                "ratio": 87.332,
-                "equal": true
-              },
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.001076,
-                "specialized_seconds": 0.001057,
-                "ratio": 1.018,
-                "equal": true
-              },
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.001045,
-                "specialized_seconds": 0.001055,
-                "ratio": 0.99,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.05145,
-                "specialized_seconds": 0.011123,
-                "ratio": 4.626,
-                "equal": true
-              },
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.011359,
-                "specialized_seconds": 0.011297,
-                "ratio": 1.005,
-                "equal": true
-              },
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.011321,
-                "specialized_seconds": 0.011236,
-                "ratio": 1.008,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "count_distinct_search_phrase",
-                "generic_seconds": 0.043485,
-                "specialized_seconds": 0.00732,
-                "ratio": 5.941,
-                "equal": true
-              },
-              {
-                "kind": "count_distinct_search_phrase",
-                "generic_seconds": 0.007283,
-                "specialized_seconds": 0.007349,
-                "ratio": 0.991,
-                "equal": true
-              },
-              {
-                "kind": "count_distinct_search_phrase",
-                "generic_seconds": 0.007267,
-                "specialized_seconds": 0.007275,
-                "ratio": 0.999,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.050416,
-                "specialized_seconds": 0.000606,
-                "ratio": 83.257,
-                "equal": true
-              },
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.000551,
-                "specialized_seconds": 0.00053,
-                "ratio": 1.039,
-                "equal": true
-              },
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.000485,
-                "specialized_seconds": 0.000478,
-                "ratio": 1.014,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.003101,
-                "specialized_seconds": 0.003307,
-                "ratio": 0.938,
-                "equal": true
-              },
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.003076,
-                "specialized_seconds": 0.003216,
-                "ratio": 0.956,
-                "equal": true
-              },
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.003168,
-                "specialized_seconds": 0.003122,
-                "ratio": 1.015,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.081132,
-                "specialized_seconds": 0.030871,
-                "ratio": 2.628,
-                "equal": true
-              },
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.031361,
-                "specialized_seconds": 0.031212,
-                "ratio": 1.005,
-                "equal": true
-              },
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.030794,
-                "specialized_seconds": 0.030843,
-                "ratio": 0.998,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.030857,
-                "specialized_seconds": 0.030265,
-                "ratio": 1.02,
-                "equal": true
-              },
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.030543,
-                "specialized_seconds": 0.030299,
-                "ratio": 1.008,
-                "equal": true
-              },
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.030696,
-                "specialized_seconds": 0.030748,
-                "ratio": 0.998,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "mobile_phone_model_distinct_user_id_top",
-                "generic_seconds": 0.016715,
-                "specialized_seconds": 0.007451,
-                "ratio": 2.243,
-                "equal": true
-              },
-              {
-                "kind": "mobile_phone_model_distinct_user_id_top",
-                "generic_seconds": 0.007396,
-                "specialized_seconds": 0.007718,
-                "ratio": 0.958,
-                "equal": true
-              },
-              {
-                "kind": "mobile_phone_model_distinct_user_id_top",
-                "generic_seconds": 0.007412,
-                "specialized_seconds": 0.008013,
-                "ratio": 0.925,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "mobile_phone_distinct_user_id_top",
-                "generic_seconds": 0.025184,
-                "specialized_seconds": 0.009322,
-                "ratio": 2.702,
-                "equal": true
-              },
-              {
-                "kind": "mobile_phone_distinct_user_id_top",
-                "generic_seconds": 0.009285,
-                "specialized_seconds": 0.009387,
-                "ratio": 0.989,
-                "equal": true
-              },
-              {
-                "kind": "mobile_phone_distinct_user_id_top",
-                "generic_seconds": 0.009197,
-                "specialized_seconds": 0.009322,
-                "ratio": 0.987,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "search_phrase_count_top",
-                "generic_seconds": 0.020755,
-                "specialized_seconds": 0.018949,
-                "ratio": 1.095,
-                "equal": true
-              },
-              {
-                "kind": "search_phrase_count_top",
-                "generic_seconds": 0.018847,
-                "specialized_seconds": 0.018743,
-                "ratio": 1.006,
-                "equal": true
-              },
-              {
-                "kind": "search_phrase_count_top",
-                "generic_seconds": 0.018749,
-                "specialized_seconds": 0.018666,
-                "ratio": 1.004,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "search_phrase_distinct_user_id_top",
-                "generic_seconds": 0.039294,
-                "specialized_seconds": 0.038643,
-                "ratio": 1.017,
-                "equal": true
-              },
-              {
-                "kind": "search_phrase_distinct_user_id_top",
-                "generic_seconds": 0.038406,
-                "specialized_seconds": 0.038627,
-                "ratio": 0.994,
-                "equal": true
-              },
-              {
-                "kind": "search_phrase_distinct_user_id_top",
-                "generic_seconds": 0.037933,
-                "specialized_seconds": 0.038493,
-                "ratio": 0.985,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "search_engine_phrase_count_top",
-                "generic_seconds": 0.097929,
-                "specialized_seconds": 0.059752,
-                "ratio": 1.639,
-                "equal": true
-              },
-              {
-                "kind": "search_engine_phrase_count_top",
-                "generic_seconds": 0.063078,
-                "specialized_seconds": 0.052015,
-                "ratio": 1.213,
-                "equal": true
-              },
-              {
-                "kind": "search_engine_phrase_count_top",
-                "generic_seconds": 0.050239,
-                "specialized_seconds": 0.04923,
-                "ratio": 1.02,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.034997,
-                "specialized_seconds": 0.017927,
-                "ratio": 1.952,
-                "equal": true
-              },
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.017668,
-                "specialized_seconds": 0.01788,
-                "ratio": 0.988,
-                "equal": true
-              },
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.017945,
-                "specialized_seconds": 0.017818,
-                "ratio": 1.007,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "user_id_search_phrase_count_top",
-                "generic_seconds": 0.081117,
-                "specialized_seconds": 0.038057,
-                "ratio": 2.131,
-                "equal": true
-              },
-              {
-                "kind": "user_id_search_phrase_count_top",
-                "generic_seconds": 0.038006,
-                "specialized_seconds": 0.049635,
-                "ratio": 0.766,
-                "equal": true
-              },
-              {
-                "kind": "user_id_search_phrase_count_top",
-                "generic_seconds": 0.041335,
-                "specialized_seconds": 0.03969,
-                "ratio": 1.041,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "user_id_search_phrase_limit_no_order",
-                "generic_seconds": 3e-06,
-                "specialized_seconds": 7e-06,
-                "ratio": 0.481,
-                "equal": true
-              },
-              {
-                "kind": "user_id_search_phrase_limit_no_order",
-                "generic_seconds": 3e-06,
-                "specialized_seconds": 1e-06,
-                "ratio": 2.696,
-                "equal": true
-              },
-              {
-                "kind": "user_id_search_phrase_limit_no_order",
-                "generic_seconds": 1e-06,
-                "specialized_seconds": 1e-06,
-                "ratio": 1.053,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "user_id_minute_search_phrase_count_top",
-                "generic_seconds": 0.400193,
-                "specialized_seconds": 0.170323,
-                "ratio": 2.35,
-                "equal": true
-              },
-              {
-                "kind": "user_id_minute_search_phrase_count_top",
-                "generic_seconds": 0.166337,
-                "specialized_seconds": 0.165413,
-                "ratio": 1.006,
-                "equal": true
-              },
-              {
-                "kind": "user_id_minute_search_phrase_count_top",
-                "generic_seconds": 0.165882,
-                "specialized_seconds": 0.165938,
-                "ratio": 1.0,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.002532,
-                "specialized_seconds": 0.002538,
-                "ratio": 0.998,
-                "equal": true
-              },
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.002497,
-                "specialized_seconds": 0.00255,
-                "ratio": 0.979,
-                "equal": true
-              },
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.002491,
-                "specialized_seconds": 0.002562,
-                "ratio": 0.972,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "count_url_like_google",
-                "generic_seconds": 0.015144,
-                "specialized_seconds": 0.002822,
-                "ratio": 5.367,
-                "equal": true
-              },
-              {
-                "kind": "count_url_like_google",
-                "generic_seconds": 0.002876,
-                "specialized_seconds": 0.002892,
-                "ratio": 0.995,
-                "equal": true
-              },
-              {
-                "kind": "count_url_like_google",
-                "generic_seconds": 0.002845,
-                "specialized_seconds": 0.002828,
-                "ratio": 1.006,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "search_phrase_min_url_google",
-                "generic_seconds": 0.001517,
-                "specialized_seconds": 3.5e-05,
-                "ratio": 43.24,
-                "equal": true
-              },
-              {
-                "kind": "search_phrase_min_url_google",
-                "generic_seconds": 2e-05,
-                "specialized_seconds": 1.7e-05,
-                "ratio": 1.182,
-                "equal": true
-              },
-              {
-                "kind": "search_phrase_min_url_google",
-                "generic_seconds": 1.9e-05,
-                "specialized_seconds": 1.5e-05,
-                "ratio": 1.301,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "search_phrase_title_google_top",
-                "generic_seconds": 0.001531,
-                "specialized_seconds": 0.000437,
-                "ratio": 3.504,
-                "equal": true
-              },
-              {
-                "kind": "search_phrase_title_google_top",
-                "generic_seconds": 0.000427,
-                "specialized_seconds": 0.000416,
-                "ratio": 1.028,
-                "equal": true
-              },
-              {
-                "kind": "search_phrase_title_google_top",
-                "generic_seconds": 0.000421,
-                "specialized_seconds": 0.000407,
-                "ratio": 1.035,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "url_like_google_order_by_event_time",
-                "generic_seconds": 0.45227,
-                "specialized_seconds": 0.320808,
-                "ratio": 1.41,
-                "equal": true
-              },
-              {
-                "kind": "url_like_google_order_by_event_time",
-                "generic_seconds": 0.319552,
-                "specialized_seconds": 0.318745,
-                "ratio": 1.003,
-                "equal": true
-              },
-              {
-                "kind": "url_like_google_order_by_event_time",
-                "generic_seconds": 0.326393,
-                "specialized_seconds": 0.320751,
-                "ratio": 1.018,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "search_phrase_event_time_top",
-                "generic_seconds": 0.111146,
-                "specialized_seconds": 0.018965,
-                "ratio": 5.861,
-                "equal": true
-              },
-              {
-                "kind": "search_phrase_event_time_top",
-                "generic_seconds": 0.019224,
-                "specialized_seconds": 0.019068,
-                "ratio": 1.008,
-                "equal": true
-              },
-              {
-                "kind": "search_phrase_event_time_top",
-                "generic_seconds": 0.019272,
-                "specialized_seconds": 0.019316,
-                "ratio": 0.998,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "search_phrase_order_by_phrase_top",
-                "generic_seconds": 0.11389,
-                "specialized_seconds": 0.038727,
-                "ratio": 2.941,
-                "equal": true
-              },
-              {
-                "kind": "search_phrase_order_by_phrase_top",
-                "generic_seconds": 0.036346,
-                "specialized_seconds": 0.035796,
-                "ratio": 1.015,
-                "equal": true
-              },
-              {
-                "kind": "search_phrase_order_by_phrase_top",
-                "generic_seconds": 0.035925,
-                "specialized_seconds": 0.0356,
-                "ratio": 1.009,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "search_phrase_event_time_phrase_top",
-                "generic_seconds": 0.019314,
-                "specialized_seconds": 0.018962,
-                "ratio": 1.019,
-                "equal": true
-              },
-              {
-                "kind": "search_phrase_event_time_phrase_top",
-                "generic_seconds": 0.019172,
-                "specialized_seconds": 0.019036,
-                "ratio": 1.007,
-                "equal": true
-              },
-              {
-                "kind": "search_phrase_event_time_phrase_top",
-                "generic_seconds": 0.019382,
-                "specialized_seconds": 0.019164,
-                "ratio": 1.011,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "url_length_by_counter",
-                "generic_seconds": 0.16925,
-                "specialized_seconds": 0.087827,
-                "ratio": 1.927,
-                "equal": true
-              },
-              {
-                "kind": "url_length_by_counter",
-                "generic_seconds": 0.087643,
-                "specialized_seconds": 0.087601,
-                "ratio": 1.0,
-                "equal": true
-              },
-              {
-                "kind": "url_length_by_counter",
-                "generic_seconds": 0.087532,
-                "specialized_seconds": 0.087685,
-                "ratio": 0.998,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "referer_domain_stats_top",
-                "generic_seconds": 9.1e-05,
-                "specialized_seconds": 3.4e-05,
-                "ratio": 2.672,
-                "equal": true
-              },
-              {
-                "kind": "referer_domain_stats_top",
-                "generic_seconds": 2.2e-05,
-                "specialized_seconds": 2.5e-05,
-                "ratio": 0.889,
-                "equal": true
-              },
-              {
-                "kind": "referer_domain_stats_top",
-                "generic_seconds": 2.2e-05,
-                "specialized_seconds": 2.1e-05,
-                "ratio": 1.048,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.000314,
-                "specialized_seconds": 0.000279,
-                "ratio": 1.122,
-                "equal": true
-              },
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.000266,
-                "specialized_seconds": 0.00025,
-                "ratio": 1.062,
-                "equal": true
-              },
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.000242,
-                "specialized_seconds": 0.000241,
-                "ratio": 1.006,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "search_engine_client_ip_agg_top",
-                "generic_seconds": 0.085374,
-                "specialized_seconds": 0.037003,
-                "ratio": 2.307,
-                "equal": true
-              },
-              {
-                "kind": "search_engine_client_ip_agg_top",
-                "generic_seconds": 0.03779,
-                "specialized_seconds": 0.036348,
-                "ratio": 1.04,
-                "equal": true
-              },
-              {
-                "kind": "search_engine_client_ip_agg_top",
-                "generic_seconds": 0.037521,
-                "specialized_seconds": 0.036888,
-                "ratio": 1.017,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "watch_id_client_ip_agg_top_filtered",
-                "generic_seconds": 0.00075,
-                "specialized_seconds": 2e-06,
-                "ratio": 359.905,
-                "equal": true
-              },
-              {
-                "kind": "watch_id_client_ip_agg_top_filtered",
-                "generic_seconds": 1e-06,
-                "specialized_seconds": 1e-06,
-                "ratio": 1.001,
-                "equal": true
-              },
-              {
-                "kind": "watch_id_client_ip_agg_top_filtered",
-                "generic_seconds": 1e-06,
-                "specialized_seconds": 1e-06,
-                "ratio": 0.896,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "watch_id_client_ip_agg_top",
-                "generic_seconds": 0.266675,
-                "specialized_seconds": 0.131661,
-                "ratio": 2.025,
-                "equal": true
-              },
-              {
-                "kind": "watch_id_client_ip_agg_top",
-                "generic_seconds": 0.132111,
-                "specialized_seconds": 0.131009,
-                "ratio": 1.008,
-                "equal": true
-              },
-              {
-                "kind": "watch_id_client_ip_agg_top",
-                "generic_seconds": 0.130936,
-                "specialized_seconds": 0.130908,
-                "ratio": 1.0,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "url_count_top",
-                "generic_seconds": 1.19927,
-                "specialized_seconds": 2e-06,
-                "ratio": 533008.852,
-                "equal": true
-              },
-              {
-                "kind": "url_count_top",
-                "generic_seconds": 1e-06,
-                "specialized_seconds": 1e-06,
-                "ratio": 1.556,
-                "equal": true
-              },
-              {
-                "kind": "url_count_top",
-                "generic_seconds": 1e-06,
-                "specialized_seconds": 1e-06,
-                "ratio": 0.941,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "one_url_count_top",
-                "generic_seconds": 1e-06,
-                "specialized_seconds": 1e-06,
-                "ratio": 1.3,
-                "equal": true
-              },
-              {
-                "kind": "one_url_count_top",
-                "generic_seconds": 1e-06,
-                "specialized_seconds": 1e-06,
-                "ratio": 0.999,
-                "equal": true
-              },
-              {
-                "kind": "one_url_count_top",
-                "generic_seconds": 1e-06,
-                "specialized_seconds": 1e-06,
-                "ratio": 1.0,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "client_ip_top10",
-                "generic_seconds": 0.031175,
-                "specialized_seconds": 0.030137,
-                "ratio": 1.034,
-                "equal": true
-              },
-              {
-                "kind": "client_ip_top10",
-                "generic_seconds": 0.031376,
-                "specialized_seconds": 0.042531,
-                "ratio": 0.738,
-                "equal": true
-              },
-              {
-                "kind": "client_ip_top10",
-                "generic_seconds": 0.029879,
-                "specialized_seconds": 0.030975,
-                "ratio": 0.965,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "url_count_top_filtered_dashboard",
-                "generic_seconds": 0.71631,
-                "specialized_seconds": 0.013025,
-                "ratio": 54.996,
-                "equal": true
-              },
-              {
-                "kind": "url_count_top_filtered_dashboard",
-                "generic_seconds": 0.01265,
-                "specialized_seconds": 0.012928,
-                "ratio": 0.978,
-                "equal": true
-              },
-              {
-                "kind": "url_count_top_filtered_dashboard",
-                "generic_seconds": 0.012455,
-                "specialized_seconds": 0.012485,
-                "ratio": 0.998,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "title_count_top_filtered_dashboard",
-                "generic_seconds": 1.35737,
-                "specialized_seconds": 0.006698,
-                "ratio": 202.654,
-                "equal": true
-              },
-              {
-                "kind": "title_count_top_filtered_dashboard",
-                "generic_seconds": 1.129726,
-                "specialized_seconds": 0.005783,
-                "ratio": 195.356,
-                "equal": true
-              },
-              {
-                "kind": "title_count_top_filtered_dashboard",
-                "generic_seconds": 1.13693,
-                "specialized_seconds": 0.005758,
-                "ratio": 197.449,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "url_count_top_filtered_offset_dashboard",
-                "generic_seconds": 0.722046,
-                "specialized_seconds": 0.003968,
-                "ratio": 181.975,
-                "equal": true
-              },
-              {
-                "kind": "url_count_top_filtered_offset_dashboard",
-                "generic_seconds": 0.003575,
-                "specialized_seconds": 0.003516,
-                "ratio": 1.017,
-                "equal": true
-              },
-              {
-                "kind": "url_count_top_filtered_offset_dashboard",
-                "generic_seconds": 0.00349,
-                "specialized_seconds": 0.00349,
-                "ratio": 1.0,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "traffic_source_dashboard",
-                "generic_seconds": 1.849496,
-                "specialized_seconds": 0.124674,
-                "ratio": 14.835,
-                "equal": true
-              },
-              {
-                "kind": "traffic_source_dashboard",
-                "generic_seconds": 0.120691,
-                "specialized_seconds": 0.121928,
-                "ratio": 0.99,
-                "equal": true
-              },
-              {
-                "kind": "traffic_source_dashboard",
-                "generic_seconds": 0.120607,
-                "specialized_seconds": 0.119425,
-                "ratio": 1.01,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "url_hash_date_dashboard",
-                "generic_seconds": 0.00779,
-                "specialized_seconds": 0.007623,
-                "ratio": 1.022,
-                "equal": true
-              },
-              {
-                "kind": "url_hash_date_dashboard",
-                "generic_seconds": 0.0077,
-                "specialized_seconds": 0.007735,
-                "ratio": 0.995,
-                "equal": true
-              },
-              {
-                "kind": "url_hash_date_dashboard",
-                "generic_seconds": 0.007722,
-                "specialized_seconds": 0.007625,
-                "ratio": 1.013,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "window_size_dashboard",
-                "generic_seconds": 0.009114,
-                "specialized_seconds": 0.004552,
-                "ratio": 2.002,
-                "equal": true
-              },
-              {
-                "kind": "window_size_dashboard",
-                "generic_seconds": 0.004517,
-                "specialized_seconds": 0.004453,
-                "ratio": 1.014,
-                "equal": true
-              },
-              {
-                "kind": "window_size_dashboard",
-                "generic_seconds": 0.004448,
-                "specialized_seconds": 0.004496,
-                "ratio": 0.989,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "time_bucket_dashboard",
-                "generic_seconds": 0.003348,
-                "specialized_seconds": 0.003476,
-                "ratio": 0.963,
-                "equal": true
-              },
-              {
-                "kind": "time_bucket_dashboard",
-                "generic_seconds": 0.003222,
-                "specialized_seconds": 0.00317,
-                "ratio": 1.016,
-                "equal": true
-              },
-              {
-                "kind": "time_bucket_dashboard",
-                "generic_seconds": 0.003135,
-                "specialized_seconds": 0.003188,
-                "ratio": 0.983,
-                "equal": true
-              }
-            ]
-          ],
-          "warm_best_generic_sum": 2.397752,
-          "warm_best_specialized_sum": 1.2691489999999996,
-          "all_equal": true
-        }
+        "warm_best_from_rows": 1.3739749999999997
       }
     },
     {
       "run": 2,
       "import": {
-        "wall_seconds": 6.84,
-        "total_seconds": 6.840309,
+        "wall_seconds": 7.81,
+        "total_seconds": 7.810519,
         "rss_bytes": 0
       },
       "query": {
         "queries": 43,
         "nulls": 0,
-        "first_sum": 9.013144,
-        "warm_best_sum": 3.69502,
-        "all_runs_sum": 16.502065,
+        "first_sum": 6.389979,
+        "warm_best_sum": 1.254206,
+        "all_runs_sum": 8.915068,
         "timings": [
           [
-            0.003121,
-            1.7e-05,
-            1.5e-05
+            2.7e-05,
+            1.4e-05,
+            1e-05
           ],
           [
-            0.001613,
-            0.000684,
-            0.00069
+            0.031834,
+            0.000321,
+            0.000313
           ],
           [
-            0.002012,
-            0.001053,
-            0.000991
+            0.028763,
+            0.000578,
+            0.000523
           ],
           [
-            0.006334,
-            0.002266,
-            0.002467
+            0.105867,
+            0.001158,
+            0.00108
           ],
           [
-            0.024749,
-            0.022528,
-            0.02259
+            0.051106,
+            0.011082,
+            0.010815
           ],
           [
-            0.016997,
-            0.014718,
-            0.014586
+            0.008908,
+            0.007181,
+            0.007214
           ],
           [
-            0.003141,
-            0.001086,
-            0.001001
+            0.035922,
+            0.000533,
+            0.00051
           ],
           [
-            0.006678,
-            0.006588,
-            0.006739
+            0.003116,
+            0.003164,
+            0.003096
           ],
           [
-            0.063987,
-            0.065024,
-            0.064198
+            0.059881,
+            0.030264,
+            0.030261
           ],
           [
-            0.061892,
-            0.061764,
-            0.061337
+            0.030111,
+            0.029881,
+            0.029916
           ],
           [
-            0.016186,
-            0.015262,
-            0.015148
+            0.008751,
+            0.007609,
+            0.007562
           ],
           [
-            0.020849,
-            0.018266,
-            0.018443
+            0.022501,
+            0.009159,
+            0.009349
           ],
           [
-            0.039372,
-            0.03857,
-            0.038287
+            0.019308,
+            0.019228,
+            0.019131
           ],
           [
-            0.077446,
-            0.076902,
-            0.075761
+            0.034984,
+            0.034992,
+            0.034466
           ],
           [
-            0.106243,
-            0.097628,
-            0.098887
+            0.071839,
+            0.046021,
+            0.046758
           ],
           [
-            0.037144,
-            0.036176,
-            0.036243
+            0.018502,
+            0.017512,
+            0.017435
           ],
           [
-            0.102198,
-            0.076672,
-            0.075737
+            0.065704,
+            0.038098,
+            0.038529
           ],
           [
-            1.1e-05,
-            1.2e-05,
-            5e-06
+            9e-06,
+            2e-06,
+            2e-06
           ],
           [
-            0.454491,
-            0.352065,
-            0.333998
+            0.331785,
+            0.161933,
+            0.16646
           ],
           [
-            0.005065,
-            0.00511,
-            0.005094
+            0.002639,
+            0.002629,
+            0.00264
           ],
           [
-            0.019055,
-            0.005742,
-            0.005678
+            0.022076,
+            0.002855,
+            0.002848
           ],
           [
-            0.001629,
-            5.9e-05,
-            4.5e-05
+            0.001335,
+            3.1e-05,
+            2.2e-05
           ],
           [
-            0.001671,
-            0.000859,
-            0.000835
+            0.001157,
+            0.000425,
+            0.000433
           ],
           [
-            0.665026,
-            0.649315,
-            0.642233
+            0.321172,
+            0.316969,
+            0.317148
           ],
           [
-            0.130421,
-            0.03846,
-            0.037888
+            0.128499,
+            0.021519,
+            0.021657
           ],
           [
-            0.143478,
-            0.072939,
-            0.071375
+            0.114098,
+            0.038365,
+            0.035495
           ],
           [
-            0.03808,
-            0.038666,
-            0.037927
+            0.018761,
+            0.018276,
+            0.018206
           ],
           [
-            0.259149,
-            0.175725,
-            0.175417
+            0.169875,
+            0.087643,
+            0.087298
           ],
           [
-            0.000126,
-            4.9e-05,
-            4.3e-05
+            9.3e-05,
+            2.2e-05,
+            2e-05
           ],
           [
-            0.000611,
-            0.000524,
-            0.000483
+            0.000298,
+            0.00026,
+            0.00024
           ],
           [
-            0.126218,
-            0.077993,
-            0.10107
+            0.089617,
+            0.03748,
+            0.036296
           ],
           [
-            0.000686,
-            8e-06,
-            6e-06
+            0.000741,
+            1e-06,
+            1e-06
           ],
           [
-            0.42839,
-            0.270063,
-            0.268853
+            0.260514,
+            0.1309,
+            0.128146
           ],
           [
-            1.211816,
-            2.1e-05,
-            1.5e-05
+            1.166433,
+            3e-06,
+            1e-06
           ],
           [
-            1.5e-05,
-            1.3e-05,
-            1.3e-05
+            1e-06,
+            1e-06,
+            1e-06
           ],
           [
-            0.071885,
-            0.064394,
-            0.064226
+            0.031193,
+            0.029964,
+            0.029942
           ],
           [
-            0.743046,
-            0.025054,
-            0.025018
+            0.705856,
+            0.01274,
+            0.012386
           ],
           [
-            1.166776,
-            1.138652,
-            1.177425
+            0.005735,
+            0.005504,
+            0.005502
           ],
           [
-            0.711021,
-            0.007205,
-            0.007107
+            0.714885,
+            0.003856,
+            0.003628
           ],
           [
-            2.20694,
-            0.240486,
-            0.241368
+            1.685722,
+            0.121022,
+            0.119875
           ],
           [
-            0.01566,
-            0.015254,
-            0.015334
+            0.007793,
+            0.007742,
+            0.007729
           ],
           [
-            0.015292,
-            0.008931,
-            0.008902
+            0.009266,
+            0.00443,
+            0.004484
           ],
           [
-            0.006626,
-            0.006362,
-            0.006281
+            0.003301,
+            0.003174,
+            0.003121
           ]
         ],
-        "warm_best_from_rows": 3.6947840000000003,
-        "compare": {
-          "repeats_per_query": 3,
-          "timings": [
-            [
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.003084,
-                "specialized_seconds": 1.5e-05,
-                "ratio": 203.906,
-                "equal": true
-              },
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.0,
-                "specialized_seconds": 1.1e-05,
-                "ratio": 0.026,
-                "equal": true
-              },
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.0,
-                "specialized_seconds": 1e-05,
-                "ratio": 0.02,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.001272,
-                "specialized_seconds": 0.00033,
-                "ratio": 3.853,
-                "equal": true
-              },
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.000339,
-                "specialized_seconds": 0.000338,
-                "ratio": 1.004,
-                "equal": true
-              },
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.000334,
-                "specialized_seconds": 0.000351,
-                "ratio": 0.952,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.001456,
-                "specialized_seconds": 0.00054,
-                "ratio": 2.693,
-                "equal": true
-              },
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.000539,
-                "specialized_seconds": 0.000507,
-                "ratio": 1.061,
-                "equal": true
-              },
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.000488,
-                "specialized_seconds": 0.000495,
-                "ratio": 0.986,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.004971,
-                "specialized_seconds": 0.001341,
-                "ratio": 3.707,
-                "equal": true
-              },
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.001156,
-                "specialized_seconds": 0.001097,
-                "ratio": 1.054,
-                "equal": true
-              },
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.001332,
-                "specialized_seconds": 0.001122,
-                "ratio": 1.187,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.013206,
-                "specialized_seconds": 0.011512,
-                "ratio": 1.147,
-                "equal": true
-              },
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.011292,
-                "specialized_seconds": 0.01122,
-                "ratio": 1.006,
-                "equal": true
-              },
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.011284,
-                "specialized_seconds": 0.011293,
-                "ratio": 0.999,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "count_distinct_search_phrase",
-                "generic_seconds": 0.009271,
-                "specialized_seconds": 0.007695,
-                "ratio": 1.205,
-                "equal": true
-              },
-              {
-                "kind": "count_distinct_search_phrase",
-                "generic_seconds": 0.007321,
-                "specialized_seconds": 0.007373,
-                "ratio": 0.993,
-                "equal": true
-              },
-              {
-                "kind": "count_distinct_search_phrase",
-                "generic_seconds": 0.007257,
-                "specialized_seconds": 0.007314,
-                "ratio": 0.992,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.002584,
-                "specialized_seconds": 0.000538,
-                "ratio": 4.804,
-                "equal": true
-              },
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.000524,
-                "specialized_seconds": 0.00055,
-                "ratio": 0.953,
-                "equal": true
-              },
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.0005,
-                "specialized_seconds": 0.000494,
-                "ratio": 1.012,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.003385,
-                "specialized_seconds": 0.003277,
-                "ratio": 1.033,
-                "equal": true
-              },
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.003319,
-                "specialized_seconds": 0.003257,
-                "ratio": 1.019,
-                "equal": true
-              },
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.003489,
-                "specialized_seconds": 0.003242,
-                "ratio": 1.076,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.032493,
-                "specialized_seconds": 0.031468,
-                "ratio": 1.033,
-                "equal": true
-              },
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.031484,
-                "specialized_seconds": 0.033512,
-                "ratio": 0.939,
-                "equal": true
-              },
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.032544,
-                "specialized_seconds": 0.031618,
-                "ratio": 1.029,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.030854,
-                "specialized_seconds": 0.031007,
-                "ratio": 0.995,
-                "equal": true
-              },
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.030807,
-                "specialized_seconds": 0.03093,
-                "ratio": 0.996,
-                "equal": true
-              },
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.030613,
-                "specialized_seconds": 0.03069,
-                "ratio": 0.997,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "mobile_phone_model_distinct_user_id_top",
-                "generic_seconds": 0.008722,
-                "specialized_seconds": 0.007436,
-                "ratio": 1.173,
-                "equal": true
-              },
-              {
-                "kind": "mobile_phone_model_distinct_user_id_top",
-                "generic_seconds": 0.007763,
-                "specialized_seconds": 0.007471,
-                "ratio": 1.039,
-                "equal": true
-              },
-              {
-                "kind": "mobile_phone_model_distinct_user_id_top",
-                "generic_seconds": 0.007322,
-                "specialized_seconds": 0.007794,
-                "ratio": 0.939,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "mobile_phone_distinct_user_id_top",
-                "generic_seconds": 0.011423,
-                "specialized_seconds": 0.009399,
-                "ratio": 1.215,
-                "equal": true
-              },
-              {
-                "kind": "mobile_phone_distinct_user_id_top",
-                "generic_seconds": 0.009122,
-                "specialized_seconds": 0.00912,
-                "ratio": 1.0,
-                "equal": true
-              },
-              {
-                "kind": "mobile_phone_distinct_user_id_top",
-                "generic_seconds": 0.009087,
-                "specialized_seconds": 0.009326,
-                "ratio": 0.974,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "search_phrase_count_top",
-                "generic_seconds": 0.019909,
-                "specialized_seconds": 0.019442,
-                "ratio": 1.024,
-                "equal": true
-              },
-              {
-                "kind": "search_phrase_count_top",
-                "generic_seconds": 0.019283,
-                "specialized_seconds": 0.019272,
-                "ratio": 1.001,
-                "equal": true
-              },
-              {
-                "kind": "search_phrase_count_top",
-                "generic_seconds": 0.019078,
-                "specialized_seconds": 0.019196,
-                "ratio": 0.994,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "search_phrase_distinct_user_id_top",
-                "generic_seconds": 0.038861,
-                "specialized_seconds": 0.038566,
-                "ratio": 1.008,
-                "equal": true
-              },
-              {
-                "kind": "search_phrase_distinct_user_id_top",
-                "generic_seconds": 0.038628,
-                "specialized_seconds": 0.038245,
-                "ratio": 1.01,
-                "equal": true
-              },
-              {
-                "kind": "search_phrase_distinct_user_id_top",
-                "generic_seconds": 0.037762,
-                "specialized_seconds": 0.037975,
-                "ratio": 0.994,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "search_engine_phrase_count_top",
-                "generic_seconds": 0.058196,
-                "specialized_seconds": 0.048016,
-                "ratio": 1.212,
-                "equal": true
-              },
-              {
-                "kind": "search_engine_phrase_count_top",
-                "generic_seconds": 0.04891,
-                "specialized_seconds": 0.048694,
-                "ratio": 1.004,
-                "equal": true
-              },
-              {
-                "kind": "search_engine_phrase_count_top",
-                "generic_seconds": 0.049702,
-                "specialized_seconds": 0.049163,
-                "ratio": 1.011,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.018898,
-                "specialized_seconds": 0.01822,
-                "ratio": 1.037,
-                "equal": true
-              },
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.018144,
-                "specialized_seconds": 0.018011,
-                "ratio": 1.007,
-                "equal": true
-              },
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.018231,
-                "specialized_seconds": 0.017997,
-                "ratio": 1.013,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "user_id_search_phrase_count_top",
-                "generic_seconds": 0.064228,
-                "specialized_seconds": 0.037943,
-                "ratio": 1.693,
-                "equal": true
-              },
-              {
-                "kind": "user_id_search_phrase_count_top",
-                "generic_seconds": 0.038616,
-                "specialized_seconds": 0.03803,
-                "ratio": 1.015,
-                "equal": true
-              },
-              {
-                "kind": "user_id_search_phrase_count_top",
-                "generic_seconds": 0.037984,
-                "specialized_seconds": 0.037728,
-                "ratio": 1.007,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "user_id_search_phrase_limit_no_order",
-                "generic_seconds": 3e-06,
-                "specialized_seconds": 1e-06,
-                "ratio": 2.324,
-                "equal": true
-              },
-              {
-                "kind": "user_id_search_phrase_limit_no_order",
-                "generic_seconds": 7e-06,
-                "specialized_seconds": 1e-06,
-                "ratio": 6.75,
-                "equal": true
-              },
-              {
-                "kind": "user_id_search_phrase_limit_no_order",
-                "generic_seconds": 1e-06,
-                "specialized_seconds": 1e-06,
-                "ratio": 1.105,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "user_id_minute_search_phrase_count_top",
-                "generic_seconds": 0.291069,
-                "specialized_seconds": 0.162895,
-                "ratio": 1.787,
-                "equal": true
-              },
-              {
-                "kind": "user_id_minute_search_phrase_count_top",
-                "generic_seconds": 0.176667,
-                "specialized_seconds": 0.175363,
-                "ratio": 1.007,
-                "equal": true
-              },
-              {
-                "kind": "user_id_minute_search_phrase_count_top",
-                "generic_seconds": 0.162786,
-                "specialized_seconds": 0.171184,
-                "ratio": 0.951,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.002502,
-                "specialized_seconds": 0.002546,
-                "ratio": 0.982,
-                "equal": true
-              },
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.002522,
-                "specialized_seconds": 0.002579,
-                "ratio": 0.978,
-                "equal": true
-              },
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.00251,
-                "specialized_seconds": 0.002576,
-                "ratio": 0.975,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "count_url_like_google",
-                "generic_seconds": 0.016127,
-                "specialized_seconds": 0.002915,
-                "ratio": 5.533,
-                "equal": true
-              },
-              {
-                "kind": "count_url_like_google",
-                "generic_seconds": 0.002877,
-                "specialized_seconds": 0.002848,
-                "ratio": 1.01,
-                "equal": true
-              },
-              {
-                "kind": "count_url_like_google",
-                "generic_seconds": 0.002833,
-                "specialized_seconds": 0.002835,
-                "ratio": 0.999,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "search_phrase_min_url_google",
-                "generic_seconds": 0.001581,
-                "specialized_seconds": 3.8e-05,
-                "ratio": 41.251,
-                "equal": true
-              },
-              {
-                "kind": "search_phrase_min_url_google",
-                "generic_seconds": 2.2e-05,
-                "specialized_seconds": 3e-05,
-                "ratio": 0.741,
-                "equal": true
-              },
-              {
-                "kind": "search_phrase_min_url_google",
-                "generic_seconds": 2.3e-05,
-                "specialized_seconds": 1.7e-05,
-                "ratio": 1.324,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "search_phrase_title_google_top",
-                "generic_seconds": 0.001197,
-                "specialized_seconds": 0.000464,
-                "ratio": 2.579,
-                "equal": true
-              },
-              {
-                "kind": "search_phrase_title_google_top",
-                "generic_seconds": 0.000431,
-                "specialized_seconds": 0.00042,
-                "ratio": 1.026,
-                "equal": true
-              },
-              {
-                "kind": "search_phrase_title_google_top",
-                "generic_seconds": 0.00042,
-                "specialized_seconds": 0.000409,
-                "ratio": 1.026,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "url_like_google_order_by_event_time",
-                "generic_seconds": 0.321926,
-                "specialized_seconds": 0.34307,
-                "ratio": 0.938,
-                "equal": true
-              },
-              {
-                "kind": "url_like_google_order_by_event_time",
-                "generic_seconds": 0.325436,
-                "specialized_seconds": 0.323855,
-                "ratio": 1.005,
-                "equal": true
-              },
-              {
-                "kind": "url_like_google_order_by_event_time",
-                "generic_seconds": 0.321918,
-                "specialized_seconds": 0.320283,
-                "ratio": 1.005,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "search_phrase_event_time_top",
-                "generic_seconds": 0.11112,
-                "specialized_seconds": 0.019274,
-                "ratio": 5.765,
-                "equal": true
-              },
-              {
-                "kind": "search_phrase_event_time_top",
-                "generic_seconds": 0.019217,
-                "specialized_seconds": 0.019218,
-                "ratio": 1.0,
-                "equal": true
-              },
-              {
-                "kind": "search_phrase_event_time_top",
-                "generic_seconds": 0.019125,
-                "specialized_seconds": 0.018742,
-                "ratio": 1.02,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "search_phrase_order_by_phrase_top",
-                "generic_seconds": 0.10797,
-                "specialized_seconds": 0.035481,
-                "ratio": 3.043,
-                "equal": true
-              },
-              {
-                "kind": "search_phrase_order_by_phrase_top",
-                "generic_seconds": 0.037347,
-                "specialized_seconds": 0.035573,
-                "ratio": 1.05,
-                "equal": true
-              },
-              {
-                "kind": "search_phrase_order_by_phrase_top",
-                "generic_seconds": 0.035661,
-                "specialized_seconds": 0.035688,
-                "ratio": 0.999,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "search_phrase_event_time_phrase_top",
-                "generic_seconds": 0.019267,
-                "specialized_seconds": 0.01879,
-                "ratio": 1.025,
-                "equal": true
-              },
-              {
-                "kind": "search_phrase_event_time_phrase_top",
-                "generic_seconds": 0.019217,
-                "specialized_seconds": 0.019429,
-                "ratio": 0.989,
-                "equal": true
-              },
-              {
-                "kind": "search_phrase_event_time_phrase_top",
-                "generic_seconds": 0.019119,
-                "specialized_seconds": 0.01879,
-                "ratio": 1.018,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "url_length_by_counter",
-                "generic_seconds": 0.171149,
-                "specialized_seconds": 0.087965,
-                "ratio": 1.946,
-                "equal": true
-              },
-              {
-                "kind": "url_length_by_counter",
-                "generic_seconds": 0.087925,
-                "specialized_seconds": 0.08778,
-                "ratio": 1.002,
-                "equal": true
-              },
-              {
-                "kind": "url_length_by_counter",
-                "generic_seconds": 0.087759,
-                "specialized_seconds": 0.087633,
-                "ratio": 1.001,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "referer_domain_stats_top",
-                "generic_seconds": 8.6e-05,
-                "specialized_seconds": 3.2e-05,
-                "ratio": 2.681,
-                "equal": true
-              },
-              {
-                "kind": "referer_domain_stats_top",
-                "generic_seconds": 2.2e-05,
-                "specialized_seconds": 2.1e-05,
-                "ratio": 1.045,
-                "equal": true
-              },
-              {
-                "kind": "referer_domain_stats_top",
-                "generic_seconds": 1.9e-05,
-                "specialized_seconds": 2e-05,
-                "ratio": 0.985,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.000316,
-                "specialized_seconds": 0.000283,
-                "ratio": 1.115,
-                "equal": true
-              },
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.000263,
-                "specialized_seconds": 0.000251,
-                "ratio": 1.046,
-                "equal": true
-              },
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.000242,
-                "specialized_seconds": 0.000231,
-                "ratio": 1.049,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "search_engine_client_ip_agg_top",
-                "generic_seconds": 0.088601,
-                "specialized_seconds": 0.037576,
-                "ratio": 2.358,
-                "equal": true
-              },
-              {
-                "kind": "search_engine_client_ip_agg_top",
-                "generic_seconds": 0.037925,
-                "specialized_seconds": 0.039401,
-                "ratio": 0.963,
-                "equal": true
-              },
-              {
-                "kind": "search_engine_client_ip_agg_top",
-                "generic_seconds": 0.063299,
-                "specialized_seconds": 0.037729,
-                "ratio": 1.678,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "watch_id_client_ip_agg_top_filtered",
-                "generic_seconds": 0.000669,
-                "specialized_seconds": 2e-06,
-                "ratio": 382.477,
-                "equal": true
-              },
-              {
-                "kind": "watch_id_client_ip_agg_top_filtered",
-                "generic_seconds": 1e-06,
-                "specialized_seconds": 1e-06,
-                "ratio": 0.999,
-                "equal": true
-              },
-              {
-                "kind": "watch_id_client_ip_agg_top_filtered",
-                "generic_seconds": 1e-06,
-                "specialized_seconds": 1e-06,
-                "ratio": 0.948,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "watch_id_client_ip_agg_top",
-                "generic_seconds": 0.29081,
-                "specialized_seconds": 0.13752,
-                "ratio": 2.115,
-                "equal": true
-              },
-              {
-                "kind": "watch_id_client_ip_agg_top",
-                "generic_seconds": 0.134073,
-                "specialized_seconds": 0.135952,
-                "ratio": 0.986,
-                "equal": true
-              },
-              {
-                "kind": "watch_id_client_ip_agg_top",
-                "generic_seconds": 0.133947,
-                "specialized_seconds": 0.134871,
-                "ratio": 0.993,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "url_count_top",
-                "generic_seconds": 1.211757,
-                "specialized_seconds": 4e-06,
-                "ratio": 306076.44,
-                "equal": true
-              },
-              {
-                "kind": "url_count_top",
-                "generic_seconds": 2e-06,
-                "specialized_seconds": 2e-06,
-                "ratio": 1.262,
-                "equal": true
-              },
-              {
-                "kind": "url_count_top",
-                "generic_seconds": 2e-06,
-                "specialized_seconds": 2e-06,
-                "ratio": 1.0,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "one_url_count_top",
-                "generic_seconds": 2e-06,
-                "specialized_seconds": 2e-06,
-                "ratio": 1.143,
-                "equal": true
-              },
-              {
-                "kind": "one_url_count_top",
-                "generic_seconds": 2e-06,
-                "specialized_seconds": 2e-06,
-                "ratio": 0.975,
-                "equal": true
-              },
-              {
-                "kind": "one_url_count_top",
-                "generic_seconds": 2e-06,
-                "specialized_seconds": 2e-06,
-                "ratio": 0.974,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "client_ip_top10",
-                "generic_seconds": 0.040414,
-                "specialized_seconds": 0.031429,
-                "ratio": 1.286,
-                "equal": true
-              },
-              {
-                "kind": "client_ip_top10",
-                "generic_seconds": 0.032012,
-                "specialized_seconds": 0.032341,
-                "ratio": 0.99,
-                "equal": true
-              },
-              {
-                "kind": "client_ip_top10",
-                "generic_seconds": 0.032447,
-                "specialized_seconds": 0.031736,
-                "ratio": 1.022,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "url_count_top_filtered_dashboard",
-                "generic_seconds": 0.729646,
-                "specialized_seconds": 0.013362,
-                "ratio": 54.606,
-                "equal": true
-              },
-              {
-                "kind": "url_count_top_filtered_dashboard",
-                "generic_seconds": 0.012739,
-                "specialized_seconds": 0.012288,
-                "ratio": 1.037,
-                "equal": true
-              },
-              {
-                "kind": "url_count_top_filtered_dashboard",
-                "generic_seconds": 0.012581,
-                "specialized_seconds": 0.012414,
-                "ratio": 1.013,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "title_count_top_filtered_dashboard",
-                "generic_seconds": 1.15956,
-                "specialized_seconds": 0.007183,
-                "ratio": 161.435,
-                "equal": true
-              },
-              {
-                "kind": "title_count_top_filtered_dashboard",
-                "generic_seconds": 1.132825,
-                "specialized_seconds": 0.005799,
-                "ratio": 195.359,
-                "equal": true
-              },
-              {
-                "kind": "title_count_top_filtered_dashboard",
-                "generic_seconds": 1.171461,
-                "specialized_seconds": 0.005691,
-                "ratio": 205.829,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "url_count_top_filtered_offset_dashboard",
-                "generic_seconds": 0.707098,
-                "specialized_seconds": 0.003893,
-                "ratio": 181.616,
-                "equal": true
-              },
-              {
-                "kind": "url_count_top_filtered_offset_dashboard",
-                "generic_seconds": 0.003602,
-                "specialized_seconds": 0.003581,
-                "ratio": 1.006,
-                "equal": true
-              },
-              {
-                "kind": "url_count_top_filtered_offset_dashboard",
-                "generic_seconds": 0.00359,
-                "specialized_seconds": 0.003497,
-                "ratio": 1.026,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "traffic_source_dashboard",
-                "generic_seconds": 2.087028,
-                "specialized_seconds": 0.119875,
-                "ratio": 17.41,
-                "equal": true
-              },
-              {
-                "kind": "traffic_source_dashboard",
-                "generic_seconds": 0.120051,
-                "specialized_seconds": 0.120399,
-                "ratio": 0.997,
-                "equal": true
-              },
-              {
-                "kind": "traffic_source_dashboard",
-                "generic_seconds": 0.120667,
-                "specialized_seconds": 0.120655,
-                "ratio": 1.0,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "url_hash_date_dashboard",
-                "generic_seconds": 0.007947,
-                "specialized_seconds": 0.007688,
-                "ratio": 1.034,
-                "equal": true
-              },
-              {
-                "kind": "url_hash_date_dashboard",
-                "generic_seconds": 0.007588,
-                "specialized_seconds": 0.00765,
-                "ratio": 0.992,
-                "equal": true
-              },
-              {
-                "kind": "url_hash_date_dashboard",
-                "generic_seconds": 0.007735,
-                "specialized_seconds": 0.007586,
-                "ratio": 1.02,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "window_size_dashboard",
-                "generic_seconds": 0.010595,
-                "specialized_seconds": 0.00467,
-                "ratio": 2.269,
-                "equal": true
-              },
-              {
-                "kind": "window_size_dashboard",
-                "generic_seconds": 0.004496,
-                "specialized_seconds": 0.004422,
-                "ratio": 1.017,
-                "equal": true
-              },
-              {
-                "kind": "window_size_dashboard",
-                "generic_seconds": 0.004444,
-                "specialized_seconds": 0.004439,
-                "ratio": 1.001,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "time_bucket_dashboard",
-                "generic_seconds": 0.003367,
-                "specialized_seconds": 0.003247,
-                "ratio": 1.037,
-                "equal": true
-              },
-              {
-                "kind": "time_bucket_dashboard",
-                "generic_seconds": 0.003166,
-                "specialized_seconds": 0.003185,
-                "ratio": 0.994,
-                "equal": true
-              },
-              {
-                "kind": "time_bucket_dashboard",
-                "generic_seconds": 0.003138,
-                "specialized_seconds": 0.003133,
-                "ratio": 1.002,
-                "equal": true
-              }
-            ]
-          ],
-          "warm_best_generic_sum": 2.405235,
-          "warm_best_specialized_sum": 1.274084,
-          "all_equal": true
-        }
+        "warm_best_from_rows": 1.2542059999999997
       }
     },
     {
       "run": 3,
       "import": {
-        "wall_seconds": 7.08,
-        "total_seconds": 7.07713,
+        "wall_seconds": 7.21,
+        "total_seconds": 7.206766,
         "rss_bytes": 0
       },
       "query": {
         "queries": 43,
         "nulls": 0,
-        "first_sum": 8.611392,
-        "warm_best_sum": 3.697976,
-        "all_runs_sum": 16.059448,
+        "first_sum": 5.988287,
+        "warm_best_sum": 1.263515,
+        "all_runs_sum": 8.524178,
         "timings": [
           [
-            0.003548,
             2.3e-05,
-            1.6e-05
-          ],
-          [
-            0.001707,
-            0.000689,
-            0.000684
-          ],
-          [
-            0.002005,
-            0.000998,
-            0.000996
-          ],
-          [
-            0.006234,
-            0.002123,
-            0.002478
-          ],
-          [
-            0.024474,
-            0.022693,
-            0.022501
-          ],
-          [
-            0.016512,
-            0.014546,
-            0.014452
-          ],
-          [
-            0.003102,
-            0.000994,
-            0.00099
-          ],
-          [
-            0.006884,
-            0.006777,
-            0.006685
-          ],
-          [
-            0.064691,
-            0.063755,
-            0.062974
-          ],
-          [
-            0.062692,
-            0.061654,
-            0.062545
-          ],
-          [
-            0.016689,
-            0.015715,
-            0.015025
-          ],
-          [
-            0.020643,
-            0.018684,
-            0.018886
-          ],
-          [
-            0.039647,
-            0.039253,
-            0.038899
-          ],
-          [
-            0.077761,
-            0.078122,
-            0.077382
-          ],
-          [
-            0.107202,
-            0.098219,
-            0.095701
-          ],
-          [
-            0.038863,
-            0.037347,
-            0.037281
-          ],
-          [
-            0.093489,
-            0.076681,
-            0.076273
-          ],
-          [
-            1.4e-05,
-            9e-06,
-            5e-06
-          ],
-          [
-            0.457089,
-            0.34274,
-            0.370136
-          ],
-          [
-            0.005213,
-            0.005276,
-            0.005581
-          ],
-          [
-            0.021152,
-            0.005811,
-            0.00575
-          ],
-          [
-            0.002162,
-            5.3e-05,
-            4.3e-05
-          ],
-          [
-            0.001979,
-            0.000877,
-            0.000864
-          ],
-          [
-            0.656955,
-            0.647333,
-            0.642219
-          ],
-          [
-            0.131428,
-            0.038774,
-            0.038707
-          ],
-          [
-            0.141555,
-            0.072624,
-            0.074019
-          ],
-          [
-            0.038247,
-            0.037854,
-            0.038371
-          ],
-          [
-            0.262937,
-            0.177273,
-            0.177697
-          ],
-          [
-            0.000156,
-            4.9e-05,
-            4.5e-05
-          ],
-          [
-            0.000656,
-            0.000552,
-            0.000535
-          ],
-          [
-            0.127172,
-            0.074555,
-            0.07533
-          ],
-          [
-            0.000236,
-            9e-06,
-            6e-06
-          ],
-          [
-            0.446748,
-            0.265133,
-            0.270962
-          ],
-          [
-            1.206131,
             1.1e-05,
-            6e-06
+            1e-05
           ],
           [
-            7e-06,
-            6e-06,
-            5e-06
+            0.004088,
+            0.000317,
+            0.000325
           ],
           [
-            0.074193,
-            0.059954,
-            0.061098
+            0.001419,
+            0.00052,
+            0.000499
           ],
           [
-            0.732274,
-            0.025676,
-            0.025389
+            0.004927,
+            0.001143,
+            0.00107
           ],
           [
-            1.138645,
-            1.138201,
-            1.138222
+            0.013045,
+            0.011259,
+            0.011281
           ],
           [
-            0.710587,
-            0.007196,
-            0.006996
+            0.009069,
+            0.007302,
+            0.007246
           ],
           [
-            1.834116,
-            0.241847,
-            0.241032
+            0.002553,
+            0.000606,
+            0.000626
           ],
           [
-            0.016235,
-            0.015268,
-            0.015265
+            0.003301,
+            0.003207,
+            0.003174
           ],
           [
-            0.012769,
-            0.009076,
-            0.008833
+            0.031028,
+            0.030764,
+            0.030693
           ],
           [
-            0.006593,
-            0.006394,
-            0.006346
+            0.02989,
+            0.03007,
+            0.029739
+          ],
+          [
+            0.008744,
+            0.007358,
+            0.007481
+          ],
+          [
+            0.01088,
+            0.00927,
+            0.009156
+          ],
+          [
+            0.019489,
+            0.019271,
+            0.019336
+          ],
+          [
+            0.03533,
+            0.034952,
+            0.035184
+          ],
+          [
+            0.056402,
+            0.046785,
+            0.0459
+          ],
+          [
+            0.018771,
+            0.017692,
+            0.017457
+          ],
+          [
+            0.056384,
+            0.037711,
+            0.037979
+          ],
+          [
+            8e-06,
+            2e-06,
+            2e-06
+          ],
+          [
+            0.251459,
+            0.169602,
+            0.168664
+          ],
+          [
+            0.002654,
+            0.00263,
+            0.002636
+          ],
+          [
+            0.017334,
+            0.002907,
+            0.002838
+          ],
+          [
+            0.001401,
+            2.6e-05,
+            1.9e-05
+          ],
+          [
+            0.00117,
+            0.000445,
+            0.000422
+          ],
+          [
+            0.321047,
+            0.319672,
+            0.318496
+          ],
+          [
+            0.129913,
+            0.021848,
+            0.02167
+          ],
+          [
+            0.120424,
+            0.036461,
+            0.035503
+          ],
+          [
+            0.019051,
+            0.018701,
+            0.018266
+          ],
+          [
+            0.171582,
+            0.087955,
+            0.087652
+          ],
+          [
+            8.7e-05,
+            2.3e-05,
+            2.1e-05
+          ],
+          [
+            0.000306,
+            0.000272,
+            0.00026
+          ],
+          [
+            0.089382,
+            0.036237,
+            0.036584
+          ],
+          [
+            0.000729,
+            2e-06,
+            1e-06
+          ],
+          [
+            0.247163,
+            0.128279,
+            0.127964
+          ],
+          [
+            1.14736,
+            3e-06,
+            1e-06
+          ],
+          [
+            2e-06,
+            1e-06,
+            1e-06
+          ],
+          [
+            0.030847,
+            0.030364,
+            0.030156
+          ],
+          [
+            0.710844,
+            0.012395,
+            0.011954
+          ],
+          [
+            0.00559,
+            0.005336,
+            0.005376
+          ],
+          [
+            0.707611,
+            0.003919,
+            0.003616
+          ],
+          [
+            1.687265,
+            0.120337,
+            0.120208
+          ],
+          [
+            0.007741,
+            0.007817,
+            0.007517
+          ],
+          [
+            0.008624,
+            0.004526,
+            0.004583
+          ],
+          [
+            0.003349,
+            0.003193,
+            0.003137
           ]
         ],
-        "warm_best_from_rows": 3.6979130000000002,
-        "compare": {
-          "repeats_per_query": 3,
-          "timings": [
-            [
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.003499,
-                "specialized_seconds": 2.1e-05,
-                "ratio": 169.648,
-                "equal": true
-              },
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.0,
-                "specialized_seconds": 1.6e-05,
-                "ratio": 0.024,
-                "equal": true
-              },
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.0,
-                "specialized_seconds": 1.1e-05,
-                "ratio": 0.019,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.001356,
-                "specialized_seconds": 0.000336,
-                "ratio": 4.037,
-                "equal": true
-              },
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.00034,
-                "specialized_seconds": 0.000342,
-                "ratio": 0.995,
-                "equal": true
-              },
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.00034,
-                "specialized_seconds": 0.000339,
-                "ratio": 1.001,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.001464,
-                "specialized_seconds": 0.000524,
-                "ratio": 2.795,
-                "equal": true
-              },
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.000498,
-                "specialized_seconds": 0.000492,
-                "ratio": 1.012,
-                "equal": true
-              },
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.0005,
-                "specialized_seconds": 0.000487,
-                "ratio": 1.026,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.00506,
-                "specialized_seconds": 0.001155,
-                "ratio": 4.382,
-                "equal": true
-              },
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.00106,
-                "specialized_seconds": 0.001053,
-                "ratio": 1.007,
-                "equal": true
-              },
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.001191,
-                "specialized_seconds": 0.001271,
-                "ratio": 0.937,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.013216,
-                "specialized_seconds": 0.011241,
-                "ratio": 1.176,
-                "equal": true
-              },
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.011339,
-                "specialized_seconds": 0.011337,
-                "ratio": 1.0,
-                "equal": true
-              },
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.011177,
-                "specialized_seconds": 0.011311,
-                "ratio": 0.988,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "count_distinct_search_phrase",
-                "generic_seconds": 0.009272,
-                "specialized_seconds": 0.007222,
-                "ratio": 1.284,
-                "equal": true
-              },
-              {
-                "kind": "count_distinct_search_phrase",
-                "generic_seconds": 0.00728,
-                "specialized_seconds": 0.007254,
-                "ratio": 1.004,
-                "equal": true
-              },
-              {
-                "kind": "count_distinct_search_phrase",
-                "generic_seconds": 0.007192,
-                "specialized_seconds": 0.00725,
-                "ratio": 0.992,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.002563,
-                "specialized_seconds": 0.000521,
-                "ratio": 4.915,
-                "equal": true
-              },
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.0005,
-                "specialized_seconds": 0.000485,
-                "ratio": 1.032,
-                "equal": true
-              },
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.000499,
-                "specialized_seconds": 0.000485,
-                "ratio": 1.03,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.003416,
-                "specialized_seconds": 0.003454,
-                "ratio": 0.989,
-                "equal": true
-              },
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.003409,
-                "specialized_seconds": 0.003358,
-                "ratio": 1.015,
-                "equal": true
-              },
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.003343,
-                "specialized_seconds": 0.003335,
-                "ratio": 1.002,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.032874,
-                "specialized_seconds": 0.031794,
-                "ratio": 1.034,
-                "equal": true
-              },
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.032159,
-                "specialized_seconds": 0.031574,
-                "ratio": 1.019,
-                "equal": true
-              },
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.03175,
-                "specialized_seconds": 0.03119,
-                "ratio": 1.018,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.031107,
-                "specialized_seconds": 0.03155,
-                "ratio": 0.986,
-                "equal": true
-              },
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.030465,
-                "specialized_seconds": 0.031153,
-                "ratio": 0.978,
-                "equal": true
-              },
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.031442,
-                "specialized_seconds": 0.031072,
-                "ratio": 1.012,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "mobile_phone_model_distinct_user_id_top",
-                "generic_seconds": 0.008747,
-                "specialized_seconds": 0.007913,
-                "ratio": 1.105,
-                "equal": true
-              },
-              {
-                "kind": "mobile_phone_model_distinct_user_id_top",
-                "generic_seconds": 0.007769,
-                "specialized_seconds": 0.007919,
-                "ratio": 0.981,
-                "equal": true
-              },
-              {
-                "kind": "mobile_phone_model_distinct_user_id_top",
-                "generic_seconds": 0.007484,
-                "specialized_seconds": 0.007504,
-                "ratio": 0.997,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "mobile_phone_distinct_user_id_top",
-                "generic_seconds": 0.011441,
-                "specialized_seconds": 0.009178,
-                "ratio": 1.247,
-                "equal": true
-              },
-              {
-                "kind": "mobile_phone_distinct_user_id_top",
-                "generic_seconds": 0.00929,
-                "specialized_seconds": 0.00937,
-                "ratio": 0.991,
-                "equal": true
-              },
-              {
-                "kind": "mobile_phone_distinct_user_id_top",
-                "generic_seconds": 0.009179,
-                "specialized_seconds": 0.009683,
-                "ratio": 0.948,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "search_phrase_count_top",
-                "generic_seconds": 0.019847,
-                "specialized_seconds": 0.019777,
-                "ratio": 1.004,
-                "equal": true
-              },
-              {
-                "kind": "search_phrase_count_top",
-                "generic_seconds": 0.019621,
-                "specialized_seconds": 0.019606,
-                "ratio": 1.001,
-                "equal": true
-              },
-              {
-                "kind": "search_phrase_count_top",
-                "generic_seconds": 0.019447,
-                "specialized_seconds": 0.019438,
-                "ratio": 1.0,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "search_phrase_distinct_user_id_top",
-                "generic_seconds": 0.03886,
-                "specialized_seconds": 0.038883,
-                "ratio": 0.999,
-                "equal": true
-              },
-              {
-                "kind": "search_phrase_distinct_user_id_top",
-                "generic_seconds": 0.038876,
-                "specialized_seconds": 0.039227,
-                "ratio": 0.991,
-                "equal": true
-              },
-              {
-                "kind": "search_phrase_distinct_user_id_top",
-                "generic_seconds": 0.038568,
-                "specialized_seconds": 0.038793,
-                "ratio": 0.994,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "search_engine_phrase_count_top",
-                "generic_seconds": 0.057755,
-                "specialized_seconds": 0.049427,
-                "ratio": 1.168,
-                "equal": true
-              },
-              {
-                "kind": "search_engine_phrase_count_top",
-                "generic_seconds": 0.049603,
-                "specialized_seconds": 0.048589,
-                "ratio": 1.021,
-                "equal": true
-              },
-              {
-                "kind": "search_engine_phrase_count_top",
-                "generic_seconds": 0.048971,
-                "specialized_seconds": 0.046707,
-                "ratio": 1.048,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.020049,
-                "specialized_seconds": 0.018795,
-                "ratio": 1.067,
-                "equal": true
-              },
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.018574,
-                "specialized_seconds": 0.018759,
-                "ratio": 0.99,
-                "equal": true
-              },
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.018673,
-                "specialized_seconds": 0.018593,
-                "ratio": 1.004,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "user_id_search_phrase_count_top",
-                "generic_seconds": 0.055065,
-                "specialized_seconds": 0.038393,
-                "ratio": 1.434,
-                "equal": true
-              },
-              {
-                "kind": "user_id_search_phrase_count_top",
-                "generic_seconds": 0.038235,
-                "specialized_seconds": 0.038419,
-                "ratio": 0.995,
-                "equal": true
-              },
-              {
-                "kind": "user_id_search_phrase_count_top",
-                "generic_seconds": 0.038244,
-                "specialized_seconds": 0.038003,
-                "ratio": 1.006,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "user_id_search_phrase_limit_no_order",
-                "generic_seconds": 3e-06,
-                "specialized_seconds": 4e-06,
-                "ratio": 0.865,
-                "equal": true
-              },
-              {
-                "kind": "user_id_search_phrase_limit_no_order",
-                "generic_seconds": 3e-06,
-                "specialized_seconds": 2e-06,
-                "ratio": 1.854,
-                "equal": true
-              },
-              {
-                "kind": "user_id_search_phrase_limit_no_order",
-                "generic_seconds": 1e-06,
-                "specialized_seconds": 1e-06,
-                "ratio": 1.101,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "user_id_minute_search_phrase_count_top",
-                "generic_seconds": 0.293331,
-                "specialized_seconds": 0.163735,
-                "ratio": 1.791,
-                "equal": true
-              },
-              {
-                "kind": "user_id_minute_search_phrase_count_top",
-                "generic_seconds": 0.172919,
-                "specialized_seconds": 0.169791,
-                "ratio": 1.018,
-                "equal": true
-              },
-              {
-                "kind": "user_id_minute_search_phrase_count_top",
-                "generic_seconds": 0.191465,
-                "specialized_seconds": 0.178643,
-                "ratio": 1.072,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.002582,
-                "specialized_seconds": 0.002617,
-                "ratio": 0.987,
-                "equal": true
-              },
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.002596,
-                "specialized_seconds": 0.002664,
-                "ratio": 0.974,
-                "equal": true
-              },
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.002877,
-                "specialized_seconds": 0.002686,
-                "ratio": 1.071,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "count_url_like_google",
-                "generic_seconds": 0.018121,
-                "specialized_seconds": 0.003013,
-                "ratio": 6.015,
-                "equal": true
-              },
-              {
-                "kind": "count_url_like_google",
-                "generic_seconds": 0.002908,
-                "specialized_seconds": 0.002887,
-                "ratio": 1.007,
-                "equal": true
-              },
-              {
-                "kind": "count_url_like_google",
-                "generic_seconds": 0.002871,
-                "specialized_seconds": 0.00287,
-                "ratio": 1.0,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "search_phrase_min_url_google",
-                "generic_seconds": 0.002106,
-                "specialized_seconds": 4.6e-05,
-                "ratio": 46.112,
-                "equal": true
-              },
-              {
-                "kind": "search_phrase_min_url_google",
-                "generic_seconds": 2.5e-05,
-                "specialized_seconds": 2.1e-05,
-                "ratio": 1.161,
-                "equal": true
-              },
-              {
-                "kind": "search_phrase_min_url_google",
-                "generic_seconds": 2e-05,
-                "specialized_seconds": 1.7e-05,
-                "ratio": 1.194,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "search_phrase_title_google_top",
-                "generic_seconds": 0.001512,
-                "specialized_seconds": 0.00046,
-                "ratio": 3.289,
-                "equal": true
-              },
-              {
-                "kind": "search_phrase_title_google_top",
-                "generic_seconds": 0.000438,
-                "specialized_seconds": 0.000433,
-                "ratio": 1.011,
-                "equal": true
-              },
-              {
-                "kind": "search_phrase_title_google_top",
-                "generic_seconds": 0.000426,
-                "specialized_seconds": 0.000432,
-                "ratio": 0.988,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "url_like_google_order_by_event_time",
-                "generic_seconds": 0.336014,
-                "specialized_seconds": 0.320915,
-                "ratio": 1.047,
-                "equal": true
-              },
-              {
-                "kind": "url_like_google_order_by_event_time",
-                "generic_seconds": 0.326576,
-                "specialized_seconds": 0.320722,
-                "ratio": 1.018,
-                "equal": true
-              },
-              {
-                "kind": "url_like_google_order_by_event_time",
-                "generic_seconds": 0.321004,
-                "specialized_seconds": 0.321182,
-                "ratio": 0.999,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "search_phrase_event_time_top",
-                "generic_seconds": 0.112224,
-                "specialized_seconds": 0.019172,
-                "ratio": 5.854,
-                "equal": true
-              },
-              {
-                "kind": "search_phrase_event_time_top",
-                "generic_seconds": 0.019347,
-                "specialized_seconds": 0.019402,
-                "ratio": 0.997,
-                "equal": true
-              },
-              {
-                "kind": "search_phrase_event_time_top",
-                "generic_seconds": 0.019346,
-                "specialized_seconds": 0.019339,
-                "ratio": 1.0,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "search_phrase_order_by_phrase_top",
-                "generic_seconds": 0.105778,
-                "specialized_seconds": 0.035754,
-                "ratio": 2.958,
-                "equal": true
-              },
-              {
-                "kind": "search_phrase_order_by_phrase_top",
-                "generic_seconds": 0.036958,
-                "specialized_seconds": 0.035648,
-                "ratio": 1.037,
-                "equal": true
-              },
-              {
-                "kind": "search_phrase_order_by_phrase_top",
-                "generic_seconds": 0.037511,
-                "specialized_seconds": 0.036476,
-                "ratio": 1.028,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "search_phrase_event_time_phrase_top",
-                "generic_seconds": 0.019365,
-                "specialized_seconds": 0.018859,
-                "ratio": 1.027,
-                "equal": true
-              },
-              {
-                "kind": "search_phrase_event_time_phrase_top",
-                "generic_seconds": 0.018736,
-                "specialized_seconds": 0.019096,
-                "ratio": 0.981,
-                "equal": true
-              },
-              {
-                "kind": "search_phrase_event_time_phrase_top",
-                "generic_seconds": 0.019184,
-                "specialized_seconds": 0.019157,
-                "ratio": 1.001,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "url_length_by_counter",
-                "generic_seconds": 0.173531,
-                "specialized_seconds": 0.089378,
-                "ratio": 1.942,
-                "equal": true
-              },
-              {
-                "kind": "url_length_by_counter",
-                "generic_seconds": 0.088782,
-                "specialized_seconds": 0.08847,
-                "ratio": 1.004,
-                "equal": true
-              },
-              {
-                "kind": "url_length_by_counter",
-                "generic_seconds": 0.088885,
-                "specialized_seconds": 0.088778,
-                "ratio": 1.001,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "referer_domain_stats_top",
-                "generic_seconds": 0.00011,
-                "specialized_seconds": 3.6e-05,
-                "ratio": 3.011,
-                "equal": true
-              },
-              {
-                "kind": "referer_domain_stats_top",
-                "generic_seconds": 2.3e-05,
-                "specialized_seconds": 2.2e-05,
-                "ratio": 1.034,
-                "equal": true
-              },
-              {
-                "kind": "referer_domain_stats_top",
-                "generic_seconds": 2e-05,
-                "specialized_seconds": 2.1e-05,
-                "ratio": 0.966,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.000321,
-                "specialized_seconds": 0.000322,
-                "ratio": 0.997,
-                "equal": true
-              },
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.000283,
-                "specialized_seconds": 0.000259,
-                "ratio": 1.095,
-                "equal": true
-              },
-              {
-                "kind": "generic_sql",
-                "generic_seconds": 0.000267,
-                "specialized_seconds": 0.000258,
-                "ratio": 1.034,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "search_engine_client_ip_agg_top",
-                "generic_seconds": 0.09054,
-                "specialized_seconds": 0.036598,
-                "ratio": 2.474,
-                "equal": true
-              },
-              {
-                "kind": "search_engine_client_ip_agg_top",
-                "generic_seconds": 0.03745,
-                "specialized_seconds": 0.037074,
-                "ratio": 1.01,
-                "equal": true
-              },
-              {
-                "kind": "search_engine_client_ip_agg_top",
-                "generic_seconds": 0.038516,
-                "specialized_seconds": 0.036784,
-                "ratio": 1.047,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "watch_id_client_ip_agg_top_filtered",
-                "generic_seconds": 0.000223,
-                "specialized_seconds": 1e-06,
-                "ratio": 162.364,
-                "equal": true
-              },
-              {
-                "kind": "watch_id_client_ip_agg_top_filtered",
-                "generic_seconds": 1e-06,
-                "specialized_seconds": 4e-06,
-                "ratio": 0.25,
-                "equal": true
-              },
-              {
-                "kind": "watch_id_client_ip_agg_top_filtered",
-                "generic_seconds": 1e-06,
-                "specialized_seconds": 1e-06,
-                "ratio": 1.0,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "watch_id_client_ip_agg_top",
-                "generic_seconds": 0.314368,
-                "specialized_seconds": 0.132103,
-                "ratio": 2.38,
-                "equal": true
-              },
-              {
-                "kind": "watch_id_client_ip_agg_top",
-                "generic_seconds": 0.132121,
-                "specialized_seconds": 0.13297,
-                "ratio": 0.994,
-                "equal": true
-              },
-              {
-                "kind": "watch_id_client_ip_agg_top",
-                "generic_seconds": 0.136197,
-                "specialized_seconds": 0.134729,
-                "ratio": 1.011,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "url_count_top",
-                "generic_seconds": 1.206095,
-                "specialized_seconds": 2e-06,
-                "ratio": 556573.758,
-                "equal": true
-              },
-              {
-                "kind": "url_count_top",
-                "generic_seconds": 1e-06,
-                "specialized_seconds": 1e-06,
-                "ratio": 1.683,
-                "equal": true
-              },
-              {
-                "kind": "url_count_top",
-                "generic_seconds": 1e-06,
-                "specialized_seconds": 1e-06,
-                "ratio": 1.061,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "one_url_count_top",
-                "generic_seconds": 1e-06,
-                "specialized_seconds": 1e-06,
-                "ratio": 1.209,
-                "equal": true
-              },
-              {
-                "kind": "one_url_count_top",
-                "generic_seconds": 1e-06,
-                "specialized_seconds": 1e-06,
-                "ratio": 0.999,
-                "equal": true
-              },
-              {
-                "kind": "one_url_count_top",
-                "generic_seconds": 1e-06,
-                "specialized_seconds": 1e-06,
-                "ratio": 1.065,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "client_ip_top10",
-                "generic_seconds": 0.042855,
-                "specialized_seconds": 0.031306,
-                "ratio": 1.369,
-                "equal": true
-              },
-              {
-                "kind": "client_ip_top10",
-                "generic_seconds": 0.03025,
-                "specialized_seconds": 0.029668,
-                "ratio": 1.02,
-                "equal": true
-              },
-              {
-                "kind": "client_ip_top10",
-                "generic_seconds": 0.030895,
-                "specialized_seconds": 0.030171,
-                "ratio": 1.024,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "url_count_top_filtered_dashboard",
-                "generic_seconds": 0.719177,
-                "specialized_seconds": 0.01306,
-                "ratio": 55.066,
-                "equal": true
-              },
-              {
-                "kind": "url_count_top_filtered_dashboard",
-                "generic_seconds": 0.013106,
-                "specialized_seconds": 0.012541,
-                "ratio": 1.045,
-                "equal": true
-              },
-              {
-                "kind": "url_count_top_filtered_dashboard",
-                "generic_seconds": 0.012743,
-                "specialized_seconds": 0.012606,
-                "ratio": 1.011,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "title_count_top_filtered_dashboard",
-                "generic_seconds": 1.131441,
-                "specialized_seconds": 0.007178,
-                "ratio": 157.626,
-                "equal": true
-              },
-              {
-                "kind": "title_count_top_filtered_dashboard",
-                "generic_seconds": 1.132424,
-                "specialized_seconds": 0.005743,
-                "ratio": 197.198,
-                "equal": true
-              },
-              {
-                "kind": "title_count_top_filtered_dashboard",
-                "generic_seconds": 1.132472,
-                "specialized_seconds": 0.005717,
-                "ratio": 198.094,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "url_count_top_filtered_offset_dashboard",
-                "generic_seconds": 0.70667,
-                "specialized_seconds": 0.003889,
-                "ratio": 181.692,
-                "equal": true
-              },
-              {
-                "kind": "url_count_top_filtered_offset_dashboard",
-                "generic_seconds": 0.003607,
-                "specialized_seconds": 0.00357,
-                "ratio": 1.01,
-                "equal": true
-              },
-              {
-                "kind": "url_count_top_filtered_offset_dashboard",
-                "generic_seconds": 0.003527,
-                "specialized_seconds": 0.003455,
-                "ratio": 1.021,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "traffic_source_dashboard",
-                "generic_seconds": 1.71305,
-                "specialized_seconds": 0.12089,
-                "ratio": 14.17,
-                "equal": true
-              },
-              {
-                "kind": "traffic_source_dashboard",
-                "generic_seconds": 0.121145,
-                "specialized_seconds": 0.120672,
-                "ratio": 1.004,
-                "equal": true
-              },
-              {
-                "kind": "traffic_source_dashboard",
-                "generic_seconds": 0.120367,
-                "specialized_seconds": 0.120621,
-                "ratio": 0.998,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "url_hash_date_dashboard",
-                "generic_seconds": 0.008531,
-                "specialized_seconds": 0.007688,
-                "ratio": 1.11,
-                "equal": true
-              },
-              {
-                "kind": "url_hash_date_dashboard",
-                "generic_seconds": 0.007586,
-                "specialized_seconds": 0.007666,
-                "ratio": 0.99,
-                "equal": true
-              },
-              {
-                "kind": "url_hash_date_dashboard",
-                "generic_seconds": 0.007622,
-                "specialized_seconds": 0.007628,
-                "ratio": 0.999,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "window_size_dashboard",
-                "generic_seconds": 0.00825,
-                "specialized_seconds": 0.004503,
-                "ratio": 1.832,
-                "equal": true
-              },
-              {
-                "kind": "window_size_dashboard",
-                "generic_seconds": 0.004552,
-                "specialized_seconds": 0.004502,
-                "ratio": 1.011,
-                "equal": true
-              },
-              {
-                "kind": "window_size_dashboard",
-                "generic_seconds": 0.004437,
-                "specialized_seconds": 0.004383,
-                "ratio": 1.012,
-                "equal": true
-              }
-            ],
-            [
-              {
-                "kind": "time_bucket_dashboard",
-                "generic_seconds": 0.003343,
-                "specialized_seconds": 0.003241,
-                "ratio": 1.032,
-                "equal": true
-              },
-              {
-                "kind": "time_bucket_dashboard",
-                "generic_seconds": 0.003208,
-                "specialized_seconds": 0.003173,
-                "ratio": 1.011,
-                "equal": true
-              },
-              {
-                "kind": "time_bucket_dashboard",
-                "generic_seconds": 0.003184,
-                "specialized_seconds": 0.00315,
-                "ratio": 1.011,
-                "equal": true
-              }
-            ]
-          ],
-          "warm_best_generic_sum": 2.4138229999999994,
-          "warm_best_specialized_sum": 1.2733369999999997,
-          "all_equal": true
-        }
+        "warm_best_from_rows": 1.2635150000000002
       }
     }
   ],

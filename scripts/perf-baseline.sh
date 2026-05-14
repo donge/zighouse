@@ -11,8 +11,11 @@ native 43-query benchmark, and writes a machine-readable JSON result.
 Default limit_rows is 10000000. Set limit_rows to 0 to import the full file.
 
 Environment:
-  PERF_REPEATS  Number of import+query measurements to run, default 3.
-  ZIGHOUSE_PERF_QUERY_PATH  Query path for the benchmark, default compare.
+  PERF_REPEATS              Number of import+query measurements to run, default 3.
+  ZIGHOUSE_PERF_QUERY_PATH  Query path for the benchmark, default specialized.
+  ZIGHOUSE                  Path to zighouse binary; if set together with
+                            SKIP_BUILD=yes the build step is skipped.
+  SKIP_BUILD                Set to 'yes' to skip 'zig build' (use with ZIGHOUSE).
 USAGE
 }
 
@@ -34,7 +37,7 @@ QUERIES=${QUERIES:-assets/queries.sql}
 ZIGHOUSE=${ZIGHOUSE:-zig-out/bin/zighouse}
 BUILD_ARGS=(-Dduckdb=false)
 PERF_REPEATS=${PERF_REPEATS:-3}
-ZIGHOUSE_PERF_QUERY_PATH=${ZIGHOUSE_PERF_QUERY_PATH:-compare}
+ZIGHOUSE_PERF_QUERY_PATH=${ZIGHOUSE_PERF_QUERY_PATH:-specialized}
 
 if [[ "$(uname -s)" == "Darwin" ]]; then
   TIME_CMD=(/usr/bin/time -l)
@@ -47,7 +50,9 @@ trap 'rm -rf "$tmp_dir"' EXIT
 
 mkdir -p "$(dirname "$OUT_JSON")"
 
-zig build "${BUILD_ARGS[@]}"
+if [[ "${SKIP_BUILD:-no}" != "yes" ]]; then
+  zig build "${BUILD_ARGS[@]}"
+fi
 
 run=1
 while [[ $run -le $PERF_REPEATS ]]; do
