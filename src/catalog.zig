@@ -17,7 +17,14 @@
 
 const std = @import("std");
 const schema = @import("schema.zig");
+const schema_infer = @import("schema_infer.zig");
 const clickbench_schema = @import("clickbench/schema.zig");
+
+/// Name of the per-table catalog manifest file stored inside the part dir.
+/// Format:
+///   table=<name>\n
+///   parquet=<absolute_or_relative_path>\n
+pub const catalog_manifest_name = "catalog.zig-house";
 
 pub const StoreLayout = enum {
     /// Legacy ZigHouse ClickBench hot-column files (hot_*.bin, *.id, *.dict.tsv …)
@@ -84,7 +91,95 @@ pub const Catalog = struct {
     pub fn registerHits(self: *Catalog, store_dir: ?[]const u8) !void {
         try self.register(clickbench_schema.hits, store_dir, .clickbench_hot);
     }
+
+    /// Write a catalog manifest for a generic_part table into
+    ///   <store_dir>/<table_name>/parts/all_1_1_0/catalog.zig-house
+    /// The manifest records the table name and the original parquet source path
+    /// so that `restoreFromStore` can reconstruct the catalog entry.
+    pub fn writeManifest(
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        store_dir: []const u8,
+        table_name: []const u8,
+        parquet_path: []const u8,
+    ) !void {
+        const manifest_path = try std.fmt.allocPrint(
+            allocator,
+            "{s}/{s}/parts/all_1_1_0/{s}",
+            .{ store_dir, table_name, catalog_manifest_name },
+        );
+        defer allocator.free(manifest_path);
+
+        const content = try std.fmt.allocPrint(
+            allocator,
+            "table={s}\nparquet={s}\n",
+            .{ table_name, parquet_path },
+        );
+        defer allocator.free(content);
+
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = manifest_path, .data = content });
+    }
+
+    /// Scan `store_dir` for generic_part catalog manifests and register each
+    /// table found.  For each <store_dir>/<table>/parts/all_1_1_0/catalog.zig-house
+    /// the schema is re-inferred from the recorded parquet path and the table is
+    /// registered with layout .generic_part.
+    ///
+    /// Errors opening or parsing individual manifests are silently skipped so
+    /// that a partially-imported store doesn't prevent other tables from loading.
+    pub fn restoreFromStore(
+        self: *Catalog,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        store_dir: []const u8,
+    ) !void {
+        var dir = std.Io.Dir.cwd().openDir(io, store_dir, .{ .iterate = true }) catch return;
+        defer dir.close(io);
+
+        var iter = dir.iterate(io);
+        while (try iter.next()) |entry| {
+            if (entry.kind != .directory) continue;
+            const table_name = entry.name;
+
+            const manifest_path = try std.fmt.allocPrint(
+                allocator,
+                "{s}/{s}/parts/all_1_1_0/{s}",
+                .{ store_dir, table_name, catalog_manifest_name },
+            );
+            defer allocator.free(manifest_path);
+
+            const content = std.Io.Dir.cwd().readFileAlloc(
+                io,
+                manifest_path,
+                allocator,
+                .limited(4096),
+            ) catch continue;
+            defer allocator.free(content);
+
+            const parquet_path = parseManifestField(content, "parquet") orelse continue;
+
+            var inferred = schema_infer.inferSchema(allocator, io, parquet_path, table_name) catch continue;
+            defer inferred.deinit();
+
+            self.register(inferred.table, store_dir, .generic_part) catch continue;
+        }
+    }
 };
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Parse a `key=value\n` line from a manifest.  Returns the value slice (pointing
+/// into `content`) for the first line whose key matches, or null.
+fn parseManifestField(content: []const u8, key: []const u8) ?[]const u8 {
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
+        if (!std.mem.eql(u8, line[0..eq], key)) continue;
+        return line[eq + 1 ..];
+    }
+    return null;
+}
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 

@@ -3,13 +3,16 @@ const build_options = @import("build_options");
 const backend = @import("backend.zig");
 const clickbench_schema = @import("clickbench/schema.zig");
 const catalog = @import("catalog.zig");
+const schema_infer = @import("schema_infer.zig");
+const loader = @import("loader.zig");
+const generic_executor = @import("generic_executor.zig");
+const generic_sql = @import("generic_sql.zig");
 const duckdb = if (build_options.duckdb) @import("duckdb.zig") else @import("duckdb_stub.zig");
 const parquet = @import("parquet.zig");
 const storage = @import("storage.zig");
 const schema = @import("schema.zig");
 const bind = @import("exec/bind.zig");
 const shape = @import("exec/shape.zig");
-const generic_sql = @import("generic_sql.zig");
 
 const usage =
     \\zighouse - minimal ClickBench-oriented analytical database
@@ -20,6 +23,8 @@ const usage =
     \\  zighouse init <data_dir>
     \\  zighouse import <hits.parquet> <data_dir>
     \\  zighouse import-hot <hits.parquet> <data_dir>
+    \\  zighouse import-parquet <hits.parquet> <store_dir> <table_name>
+    \\  zighouse generic-query <store_dir> <table_name> <sql>
     \\  zighouse import-clickbench-csv-hot <hits.csv> <data_dir>
     \\  zighouse import-clickbench-parquet-hot <hits.parquet> <data_dir> [limit_rows]
     \\  zighouse import-clickbench-parquet-native-hot <hits.parquet> <data_dir> [limit_rows]
@@ -146,6 +151,46 @@ fn runCommand(init: std.process.Init, allocator: std.mem.Allocator, args: *std.p
         defer selected.deinit();
         try selected.importParquet(parquet_path);
         try printOut(init.io, "imported hot columns {s} -> {s}\n", .{ parquet_path, data_dir });
+    } else if (std.mem.eql(u8, command, "import-parquet")) {
+        // Generic Parquet import: infer schema, write generic_part store, write catalog manifest.
+        // Usage: zighouse import-parquet <parquet_path> <store_dir> <table_name>
+        const parquet_path = args.next() orelse return error.MissingParquetPath;
+        const store_dir = args.next() orelse return error.MissingDataDir;
+        const table_name = args.next() orelse return error.MissingTableName;
+        var inferred = try schema_infer.inferSchema(allocator, init.io, parquet_path, table_name);
+        defer inferred.deinit();
+        const row_count = try loader.importParquet(allocator, init.io, parquet_path, store_dir, inferred.table);
+        try catalog.Catalog.writeManifest(init.io, allocator, store_dir, table_name, parquet_path);
+        try printOut(init.io, "imported {d} rows {s} -> {s}/{s}\n", .{ row_count, parquet_path, store_dir, table_name });
+    } else if (std.mem.eql(u8, command, "generic-query")) {
+        // Query a generic_part store.
+        // Usage: zighouse generic-query <store_dir> <table_name> <sql>
+        const store_dir = args.next() orelse return error.MissingDataDir;
+        const table_name = args.next() orelse return error.MissingTableName;
+        const sql = args.next() orelse return error.MissingSql;
+        // Locate the catalog manifest to get the original parquet path.
+        const manifest_path = try std.fmt.allocPrint(
+            allocator,
+            "{s}/{s}/parts/all_1_1_0/catalog.zig-house",
+            .{ store_dir, table_name },
+        );
+        defer allocator.free(manifest_path);
+        const manifest_content = try std.Io.Dir.cwd().readFileAlloc(
+            init.io,
+            manifest_path,
+            allocator,
+            .limited(4096),
+        );
+        defer allocator.free(manifest_content);
+        const parquet_path = parseCatalogField(manifest_content, "parquet") orelse return error.MissingParquetInManifest;
+        // Infer schema from Parquet file.
+        var inferred = try schema_infer.inferSchema(allocator, init.io, parquet_path, table_name);
+        defer inferred.deinit();
+        // Parse and run the query.
+        const plan = (try generic_sql.parse(allocator, sql)) orelse return error.UnsupportedGenericQuery;
+        const output = try generic_executor.run(allocator, init.io, plan, parquet_path, &inferred.table);
+        defer allocator.free(output);
+        try writeOut(init.io, output);
     } else if (std.mem.eql(u8, command, "import-clickbench-csv-hot")) {
         const csv_path = args.next() orelse return error.MissingCsvPath;
         const data_dir = args.next() orelse return error.MissingDataDir;
@@ -491,6 +536,18 @@ fn printUsage(io: std.Io) !void {
     try writeOut(io, usage);
 }
 
+/// Parse a `key=value\n` line from a catalog manifest.
+fn parseCatalogField(content: []const u8, key: []const u8) ?[]const u8 {
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
+        if (!std.mem.eql(u8, line[0..eq], key)) continue;
+        return line[eq + 1 ..];
+    }
+    return null;
+}
+
 fn compareDuckDbNative(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8, queries_path: []const u8, range: duckdb.QueryRange) !void {
     const native_mod = @import("native.zig");
     var duck = duckdb.DuckDb.init(allocator, io, data_dir);
@@ -817,9 +874,10 @@ fn printErr(io: std.Io, comptime fmt: []const u8, args: anytype) !void {
     try std.Io.File.stderr().writeStreamingAll(io, bytes);
 }
 
-// Pull catalog and store tests into this test binary.
+// Pull catalog, schema_infer and store tests into this test binary.
 comptime {
     _ = catalog;
+    _ = schema_infer;
 }
 
 test "schema has ClickBench column count" {

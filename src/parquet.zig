@@ -115,6 +115,18 @@ pub fn rowCountPath(allocator: std.mem.Allocator, io: std.Io, path: []const u8) 
     return @intCast(meta.num_rows);
 }
 
+/// Read Parquet file footer metadata.  Caller owns the returned LoadedMetadata
+/// and must call .deinit() when done.
+pub fn readMetadataPath(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !LoadedMetadata {
+    var file = if (std.fs.path.isAbsolute(path))
+        try std.Io.Dir.openFileAbsolute(io, path, .{})
+    else
+        try std.Io.Dir.cwd().openFile(io, path, .{});
+    defer file.close(io);
+    const stat = try file.stat(io);
+    return readMetadataFromFile(allocator, io, &file, stat.size);
+}
+
 pub fn inspectPath(allocator: std.mem.Allocator, io: std.Io, path: []const u8) ![]u8 {
     var file = if (std.fs.path.isAbsolute(path))
         try std.Io.Dir.openFileAbsolute(io, path, .{})
@@ -1327,12 +1339,12 @@ fn fnv1a(seed: u64, bytes: []const u8) u64 {
     return h;
 }
 
-const LoadedMetadata = struct {
+pub const LoadedMetadata = struct {
     backing_allocator: std.mem.Allocator,
     arena: *std.heap.ArenaAllocator,
     meta: Metadata,
 
-    fn deinit(self: *LoadedMetadata) void {
+    pub fn deinit(self: *LoadedMetadata) void {
         self.arena.deinit();
         self.backing_allocator.destroy(self.arena);
     }

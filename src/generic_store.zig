@@ -88,7 +88,7 @@ pub fn writeColumnsTxt(
     var text: std.ArrayListUnmanaged(u8) = .empty;
     defer text.deinit(allocator);
     for (table.columns) |col| {
-        try text.writer(allocator).print("{s}\t{s}\n", .{ col.name, @tagName(col.ty) });
+        try text.print(allocator, "{s}\t{s}\n", .{ col.name, @tagName(col.ty) });
     }
     const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ part, columns_txt_name });
     defer allocator.free(path);
