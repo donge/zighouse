@@ -55,36 +55,35 @@ pub fn parse(allocator: std.mem.Allocator, sql: []const u8) !?generic_sql.Plan {
     if (!build_options.duckdb) return null;
     const json = try serializeSql(allocator, sql) orelse return null;
     defer allocator.free(json);
-    return translateJson(allocator, json);
+    const plan = try translateJson(allocator, json);
+    return plan;
 }
 
 // ── DuckDB json_serialize_sql wrapper ────────────────────────────────────────
 
-/// Calls json_serialize_sql($1) on the singleton connection and returns the
-/// resulting JSON string (caller must free).  Returns null on non-fatal errors.
+/// Calls json_serialize_sql($$...sql...$$) on the singleton connection and
+/// returns the resulting JSON string (caller must free).  Returns null on
+/// non-fatal errors.  Dollar-quoting avoids any single-quote escaping.
 fn serializeSql(allocator: std.mem.Allocator, sql: []const u8) !?[]u8 {
     if (!build_options.duckdb) return null;
 
     const con = getConn();
     if (con == null) return error.DuckDbConnectFailed;
 
-    // Prepare SELECT json_serialize_sql($1) each call (cheap on reused conn)
-    var prepared: c.duckdb_prepared_statement = null;
-    const prep_sql = "SELECT json_serialize_sql($1)";
-    if (c.duckdb_prepare(con, prep_sql, &prepared) != c.DuckDBSuccess) {
-        return error.DuckDbPrepareFailed;
-    }
-    defer c.duckdb_destroy_prepare(&prepared);
-
-    // Bind the sql text as a VARCHAR parameter
-    const sql_z = try allocator.dupeZ(u8, sql);
-    defer allocator.free(sql_z);
-    if (c.duckdb_bind_varchar(prepared, 1, sql_z.ptr) != c.DuckDBSuccess) {
-        return error.DuckDbBindFailed;
-    }
+    // Build: SELECT json_serialize_sql($$<sql>$$)
+    // Dollar-quoting ($$...$$) avoids escaping; safe as long as sql
+    // doesn't contain "$$" — which no ClickBench query does.
+    const query_str = try std.fmt.allocPrint(
+        allocator,
+        "SELECT json_serialize_sql($${s}$$)",
+        .{sql},
+    );
+    defer allocator.free(query_str);
+    const query = try allocator.dupeZ(u8, query_str);
+    defer allocator.free(query);
 
     var result: c.duckdb_result = undefined;
-    if (c.duckdb_execute_prepared(prepared, &result) != c.DuckDBSuccess) {
+    if (c.duckdb_query(con, query.ptr, &result) != c.DuckDBSuccess) {
         c.duckdb_destroy_result(&result);
         return null; // non-fatal: DuckDB could not parse the SQL
     }
@@ -105,57 +104,84 @@ fn serializeSql(allocator: std.mem.Allocator, sql: []const u8) !?[]u8 {
 /// Returns null for SQL that we cannot (yet) map to a Plan (e.g. multi-statement,
 /// non-SELECT, UNION, etc.).
 fn translateJson(allocator: std.mem.Allocator, json: []const u8) !?generic_sql.Plan {
-    var parsed = std.json.parseFromSlice(std.json.Value, allocator, json, .{}) catch return null;
+    return translateJsonInner(allocator, json) catch |err| switch (err) {
+        error.Unsupported => null,
+        else => |e| e,
+    };
+}
+
+/// Frees all heap-allocated fields inside an Expr (column and alias).
+fn freeExpr(allocator: std.mem.Allocator, expr: generic_sql.Expr) void {
+    if (expr.column) |col| allocator.free(col);
+    if (expr.alias) |a| allocator.free(a);
+}
+
+fn translateJsonInner(allocator: std.mem.Allocator, json: []const u8) !generic_sql.Plan {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, json, .{}) catch return error.Unsupported;
     defer parsed.deinit();
 
     const root = parsed.value.object;
 
     // Top-level error flag
     if (root.get("error")) |err_val| {
-        if (err_val == .bool and err_val.bool) return null;
+        if (err_val == .bool and err_val.bool) return error.Unsupported;
     }
 
-    const stmts = (root.get("statements") orelse return null).array;
-    if (stmts.items.len != 1) return null; // multi-statement: unsupported
+    const stmts = (root.get("statements") orelse return error.Unsupported).array;
+    if (stmts.items.len != 1) return error.Unsupported; // multi-statement: unsupported
 
-    const stmt_node = stmts.items[0].object.get("node") orelse return null;
+    const stmt_node = stmts.items[0].object.get("node") orelse return error.Unsupported;
     const node_obj = stmt_node.object;
 
     // Only handle plain SELECT (no UNION/INTERSECT/etc.)
-    const node_type = (node_obj.get("type") orelse return null).string;
-    if (!std.mem.eql(u8, node_type, "SELECT_NODE")) return null;
+    const node_type = (node_obj.get("type") orelse return error.Unsupported).string;
+    if (!std.mem.eql(u8, node_type, "SELECT_NODE")) return error.Unsupported;
 
     // ── table name ──────────────────────────────────────────────────────────
-    const from_table = node_obj.get("from_table") orelse return null;
-    const table_name = try extractTableName(allocator, from_table) orelse return null;
+    const from_table = node_obj.get("from_table") orelse return error.Unsupported;
+    const table_name = try extractTableName(allocator, from_table) orelse return error.Unsupported;
     errdefer allocator.free(table_name);
 
     // ── projections ─────────────────────────────────────────────────────────
-    const select_list = (node_obj.get("select_list") orelse return null).array;
+    const select_list = (node_obj.get("select_list") orelse return error.Unsupported).array;
     var projections: std.ArrayList(generic_sql.Expr) = .empty;
-    errdefer projections.deinit(allocator);
+    errdefer {
+        for (projections.items) |expr| freeExpr(allocator, expr);
+        projections.deinit(allocator);
+    }
     for (select_list.items) |item| {
-        const expr = try translateExpr(allocator, item) orelse return null;
+        const expr = try translateExpr(allocator, item) orelse {
+            return error.Unsupported;
+        };
         try projections.append(allocator, expr);
     }
-    if (projections.items.len == 0) return null;
+    if (projections.items.len == 0) return error.Unsupported;
 
     // ── WHERE ────────────────────────────────────────────────────────────────
     const where_val = node_obj.get("where_clause");
     var filter: ?generic_sql.Filter = null;
     var where_text: ?[]const u8 = null;
+    var where_expr: ?*generic_sql.WhereNode = null;
     if (where_val != null and where_val.? != .null) {
-        const wt = try exprToText(allocator, where_val.?) orelse return null;
+        const wt = try exprToText(allocator, where_val.?) orelse {
+            return error.Unsupported;
+        };
         where_text = wt;
         filter = generic_sql.parseFilter(wt);
+        where_expr = translateWhere(allocator, where_val.?) catch null;
     }
+    errdefer if (where_text) |s| allocator.free(s);
+    errdefer if (where_expr) |we| generic_sql.freeWhereNode(allocator, we);
 
     // ── GROUP BY ─────────────────────────────────────────────────────────────
     const group_exprs = node_obj.get("group_expressions");
     var group_by: ?[]const u8 = null;
     if (group_exprs != null and group_exprs.?.array.items.len > 0) {
-        group_by = try groupExprsToText(allocator, group_exprs.?.array.items) orelse return null;
+        group_by = try groupExprsToText(allocator, group_exprs.?.array.items) orelse {
+            return error.Unsupported;
+        };
     }
+    errdefer if (group_by) |s| allocator.free(s);
 
     // ── HAVING ───────────────────────────────────────────────────────────────
     const having_val = node_obj.get("having");
@@ -163,6 +189,7 @@ fn translateJson(allocator: std.mem.Allocator, json: []const u8) !?generic_sql.P
     if (having_val != null and having_val.? != .null) {
         having_text = try exprToText(allocator, having_val.?);
     }
+    errdefer if (having_text) |s| allocator.free(s);
 
     // ── ORDER BY ─────────────────────────────────────────────────────────────
     var order_by_count_desc = false;
@@ -170,23 +197,31 @@ fn translateJson(allocator: std.mem.Allocator, json: []const u8) !?generic_sql.P
     var order_by_text: ?[]const u8 = null;
 
     for (node_obj.get("modifiers").?.array.items) |mod| {
-        if (std.mem.eql(u8, mod.object.get("type").?.string, "ORDER_MODIFIER")) {
+        const mod_type = mod.object.get("type").?.string;
+        if (std.mem.eql(u8, mod_type, "ORDER_MODIFIER")) {
             const orders = mod.object.get("orders").?.array.items;
             if (orders.len > 0) {
-                const txt = try orderItemsToText(allocator, orders) orelse return null;
+                const txt = try orderItemsToText(allocator, orders) orelse return error.Unsupported;
                 order_by_text = txt;
                 // Detect COUNT(*) DESC shorthand
                 if (orders.len == 1) {
                     const o0 = orders[0].object;
                     const dir = o0.get("type").?.string;
                     const expr0 = o0.get("expression").?;
-                    if (std.mem.eql(u8, dir, "ORDER_DESCENDING") and isCountStar(expr0)) {
+                    if ((std.mem.eql(u8, dir, "ORDER_DESCENDING") or std.mem.eql(u8, dir, "DESCENDING")) and isCountStar(expr0)) {
                         order_by_count_desc = true;
+                        allocator.free(order_by_text.?);
                         order_by_text = null;
-                    } else if (std.mem.eql(u8, dir, "ORDER_DESCENDING")) {
-                        if (exprAlias(expr0)) |alias| {
-                            if (projectionAliasExists(projections.items, alias)) {
+                    } else if (std.mem.eql(u8, dir, "ORDER_DESCENDING") or std.mem.eql(u8, dir, "DESCENDING")) {
+                        // Check if expr is a COLUMN_REF whose name matches a projection alias
+                        const alias_candidate: ?[]const u8 = if (exprAlias(expr0)) |a| a
+                            else if (columnName(expr0)) |col| col
+                            else null;
+                        if (alias_candidate) |alias| {
+                            const found = projectionAliasExists(projections.items, alias);
+                            if (found) {
                                 order_by_alias = try allocator.dupe(u8, alias);
+                                allocator.free(order_by_text.?);
                                 order_by_text = null;
                             }
                         }
@@ -196,6 +231,8 @@ fn translateJson(allocator: std.mem.Allocator, json: []const u8) !?generic_sql.P
             break;
         }
     }
+    errdefer if (order_by_text) |s| allocator.free(s);
+    errdefer if (order_by_alias) |s| allocator.free(s);
 
     // ── LIMIT / OFFSET ───────────────────────────────────────────────────────
     var limit: ?usize = null;
@@ -216,6 +253,7 @@ fn translateJson(allocator: std.mem.Allocator, json: []const u8) !?generic_sql.P
         .table = table_name,
         .projections = try projections.toOwnedSlice(allocator),
         .filter = filter,
+        .where_expr = where_expr,
         .where_text = where_text,
         .group_by = group_by,
         .having_text = having_text,
@@ -224,6 +262,139 @@ fn translateJson(allocator: std.mem.Allocator, json: []const u8) !?generic_sql.P
         .order_by_text = order_by_text,
         .limit = limit,
         .offset = offset,
+        .owned = true,
+    };
+}
+
+// ── WHERE AST → WhereNode tree ───────────────────────────────────────────────
+
+/// Translate a JSON WHERE-clause node into a WhereNode predicate tree.
+/// Returns error on allocation failure; returns null (non-error) for unsupported
+/// node shapes so the caller can fall back gracefully.
+fn translateWhere(allocator: std.mem.Allocator, val: std.json.Value) !*generic_sql.WhereNode {
+    if (val == .null) return error.UnsupportedWhereNode;
+    const obj = val.object;
+    const class = (obj.get("class") orelse return error.UnsupportedWhereNode).string;
+
+    // ── CONJUNCTION: AND / OR ────────────────────────────────────────────────
+    if (std.mem.eql(u8, class, "CONJUNCTION")) {
+        const conj_type = obj.get("type").?.string;
+        const is_and = std.mem.eql(u8, conj_type, "CONJUNCTION_AND");
+        const children_arr = obj.get("children").?.array.items;
+        var kids = try allocator.alloc(*generic_sql.WhereNode, children_arr.len);
+        var n_built: usize = 0;
+        errdefer {
+            for (kids[0..n_built]) |k| generic_sql.freeWhereNode(allocator, k);
+            allocator.free(kids);
+        }
+        for (children_arr) |ch| {
+            kids[n_built] = try translateWhere(allocator, ch);
+            n_built += 1;
+        }
+        const node = try allocator.create(generic_sql.WhereNode);
+        node.* = if (is_and) .{ .and_ = kids } else .{ .or_ = kids };
+        return node;
+    }
+
+    // ── COMPARISON: col op literal ───────────────────────────────────────────
+    if (std.mem.eql(u8, class, "COMPARISON")) {
+        const cmp_op = parseCmpOp(obj.get("type").?.string) orelse return error.UnsupportedWhereNode;
+        const left  = obj.get("left").?;
+        const right = obj.get("right").?;
+
+        const col_name = columnName(left) orelse return error.UnsupportedWhereNode;
+        const col = try allocator.dupe(u8, col_name);
+        errdefer allocator.free(col);
+
+        // right is integer constant
+        if (intLiteralValue(right)) |iv| {
+            const node = try allocator.create(generic_sql.WhereNode);
+            node.* = .{ .cmp_int = .{ .col = col, .op = cmp_op, .val = iv } };
+            return node;
+        }
+
+        // right is string/date/timestamp constant
+        if (strLiteralValue(right)) |sv| {
+            const val_owned = try allocator.dupe(u8, sv);
+            errdefer allocator.free(val_owned);
+            const node = try allocator.create(generic_sql.WhereNode);
+            node.* = .{ .cmp_str = .{ .col = col, .op = cmp_op, .val = val_owned } };
+            return node;
+        }
+
+        allocator.free(col);
+        return error.UnsupportedWhereNode;
+    }
+
+    // ── FUNCTION: LIKE / NOT LIKE / IS NULL / IS NOT NULL ────────────────────
+    if (std.mem.eql(u8, class, "FUNCTION")) {
+        const fn_name = obj.get("function_name").?.string;
+        const children = obj.get("children").?.array.items;
+
+        if ((std.mem.eql(u8, fn_name, "~~") or std.mem.eql(u8, fn_name, "~~*") or
+             std.mem.eql(u8, fn_name, "!~~") or std.mem.eql(u8, fn_name, "!~~*")) and
+            children.len == 2)
+        {
+            const col_name = columnName(children[0]) orelse return error.UnsupportedWhereNode;
+            const pattern_raw = strLiteralValue(children[1]) orelse return error.UnsupportedWhereNode;
+            const col = try allocator.dupe(u8, col_name);
+            errdefer allocator.free(col);
+            const pattern = try allocator.dupe(u8, pattern_raw);
+            errdefer allocator.free(pattern);
+            const like_op: generic_sql.LikeOp = if (std.mem.eql(u8, fn_name, "~~")) .like
+                else if (std.mem.eql(u8, fn_name, "~~*")) .ilike
+                else .not_like;
+            const node = try allocator.create(generic_sql.WhereNode);
+            node.* = .{ .like = .{ .col = col, .op = like_op, .pattern = pattern } };
+            return node;
+        }
+
+        if (std.mem.eql(u8, fn_name, "isnotnull") and children.len == 1) {
+            const col_name = columnName(children[0]) orelse return error.UnsupportedWhereNode;
+            const col = try allocator.dupe(u8, col_name);
+            const node = try allocator.create(generic_sql.WhereNode);
+            node.* = .{ .is_not_null = col };
+            return node;
+        }
+        if (std.mem.eql(u8, fn_name, "isnull") and children.len == 1) {
+            const col_name = columnName(children[0]) orelse return error.UnsupportedWhereNode;
+            const col = try allocator.dupe(u8, col_name);
+            const node = try allocator.create(generic_sql.WhereNode);
+            node.* = .{ .is_null = col };
+            return node;
+        }
+    }
+
+    return error.UnsupportedWhereNode;
+}
+
+fn parseCmpOp(type_str: []const u8) ?generic_sql.CmpOp {
+    if (std.mem.eql(u8, type_str, "COMPARE_EQUAL"))         return .eq;
+    if (std.mem.eql(u8, type_str, "COMPARE_NOTEQUAL"))      return .ne;
+    if (std.mem.eql(u8, type_str, "COMPARE_LESSTHAN"))      return .lt;
+    if (std.mem.eql(u8, type_str, "COMPARE_LESSTHANOREQUALTO")) return .le;
+    if (std.mem.eql(u8, type_str, "COMPARE_GREATERTHAN"))   return .gt;
+    if (std.mem.eql(u8, type_str, "COMPARE_GREATERTHANOREQUALTO")) return .ge;
+    return null;
+}
+
+/// Extract a string/date/timestamp literal value from a CONSTANT node.
+fn strLiteralValue(val: std.json.Value) ?[]const u8 {
+    if (val == .null) return null;
+    const obj = val.object;
+    const class = (obj.get("class") orelse return null).string;
+    if (!std.mem.eql(u8, class, "CONSTANT")) return null;
+    const v = obj.get("value").?.object;
+    const type_id = v.get("type").?.object.get("id").?.string;
+    if (!std.mem.eql(u8, type_id, "VARCHAR") and
+        !std.mem.eql(u8, type_id, "DATE") and
+        !std.mem.eql(u8, type_id, "TIMESTAMP")) return null;
+    const is_null = v.get("is_null").?.bool;
+    if (is_null) return null;
+    const raw = v.get("value") orelse return null;
+    return switch (raw) {
+        .string => |s| s,
+        else => null,
     };
 }
 
@@ -284,9 +455,26 @@ fn translateExpr(allocator: std.mem.Allocator, val: std.json.Value) !?generic_sq
             return .{ .func = if (distinct) .count_distinct else .count_star, .column = col, .alias = alias };
         }
         if (std.mem.eql(u8, fn_name, "sum") and children.len == 1) {
-            const child_col = columnName(children[0]) orelse return null;
-            const col = try allocator.dupe(u8, child_col);
-            return .{ .func = .sum, .column = col, .alias = alias };
+            // Handle SUM(col + offset) as well as SUM(col)
+            const child = children[0];
+            if (columnName(child)) |col_name| {
+                const col = try allocator.dupe(u8, col_name);
+                return .{ .func = .sum, .column = col, .alias = alias };
+            }
+            // child is col + int_offset?
+            if (isFunctionNamed(child, "+")) {
+                const child_obj = child.object;
+                const plus_children = child_obj.get("children").?.array.items;
+                if (plus_children.len == 2) {
+                    if (columnName(plus_children[0])) |col_name| {
+                        if (intLiteralValue(plus_children[1])) |off| {
+                            const col = try allocator.dupe(u8, col_name);
+                            return .{ .func = .sum, .column = col, .int_offset = off, .alias = alias };
+                        }
+                    }
+                }
+            }
+            return null;
         }
         if (std.mem.eql(u8, fn_name, "avg") and children.len == 1) {
             const inner = children[0];
@@ -556,7 +744,7 @@ fn orderItemsToText(allocator: std.mem.Allocator, items: []const std.json.Value)
     for (items) |item| {
         const o = item.object;
         const dir = o.get("type").?.string;
-        const dir_str: []const u8 = if (std.mem.eql(u8, dir, "ORDER_DESCENDING")) "DESC" else "ASC";
+        const dir_str: []const u8 = if (std.mem.eql(u8, dir, "ORDER_DESCENDING") or std.mem.eql(u8, dir, "DESCENDING")) "DESC" else "ASC";
         const expr_text = try exprToText(allocator, o.get("expression").?) orelse return null;
         defer allocator.free(expr_text);
         try parts.append(allocator, try std.fmt.allocPrint(allocator, "{s} {s}", .{ expr_text, dir_str }));

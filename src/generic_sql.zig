@@ -10,6 +10,46 @@ pub const Expr = struct {
     alias: ?[]const u8 = null,
 };
 
+// ── WhereNode: generic predicate tree ─────────────────────────────────────────
+//
+// Represents an arbitrary WHERE / HAVING clause as a typed tree.
+// Used by generic_executor.zig to evaluate predicates over streaming rows.
+// native.zig continues to use the legacy Filter struct for its specialised paths.
+
+pub const CmpOp = enum { eq, ne, lt, le, gt, ge };
+pub const LikeOp = enum { like, not_like, ilike };
+
+pub const WhereNode = union(enum) {
+    /// col op int  (e.g. Age > 0, EventDate >= 15887)
+    cmp_int: struct { col: []const u8, op: CmpOp, val: i64 },
+    /// col op 'str'  (e.g. SearchPhrase <> '', URL = 'foo')
+    cmp_str: struct { col: []const u8, op: CmpOp, val: []const u8 },
+    /// col LIKE / NOT LIKE / ILIKE 'pattern'
+    like: struct { col: []const u8, op: LikeOp, pattern: []const u8 },
+    /// col IS NULL
+    is_null: []const u8,
+    /// col IS NOT NULL
+    is_not_null: []const u8,
+    /// AND / OR over a list of children (children slice is owned by allocator)
+    and_: []const *WhereNode,
+    or_: []const *WhereNode,
+};
+
+/// Recursively free a WhereNode tree.
+pub fn freeWhereNode(allocator: std.mem.Allocator, node: *WhereNode) void {
+    switch (node.*) {
+        .cmp_int => |c| allocator.free(c.col),
+        .cmp_str => |c| { allocator.free(c.col); allocator.free(c.val); },
+        .like    => |l| { allocator.free(l.col); allocator.free(l.pattern); },
+        .is_null, .is_not_null => |col| allocator.free(col),
+        .and_, .or_ => |children| {
+            for (children) |ch| freeWhereNode(allocator, ch);
+            allocator.free(children);
+        },
+    }
+    allocator.destroy(node);
+}
+
 pub const FilterOp = enum { equal, not_equal, greater, greater_equal, less, less_equal };
 
 pub const Predicate = struct {
@@ -29,6 +69,10 @@ pub const Plan = struct {
     table: []const u8,
     projections: []const Expr,
     filter: ?Filter = null,
+    /// Typed WHERE predicate tree (superset of `filter`).
+    /// Populated by the DuckDB-backed parser; null when using the legacy parser.
+    /// Free with freeWhereNode(allocator, where_expr) before calling deinit.
+    where_expr: ?*WhereNode = null,
     where_text: ?[]const u8 = null,
     group_by: ?[]const u8 = null,
     having_text: ?[]const u8 = null,
@@ -37,13 +81,54 @@ pub const Plan = struct {
     order_by_text: ?[]const u8 = null,
     limit: ?usize = null,
     offset: ?usize = null,
+    /// When true, all string fields (table, where_text, group_by, having_text,
+    /// order_by_alias, order_by_text) were heap-allocated by the DuckDB parser
+    /// and must be freed by deinit().  Legacy parser uses SQL slices (no free).
+    owned: bool = false,
 };
 
 /// Parse `sql` into a Plan.  Tries the DuckDB-backed parser first (when DuckDB
 /// is linked); falls back to the legacy hand-written parser on failure.
 pub fn parse(allocator: std.mem.Allocator, sql: []const u8) !?Plan {
-    if (duckdb_parse.parse(allocator, sql) catch null) |plan| return plan;
+    if (duckdb_parse.parse(allocator, sql) catch null) |plan| {
+        // Validate that the plan matches a supported shape before accepting it.
+        // Also reject if there's an ORDER BY that's not supported by the specialised paths.
+        const order_ok = if (plan.order_by_text) |obt|
+            plan.order_by_alias != null or plan.order_by_count_desc or validOrderByText(obt)
+        else true;
+        if (order_ok and validPlanShape(plan.projections, plan.filter, plan.where_text, plan.group_by, plan.having_text, plan.order_by_text, plan.limit, plan.offset)) {
+            return plan;
+        }
+        // If the DuckDB-parsed plan has a where_expr (generic executor path),
+        // accept it via the looser generic shape check without falling back.
+        if (plan.where_expr != null and validGenericShape(plan.projections, plan.having_text)) {
+            return plan;
+        }
+        // DuckDB-parsed plan did not match a supported shape; free it and fall
+        // through to the legacy parser (which may also return null).
+        deinit(allocator, plan);
+    }
     return parseLegacy(allocator, sql);
+}
+
+/// Returns true if the projection list is valid for generic scan/agg execution:
+/// either all scalar aggregates (no column_ref) or all column references / int
+/// literals (no aggregates mixed with references).  Having clauses are not
+/// supported in the generic path.
+fn validGenericShape(projections: []const Expr, having_text: ?[]const u8) bool {
+    if (having_text != null) return false;
+    if (projections.len == 0) return false;
+    var has_agg = false;
+    var has_col = false;
+    for (projections) |p| {
+        switch (p.func) {
+            .column_ref, .int_literal => has_col = true,
+            else => has_agg = true,
+        }
+    }
+    // Mixed agg + column_ref without GROUP BY is not supported here.
+    if (has_agg and has_col) return false;
+    return true;
 }
 
 fn parseLegacy(allocator: std.mem.Allocator, sql: []const u8) !?Plan {
@@ -161,6 +246,20 @@ fn parseLegacy(allocator: std.mem.Allocator, sql: []const u8) !?Plan {
 }
 
 pub fn deinit(allocator: std.mem.Allocator, plan: Plan) void {
+    if (plan.where_expr) |we| freeWhereNode(allocator, we);
+    if (plan.owned) {
+        allocator.free(plan.table);
+        if (plan.where_text) |s| allocator.free(s);
+        if (plan.group_by) |s| allocator.free(s);
+        if (plan.having_text) |s| allocator.free(s);
+        if (plan.order_by_alias) |s| allocator.free(s);
+        if (plan.order_by_text) |s| allocator.free(s);
+        // Also free alias strings inside projections
+        for (plan.projections) |expr| {
+            if (expr.alias) |a| allocator.free(a);
+            if (expr.column) |col| allocator.free(col);
+        }
+    }
     allocator.free(plan.projections);
 }
 
@@ -977,7 +1076,11 @@ test "rejects unsupported sql" {
     // Non-"hits" table names are now parsed successfully; callers (e.g.
     // Native.executeGenericSql) validate the table name and return
     // error.UnknownTable for unrecognised tables.
-    try std.testing.expect((try parse(std.testing.allocator, "SELECT COUNT(*) FROM hits WHERE AdvEngineID <> 0 AND ResolutionWidth > 0 AND IsRefresh = 0")) == null);
+    // Note: complex multi-condition WHERE queries with aggregates are now
+    // accepted by the generic executor path (where_expr + validGenericShape).
+    const plan = (try parse(std.testing.allocator, "SELECT COUNT(*) FROM hits WHERE AdvEngineID <> 0 AND ResolutionWidth > 0 AND IsRefresh = 0")).?;
+    defer deinit(std.testing.allocator, plan);
+    try std.testing.expect(plan.where_expr != null);
 }
 
 test "parses filtered column projection" {

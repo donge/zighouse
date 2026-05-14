@@ -27,6 +27,7 @@ const generic_sql = @import("generic_sql.zig");
 const parquet = @import("parquet.zig");
 const clickbench_schema = @import("clickbench/schema.zig");
 const schema = @import("schema.zig");
+const build_options = @import("build_options");
 
 // ── Public entry point ────────────────────────────────────────────────────────
 
@@ -165,7 +166,129 @@ const Value = union(enum) {
 
 // ── Predicate evaluation ──────────────────────────────────────────────────────
 
+/// Evaluate a `WhereNode` predicate tree against a row.
+/// Returns true if the row passes the predicate.
+fn evalWhereNode(node: *const generic_sql.WhereNode, row: *const RowCtx) bool {
+    switch (node.*) {
+        .cmp_int => |c| {
+            const v = row.get(c.col) orelse return false;
+            const iv = v.toI64() orelse return false;
+            return switch (c.op) {
+                .eq => iv == c.val,
+                .ne => iv != c.val,
+                .lt => iv <  c.val,
+                .le => iv <= c.val,
+                .gt => iv >  c.val,
+                .ge => iv >= c.val,
+            };
+        },
+        .cmp_str => |c| {
+            const v = row.get(c.col) orelse return false;
+            const sv = v.toStr() orelse {
+                // numeric column compared to string literal (e.g. date as epoch vs '2013-07-01')
+                // Try parsing the string as a date-epoch integer
+                if (c.op == .eq or c.op == .ne or c.op == .lt or c.op == .le or c.op == .gt or c.op == .ge) {
+                    if (parseDateStr(c.val)) |epoch| {
+                        const iv = v.toI64() orelse return false;
+                        return switch (c.op) {
+                            .eq => iv == epoch,
+                            .ne => iv != epoch,
+                            .lt => iv <  epoch,
+                            .le => iv <= epoch,
+                            .gt => iv >  epoch,
+                            .ge => iv >= epoch,
+                        };
+                    }
+                }
+                return false;
+            };
+            return switch (c.op) {
+                .eq => std.mem.eql(u8, sv, c.val),
+                .ne => !std.mem.eql(u8, sv, c.val),
+                .lt => std.mem.order(u8, sv, c.val) == .lt,
+                .le => std.mem.order(u8, sv, c.val) != .gt,
+                .gt => std.mem.order(u8, sv, c.val) == .gt,
+                .ge => std.mem.order(u8, sv, c.val) != .lt,
+            };
+        },
+        .like => |l| {
+            const v = row.get(l.col) orelse return false;
+            const sv = v.toStr() orelse return false;
+            const matched = likeMatch(sv, l.pattern, l.op == .ilike);
+            return switch (l.op) {
+                .like, .ilike => matched,
+                .not_like => !matched,
+            };
+        },
+        .is_null => |col| {
+            const v = row.get(col) orelse return true; // missing → null
+            return v == .null_val;
+        },
+        .is_not_null => |col| {
+            const v = row.get(col) orelse return false;
+            return v != .null_val;
+        },
+        .and_ => |children| {
+            for (children) |ch| if (!evalWhereNode(ch, row)) return false;
+            return true;
+        },
+        .or_ => |children| {
+            for (children) |ch| if (evalWhereNode(ch, row)) return true;
+            return false;
+        },
+    }
+}
+
+/// SQL LIKE pattern matching: '%' matches any sequence, '_' matches one char.
+/// case_insensitive=true for ILIKE.
+fn likeMatch(str: []const u8, pattern: []const u8, case_insensitive: bool) bool {
+    if (pattern.len == 0) return str.len == 0;
+    if (pattern[0] == '%') {
+        // Try matching the rest of the pattern at each position in str
+        if (likeMatch(str, pattern[1..], case_insensitive)) return true;
+        if (str.len == 0) return false;
+        return likeMatch(str[1..], pattern, case_insensitive);
+    }
+    if (str.len == 0) return false;
+    if (pattern[0] == '_') {
+        return likeMatch(str[1..], pattern[1..], case_insensitive);
+    }
+    const match = if (case_insensitive)
+        std.ascii.toLower(str[0]) == std.ascii.toLower(pattern[0])
+    else
+        str[0] == pattern[0];
+    if (!match) return false;
+    return likeMatch(str[1..], pattern[1..], case_insensitive);
+}
+
+/// Parse a 'YYYY-MM-DD' date string into days-since-epoch (DuckDB DATE epoch).
+/// Returns null if the string is not a recognisable date.
+fn parseDateStr(s: []const u8) ?i64 {
+    // Accept 'YYYY-MM-DD' (10 chars)
+    if (s.len != 10 or s[4] != '-' or s[7] != '-') return null;
+    const y = std.fmt.parseInt(i32, s[0..4], 10) catch return null;
+    const m = std.fmt.parseInt(u8,  s[5..7], 10) catch return null;
+    const d = std.fmt.parseInt(u8,  s[8..10], 10) catch return null;
+    // Days since 1970-01-01 using a simple Gregorian calendar formula
+    return dateToDays(y, m, d);
+}
+
+fn dateToDays(year: i32, month: u8, day: u8) i64 {
+    // Zeller-style: count days from 1970-01-01
+    var y: i64 = year;
+    var m: i64 = month;
+    if (m <= 2) { y -= 1; m += 12; }
+    const a = @divFloor(y, 100);
+    const b = 2 - a + @divFloor(a, 4);
+    const jdn = @as(i64, @intFromFloat(@floor(365.25 * @as(f64, @floatFromInt(y + 4716))))) +
+                @as(i64, @intFromFloat(@floor(30.6001 * @as(f64, @floatFromInt(m + 1))))) +
+                @as(i64, day) + b - 1524;
+    // Julian Day Number for 1970-01-01 is 2440588
+    return jdn - 2440588;
+}
+
 /// Evaluate `Filter` against a row represented as a name→Value lookup.
+/// Used as fallback when where_expr is not available.
 fn evalFilter(filter: generic_sql.Filter, row: *const RowCtx) bool {
     const lv = row.get(filter.column) orelse return false;
     // Only numeric comparisons in Filter (string comparisons use where_text path)
@@ -205,6 +328,14 @@ fn evalFilter(filter: generic_sql.Filter, row: *const RowCtx) bool {
         };
     }
     return true;
+}
+
+/// Evaluate the plan's WHERE predicate against a row.
+/// Prefers where_expr (full Expr tree) over the legacy filter struct.
+fn evalPlanFilter(plan: generic_sql.Plan, row: *const RowCtx) bool {
+    if (plan.where_expr) |we| return evalWhereNode(we, row);
+    if (plan.filter) |f| return evalFilter(f, row);
+    return true; // no filter: row passes
 }
 
 // ── Row context: a lightweight name→value map backed by parallel slices ──────
@@ -513,9 +644,7 @@ const ScalarAggCtx = struct {
 
     fn observe(self: *ScalarAggCtx, row: *const RowCtx) anyerror!void {
         // Apply filter
-        if (self.plan.filter) |filter| {
-            if (!evalFilter(filter, row)) return;
-        }
+        if (!evalPlanFilter(self.plan, row)) return;
         // Update each aggregate
         for (self.plan.projections, self.states) |proj, *state| {
             const v = evalProjectionExpr(proj, row);
@@ -590,9 +719,7 @@ const GroupByCtx = struct {
     }
 
     fn observe(self: *GroupByCtx, row: *const RowCtx) anyerror!void {
-        if (self.plan.filter) |filter| {
-            if (!evalFilter(filter, row)) return;
-        }
+        if (!evalPlanFilter(self.plan, row)) return;
 
         // Build composite key
         var key_buf: std.ArrayList(u8) = .empty;
@@ -783,9 +910,7 @@ const ScanCtx = struct {
     }
 
     fn observe(self: *ScanCtx, row: *const RowCtx) anyerror!void {
-        if (self.plan.filter) |filter| {
-            if (!evalFilter(filter, row)) return;
-        }
+        if (!evalPlanFilter(self.plan, row)) return;
 
         // For ORDER BY / LIMIT we need to collect all matching rows.
         // Without ORDER BY and with LIMIT we can short-circuit.
@@ -868,6 +993,30 @@ const ScanCtx = struct {
 
 // ── Helper: collect needed column names from a Plan ───────────────────────────
 
+fn collectWhereNodeColumns(
+    allocator: std.mem.Allocator,
+    seen: *std.StringHashMap(void),
+    needed: *std.ArrayList([]const u8),
+    node: *const generic_sql.WhereNode,
+) !void {
+    const add = struct {
+        fn f(alloc: std.mem.Allocator, s: *std.StringHashMap(void), lst: *std.ArrayList([]const u8), name: []const u8) !void {
+            if (s.contains(name)) return;
+            if (lookupColumn(name) == null) return;
+            try s.put(name, {});
+            try lst.append(alloc, name);
+        }
+    }.f;
+    switch (node.*) {
+        .cmp_int  => |c| try add(allocator, seen, needed, c.col),
+        .cmp_str  => |c| try add(allocator, seen, needed, c.col),
+        .like     => |l| try add(allocator, seen, needed, l.col),
+        .is_null, .is_not_null => |col| try add(allocator, seen, needed, col),
+        .and_ => |children| for (children) |ch| try collectWhereNodeColumns(allocator, seen, needed, ch),
+        .or_  => |children| for (children) |ch| try collectWhereNodeColumns(allocator, seen, needed, ch),
+    }
+}
+
 fn collectNeededColumns(
     allocator: std.mem.Allocator,
     plan: generic_sql.Plan,
@@ -901,6 +1050,10 @@ fn collectNeededColumns(
         }
         for (cols) |col| try add(allocator, &seen, needed, col);
     }
+    // Also collect columns referenced by where_expr so filter evaluation works.
+    if (plan.where_expr) |we| try collectWhereNodeColumns(allocator, &seen, needed, we);
+    // Ensure at least one column is present so streamRows can count rows.
+    if (needed.items.len == 0) try add(allocator, &seen, needed, "CounterID");
 }
 
 // ── Helper: parse group-by column list ───────────────────────────────────────
@@ -999,7 +1152,7 @@ fn allAggregates(projections: []const generic_sql.Expr) bool {
 //   WatchID=..., CounterID=62, Age=30, EventDate=15887, ...
 // Run with: zig build test
 
-const fixture_parquet = "data/fixture_hits.parquet";
+const fixture_parquet = build_options.fixture_parquet_path;
 
 fn runQuery(allocator: std.mem.Allocator, sql: []const u8) ![]u8 {
     const plan = (try generic_sql.parse(allocator, sql)) orelse
@@ -1108,4 +1261,65 @@ test "value order" {
     try std.testing.expect(Value.order(.{ .i64 = 2 }, .{ .i64 = 1 }) == .gt);
     try std.testing.expect(Value.order(.{ .i64 = 1 }, .{ .i64 = 1 }) == .eq);
     try std.testing.expect(Value.order(.{ .str = "a" }, .{ .str = "b" }) == .lt);
+}
+
+test "likeMatch: basic percent wildcard" {
+    try std.testing.expect(likeMatch("hello world", "hello%", false));
+    try std.testing.expect(likeMatch("hello world", "%world", false));
+    try std.testing.expect(likeMatch("hello world", "%lo wo%", false));
+    try std.testing.expect(!likeMatch("hello world", "hello", false));
+}
+
+test "likeMatch: underscore wildcard" {
+    try std.testing.expect(likeMatch("abc", "a_c", false));
+    try std.testing.expect(!likeMatch("ac", "a_c", false));
+    try std.testing.expect(likeMatch("aXc", "a_c", false));
+}
+
+test "likeMatch: case insensitive ILIKE" {
+    try std.testing.expect(likeMatch("Hello World", "hello%", true));
+    try std.testing.expect(likeMatch("GOOGLE", "%oog%", true));
+    try std.testing.expect(!likeMatch("GOOGLE", "%oog%", false));
+}
+
+test "likeMatch: empty pattern and string" {
+    try std.testing.expect(likeMatch("", "%", false));
+    try std.testing.expect(likeMatch("", "", false));
+    try std.testing.expect(!likeMatch("a", "", false));
+}
+
+test "smoke: WHERE AND multi-condition match" {
+    // Age=30 AND CounterID=62 — fixture row should match
+    const allocator = std.testing.allocator;
+    const out = try runQuery(allocator,
+        "SELECT CounterID FROM hits WHERE Age > 0 AND CounterID = 62");
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings("CounterID\n62\n", out);
+}
+
+test "smoke: WHERE AND multi-condition no match" {
+    // Age=30 AND CounterID=999 — no row matches
+    const allocator = std.testing.allocator;
+    const out = try runQuery(allocator,
+        "SELECT CounterID FROM hits WHERE Age > 0 AND CounterID = 999");
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings("CounterID\n", out);
+}
+
+test "smoke: WHERE date string comparison" {
+    // EventDate=15887 corresponds to 2013-07-03; row should pass >= '2013-07-01'
+    const allocator = std.testing.allocator;
+    const out = try runQuery(allocator,
+        "SELECT CounterID FROM hits WHERE EventDate >= '2013-07-01' AND EventDate < '2013-07-10'");
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings("CounterID\n62\n", out);
+}
+
+test "smoke: WHERE date string no match" {
+    // EventDate=15887 should not pass > '2013-12-31'
+    const allocator = std.testing.allocator;
+    const out = try runQuery(allocator,
+        "SELECT CounterID FROM hits WHERE EventDate > '2013-12-31'");
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings("CounterID\n", out);
 }

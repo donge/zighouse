@@ -922,6 +922,7 @@ const FixedDictColumnIterator = struct {
     end: u64,
     offset: u64,
     header_buf: []u8,
+    is_optional: bool = false,
     dict: []i64 = &.{},
     ids_payload: []u8 = &.{},
     plain_payload: []u8 = &.{},
@@ -1099,12 +1100,22 @@ const FixedDictColumnIterator = struct {
                 const encoding = data_header.encoding orelse return error.InvalidParquetMetadata;
                 if (encoding == 0) {
                     const values: usize = @intCast(data_header.num_values);
-                    if (page.payload.len < values * self.width) {
+                    // Detect OPTIONAL columns: payload may start with 4-byte def-level
+                    // byte-count followed by RLE def-levels, then actual values.
+                    // Heuristic: if payload is larger than values*width, skip def levels.
+                    var payload_start: usize = 0;
+                    if (page.payload.len > values * self.width and page.payload.len >= 4) {
+                        const def_len = std.mem.readInt(u32, page.payload[0..4], .little);
+                        if (4 + def_len + values * self.width <= page.payload.len) {
+                            payload_start = 4 + @as(usize, def_len);
+                        }
+                    }
+                    if (page.payload.len < payload_start + values * self.width) {
                         self.allocator.free(page.payload);
                         return error.InvalidParquetMetadata;
                     }
                     self.plain_payload = page.payload;
-                    self.plain_pos = 0;
+                    self.plain_pos = payload_start;
                     self.page_remaining = values;
                     self.page_mode = .plain;
                     return;
@@ -1317,17 +1328,21 @@ fn fnv1a(seed: u64, bytes: []const u8) u64 {
 }
 
 const LoadedMetadata = struct {
-    arena: std.heap.ArenaAllocator,
+    backing_allocator: std.mem.Allocator,
+    arena: *std.heap.ArenaAllocator,
     meta: Metadata,
 
     fn deinit(self: *LoadedMetadata) void {
         self.arena.deinit();
+        self.backing_allocator.destroy(self.arena);
     }
 };
 
 fn readMetadataFromFile(allocator: std.mem.Allocator, io: std.Io, file: *std.Io.File, file_size: u64) !LoadedMetadata {
     if (file_size < 12) return error.InvalidParquetFile;
-    var arena = std.heap.ArenaAllocator.init(allocator);
+    const arena = try allocator.create(std.heap.ArenaAllocator);
+    errdefer allocator.destroy(arena);
+    arena.* = std.heap.ArenaAllocator.init(allocator);
     errdefer arena.deinit();
 
     var trailer: [8]u8 = undefined;
@@ -1343,7 +1358,7 @@ fn readMetadataFromFile(allocator: std.mem.Allocator, io: std.Io, file: *std.Io.
     if (footer_n != footer.len) return error.InvalidParquetFile;
 
     var parser = CompactParser{ .allocator = arena.allocator(), .buf = footer };
-    return .{ .arena = arena, .meta = try parser.readFileMetaData() };
+    return .{ .backing_allocator = allocator, .arena = arena, .meta = try parser.readFileMetaData() };
 }
 
 const Page = struct {

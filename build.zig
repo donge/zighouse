@@ -20,6 +20,8 @@ pub fn build(b: *std.Build) void {
     const install_bench_tools = b.option(bool, "bench-tools", "Install benchmark helper executables") orelse true;
     const options = b.addOptions();
     options.addOption(bool, "duckdb", enable_duckdb);
+    const fixture_parquet_path = b.fmt("{s}/data/fixture_hits.parquet", .{b.build_root.path orelse "."});
+    options.addOption([]const u8, "fixture_parquet_path", fixture_parquet_path);
 
     const exe = b.addExecutable(.{
         .name = "zighouse",
@@ -164,6 +166,26 @@ pub fn build(b: *std.Build) void {
     });
     const schema_test_cmd = b.addRunArtifact(schema_tests);
 
+    const generic_executor_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/generic_executor.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    generic_executor_tests.root_module.addOptions("build_options", options);
+    generic_executor_tests.root_module.link_libc = true;
+    if (enable_duckdb) {
+        const duckdb_include = b.fmt("{s}/include", .{duckdb_prefix});
+        const duckdb_lib = b.fmt("{s}/lib", .{duckdb_prefix});
+        generic_executor_tests.root_module.addIncludePath(.{ .cwd_relative = duckdb_include });
+        generic_executor_tests.root_module.addLibraryPath(.{ .cwd_relative = duckdb_lib });
+        generic_executor_tests.root_module.addRPath(.{ .cwd_relative = duckdb_lib });
+        generic_executor_tests.root_module.linkSystemLibrary("duckdb", .{});
+    }
+    const generic_executor_test_cmd = b.addRunArtifact(generic_executor_tests);
+    generic_executor_test_cmd.setCwd(b.path("."));
+
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&test_cmd.step);
     test_step.dependOn(&simd_test_cmd.step);
@@ -175,6 +197,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&lowcard_test_cmd.step);
     test_step.dependOn(&parquet_test_cmd.step);
     test_step.dependOn(&schema_test_cmd.step);
+    test_step.dependOn(&generic_executor_test_cmd.step);
 
     if (!install_bench_tools) return;
 

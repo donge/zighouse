@@ -896,7 +896,7 @@ test "inferShape: scalar aggregates with no group_by" {
     };
     for (cases) |c| {
         const plan = try parseHitsPlan(allocator, c.sql);
-        defer allocator.free(plan.projections);
+        defer generic_sql.deinit(allocator, plan);
         try std.testing.expectEqual(c.want, shape.inferShape(plan, &clickbench_schema.hits));
     }
 }
@@ -904,7 +904,7 @@ test "inferShape: scalar aggregates with no group_by" {
 test "inferShape: filtered_scalar for LIKE filters" {
     const allocator = std.testing.allocator;
     const plan = try parseHitsPlan(allocator, "SELECT COUNT(*) FROM hits WHERE URL LIKE '%google%'");
-    defer allocator.free(plan.projections);
+    defer generic_sql.deinit(allocator, plan);
     try std.testing.expectEqual(shape.PlanShape.filtered_scalar, shape.inferShape(plan, &clickbench_schema.hits));
 }
 
@@ -914,7 +914,7 @@ test "inferShape: lowcard_count_top for q13 SearchPhrase" {
         allocator,
         "SELECT SearchPhrase, COUNT(*) AS c FROM hits WHERE SearchPhrase <> '' GROUP BY SearchPhrase ORDER BY c DESC LIMIT 10",
     );
-    defer allocator.free(plan.projections);
+    defer generic_sql.deinit(allocator, plan);
     try std.testing.expectEqual(shape.PlanShape.lowcard_count_top, shape.inferShape(plan, &clickbench_schema.hits));
 }
 
@@ -926,7 +926,7 @@ test "inferShape: lowcard_distinct_top for q11/q14" {
     };
     for (cases) |sql| {
         const plan = try parseHitsPlan(allocator, sql);
-        defer allocator.free(plan.projections);
+        defer generic_sql.deinit(allocator, plan);
         try std.testing.expectEqual(shape.PlanShape.lowcard_distinct_top, shape.inferShape(plan, &clickbench_schema.hits));
     }
 }
@@ -937,7 +937,7 @@ test "inferShape: fixed_distinct_top for q9 RegionID" {
         allocator,
         "SELECT RegionID, COUNT(DISTINCT UserID) AS u FROM hits GROUP BY RegionID ORDER BY u DESC LIMIT 10",
     );
-    defer allocator.free(plan.projections);
+    defer generic_sql.deinit(allocator, plan);
     try std.testing.expectEqual(shape.PlanShape.fixed_distinct_top, shape.inferShape(plan, &clickbench_schema.hits));
 }
 
@@ -947,7 +947,7 @@ test "inferShape: dense_count_group for q8 AdvEngineID (no LIMIT)" {
         allocator,
         "SELECT AdvEngineID, COUNT(*) FROM hits WHERE AdvEngineID <> 0 GROUP BY AdvEngineID ORDER BY COUNT(*) DESC",
     );
-    defer allocator.free(plan.projections);
+    defer generic_sql.deinit(allocator, plan);
     try std.testing.expectEqual(shape.PlanShape.dense_count_group, shape.inferShape(plan, &clickbench_schema.hits));
 }
 
@@ -957,7 +957,7 @@ test "inferShape: dense_avg_count_top for q10 RegionID stats" {
         allocator,
         "SELECT RegionID, SUM(AdvEngineID), COUNT(*) AS c, AVG(ResolutionWidth), COUNT(DISTINCT UserID) FROM hits GROUP BY RegionID ORDER BY c DESC LIMIT 10",
     );
-    defer allocator.free(plan.projections);
+    defer generic_sql.deinit(allocator, plan);
     try std.testing.expectEqual(shape.PlanShape.dense_avg_count_top, shape.inferShape(plan, &clickbench_schema.hits));
 }
 
@@ -975,7 +975,7 @@ test "inferShape: tuple_agg_top for composite group keys" {
     };
     for (cases) |sql| {
         const plan = try parseHitsPlan(allocator, sql);
-        defer allocator.free(plan.projections);
+        defer generic_sql.deinit(allocator, plan);
         try std.testing.expectEqual(shape.PlanShape.tuple_agg_top, shape.inferShape(plan, &clickbench_schema.hits));
     }
 }
@@ -986,7 +986,7 @@ test "inferShape: hashed_late_materialize_top for q21 URL" {
         allocator,
         "SELECT URL, COUNT(*) AS c FROM hits GROUP BY URL ORDER BY c DESC LIMIT 10",
     );
-    defer allocator.free(plan.projections);
+    defer generic_sql.deinit(allocator, plan);
     try std.testing.expectEqual(shape.PlanShape.hashed_late_materialize_top, shape.inferShape(plan, &clickbench_schema.hits));
 }
 
@@ -997,7 +997,7 @@ test "inferShape: offset_count_top for dashboards with OFFSET" {
         allocator,
         "SELECT URL, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND IsRefresh = 0 AND IsLink <> 0 AND IsDownload = 0 GROUP BY URL ORDER BY PageViews DESC LIMIT 10 OFFSET 1000",
     );
-    defer allocator.free(plan.projections);
+    defer generic_sql.deinit(allocator, plan);
     try std.testing.expectEqual(shape.PlanShape.offset_count_top, shape.inferShape(plan, &clickbench_schema.hits));
 }
 
@@ -1007,7 +1007,7 @@ test "inferShape: unknown for projection-only top-N" {
         allocator,
         "SELECT SearchPhrase FROM hits WHERE SearchPhrase <> '' ORDER BY EventTime LIMIT 10",
     );
-    defer allocator.free(plan.projections);
+    defer generic_sql.deinit(allocator, plan);
     try std.testing.expectEqual(shape.PlanShape.unknown, shape.inferShape(plan, &clickbench_schema.hits));
 }
 
