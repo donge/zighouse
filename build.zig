@@ -23,6 +23,13 @@ pub fn build(b: *std.Build) void {
     const fixture_parquet_path = b.fmt("{s}/data/fixture_hits.parquet", .{b.build_root.path orelse "."});
     options.addOption([]const u8, "fixture_parquet_path", fixture_parquet_path);
 
+    // Shared schema module (used by clickhouse_format test targets)
+    const schema_mod = b.createModule(.{
+        .root_source_file = b.path("src/schema.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const exe = b.addExecutable(.{
         .name = "zighouse",
         .root_module = b.createModule(.{
@@ -215,6 +222,83 @@ pub fn build(b: *std.Build) void {
     loader_tests.root_module.link_libc = true;
     const loader_test_cmd = b.addRunArtifact(loader_tests);
 
+    // ── clickhouse_format tests ─────────────────────────────────────────────
+    const lz4_prefix = b.option([]const u8, "lz4-prefix", "LZ4 installation prefix") orelse "/opt/homebrew/opt/lz4";
+    const lz4_include = b.fmt("{s}/include", .{lz4_prefix});
+    const lz4_lib = b.fmt("{s}/lib", .{lz4_prefix});
+
+    const ch_block_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/clickhouse_format/block.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    ch_block_tests.root_module.link_libc = true;
+    ch_block_tests.root_module.addIncludePath(.{ .cwd_relative = lz4_include });
+    ch_block_tests.root_module.addLibraryPath(.{ .cwd_relative = lz4_lib });
+    ch_block_tests.root_module.addRPath(.{ .cwd_relative = lz4_lib });
+    ch_block_tests.root_module.linkSystemLibrary("lz4", .{});
+    const ch_block_test_cmd = b.addRunArtifact(ch_block_tests);
+
+    // types.zig — no lz4 dependency
+    const ch_types_mod = b.createModule(.{
+        .root_source_file = b.path("src/clickhouse_format/types.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    ch_types_mod.addImport("schema", schema_mod);
+    const ch_types_tests = b.addTest(.{
+        .root_module = ch_types_mod,
+    });
+    const ch_types_test_cmd = b.addRunArtifact(ch_types_tests);
+
+    // columns_txt.zig
+    const ch_columns_txt_mod = b.createModule(.{
+        .root_source_file = b.path("src/clickhouse_format/columns_txt.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    ch_columns_txt_mod.addImport("schema", schema_mod);
+    ch_columns_txt_mod.addImport("types", ch_types_mod);
+    const ch_columns_txt_tests = b.addTest(.{
+        .root_module = ch_columns_txt_mod,
+    });
+    const ch_columns_txt_test_cmd = b.addRunArtifact(ch_columns_txt_tests);
+
+    // count_txt.zig
+    const ch_count_txt_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/clickhouse_format/count_txt.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const ch_count_txt_test_cmd = b.addRunArtifact(ch_count_txt_tests);
+
+    // marks.zig
+    const ch_marks_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/clickhouse_format/marks.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const ch_marks_test_cmd = b.addRunArtifact(ch_marks_tests);
+
+    // primary_idx.zig
+    const ch_primary_idx_mod = b.createModule(.{
+        .root_source_file = b.path("src/clickhouse_format/primary_idx.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    ch_primary_idx_mod.addImport("schema", schema_mod);
+    ch_primary_idx_mod.addImport("types", ch_types_mod);
+    const ch_primary_idx_tests = b.addTest(.{
+        .root_module = ch_primary_idx_mod,
+    });
+    const ch_primary_idx_test_cmd = b.addRunArtifact(ch_primary_idx_tests);
+
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&test_cmd.step);
     test_step.dependOn(&simd_test_cmd.step);
@@ -230,6 +314,12 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&schema_infer_test_cmd.step);
     test_step.dependOn(&generic_store_test_cmd.step);
     test_step.dependOn(&loader_test_cmd.step);
+    test_step.dependOn(&ch_block_test_cmd.step);
+    test_step.dependOn(&ch_types_test_cmd.step);
+    test_step.dependOn(&ch_columns_txt_test_cmd.step);
+    test_step.dependOn(&ch_count_txt_test_cmd.step);
+    test_step.dependOn(&ch_marks_test_cmd.step);
+    test_step.dependOn(&ch_primary_idx_test_cmd.step);
 
     if (!install_bench_tools) return;
 
