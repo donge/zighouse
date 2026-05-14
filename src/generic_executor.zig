@@ -995,6 +995,86 @@ fn allAggregates(projections: []const generic_sql.Expr) bool {
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
+// Smoke tests against data/fixture_hits.parquet (1 row):
+//   WatchID=..., CounterID=62, Age=30, EventDate=15887, ...
+// Run with: zig build test
+
+const fixture_parquet = "data/fixture_hits.parquet";
+
+fn runQuery(allocator: std.mem.Allocator, sql: []const u8) ![]u8 {
+    const plan = (try generic_sql.parse(allocator, sql)) orelse
+        return error.ParseFailed;
+    defer generic_sql.deinit(allocator, plan);
+    return run(allocator, std.testing.io, plan, fixture_parquet);
+}
+
+test "smoke: count(*)" {
+    const allocator = std.testing.allocator;
+    const out = try runQuery(allocator, "SELECT count(*) FROM hits");
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings("count_star()\n1\n", out);
+}
+
+test "smoke: sum(Age)" {
+    const allocator = std.testing.allocator;
+    const out = try runQuery(allocator, "SELECT sum(Age) FROM hits");
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings("sum(Age)\n30\n", out);
+}
+
+test "smoke: avg(Age)" {
+    const allocator = std.testing.allocator;
+    const out = try runQuery(allocator, "SELECT avg(Age) FROM hits");
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings("avg(Age)\n30\n", out);
+}
+
+test "smoke: min and max EventDate" {
+    const allocator = std.testing.allocator;
+    const out = try runQuery(allocator, "SELECT min(EventDate), max(EventDate) FROM hits");
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings("min(EventDate),max(EventDate)\n15887,15887\n", out);
+}
+
+test "smoke: count(DISTINCT CounterID)" {
+    const allocator = std.testing.allocator;
+    const out = try runQuery(allocator, "SELECT count(DISTINCT CounterID) FROM hits");
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings("count(DISTINCT CounterID)\n1\n", out);
+}
+
+test "smoke: GROUP BY CounterID" {
+    const allocator = std.testing.allocator;
+    const out = try runQuery(allocator,
+        "SELECT CounterID, count(*) AS c FROM hits GROUP BY CounterID ORDER BY c DESC LIMIT 5");
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings("CounterID,c\n62,1\n", out);
+}
+
+test "smoke: WHERE Age > 0 scan" {
+    const allocator = std.testing.allocator;
+    const out = try runQuery(allocator,
+        "SELECT CounterID FROM hits WHERE Age > 0 LIMIT 5");
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings("CounterID\n62\n", out);
+}
+
+test "smoke: WHERE no match returns header only" {
+    const allocator = std.testing.allocator;
+    const out = try runQuery(allocator,
+        "SELECT CounterID FROM hits WHERE Age > 999 LIMIT 5");
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings("CounterID\n", out);
+}
+
+test "smoke: sum with WHERE filter" {
+    const allocator = std.testing.allocator;
+    const out = try runQuery(allocator,
+        "SELECT sum(Age) FROM hits WHERE Age > 0");
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings("sum(Age)\n30\n", out);
+}
+
 test "allAggregates" {
     const std2 = std;
     _ = std2;
