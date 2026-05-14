@@ -56,7 +56,7 @@ pub fn parse(allocator: std.mem.Allocator, sql: []const u8) !?Plan {
     const offset_pos = indexOfKeyword(after_from, "offset");
     const table_end = minOptionalPos(where_pos, minOptionalPos(group_by_pos, minOptionalPos(having_pos, minOptionalPos(order_by_pos, minOptionalPos(limit_pos, offset_pos))))) orelse after_from.len;
     const table_text = std.mem.trim(u8, after_from[0..table_end], " \t\r\n");
-    if (!asciiEqlIgnoreCase(table_text, "hits")) return null;
+    // Table name is passed through to Plan.table; callers validate it.
 
     var projections: std.ArrayList(Expr) = .empty;
     errdefer projections.deinit(allocator);
@@ -662,6 +662,19 @@ test "parses count star" {
     try std.testing.expect(plan.filter == null);
 }
 
+test "table name is passed through without validation" {
+    const plan = (try parse(std.testing.allocator, "SELECT COUNT(*) FROM events")).?;
+    defer deinit(std.testing.allocator, plan);
+    try std.testing.expectEqualStrings("events", plan.table);
+    try std.testing.expectEqual(AggregateFn.count_star, plan.projections[0].func);
+}
+
+test "table name is case preserved" {
+    const plan = (try parse(std.testing.allocator, "SELECT COUNT(*) FROM Hits")).?;
+    defer deinit(std.testing.allocator, plan);
+    try std.testing.expectEqualStrings("Hits", plan.table);
+}
+
 test "parses aggregate list" {
     const plan = (try parse(std.testing.allocator, "SELECT SUM(AdvEngineID), COUNT(*), AVG(ResolutionWidth) FROM hits")).?;
     defer deinit(std.testing.allocator, plan);
@@ -953,7 +966,9 @@ test "parses two predicate and filter" {
 
 test "rejects unsupported sql" {
     try std.testing.expect((try parse(std.testing.allocator, "SELECT URL FROM hits")) == null);
-    try std.testing.expect((try parse(std.testing.allocator, "SELECT COUNT(*) FROM other")) == null);
+    // Non-"hits" table names are now parsed successfully; callers (e.g.
+    // Native.executeGenericSql) validate the table name and return
+    // error.UnknownTable for unrecognised tables.
     try std.testing.expect((try parse(std.testing.allocator, "SELECT COUNT(*) FROM hits WHERE AdvEngineID <> 0 AND ResolutionWidth > 0 AND IsRefresh = 0")) == null);
 }
 

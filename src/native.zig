@@ -424,7 +424,10 @@ pub const Native = struct {
     }
 
     fn executeGenericSql(self: *Native, plan: generic_sql.Plan) anyerror![]u8 {
-        if (!asciiEqlIgnoreCase(plan.table, "hits")) return error.UnsupportedGenericQuery;
+        if (!asciiEqlIgnoreCase(plan.table, "hits")) {
+            std.debug.print("error: unknown table '{s}'\n", .{plan.table});
+            return error.UnknownTable;
+        }
         const hot = self.getHotColumns() catch |err| switch (err) {
             error.FileNotFound => return error.UnsupportedGenericQuery,
             else => return err,
