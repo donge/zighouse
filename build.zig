@@ -299,6 +299,22 @@ pub fn build(b: *std.Build) void {
     });
     const ch_primary_idx_test_cmd = b.addRunArtifact(ch_primary_idx_tests);
 
+    // checksums.zig — needs lz4
+    const ch_checksums_mod = b.createModule(.{
+        .root_source_file = b.path("src/clickhouse_format/checksums.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    ch_checksums_mod.link_libc = true;
+    ch_checksums_mod.addIncludePath(.{ .cwd_relative = lz4_include });
+    ch_checksums_mod.addLibraryPath(.{ .cwd_relative = lz4_lib });
+    ch_checksums_mod.addRPath(.{ .cwd_relative = lz4_lib });
+    ch_checksums_mod.linkSystemLibrary("lz4", .{});
+    const ch_checksums_tests = b.addTest(.{
+        .root_module = ch_checksums_mod,
+    });
+    const ch_checksums_test_cmd = b.addRunArtifact(ch_checksums_tests);
+
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&test_cmd.step);
     test_step.dependOn(&simd_test_cmd.step);
@@ -320,6 +336,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&ch_count_txt_test_cmd.step);
     test_step.dependOn(&ch_marks_test_cmd.step);
     test_step.dependOn(&ch_primary_idx_test_cmd.step);
+    test_step.dependOn(&ch_checksums_test_cmd.step);
 
     if (!install_bench_tools) return;
 
