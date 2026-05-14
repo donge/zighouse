@@ -197,7 +197,14 @@ fn urlHashDateDashboardPlan(plan: generic_sql.Plan) bool {
 
 fn timeBucketDashboardPlan(plan: generic_sql.Plan) bool {
     if (plan.filter != null or plan.limit != 10 or plan.offset != 1000) return false;
-    if (!asciiEqlIgnoreCase(plan.order_by_text orelse return false, "DATE_TRUNC('minute', EventTime)")) return false;
+    const obt = plan.order_by_text orelse return false;
+    // Accept both "DATE_TRUNC('minute', EventTime)" (legacy) and
+    // "date_trunc('minute', EventTime) ASC" (DuckDB parser with direction)
+    const obt_trimmed = if (std.ascii.endsWithIgnoreCase(obt, " asc"))
+        std.mem.trim(u8, obt[0..obt.len - 4], " \t")
+    else
+        obt;
+    if (!asciiEqlIgnoreCase(obt_trimmed, "DATE_TRUNC('minute', EventTime)")) return false;
     if (!asciiEqlIgnoreCase(plan.where_text orelse return false, "CounterID = 62 AND EventDate >= '2013-07-14' AND EventDate <= '2013-07-15' AND IsRefresh = 0 AND DontCountHits = 0")) return false;
     if (!asciiEqlIgnoreCase(plan.group_by orelse return false, "DATE_TRUNC('minute', EventTime)")) return false;
     if (plan.projections.len != 2) return false;

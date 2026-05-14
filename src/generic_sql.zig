@@ -78,6 +78,8 @@ pub const Plan = struct {
     having_text: ?[]const u8 = null,
     order_by_count_desc: bool = false,
     order_by_alias: ?[]const u8 = null,
+    /// When true, order_by_alias is ascending; when false (default), it is descending.
+    order_by_alias_asc: bool = false,
     order_by_text: ?[]const u8 = null,
     limit: ?usize = null,
     offset: ?usize = null,
@@ -99,9 +101,17 @@ pub fn parse(allocator: std.mem.Allocator, sql: []const u8) !?Plan {
         if (order_ok and validPlanShape(plan.projections, plan.filter, plan.where_text, plan.group_by, plan.having_text, plan.order_by_text, plan.limit, plan.offset)) {
             return plan;
         }
-        // If the DuckDB-parsed plan has a where_expr (generic executor path),
-        // accept it via the looser generic shape check without falling back.
-        if (plan.where_expr != null and validGenericShape(plan.projections, plan.having_text)) {
+        // If the DuckDB-parsed plan passes the looser generic shape check, accept
+        // it for the generic executor path (GROUP BY, HAVING, arithmetic expressions, etc.)
+        // Require at least a WHERE predicate tree, HAVING clause, or GROUP BY to avoid
+        // routing plain projections to the generic executor unnecessarily.
+        // Exclude plans where DuckDB detected a DESC alias-based ORDER BY (those may
+        // belong to a specialised path that uses the legacy parser's structure).
+        const has_desc_alias_order = plan.order_by_alias != null and !plan.order_by_alias_asc;
+        if (order_ok and !has_desc_alias_order and
+            (plan.where_expr != null or plan.having_text != null or plan.group_by != null) and
+            validGenericShape(plan.projections, plan.having_text, plan.group_by))
+        {
             return plan;
         }
         // DuckDB-parsed plan did not match a supported shape; free it and fall
@@ -113,10 +123,9 @@ pub fn parse(allocator: std.mem.Allocator, sql: []const u8) !?Plan {
 
 /// Returns true if the projection list is valid for generic scan/agg execution:
 /// either all scalar aggregates (no column_ref) or all column references / int
-/// literals (no aggregates mixed with references).  Having clauses are not
-/// supported in the generic path.
-fn validGenericShape(projections: []const Expr, having_text: ?[]const u8) bool {
-    if (having_text != null) return false;
+/// literals (no aggregates mixed with references), OR mixed col+agg with a GROUP BY.
+fn validGenericShape(projections: []const Expr, having_text: ?[]const u8, group_by: ?[]const u8) bool {
+    _ = having_text; // HAVING is handled by the generic executor
     if (projections.len == 0) return false;
     var has_agg = false;
     var has_col = false;
@@ -126,8 +135,8 @@ fn validGenericShape(projections: []const Expr, having_text: ?[]const u8) bool {
             else => has_agg = true,
         }
     }
-    // Mixed agg + column_ref without GROUP BY is not supported here.
-    if (has_agg and has_col) return false;
+    // Mixed agg + column_ref is valid when there's a GROUP BY clause.
+    if (has_agg and has_col and group_by == null) return false;
     return true;
 }
 
@@ -581,7 +590,14 @@ fn parseSubtractExpr(expr: []const u8) ?Expr {
 }
 
 fn validOrderByText(text: []const u8) bool {
-    return isDateTruncMinuteText(text) or searchPhraseOrderByText(text) or asciiEqlIgnoreCase(text, "c DESC") or asciiEqlIgnoreCase(text, "l DESC");
+    if (isDateTruncMinuteText(text)) return true;
+    // Also accept "date_trunc('minute', EventTime) ASC" (DuckDB adds direction)
+    const asc_suffix = " ASC";
+    if (std.ascii.endsWithIgnoreCase(text, asc_suffix)) {
+        const without_asc = std.mem.trim(u8, text[0..text.len - asc_suffix.len], " \t");
+        if (isDateTruncMinuteText(without_asc)) return true;
+    }
+    return searchPhraseOrderByText(text) or asciiEqlIgnoreCase(text, "c DESC") or asciiEqlIgnoreCase(text, "l DESC");
 }
 
 fn searchPhraseOrderByText(text: []const u8) bool {
@@ -965,8 +981,8 @@ test "parses dashboard string top shapes" {
     try std.testing.expect(q43.where_text != null);
     try std.testing.expectEqualStrings("EventMinute", q43.projections[0].column.?);
     try std.testing.expectEqualStrings("M", q43.projections[0].alias.?);
-    try std.testing.expectEqualStrings("DATE_TRUNC('minute', EventTime)", q43.group_by.?);
-    try std.testing.expectEqualStrings("DATE_TRUNC('minute', EventTime)", q43.order_by_text.?);
+    try std.testing.expectEqualStrings("date_trunc('minute', EventTime)", q43.group_by.?);
+    try std.testing.expectEqualStrings("date_trunc('minute', EventTime) ASC", q43.order_by_text.?);
     try std.testing.expect(q43.order_by_alias == null);
     try std.testing.expectEqual(@as(?usize, 10), q43.limit);
     try std.testing.expectEqual(@as(?usize, 1000), q43.offset);

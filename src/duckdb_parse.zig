@@ -365,6 +365,50 @@ fn translateWhere(allocator: std.mem.Allocator, val: std.json.Value) !*generic_s
         }
     }
 
+    // ── OPERATOR: IN / NOT IN ────────────────────────────────────────────────
+    if (std.mem.eql(u8, class, "OPERATOR")) {
+        const op_type = obj.get("type").?.string;
+        const children = obj.get("children").?.array.items;
+        if ((std.mem.eql(u8, op_type, "OPERATOR_IN") or std.mem.eql(u8, op_type, "OPERATOR_NOT_IN")) and
+            children.len >= 2)
+        {
+            const col_name = columnName(children[0]) orelse return error.UnsupportedWhereNode;
+            const col = try allocator.dupe(u8, col_name);
+            errdefer allocator.free(col);
+            const negate = std.mem.eql(u8, op_type, "OPERATOR_NOT_IN");
+            // Build one cmp_int node per value, combined with OR (or AND for NOT IN)
+            const vals = children[1..];
+            var kids = try allocator.alloc(*generic_sql.WhereNode, vals.len);
+            var n_built: usize = 0;
+            errdefer {
+                for (kids[0..n_built]) |k| generic_sql.freeWhereNode(allocator, k);
+                allocator.free(kids);
+            }
+            for (vals) |val_node| {
+                const iv = intLiteralValue(val_node) orelse {
+                    // Free already-built kids and col
+                    for (kids[0..n_built]) |k| generic_sql.freeWhereNode(allocator, k);
+                    allocator.free(kids);
+                    allocator.free(col);
+                    return error.UnsupportedWhereNode;
+                };
+                // Each child needs its own copy of col
+                const kid_col = try allocator.dupe(u8, col_name);
+                errdefer allocator.free(kid_col);
+                const kid = try allocator.create(generic_sql.WhereNode);
+                kid.* = .{ .cmp_int = .{ .col = kid_col, .op = if (negate) .ne else .eq, .val = iv } };
+                kids[n_built] = kid;
+                n_built += 1;
+            }
+            // Free the original col copy since each kid has its own
+            allocator.free(col);
+            const node = try allocator.create(generic_sql.WhereNode);
+            // IN → OR of equalities; NOT IN → AND of inequalities
+            node.* = if (negate) .{ .and_ = kids } else .{ .or_ = kids };
+            return node;
+        }
+    }
+
     return error.UnsupportedWhereNode;
 }
 
@@ -505,7 +549,7 @@ fn translateExpr(allocator: std.mem.Allocator, val: std.json.Value) !?generic_sq
             return .{ .func = .count_distinct, .column = col, .alias = alias };
         }
         // col + int_offset  (e.g. ResolutionWidth + 1)
-        if (std.mem.eql(u8, fn_name, "+") and children.len == 2) {
+        if ((std.mem.eql(u8, fn_name, "+") or std.mem.eql(u8, fn_name, "add")) and children.len == 2) {
             if (columnName(children[0])) |col_name| {
                 if (intLiteralValue(children[1])) |off| {
                     const col = try allocator.dupe(u8, col_name);
@@ -513,10 +557,37 @@ fn translateExpr(allocator: std.mem.Allocator, val: std.json.Value) !?generic_sq
                 }
             }
         }
+        // col - int_offset  (e.g. ClientIP - 1)
+        if ((std.mem.eql(u8, fn_name, "-") or std.mem.eql(u8, fn_name, "subtract")) and children.len == 2) {
+            if (columnName(children[0])) |col_name| {
+                if (intLiteralValue(children[1])) |off| {
+                    const col = try allocator.dupe(u8, col_name);
+                    return .{ .func = .column_ref, .column = col, .int_offset = -off, .alias = alias };
+                }
+            }
+        }
         if (std.mem.eql(u8, fn_name, "length") and children.len == 1) {
             const child_col = columnName(children[0]) orelse return null;
             const col = try allocator.dupe(u8, child_col);
             return .{ .func = .column_ref, .column = col, .alias = alias };
+        }
+        // date_trunc('minute', EventTime) → column_ref "EventMinute" (matches group key)
+        if (std.mem.eql(u8, fn_name, "date_trunc") and children.len == 2) {
+            if (isConstantString(children[0], "minute")) {
+                if (columnName(children[1])) |_| {
+                    const col = try allocator.dupe(u8, "EventMinute");
+                    return .{ .func = .column_ref, .column = col, .alias = alias };
+                }
+            }
+        }
+        // date_part('minute', EventTime) / extract(minute FROM EventTime) → EventMinuteOfHour
+        if (std.mem.eql(u8, fn_name, "date_part") and children.len == 2) {
+            if (isConstantString(children[0], "minute")) {
+                if (columnName(children[1])) |_| {
+                    const col = try allocator.dupe(u8, "EventMinuteOfHour");
+                    return .{ .func = .column_ref, .column = col, .alias = alias };
+                }
+            }
         }
         // Fallback: render as text for executor passthrough
         const fn_text = try exprToText(allocator, val) orelse return null;
@@ -626,6 +697,26 @@ fn exprToText(allocator: std.mem.Allocator, val: std.json.Value) !?[]const u8 {
             const r = try exprToText(allocator, children[1]) orelse return null;
             defer allocator.free(r);
             return try std.fmt.allocPrint(allocator, "{s} NOT LIKE {s}", .{ l, r });
+        }
+        // Arithmetic binary operators: subtract, add, multiply, divide
+        if (children.len == 2) {
+            const op_sym: ?[]const u8 = if (std.mem.eql(u8, fn_name, "subtract") or std.mem.eql(u8, fn_name, "-"))
+                "-"
+            else if (std.mem.eql(u8, fn_name, "add") or std.mem.eql(u8, fn_name, "+"))
+                "+"
+            else if (std.mem.eql(u8, fn_name, "multiply") or std.mem.eql(u8, fn_name, "*"))
+                "*"
+            else if (std.mem.eql(u8, fn_name, "divide") or std.mem.eql(u8, fn_name, "/"))
+                "/"
+            else
+                null;
+            if (op_sym) |sym| {
+                const l = try exprToText(allocator, children[0]) orelse return null;
+                defer allocator.free(l);
+                const r = try exprToText(allocator, children[1]) orelse return null;
+                defer allocator.free(r);
+                return try std.fmt.allocPrint(allocator, "{s} {s} {s}", .{ l, sym, r });
+            }
         }
         // Generic function: fn_name(arg1, arg2, ...)
         var args: std.ArrayList(u8) = .empty;
@@ -780,6 +871,21 @@ fn columnName(val: std.json.Value) ?[]const u8 {
     return names.items[names.items.len - 1].string;
 }
 
+/// Returns true if val is a CONSTANT string node equal to `s` (case-insensitive).
+fn isConstantString(val: std.json.Value, s: []const u8) bool {
+    if (val == .null) return false;
+    const obj = val.object;
+    const class = (obj.get("class") orelse return false).string;
+    if (!std.mem.eql(u8, class, "CONSTANT")) return false;
+    const v = obj.get("value") orelse return false;
+    const vobj = v.object;
+    const raw = vobj.get("value") orelse return false;
+    return switch (raw) {
+        .string => |str| std.ascii.eqlIgnoreCase(str, s),
+        else => false,
+    };
+}
+
 fn intLiteralValue(val: std.json.Value) ?i64 {
     if (val == .null) return null;
     const obj = val.object;
@@ -837,6 +943,13 @@ fn functionFirstChildColName(val: std.json.Value) ?[]const u8 {
 fn projectionAliasExists(projs: []const generic_sql.Expr, alias: []const u8) bool {
     for (projs) |p| {
         if (p.alias) |a| if (std.ascii.eqlIgnoreCase(a, alias)) return true;
+    }
+    return false;
+}
+
+fn projectionColExists(projs: []const generic_sql.Expr, col: []const u8) bool {
+    for (projs) |p| {
+        if (p.column) |pc| if (std.ascii.eqlIgnoreCase(pc, col)) return true;
     }
     return false;
 }

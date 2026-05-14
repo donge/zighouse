@@ -683,20 +683,36 @@ const GroupEntry = struct {
     states: []AggState,    // one per non-key projection
 };
 
+/// Group key expression: a base column plus an integer offset.
+/// For "ClientIP - 1", base = "ClientIP", offset = -1.
+/// For plain "ClientIP", offset = 0.
+const GroupKeyExpr = struct {
+    base_col: []const u8,  // base column name (heap-allocated)
+    offset: i64 = 0,
+};
+
 const GroupByCtx = struct {
     allocator: std.mem.Allocator,
     plan: generic_sql.Plan,
     map: std.StringHashMap(usize), // key → index into entries
     entries: std.ArrayList(GroupEntry),
-    group_cols: []const []const u8, // parsed group-by column names
+    group_cols: []const []const u8, // parsed group-by base column names (for backwards compat)
+    group_exprs: []const GroupKeyExpr, // full group key expressions with offsets
 
     fn init(allocator: std.mem.Allocator, plan: generic_sql.Plan) GroupByCtx {
-        return .{
+        const exprs = parseGroupExprs(allocator, plan.group_by orelse "") catch &.{};
+        // Derive simple col names from exprs for deinit / header
+        const cols: [][]const u8 = allocator.alloc([]const u8, exprs.len) catch
+            (allocator.dupe([]const u8, &.{}) catch &.{});
+        for (exprs, 0..) |e, i| {
+            cols[i] = allocator.dupe(u8, e.base_col) catch e.base_col;
+        }        return .{
             .allocator = allocator,
             .plan = plan,
             .map = std.StringHashMap(usize).init(allocator),
             .entries = .empty,
-            .group_cols = parseGroupCols(allocator, plan.group_by orelse "") catch &.{},
+            .group_cols = cols,
+            .group_exprs = exprs,
         };
     }
 
@@ -716,16 +732,38 @@ const GroupByCtx = struct {
             for (self.group_cols) |col| allocator.free(col);
             allocator.free(self.group_cols);
         }
+        if (self.group_exprs.len > 0) {
+            for (self.group_exprs) |e| allocator.free(e.base_col);
+            allocator.free(self.group_exprs);
+        }
+    }
+
+    /// Evaluate a group key expression against a row.
+    fn evalGroupKeyExpr(expr: GroupKeyExpr, row: *const RowCtx) Value {
+        // EventMinute is a derived column: truncate EventTime timestamp to minutes
+        if (std.ascii.eqlIgnoreCase(expr.base_col, "EventMinute")) {
+            // EventTime is stored as microseconds since epoch (DuckDB TIMESTAMP)
+            // Truncate to minutes: floor(ts / 60_000_000) * 60_000_000
+            const ts_v = row.get("EventTime") orelse return Value{ .null_val = {} };
+            const ts = ts_v.toI64() orelse return Value{ .null_val = {} };
+            const minute_us: i64 = 60 * 1_000_000;
+            const truncated = @divFloor(ts, minute_us) * minute_us;
+            return Value{ .i64 = truncated + expr.offset };
+        }
+        const v = row.get(expr.base_col) orelse return Value{ .null_val = {} };
+        if (expr.offset == 0) return v;
+        const iv = v.toI64() orelse return v;
+        return Value{ .i64 = iv + expr.offset };
     }
 
     fn observe(self: *GroupByCtx, row: *const RowCtx) anyerror!void {
         if (!evalPlanFilter(self.plan, row)) return;
 
-        // Build composite key
+        // Build composite key using evaluated expressions
         var key_buf: std.ArrayList(u8) = .empty;
         defer key_buf.deinit(self.allocator);
-        for (self.group_cols) |col| {
-            const v = row.get(col) orelse Value{ .null_val = {} };
+        for (self.group_exprs) |expr| {
+            const v = evalGroupKeyExpr(expr, row);
             try v.writeCsv(&key_buf, self.allocator);
             try key_buf.append(self.allocator, 0); // separator
         }
@@ -738,10 +776,10 @@ const GroupByCtx = struct {
             gop.value_ptr.* = self.entries.items.len;
             gop.key_ptr.* = owned_key;
 
-            // Clone key values
-            const key_values = try self.allocator.alloc(Value, self.group_cols.len);
-            for (self.group_cols, key_values) |col, *kv| {
-                const v = row.get(col) orelse Value{ .null_val = {} };
+            // Clone key values (evaluated expressions)
+            const key_values = try self.allocator.alloc(Value, self.group_exprs.len);
+            for (self.group_exprs, key_values) |expr, *kv| {
+                const v = evalGroupKeyExpr(expr, row);
                 kv.* = switch (v) {
                     .str => |s| Value{ .str = try self.allocator.dupe(u8, s) },
                     else => v,
@@ -771,7 +809,7 @@ const GroupByCtx = struct {
         const entries = self.entries.items;
 
         // Determine sort key: order_by_count_desc → sort by count(*) desc,
-        // order_by_alias → sort by that alias desc,
+        // order_by_alias → sort by that alias (desc by default, asc if order_by_alias_asc),
         // order_by_text → best effort by first agg
         const order_by_count_desc = plan.order_by_count_desc;
         const order_by_alias = plan.order_by_alias;
@@ -787,10 +825,18 @@ const GroupByCtx = struct {
             if (order_by_alias) |alias| {
                 for (plan.projections, 0..) |p, i| {
                     if (p.alias) |a| if (std.ascii.eqlIgnoreCase(a, alias)) break :blk i;
+                    // Also match by column name for GROUP BY key projections
+                    if (p.column) |c| if (std.ascii.eqlIgnoreCase(c, alias)) break :blk i;
                 }
                 break :blk null;
             }
             break :blk null;
+        };
+
+        // Parse HAVING predicate: "COUNT(*) > N" or "count_star() > N"
+        const having: ?HavingPred = blk: {
+            const ht = plan.having_text orelse break :blk null;
+            break :blk parseHavingPred(plan.projections, ht);
         };
 
         // Sort
@@ -824,17 +870,13 @@ const GroupByCtx = struct {
             .entries = entries,
             .plan = plan,
             .sort_idx = sort_proj_idx,
-            .desc = order_by_count_desc or order_by_alias != null,
+            .desc = order_by_count_desc or (order_by_alias != null and !plan.order_by_alias_asc),
         };
         std.sort.block(usize, indices, sort_ctx, SortCtx.lessThan);
 
-        // Apply limit / offset
+        // Apply HAVING filter, then limit / offset
         const offset = plan.offset orelse 0;
         const limit = plan.limit orelse std.math.maxInt(usize);
-
-        const start = @min(offset, indices.len);
-        const end = @min(start + limit, indices.len);
-        const out_indices = indices[start..end];
 
         var out: std.ArrayList(u8) = .empty;
         errdefer out.deinit(allocator);
@@ -842,9 +884,36 @@ const GroupByCtx = struct {
         // Header
         try writeGroupHeader(&out, allocator, plan, self.group_cols);
 
-        // Rows
-        for (out_indices) |idx| {
+        // Rows: apply HAVING then offset/limit
+        var emitted: usize = 0;
+        var skipped: usize = 0;
+        for (indices) |idx| {
             const entry = entries[idx];
+
+            // HAVING filter
+            if (having) |hv| {
+                if (hv.proj_idx < entry.states.len) {
+                    const v = entry.states[hv.proj_idx].result(plan.projections[hv.proj_idx].func);
+                    const iv = v.toI64() orelse 0;
+                    const passes = switch (hv.op) {
+                        .eq => iv == hv.threshold,
+                        .ne => iv != hv.threshold,
+                        .lt => iv <  hv.threshold,
+                        .le => iv <= hv.threshold,
+                        .gt => iv >  hv.threshold,
+                        .ge => iv >= hv.threshold,
+                    };
+                    if (!passes) continue;
+                }
+            }
+
+            if (skipped < offset) {
+                skipped += 1;
+                continue;
+            }
+            if (emitted >= limit) break;
+            emitted += 1;
+
             var col_written: usize = 0;
 
             // Write projections
@@ -858,10 +927,10 @@ const GroupByCtx = struct {
                         col_written += 1;
                         continue;
                     };
-                    // Check if it's a group key
+                    // Check if it matches a group key expression (by base col + offset)
                     var is_key = false;
-                    for (self.group_cols, entry.key_values) |gc, kv| {
-                        if (std.ascii.eqlIgnoreCase(gc, col_name)) {
+                    for (self.group_exprs, entry.key_values) |ge, kv| {
+                        if (std.ascii.eqlIgnoreCase(ge.base_col, col_name) and ge.offset == proj.int_offset) {
                             try kv.writeCsv(&out, allocator);
                             is_key = true;
                             break;
@@ -1035,25 +1104,70 @@ fn collectNeededColumns(
     }.f;
 
     for (plan.projections) |proj| {
-        if (proj.column) |col| try add(allocator, &seen, needed, col);
+        if (proj.column) |col| {
+            // Handle "length(<actual_col>)" — collect the inner column
+            if (parseLengthCall(col)) |inner| {
+                try add(allocator, &seen, needed, inner);
+            } else {
+                try add(allocator, &seen, needed, col);
+            }
+        }
     }
     if (plan.filter) |filter| {
         try add(allocator, &seen, needed, filter.column);
         if (filter.second) |sec| try add(allocator, &seen, needed, sec.column);
     }
-    // Parse group-by columns
+    // Parse group-by columns using parseGroupExprs (handles arithmetic + date_trunc)
     if (plan.group_by) |gb| {
-        const cols = try parseGroupCols(allocator, gb);
+        const exprs = try parseGroupExprs(allocator, gb);
         defer {
-            for (cols) |c| allocator.free(c);
-            allocator.free(cols);
+            for (exprs) |e| allocator.free(e.base_col);
+            allocator.free(exprs);
         }
-        for (cols) |col| try add(allocator, &seen, needed, col);
+        for (exprs) |e| {
+            // "EventMinute" maps to the EventTime column in Parquet
+            const real_col = if (std.ascii.eqlIgnoreCase(e.base_col, "EventMinute")) "EventTime" else e.base_col;
+            try add(allocator, &seen, needed, real_col);
+        }
     }
     // Also collect columns referenced by where_expr so filter evaluation works.
     if (plan.where_expr) |we| try collectWhereNodeColumns(allocator, &seen, needed, we);
     // Ensure at least one column is present so streamRows can count rows.
     if (needed.items.len == 0) try add(allocator, &seen, needed, "CounterID");
+}
+
+// ── Helper: parse HAVING predicate ───────────────────────────────────────────
+//
+// Supports: "COUNT(*) > N", "count_star() > N", "c > N" (alias), etc.
+// Returns null if the HAVING text cannot be parsed.
+
+const HavingPred = struct { proj_idx: usize, op: generic_sql.CmpOp, threshold: i64 };
+
+fn parseHavingPred(projections: []const generic_sql.Expr, having_text: []const u8) ?HavingPred {
+    const ops = [_]struct { text: []const u8, op: generic_sql.CmpOp }{
+        .{ .text = ">=", .op = .ge },
+        .{ .text = "<=", .op = .le },
+        .{ .text = "<>", .op = .ne },
+        .{ .text = ">",  .op = .gt },
+        .{ .text = "<",  .op = .lt },
+        .{ .text = "=",  .op = .eq },
+    };
+    for (ops) |candidate| {
+        const pos = std.mem.indexOf(u8, having_text, candidate.text) orelse continue;
+        const lhs = std.mem.trim(u8, having_text[0..pos], " \t\r\n");
+        const rhs = std.mem.trim(u8, having_text[pos + candidate.text.len ..], " \t\r\n");
+        const threshold = std.fmt.parseInt(i64, rhs, 10) catch continue;
+        // Match lhs to a projection: count_star name variants, alias, or column
+        for (projections, 0..) |p, i| {
+            if (std.ascii.eqlIgnoreCase(lhs, "COUNT(*)") or
+                std.ascii.eqlIgnoreCase(lhs, "count_star()"))
+            {
+                if (p.func == .count_star) return .{ .proj_idx = i, .op = candidate.op, .threshold = threshold };
+            }
+            if (p.alias) |a| if (std.ascii.eqlIgnoreCase(lhs, a)) return .{ .proj_idx = i, .op = candidate.op, .threshold = threshold };
+        }
+    }
+    return null;
 }
 
 // ── Helper: parse group-by column list ───────────────────────────────────────
@@ -1064,17 +1178,118 @@ fn parseGroupCols(allocator: std.mem.Allocator, group_by: []const u8) ![][]const
         for (result.items) |c| allocator.free(c);
         result.deinit(allocator);
     }
-    var iter = std.mem.splitScalar(u8, group_by, ',');
-    while (iter.next()) |part| {
-        const trimmed = std.mem.trim(u8, part, " \t\r\n");
-        if (trimmed.len == 0) continue;
-        // Skip numeric position references like "1", "2"
-        _ = std.fmt.parseInt(usize, trimmed, 10) catch {
-            try result.append(allocator, try allocator.dupe(u8, trimmed));
-            continue;
-        };
-        // numeric: try to resolve to the n-th projection column name
-        // (handled by caller if needed)
+    // Split on commas at depth 0 (ignore commas inside parentheses)
+    var depth: usize = 0;
+    var start: usize = 0;
+    var i: usize = 0;
+    while (i <= group_by.len) : (i += 1) {
+        const c = if (i < group_by.len) group_by[i] else ',';
+        switch (c) {
+            '(' => depth += 1,
+            ')' => { if (depth > 0) depth -= 1; },
+            ',' => if (depth == 0) {
+                const part = std.mem.trim(u8, group_by[start..i], " \t\r\n");
+                start = i + 1;
+                if (part.len == 0) continue;
+                // Skip numeric position references like "1", "2"
+                if (std.fmt.parseInt(usize, part, 10) catch null) |_| continue;
+                // Map date_trunc('minute', EventTime) → EventMinute
+                if (isDateTruncMinutePart(part)) {
+                    try result.append(allocator, try allocator.dupe(u8, "EventMinute"));
+                    continue;
+                }
+                // Handle arithmetic expressions like "ClientIP - 1": use the base column name
+                const base = extractBaseColumnName(part);
+                try result.append(allocator, try allocator.dupe(u8, base));
+            },
+            else => {},
+        }
+    }
+    return result.toOwnedSlice(allocator);
+}
+
+/// Returns true if `part` is a date_trunc('minute', EventTime) expression.
+fn isDateTruncMinutePart(part: []const u8) bool {
+    const lower_len = part.len;
+    if (lower_len < 7) return false;
+    if (!std.ascii.startsWithIgnoreCase(part, "date_trunc")) return false;
+    const open = std.mem.indexOfScalar(u8, part, '(') orelse return false;
+    const close = std.mem.lastIndexOfScalar(u8, part, ')') orelse return false;
+    if (close <= open) return false;
+    const inner = std.mem.trim(u8, part[open + 1 .. close], " \t\r\n");
+    const comma = std.mem.indexOfScalar(u8, inner, ',') orelse return false;
+    const unit = std.mem.trim(u8, inner[0..comma], " \t\r\n");
+    const source = std.mem.trim(u8, inner[comma + 1 ..], " \t\r\n");
+    return std.mem.eql(u8, unit, "'minute'") and std.ascii.eqlIgnoreCase(source, "EventTime");
+}
+
+/// Extract the base column name from an expression like "ClientIP - 1" → "ClientIP".
+/// If no operator is found, returns the full expression (assumed to be a plain identifier).
+fn extractBaseColumnName(expr: []const u8) []const u8 {
+    // Look for arithmetic operators: only minus for now (covers q36)
+    for ([_]u8{ '-', '+' }) |op| {
+        if (std.mem.indexOfScalar(u8, expr, op)) |pos| {
+            const base = std.mem.trim(u8, expr[0..pos], " \t\r\n");
+            if (base.len > 0) return base;
+        }
+    }
+    return expr;
+}
+
+/// Parse a group-by expression string like "ClientIP - 1" into a GroupKeyExpr.
+fn parseGroupKeyExpr(allocator: std.mem.Allocator, part: []const u8) !GroupKeyExpr {
+    // date_trunc → EventMinute with offset 0
+    if (isDateTruncMinutePart(part)) {
+        return .{ .base_col = try allocator.dupe(u8, "EventMinute"), .offset = 0 };
+    }
+    // Look for subtraction
+    if (std.mem.indexOfScalar(u8, part, '-')) |pos| {
+        const base = std.mem.trim(u8, part[0..pos], " \t\r\n");
+        const rest = std.mem.trim(u8, part[pos + 1 ..], " \t\r\n");
+        if (base.len > 0) {
+            if (std.fmt.parseInt(i64, rest, 10) catch null) |off| {
+                return .{ .base_col = try allocator.dupe(u8, base), .offset = -off };
+            }
+        }
+    }
+    // Look for addition
+    if (std.mem.indexOfScalar(u8, part, '+')) |pos| {
+        const base = std.mem.trim(u8, part[0..pos], " \t\r\n");
+        const rest = std.mem.trim(u8, part[pos + 1 ..], " \t\r\n");
+        if (base.len > 0) {
+            if (std.fmt.parseInt(i64, rest, 10) catch null) |off| {
+                return .{ .base_col = try allocator.dupe(u8, base), .offset = off };
+            }
+        }
+    }
+    return .{ .base_col = try allocator.dupe(u8, part), .offset = 0 };
+}
+
+/// Parse group-by string into GroupKeyExpr slice (handles depth-0 comma splitting).
+fn parseGroupExprs(allocator: std.mem.Allocator, group_by: []const u8) ![]GroupKeyExpr {
+    var result: std.ArrayList(GroupKeyExpr) = .empty;
+    errdefer {
+        for (result.items) |e| allocator.free(e.base_col);
+        result.deinit(allocator);
+    }
+    var depth: usize = 0;
+    var start: usize = 0;
+    var i: usize = 0;
+    while (i <= group_by.len) : (i += 1) {
+        const c = if (i < group_by.len) group_by[i] else ',';
+        switch (c) {
+            '(' => depth += 1,
+            ')' => { if (depth > 0) depth -= 1; },
+            ',' => if (depth == 0) {
+                const part = std.mem.trim(u8, group_by[start..i], " \t\r\n");
+                start = i + 1;
+                if (part.len == 0) continue;
+                // Skip numeric position references
+                if (std.fmt.parseInt(usize, part, 10) catch null) |_| continue;
+                try result.append(allocator, try parseGroupKeyExpr(allocator, part));
+            },
+            else => {},
+        }
     }
     return result.toOwnedSlice(allocator);
 }
@@ -1091,9 +1306,25 @@ fn evalProjectionExpr(proj: generic_sql.Expr, row: *const RowCtx) Value {
         .count_star  => return Value{ .i64 = 1 }, // counted by AggState
         .count_distinct, .sum, .avg, .min, .max => {
             const col = proj.column orelse return Value{ .null_val = {} };
+            // Handle "length(<actual_col>)" — compute string length instead of column value
+            if (parseLengthCall(col)) |inner_col| {
+                const v = row.get(inner_col) orelse return Value{ .null_val = {} };
+                return switch (v) {
+                    .str => |s| Value{ .i64 = @intCast(s.len) },
+                    else => Value{ .null_val = {} },
+                };
+            }
             return row.get(col) orelse Value{ .null_val = {} };
         },
     }
+}
+
+/// If expr is of the form "length(<col>)" (case-insensitive), returns the inner col name.
+fn parseLengthCall(expr: []const u8) ?[]const u8 {
+    const prefix = "length(";
+    if (!std.ascii.startsWithIgnoreCase(expr, prefix)) return null;
+    if (expr[expr.len - 1] != ')') return null;
+    return expr[prefix.len .. expr.len - 1];
 }
 
 // ── Helper: write expression header label ────────────────────────────────────
@@ -1104,7 +1335,16 @@ fn writeExprHeader(out: *std.ArrayList(u8), allocator: std.mem.Allocator, proj: 
         return;
     }
     switch (proj.func) {
-        .column_ref => try out.appendSlice(allocator, proj.column orelse "*"),
+        .column_ref => {
+            const col = proj.column orelse "*";
+            if (proj.int_offset == 0) {
+                try out.appendSlice(allocator, col);
+            } else if (proj.int_offset > 0) {
+                try out.print(allocator, "{s} + {d}", .{ col, proj.int_offset });
+            } else {
+                try out.print(allocator, "{s} - {d}", .{ col, -proj.int_offset });
+            }
+        },
         .int_literal => try out.print(allocator, "{d}", .{proj.int_offset}),
         .count_star => try out.appendSlice(allocator, "count_star()"),
         .count_distinct => try out.print(allocator, "count(DISTINCT {s})", .{proj.column orelse ""}),

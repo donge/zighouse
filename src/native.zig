@@ -219,7 +219,13 @@ pub const Native = struct {
     }
 
     pub fn query(self: *Native, sql: []const u8) ![]u8 {
-        return self.queryWithMode(sql, queryPathMode());
+        // When a parquet file is provided, use generic mode so the parquet
+        // streaming fallback is attempted after specialized paths fail.
+        const mode: QueryPathMode = if (self.parquet_path != null and queryPathMode() == .specialized)
+            .generic
+        else
+            queryPathMode();
+        return self.queryWithMode(sql, mode);
     }
 
     fn queryWithMode(self: *Native, sql: []const u8, mode: QueryPathMode) anyerror![]u8 {
