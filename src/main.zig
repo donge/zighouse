@@ -188,6 +188,7 @@ fn runCommand(init: std.process.Init, allocator: std.mem.Allocator, args: *std.p
         defer inferred.deinit();
         // Parse and run the query.
         const plan = (try generic_sql.parse(allocator, sql)) orelse return error.UnsupportedGenericQuery;
+        defer generic_sql.deinit(allocator, plan);
         const output = try generic_executor.run(allocator, init.io, plan, parquet_path, &inferred.table);
         defer allocator.free(output);
         try writeOut(init.io, output);

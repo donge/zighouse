@@ -32,6 +32,10 @@ pub const ColumnMeta = struct {
     total_compressed_size: i64 = 0,
     data_page_offset: ?i64 = null,
     dictionary_page_offset: ?i64 = null,
+    /// True when column repetition is OPTIONAL or REPEATED (nullable).
+    /// False (default) means REQUIRED: no definition/repetition level bytes
+    /// are present in DATA_PAGE payloads.
+    is_optional: bool = false,
 };
 
 pub const DataPageHeader = struct {
@@ -340,7 +344,7 @@ pub fn decodeFixedDictionaryPath(allocator: std.mem.Allocator, io: std.Io, path:
             if (dict.len == 0) return error.InvalidParquetMetadata;
             const page_values = @min(@as(usize, @intCast(@max(data_header.num_values, 0))), wanted - decoded);
             const out = values[decoded .. decoded + page_values];
-            try decodeDictionaryIdsToFixed(page.payload, dict, out);
+            try decodeDictionaryIdsToFixed(page.payload, dict, out, col.is_optional);
             decoded += page_values;
         }
     }
@@ -520,9 +524,11 @@ pub fn decodeByteArrayPath(allocator: std.mem.Allocator, io: std.Io, path: []con
                 }
             } else {
                 if (page.payload.len == 0) return error.InvalidParquetMetadata;
-                const bit_width = page.payload[0];
+                const _start = dictIdsStart(page.payload, col.is_optional);
+                if (_start >= page.payload.len) return error.InvalidParquetMetadata;
+                const bit_width = page.payload[_start];
                 if (bit_width > 32) return error.InvalidParquetMetadata;
-                var decoder = RleBitPackedDecoder{ .buf = page.payload[1..], .bit_width = bit_width };
+                var decoder = RleBitPackedDecoder{ .buf = page.payload[_start + 1 ..], .bit_width = bit_width };
                 for (0..page_values) |_| {
                     const id = try decoder.next();
                     try samples.append(allocator, try dict.value(id));
@@ -1136,13 +1142,18 @@ const FixedDictColumnIterator = struct {
                     self.allocator.free(page.payload);
                     return error.InvalidParquetMetadata;
                 }
-                const bit_width = page.payload[0];
+                const _start = dictIdsStart(page.payload, self.col.is_optional);
+                if (_start >= page.payload.len) {
+                    self.allocator.free(page.payload);
+                    return error.InvalidParquetMetadata;
+                }
+                const bit_width = page.payload[_start];
                 if (bit_width > 32) {
                     self.allocator.free(page.payload);
                     return error.InvalidParquetMetadata;
                 }
                 self.ids_payload = page.payload;
-                self.decoder = .{ .buf = self.ids_payload[1..], .bit_width = bit_width };
+                self.decoder = .{ .buf = self.ids_payload[_start + 1 ..], .bit_width = bit_width };
                 self.page_remaining = @intCast(data_header.num_values);
                 self.page_mode = .dict_ids;
                 return;
@@ -1161,6 +1172,7 @@ const ByteArrayColumnIterator = struct {
     end: u64,
     offset: u64,
     header_buf: []u8,
+    is_optional: bool = false,
     dict: StringDict = .{},
     ids_payload: []u8 = &.{},
     plain_payload: []u8 = &.{},
@@ -1183,6 +1195,7 @@ const ByteArrayColumnIterator = struct {
             .end = @min(file_size, offset + @as(u64, @intCast(col.total_compressed_size))),
             .offset = offset,
             .header_buf = header_buf,
+            .is_optional = col.is_optional,
         };
     }
 
@@ -1295,13 +1308,18 @@ const ByteArrayColumnIterator = struct {
                     self.allocator.free(page.payload);
                     return error.InvalidParquetMetadata;
                 }
-                const bit_width = page.payload[0];
+                const _start = dictIdsStart(page.payload, self.is_optional);
+                if (_start >= page.payload.len) {
+                    self.allocator.free(page.payload);
+                    return error.InvalidParquetMetadata;
+                }
+                const bit_width = page.payload[_start];
                 if (bit_width > 32) {
                     self.allocator.free(page.payload);
                     return error.InvalidParquetMetadata;
                 }
                 self.ids_payload = page.payload;
-                self.decoder = .{ .buf = self.ids_payload[1..], .bit_width = bit_width };
+                self.decoder = .{ .buf = self.ids_payload[_start + 1 ..], .bit_width = bit_width };
                 self.page_remaining = @intCast(data_header.num_values);
                 self.page_mode = .dict_ids;
                 return;
@@ -1446,11 +1464,43 @@ fn decodePlainFixedDict(allocator: std.mem.Allocator, payload: []const u8, raw_c
     return dict;
 }
 
-fn decodeDictionaryIdsToFixed(payload: []const u8, dict: []const i64, out: []i64) !void {
+/// Skip repetition-level and definition-level sections at the start of a
+/// PLAIN_DICTIONARY data page payload, returning the offset at which the
+/// dict-index bit_width byte starts.
+///
+/// Parquet DATA_PAGE (v1) payload layout:
+///   [4-byte rep-level byte count][rep-level RLE/BP data]   (OPTIONAL/REPEATED only)
+///   [4-byte def-level byte count][def-level RLE/BP data]   (OPTIONAL/REPEATED only)
+///   [1-byte bit_width][dict-index RLE/BP data]
+///
+/// For REQUIRED columns (is_optional=false) both level sections are absent and
+/// the payload starts directly with the bit_width byte.  We must NOT apply the
+/// heuristic in that case because the bit_width byte can be misread as a valid
+/// section_len.
+fn dictIdsStart(payload: []const u8, is_optional: bool) usize {
+    if (!is_optional) return 0;
+    var pos: usize = 0;
+    // Skip up to two level sections (rep then def).
+    var sections: usize = 0;
+    while (sections < 2 and pos + 4 <= payload.len) : (sections += 1) {
+        const section_len = std.mem.readInt(u32, payload[pos..][0..4], .little);
+        // Sanity: section_len must leave room for bit_width byte after it.
+        if (section_len + 4 + 1 > payload.len - pos) break;
+        // Sanity: bit_width candidate after this section must be <= 32.
+        const candidate_bw = payload[pos + 4 + @as(usize, section_len)];
+        if (candidate_bw > 32) break;
+        pos += 4 + @as(usize, section_len);
+    }
+    return pos;
+}
+
+fn decodeDictionaryIdsToFixed(payload: []const u8, dict: []const i64, out: []i64, is_optional: bool) !void {
     if (payload.len == 0) return error.InvalidParquetMetadata;
-    const bit_width = payload[0];
+    const start = dictIdsStart(payload, is_optional);
+    if (start >= payload.len) return error.InvalidParquetMetadata;
+    const bit_width = payload[start];
     if (bit_width > 32) return error.InvalidParquetMetadata;
-    var decoder = RleBitPackedDecoder{ .buf = payload[1..], .bit_width = bit_width };
+    var decoder = RleBitPackedDecoder{ .buf = payload[start + 1 ..], .bit_width = bit_width };
     for (out) |*slot| {
         const id = try decoder.next();
         if (id >= dict.len) return error.InvalidParquetMetadata;
@@ -1795,6 +1845,29 @@ const CompactParser = struct {
             6 => meta.created_by = try self.readBinary(),
             else => try self.skip(field.type_),
         };
+        // Post-process: populate is_optional on each ColumnMeta by matching
+        // the column path against schema elements.  SchemaElement[0] is the
+        // file-level message element; leaf elements follow.
+        // repetition: 0=REQUIRED, 1=OPTIONAL, 2=REPEATED.
+        // We build a name→repetition map from the schema list.
+        if (meta.schema.len > 1) {
+            for (meta.row_groups) |rg| {
+                // Cast away const — memory is arena-owned and mutable.
+                const cols: []ColumnMeta = @constCast(rg.columns);
+                for (cols) |*col| {
+                    // col.path is the dotted column path; last component is the
+                    // leaf schema element name.
+                    const leaf_name = if (col.path.len > 0) col.path[col.path.len - 1] else continue;
+                    for (meta.schema[1..]) |el| {
+                        if (std.mem.eql(u8, el.name, leaf_name)) {
+                            const rep = el.repetition orelse 0;
+                            col.is_optional = (rep != 0);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
         return meta;
     }
 
