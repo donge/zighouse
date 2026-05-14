@@ -2,6 +2,7 @@ const std = @import("std");
 const build_options = @import("build_options");
 const backend = @import("backend.zig");
 const clickbench_schema = @import("clickbench/schema.zig");
+const catalog = @import("catalog.zig");
 const duckdb = if (build_options.duckdb) @import("duckdb.zig") else @import("duckdb_stub.zig");
 const parquet = @import("parquet.zig");
 const storage = @import("storage.zig");
@@ -814,6 +815,11 @@ fn printErr(io: std.Io, comptime fmt: []const u8, args: anytype) !void {
     var buffer: [4096]u8 = undefined;
     const bytes = try std.fmt.bufPrint(&buffer, fmt, args);
     try std.Io.File.stderr().writeStreamingAll(io, bytes);
+}
+
+// Pull catalog and store tests into this test binary.
+comptime {
+    _ = catalog;
 }
 
 test "schema has ClickBench column count" {

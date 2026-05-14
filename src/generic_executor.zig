@@ -33,21 +33,21 @@ const build_options = @import("build_options");
 
 /// Execute `plan` against `parquet_path` and return the result as a
 /// CSV-formatted string (header row + data rows, comma-separated).
+/// `table` is used to resolve column names to Parquet column indices and types.
 /// Returns `error.UnsupportedGenericQuery` when the plan shape is not handled.
 pub fn run(
     allocator: std.mem.Allocator,
     io: std.Io,
     plan: generic_sql.Plan,
     parquet_path: []const u8,
+    table: *const schema.Table,
 ) anyerror![]u8 {
-    // Reject non-hits tables immediately; caller already checks but be defensive.
-    if (!std.ascii.eqlIgnoreCase(plan.table, "hits")) return error.UnsupportedGenericQuery;
-
     const exec = Executor{
         .allocator = allocator,
         .io = io,
         .plan = plan,
         .parquet_path = parquet_path,
+        .table = table,
     };
 
     // Dispatch based on plan shape
@@ -70,11 +70,11 @@ const ColDesc = struct {
     kind: ColKind,
 };
 
-fn lookupColumn(name: []const u8) ?ColDesc {
+fn lookupColumn(tbl: *const schema.Table, name: []const u8) ?ColDesc {
     // Handle computed / derived column names used in plan projections
     // e.g. "extract(minute from EventTime)" handled elsewhere; skip
-    const idx = clickbench_schema.findColumn(name) orelse return null;
-    const col = clickbench_schema.hits.columns[idx];
+    const idx = tbl.findColumn(name) orelse return null;
+    const col = tbl.columns[idx];
     const kind: ColKind = switch (col.ty) {
         .int16 => .fixed_i16,
         .int32 => .fixed_i32,
@@ -359,6 +359,7 @@ const Executor = struct {
     io: std.Io,
     plan: generic_sql.Plan,
     parquet_path: []const u8,
+    table: *const schema.Table,
 
     // ── Scalar aggregate ─────────────────────────────────────────────────────
 
@@ -366,7 +367,7 @@ const Executor = struct {
         // Collect column names needed
         var needed: std.ArrayList([]const u8) = .empty;
         defer needed.deinit(self.allocator);
-        try collectNeededColumns(self.allocator, self.plan, &needed);
+        try collectNeededColumns(self.allocator, self.plan, &needed, self.table);
 
         var ctx = ScalarAggCtx.init(self.allocator, self.plan);
         defer ctx.deinit();
@@ -379,7 +380,7 @@ const Executor = struct {
     fn runGroupBy(self: Executor) anyerror![]u8 {
         var needed: std.ArrayList([]const u8) = .empty;
         defer needed.deinit(self.allocator);
-        try collectNeededColumns(self.allocator, self.plan, &needed);
+        try collectNeededColumns(self.allocator, self.plan, &needed, self.table);
 
         var ctx = GroupByCtx.init(self.allocator, self.plan);
         defer ctx.deinit(self.allocator);
@@ -392,7 +393,7 @@ const Executor = struct {
     fn runScan(self: Executor) anyerror![]u8 {
         var needed: std.ArrayList([]const u8) = .empty;
         defer needed.deinit(self.allocator);
-        try collectNeededColumns(self.allocator, self.plan, &needed);
+        try collectNeededColumns(self.allocator, self.plan, &needed, self.table);
 
         var ctx = ScanCtx.init(self.allocator, self.plan);
         defer ctx.deinit(self.allocator);
@@ -423,7 +424,7 @@ const Executor = struct {
         defer str_descs.deinit(self.allocator);
 
         for (needed.items) |name| {
-            const desc = lookupColumn(name) orelse continue;
+            const desc = lookupColumn(self.table, name) orelse continue;
             switch (desc.kind) {
                 .string => try str_descs.append(self.allocator, desc),
                 else    => try fixed_descs.append(self.allocator, desc),
@@ -1067,22 +1068,23 @@ fn collectWhereNodeColumns(
     seen: *std.StringHashMap(void),
     needed: *std.ArrayList([]const u8),
     node: *const generic_sql.WhereNode,
+    table: *const schema.Table,
 ) !void {
     const add = struct {
-        fn f(alloc: std.mem.Allocator, s: *std.StringHashMap(void), lst: *std.ArrayList([]const u8), name: []const u8) !void {
+        fn f(alloc: std.mem.Allocator, s: *std.StringHashMap(void), lst: *std.ArrayList([]const u8), name: []const u8, tbl: *const schema.Table) !void {
             if (s.contains(name)) return;
-            if (lookupColumn(name) == null) return;
+            if (tbl.findColumn(name) == null) return;
             try s.put(name, {});
             try lst.append(alloc, name);
         }
     }.f;
     switch (node.*) {
-        .cmp_int  => |c| try add(allocator, seen, needed, c.col),
-        .cmp_str  => |c| try add(allocator, seen, needed, c.col),
-        .like     => |l| try add(allocator, seen, needed, l.col),
-        .is_null, .is_not_null => |col| try add(allocator, seen, needed, col),
-        .and_ => |children| for (children) |ch| try collectWhereNodeColumns(allocator, seen, needed, ch),
-        .or_  => |children| for (children) |ch| try collectWhereNodeColumns(allocator, seen, needed, ch),
+        .cmp_int  => |c| try add(allocator, seen, needed, c.col, table),
+        .cmp_str  => |c| try add(allocator, seen, needed, c.col, table),
+        .like     => |l| try add(allocator, seen, needed, l.col, table),
+        .is_null, .is_not_null => |col| try add(allocator, seen, needed, col, table),
+        .and_ => |children| for (children) |ch| try collectWhereNodeColumns(allocator, seen, needed, ch, table),
+        .or_  => |children| for (children) |ch| try collectWhereNodeColumns(allocator, seen, needed, ch, table),
     }
 }
 
@@ -1090,14 +1092,15 @@ fn collectNeededColumns(
     allocator: std.mem.Allocator,
     plan: generic_sql.Plan,
     needed: *std.ArrayList([]const u8),
+    table: *const schema.Table,
 ) !void {
     var seen = std.StringHashMap(void).init(allocator);
     defer seen.deinit();
 
     const add = struct {
-        fn f(alloc: std.mem.Allocator, s: *std.StringHashMap(void), lst: *std.ArrayList([]const u8), name: []const u8) !void {
+        fn f(alloc: std.mem.Allocator, s: *std.StringHashMap(void), lst: *std.ArrayList([]const u8), name: []const u8, tbl: *const schema.Table) !void {
             if (s.contains(name)) return;
-            if (lookupColumn(name) == null) return; // skip unknown (computed) columns
+            if (tbl.findColumn(name) == null) return; // skip unknown (computed) columns
             try s.put(name, {});
             try lst.append(alloc, name);
         }
@@ -1107,15 +1110,15 @@ fn collectNeededColumns(
         if (proj.column) |col| {
             // Handle "length(<actual_col>)" — collect the inner column
             if (parseLengthCall(col)) |inner| {
-                try add(allocator, &seen, needed, inner);
+                try add(allocator, &seen, needed, inner, table);
             } else {
-                try add(allocator, &seen, needed, col);
+                try add(allocator, &seen, needed, col, table);
             }
         }
     }
     if (plan.filter) |filter| {
-        try add(allocator, &seen, needed, filter.column);
-        if (filter.second) |sec| try add(allocator, &seen, needed, sec.column);
+        try add(allocator, &seen, needed, filter.column, table);
+        if (filter.second) |sec| try add(allocator, &seen, needed, sec.column, table);
     }
     // Parse group-by columns using parseGroupExprs (handles arithmetic + date_trunc)
     if (plan.group_by) |gb| {
@@ -1127,13 +1130,17 @@ fn collectNeededColumns(
         for (exprs) |e| {
             // "EventMinute" maps to the EventTime column in Parquet
             const real_col = if (std.ascii.eqlIgnoreCase(e.base_col, "EventMinute")) "EventTime" else e.base_col;
-            try add(allocator, &seen, needed, real_col);
+            try add(allocator, &seen, needed, real_col, table);
         }
     }
     // Also collect columns referenced by where_expr so filter evaluation works.
-    if (plan.where_expr) |we| try collectWhereNodeColumns(allocator, &seen, needed, we);
+    if (plan.where_expr) |we| try collectWhereNodeColumns(allocator, &seen, needed, we, table);
     // Ensure at least one column is present so streamRows can count rows.
-    if (needed.items.len == 0) try add(allocator, &seen, needed, "CounterID");
+    if (needed.items.len == 0) {
+        // Fall back to first column in schema if "CounterID" is not available.
+        const fallback = if (table.findColumn("CounterID") != null) "CounterID" else table.columns[0].name;
+        try add(allocator, &seen, needed, fallback, table);
+    }
 }
 
 // ── Helper: parse HAVING predicate ───────────────────────────────────────────
@@ -1398,7 +1405,7 @@ fn runQuery(allocator: std.mem.Allocator, sql: []const u8) ![]u8 {
     const plan = (try generic_sql.parse(allocator, sql)) orelse
         return error.ParseFailed;
     defer generic_sql.deinit(allocator, plan);
-    return run(allocator, std.testing.io, plan, fixture_parquet);
+    return run(allocator, std.testing.io, plan, fixture_parquet, &clickbench_schema.hits);
 }
 
 test "smoke: count(*)" {

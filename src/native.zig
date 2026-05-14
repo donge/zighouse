@@ -1169,7 +1169,7 @@ pub const Native = struct {
     /// Called from queryWithMode when executeGenericSql returns UnsupportedGenericQuery.
     fn executeGenericParquetFallback(self: *Native, plan: generic_sql.Plan) anyerror!?[]u8 {
         const pq = self.parquet_path orelse return null;
-        return try generic_executor.run(self.allocator, self.io, plan, pq);
+        return try generic_executor.run(self.allocator, self.io, plan, pq, &clickbench_schema.hits);
     }
 };
 
