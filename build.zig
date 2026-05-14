@@ -315,6 +315,34 @@ pub fn build(b: *std.Build) void {
     });
     const ch_checksums_test_cmd = b.addRunArtifact(ch_checksums_tests);
 
+    // string_codec.zig
+    const ch_string_codec_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/clickhouse_format/string_codec.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const ch_string_codec_test_cmd = b.addRunArtifact(ch_string_codec_tests);
+
+    // part.zig — needs lz4 + schema + all sub-modules
+    const ch_part_mod = b.createModule(.{
+        .root_source_file = b.path("src/clickhouse_format/part.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    ch_part_mod.link_libc = true;
+    ch_part_mod.addIncludePath(.{ .cwd_relative = lz4_include });
+    ch_part_mod.addLibraryPath(.{ .cwd_relative = lz4_lib });
+    ch_part_mod.addRPath(.{ .cwd_relative = lz4_lib });
+    ch_part_mod.linkSystemLibrary("lz4", .{});
+    ch_part_mod.addImport("schema", schema_mod);
+    ch_part_mod.addImport("types", ch_types_mod);
+    const ch_part_tests = b.addTest(.{
+        .root_module = ch_part_mod,
+    });
+    const ch_part_test_cmd = b.addRunArtifact(ch_part_tests);
+
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&test_cmd.step);
     test_step.dependOn(&simd_test_cmd.step);
@@ -337,6 +365,8 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&ch_marks_test_cmd.step);
     test_step.dependOn(&ch_primary_idx_test_cmd.step);
     test_step.dependOn(&ch_checksums_test_cmd.step);
+    test_step.dependOn(&ch_string_codec_test_cmd.step);
+    test_step.dependOn(&ch_part_test_cmd.step);
 
     if (!install_bench_tools) return;
 
