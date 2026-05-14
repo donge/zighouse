@@ -49,8 +49,8 @@ const usage =
     \\  zighouse build-q21-count-google <data_dir>
     \\  zighouse build-referer-sidecars <data_dir>
     \\  zighouse query-csv <csv_path> <sql>  tables: csv (header), csv_no_header
-    \\  zighouse query <data_dir> <sql>
-    \\  zighouse query-timed <data_dir> <sql>
+    \\  zighouse query <data_dir> <sql> [--parquet <hits.parquet>]
+    \\  zighouse query-timed <data_dir> <sql> [--parquet <hits.parquet>]
     \\  zighouse compare-duckdb-native <data_dir> <queries.sql> [first] [limit]
     \\  zighouse store-info <data_dir>
     \\  zighouse native-status <data_dir>
@@ -391,18 +391,37 @@ fn runCommand(init: std.process.Init, allocator: std.mem.Allocator, args: *std.p
     } else if (std.mem.eql(u8, command, "query")) {
         const data_dir = args.next() orelse return error.MissingDataDir;
         const sql = args.next() orelse return error.MissingSql;
+        // Optional: --parquet <path>  enables the generic parquet-streaming fallback
+        var parquet_override: ?[]const u8 = null;
+        while (args.next()) |flag| {
+            if (std.mem.eql(u8, flag, "--parquet")) {
+                parquet_override = args.next() orelse return error.MissingParquetPath;
+            }
+        }
         try storage.ensureStore(init.io, data_dir);
         var selected = backend.Backend.init(allocator, init.io, data_dir, options);
         defer selected.deinit();
+        if (parquet_override) |pq| {
+            if (selected == .native) selected.native.parquet_path = pq;
+        }
         const output = try selected.query(sql);
         defer allocator.free(output);
         try writeOut(init.io, output);
     } else if (std.mem.eql(u8, command, "query-timed")) {
         const data_dir = args.next() orelse return error.MissingDataDir;
         const sql = args.next() orelse return error.MissingSql;
+        var parquet_override: ?[]const u8 = null;
+        while (args.next()) |flag| {
+            if (std.mem.eql(u8, flag, "--parquet")) {
+                parquet_override = args.next() orelse return error.MissingParquetPath;
+            }
+        }
         try storage.ensureStore(init.io, data_dir);
         var selected = backend.Backend.init(allocator, init.io, data_dir, options);
         defer selected.deinit();
+        if (parquet_override) |pq| {
+            if (selected == .native) selected.native.parquet_path = pq;
+        }
         const started = std.Io.Clock.Timestamp.now(init.io, .awake);
         const output = try selected.query(sql);
         const ended = std.Io.Clock.Timestamp.now(init.io, .awake);

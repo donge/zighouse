@@ -3,6 +3,7 @@ const agg = @import("agg.zig");
 const chdb = @import("chdb.zig");
 const clickbench_import = @import("clickbench_import.zig");
 const clickbench_dispatch = @import("clickbench/dispatch.zig");
+const generic_executor = @import("generic_executor.zig");
 const clickbench_schema = @import("clickbench/schema.zig");
 const clickbench_queries = @import("clickbench_queries.zig");
 const build_options = @import("build_options");
@@ -66,6 +67,10 @@ pub const Native = struct {
     url_dot_google_matches_cache: ?[]u8,
     title_google_matches_cache: ?[]u8,
     experimental: bool,
+    /// Optional path to hits.parquet for the generic fallback executor.
+    /// When set, queries that cannot be handled by the specialized or hot-column
+    /// paths will be evaluated by streaming the Parquet file directly.
+    parquet_path: ?[]const u8 = null,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8) Native {
         return .{ .allocator = allocator, .io = io, .data_dir = data_dir, .hot_cache = null, .user_id_cache = null, .search_phrase_cache = null, .url_cache = null, .title_cache = null, .url_hash_string_cache = .init(allocator), .title_hash_string_cache = .init(allocator), .referer_hash_string_cache = .init(allocator), .q34_url_top_cache = null, .url_google_matches_cache = null, .url_dot_google_matches_cache = null, .title_google_matches_cache = null, .experimental = true };
@@ -223,10 +228,14 @@ pub const Native = struct {
                 const generic_plan = try generic_sql.parse(self.allocator, sql);
                 defer if (generic_plan) |plan| generic_sql.deinit(self.allocator, plan);
                 if (generic_plan) |plan| switch (mode) {
-                    .generic => if (self.executeGenericSql(plan) catch |err| switch (err) {
-                        error.UnsupportedGenericQuery => null,
-                        else => return err,
-                    }) |output| return output,
+                    .generic => {
+                        if (self.executeGenericSql(plan) catch |err| switch (err) {
+                            error.UnsupportedGenericQuery => null,
+                            else => return err,
+                        }) |output| return output;
+                        // Fallback: stream directly from Parquet if --parquet was supplied
+                        if (try self.executeGenericParquetFallback(plan)) |output| return output;
+                    },
                     .compare => if (self.queryCompareGenericSql(sql, plan) catch |err| switch (err) {
                         error.UnsupportedGenericQuery => null,
                         else => return err,
@@ -1155,6 +1164,13 @@ pub const Native = struct {
 
     fn convertHotCsvToBinary(self: *Native, hot_path: []const u8) !void {
         try convertHotCsvToBinaryStreaming(self.allocator, self.io, self.data_dir, hot_path);
+    }
+
+    /// Try the generic parquet-streaming executor as a last resort.
+    /// Called from queryWithMode when executeGenericSql returns UnsupportedGenericQuery.
+    fn executeGenericParquetFallback(self: *Native, plan: generic_sql.Plan) anyerror!?[]u8 {
+        const pq = self.parquet_path orelse return null;
+        return try generic_executor.run(self.allocator, self.io, plan, pq);
     }
 };
 
