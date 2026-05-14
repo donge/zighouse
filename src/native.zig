@@ -5703,12 +5703,15 @@ fn bindClickBenchGroupColumn(ptr: *const anyopaque, name: []const u8) anyerror!n
 
 fn bindClickBenchGroupFilterColumn(ptr: *const anyopaque, name: []const u8) anyerror!native_group.BoundColumn {
     const data: *const GroupContextData = @ptrCast(@alignCast(ptr));
-    if (asciiEqlIgnoreCase(name, "URL")) return .{ .name = "URL", .column = .{ .i32 = data.hot.url_length orelse return error.UnsupportedGenericColumn } };
-    if (asciiEqlIgnoreCase(name, "SearchPhrase")) {
-        const phrase = data.search_phrase orelse return error.UnsupportedGenericColumn;
-        return .{ .name = "SearchPhrase", .column = .{ .empty_text_id = .{ .ids = phrase.ids.values, .empty_id = phrase.emptyId() orelse return error.UnsupportedGenericColumn } } };
-    }
-    return bindClickBenchGroupColumn(ptr, name);
+    // Schema-driven path: look up the column via Native.bindColumn, plus an
+    // optional per-row length sidecar (URL has hot.url_length). The adapter
+    // chooses the i32-length encoding when a sidecar exists, else falls
+    // back to empty_text_id (lowcard_text dictionary id != empty_id).
+    if (data.native.bindColumn(name)) |bound| {
+        const length_sidecar = nonemptyLengthSidecar(data.hot, name);
+        if (binder.asGroupFilterColumn(bound, length_sidecar)) |group_col| return group_col else |_| {}
+    } else |_| {}
+    return error.UnsupportedGenericColumn;
 }
 
 fn reduceScalarContext(data: *const ReduceContextData) native_reduce.ScalarContext {
@@ -5744,8 +5747,22 @@ fn bindClickBenchReduceColumnImpl(native: *Native, hot: *const HotColumns, name:
 
 fn bindClickBenchReduceFilterColumn(ptr: *const anyopaque, name: []const u8) anyerror!native_reduce.Column {
     const data: *const ReduceContextData = @ptrCast(@alignCast(ptr));
-    if (asciiEqlIgnoreCase(name, "URL")) return .{ .i32 = data.hot.url_length orelse return error.UnsupportedGenericColumn };
+    // Schema-driven path: lowcard_text columns with a length sidecar lower
+    // to i32 (e.g. URL via hot.url_length); other variants delegate.
+    if (data.native.bindColumn(name)) |bound| {
+        const length_sidecar = nonemptyLengthSidecar(data.hot, name);
+        if (binder.asReduceFilterColumn(bound, length_sidecar)) |col| return col else |_| {}
+    } else |_| {}
     return bindClickBenchReduceColumn(ptr, name);
+}
+
+/// Look up an i32 per-row length sidecar for a schema column, used to
+/// rewrite `<col> <> ''` filters to `length != 0`. Today only URL has one
+/// (materialized at import time as `hot.url_length`); callers must accept
+/// `null` and fall back to a different encoding.
+fn nonemptyLengthSidecar(hot: *const HotColumns, name: []const u8) ?[]const i32 {
+    if (asciiEqlIgnoreCase(name, "URL")) return hot.url_length;
+    return null;
 }
 
 const UserIdEncoding = struct {

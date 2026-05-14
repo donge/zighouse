@@ -56,3 +56,45 @@ pub fn asReduceColumn(bc: bind.BoundColumn) !native_reduce.Column {
         else => error.UnsupportedGenericColumn,
     };
 }
+
+/// Filter-context projection for group binders. Differs from `asGroupColumn`
+/// only for `lowcard_text`: when an i32 length sidecar is supplied (e.g.
+/// URL's `hot.url_length`), the filter form prefers that slice so
+/// `<col> <> ''` lowers to `length != 0` -- consumed by `bindFilterI32`.
+/// When no length sidecar is supplied (e.g. SearchPhrase), the empty_text_id
+/// form is returned, matched by `bindEmptyTextId`. Both encodings are
+/// semantically equivalent for "non-empty string"; the i32 form avoids
+/// dictionary indirection.
+///
+/// `length_sidecar` is threaded by the filter binder rather than carried in
+/// `BoundColumn` itself: keeping the union layout stable preserves the
+/// codegen profile of the much hotter non-filter group/reduce paths.
+pub fn asGroupFilterColumn(bc: bind.BoundColumn, length_sidecar: ?[]const i32) !native_group.BoundColumn {
+    return switch (bc) {
+        .lowcard_text => |c| blk: {
+            if (length_sidecar) |length_values| {
+                break :blk .{ .name = c.name, .column = .{ .i32 = length_values } };
+            }
+            const empty_id = c.empty_id orelse return error.UnsupportedGenericColumn;
+            break :blk .{
+                .name = c.name,
+                .column = .{ .empty_text_id = .{ .ids = c.column.ids.values, .empty_id = empty_id } },
+            };
+        },
+        else => asGroupColumn(bc),
+    };
+}
+
+/// Filter-context projection for reduce binders. Lowers `lowcard_text` to
+/// its supplied i32 length sidecar (the only encoding `native_reduce`
+/// currently consumes for non-empty filters). Other variants delegate to
+/// `asReduceColumn`.
+pub fn asReduceFilterColumn(bc: bind.BoundColumn, length_sidecar: ?[]const i32) !native_reduce.Column {
+    return switch (bc) {
+        .lowcard_text => blk: {
+            const length_values = length_sidecar orelse return error.UnsupportedGenericColumn;
+            break :blk .{ .i32 = length_values };
+        },
+        else => asReduceColumn(bc),
+    };
+}
