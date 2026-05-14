@@ -1,4 +1,5 @@
 const std = @import("std");
+const duckdb_parse = @import("duckdb_parse.zig");
 
 pub const AggregateFn = enum { column_ref, int_literal, count_star, count_distinct, sum, avg, min, max };
 
@@ -38,7 +39,14 @@ pub const Plan = struct {
     offset: ?usize = null,
 };
 
+/// Parse `sql` into a Plan.  Tries the DuckDB-backed parser first (when DuckDB
+/// is linked); falls back to the legacy hand-written parser on failure.
 pub fn parse(allocator: std.mem.Allocator, sql: []const u8) !?Plan {
+    if (duckdb_parse.parse(allocator, sql) catch null) |plan| return plan;
+    return parseLegacy(allocator, sql);
+}
+
+fn parseLegacy(allocator: std.mem.Allocator, sql: []const u8) !?Plan {
     const trimmed = std.mem.trim(u8, sql, " \t\r\n;");
     const from_pos = indexOfTopLevelKeyword(trimmed, "from") orelse return null;
     const select_kw = "select";
@@ -525,7 +533,7 @@ fn parseCall(expr: []const u8, name: []const u8) ?[]const u8 {
     return expr[open + 1 .. close];
 }
 
-fn parseFilter(where_body: []const u8) ?Filter {
+pub fn parseFilter(where_body: []const u8) ?Filter {
     if (indexOfKeyword(where_body, "and")) |and_pos| {
         const right = std.mem.trim(u8, where_body[and_pos + "and".len ..], " \t\r\n");
         if (indexOfKeyword(right, "and") != null) return null;

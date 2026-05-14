@@ -16,6 +16,7 @@ pub fn build(b: *std.Build) void {
         "Prioritize performance, safety, or binary size (default: ReleaseFast)",
     ) orelse .ReleaseFast;
     const enable_duckdb = b.option(bool, "duckdb", "Link DuckDB and enable DuckDB-backed commands") orelse true;
+    const duckdb_prefix = b.option([]const u8, "duckdb-prefix", "DuckDB installation prefix") orelse "/opt/homebrew/opt/duckdb";
     const install_bench_tools = b.option(bool, "bench-tools", "Install benchmark helper executables") orelse true;
     const options = b.addOptions();
     options.addOption(bool, "duckdb", enable_duckdb);
@@ -34,7 +35,6 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addOptions("build_options", options);
     exe.root_module.link_libc = true;
     if (enable_duckdb) {
-        const duckdb_prefix = b.option([]const u8, "duckdb-prefix", "DuckDB installation prefix") orelse "/opt/homebrew/opt/duckdb";
         const duckdb_include = b.fmt("{s}/include", .{duckdb_prefix});
         const duckdb_lib = b.fmt("{s}/lib", .{duckdb_prefix});
         exe.root_module.addIncludePath(.{ .cwd_relative = duckdb_include });
@@ -62,6 +62,15 @@ pub fn build(b: *std.Build) void {
         }),
     });
     unit_tests.root_module.addOptions("build_options", options);
+    unit_tests.root_module.link_libc = true;
+    if (enable_duckdb) {
+        const duckdb_include = b.fmt("{s}/include", .{duckdb_prefix});
+        const duckdb_lib = b.fmt("{s}/lib", .{duckdb_prefix});
+        unit_tests.root_module.addIncludePath(.{ .cwd_relative = duckdb_include });
+        unit_tests.root_module.addLibraryPath(.{ .cwd_relative = duckdb_lib });
+        unit_tests.root_module.addRPath(.{ .cwd_relative = duckdb_lib });
+        unit_tests.root_module.linkSystemLibrary("duckdb", .{});
+    }
     const test_cmd = b.addRunArtifact(unit_tests);
 
     const simd_tests = b.addTest(.{
@@ -116,6 +125,16 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    generic_sql_tests.root_module.addOptions("build_options", options);
+    generic_sql_tests.root_module.link_libc = true;
+    if (enable_duckdb) {
+        const duckdb_include = b.fmt("{s}/include", .{duckdb_prefix});
+        const duckdb_lib = b.fmt("{s}/lib", .{duckdb_prefix});
+        generic_sql_tests.root_module.addIncludePath(.{ .cwd_relative = duckdb_include });
+        generic_sql_tests.root_module.addLibraryPath(.{ .cwd_relative = duckdb_lib });
+        generic_sql_tests.root_module.addRPath(.{ .cwd_relative = duckdb_lib });
+        generic_sql_tests.root_module.linkSystemLibrary("duckdb", .{});
+    }
     const generic_sql_test_cmd = b.addRunArtifact(generic_sql_tests);
 
     const lowcard_tests = b.addTest(.{
