@@ -947,9 +947,3 @@ fn projectionAliasExists(projs: []const generic_sql.Expr, alias: []const u8) boo
     return false;
 }
 
-fn projectionColExists(projs: []const generic_sql.Expr, col: []const u8) bool {
-    for (projs) |p| {
-        if (p.column) |pc| if (std.ascii.eqlIgnoreCase(pc, col)) return true;
-    }
-    return false;
-}

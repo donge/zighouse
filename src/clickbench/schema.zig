@@ -75,36 +75,6 @@ fn lowcardTextWithHash(
     };
 }
 
-fn hashText(
-    name: []const u8,
-    cardinality: schema.CardinalityHint,
-    storage: schema.StorageHint,
-    hash_column: []const u8,
-    dict_path_name: ?[]const u8,
-    id_path_name: ?[]const u8,
-    offsets_path_name: ?[]const u8,
-    bytes_path_name: ?[]const u8,
-    capabilities: schema.StringCapabilities,
-) Column {
-    return .{
-        .name = name,
-        .ty = .text,
-        .cardinality = cardinality,
-        .storage = storage,
-        .string_encoding = .hash_late_materialized,
-        .physical = .{ .hash_text = .{
-            .hash_column = hash_column,
-            .dict_path_name = dict_path_name,
-            .id_path_name = id_path_name,
-            .offsets_path_name = offsets_path_name,
-            .bytes_path_name = bytes_path_name,
-            .empty = .stored_empty_string,
-        } },
-        .materialize = &.{ .hash_column, .hash_to_string_dict },
-        .capabilities = capabilities,
-    };
-}
-
 fn lazyText(name: []const u8, cardinality: schema.CardinalityHint, hash_column: ?[]const u8, sidecar_path_name: ?[]const u8, capabilities: schema.StringCapabilities) Column {
     return .{
         .name = name,

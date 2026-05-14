@@ -479,11 +479,6 @@ fn startsWithIgnoreCase(value: []const u8, prefix: []const u8) bool {
     return asciiEqlIgnoreCase(value[0..prefix.len], prefix);
 }
 
-fn hasEmptyStringFilter(plan: generic_sql.Plan, column: []const u8) bool {
-    const filter = plan.filter orelse return false;
-    return filter.second == null and filter.op == .not_equal and filter.int_value == 0 and asciiEqlIgnoreCase(filter.column, column);
-}
-
 fn orderByAlias(plan: generic_sql.Plan, alias: []const u8) bool {
     return if (plan.order_by_alias) |got| asciiEqlIgnoreCase(got, alias) else false;
 }
