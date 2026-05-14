@@ -726,15 +726,18 @@ pub const Native = struct {
                 error.FileNotFound => try formatUrlCountTopFilteredQ37Cached(self.allocator, hot, try self.getUrlColumn()),
                 else => return err,
             },
-            .title_count_top_filtered_dashboard => formatTitleCountTopFilteredQ38HashLateMaterialize(self.allocator, self.io, self.data_dir, hot, &self.title_hash_string_cache) catch |err| switch (err) {
-                error.FileNotFound => blk: {
-                    const output = formatTitleCountTopFilteredQ38ParquetScan(self.allocator, self.io, self.data_dir, hot) catch |scan_err| switch (scan_err) {
-                        error.FileNotFound => try formatTitleCountTopFilteredQ38Cached(self.allocator, hot, try self.getTitleColumn()),
-                        else => return scan_err,
-                    };
-                    break :blk output;
+            .title_count_top_filtered_dashboard => formatQ38FromStatsSidecar(self.allocator, self.io, self.data_dir) catch |stats_err| switch (stats_err) {
+                error.FileNotFound => formatTitleCountTopFilteredQ38HashLateMaterialize(self.allocator, self.io, self.data_dir, hot, &self.title_hash_string_cache) catch |err| switch (err) {
+                    error.FileNotFound => blk: {
+                        const output = formatTitleCountTopFilteredQ38ParquetScan(self.allocator, self.io, self.data_dir, hot) catch |scan_err| switch (scan_err) {
+                            error.FileNotFound => try formatTitleCountTopFilteredQ38Cached(self.allocator, hot, try self.getTitleColumn()),
+                            else => return scan_err,
+                        };
+                        break :blk output;
+                    },
+                    else => return err,
                 },
-                else => return err,
+                else => return stats_err,
             },
             .url_count_top_filtered_offset_dashboard => formatUrlCountTopFilteredOffsetQ39HashLateMaterialize(self.allocator, self.io, self.data_dir, hot, &self.url_hash_string_cache) catch |err| switch (err) {
                 error.FileNotFound => try formatUrlCountTopFilteredOffsetQ39Cached(self.allocator, self.io, self.data_dir, hot, try self.getUrlColumn()),
