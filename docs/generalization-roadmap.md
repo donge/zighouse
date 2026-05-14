@@ -2,15 +2,13 @@
 
 ## Background
 
-ZigHouse currently has a high-performance native columnar execution path for ClickBench, but the codebase is still organized around a ClickBench-specific workload:
+ZigHouse is a native analytical engine optimized for ClickBench.  The codebase
+started as a benchmark-specific binary and has been progressively generalized
+across Phases A–G while preserving the specialized ClickBench performance path.
 
-- `src/native.zig` contains many query-pattern matchers and `formatQ...` execution paths.
-- `src/schema.zig` is fixed to the ClickBench `hits` schema.
-- `src/storage.zig` has many ClickBench hot-column, sidecar, and artifact file names.
-- `src/planner.zig` only covers a few artifact plans and CSV count, not a general SQL planner.
-- The reusable assets are the Parquet decoder, mmap column scans, SIMD/hashmap/parallel primitives, and columnar execution kernels.
-
-The goal is to evolve ZigHouse from a benchmark-specific binary into a native analytical engine that can import flat Parquet datasets and execute a useful SQL subset, without losing the existing ClickBench performance baseline unless a trade-off is explicitly reviewed.
+The goal is to support arbitrary analytical SQL on flat Parquet datasets without
+losing the existing ClickBench performance baseline unless a trade-off is
+explicitly reviewed.
 
 ## Principles
 
@@ -23,7 +21,8 @@ scripts/perf-baseline.sh data/hits.parquet /tmp/zighouse-perf-store /tmp/zighous
 scripts/perf-compare.py perf/baselines/local-10m-submit.json /tmp/zighouse-candidate.json
 ```
 
-4. If a generality improvement regresses performance, record the regression, likely cause, and whether the trade-off is acceptable before merging.
+4. If a generality improvement regresses performance, record the regression,
+   likely cause, and whether the trade-off is acceptable before merging.
 5. Default gates:
    - Query `warm_best_sum`: max `5%` regression.
    - Import total: max `7.5%` regression.
@@ -31,214 +30,74 @@ scripts/perf-compare.py perf/baselines/local-10m-submit.json /tmp/zighouse-candi
 
 ## Current Performance Baseline
 
-Baseline file:
-
-- `perf/baselines/local-10m-submit.json`
-
-Current baseline:
+Baseline file: `perf/baselines/local-10m-submit.json`
 
 - Data: `data/hits.parquet`
 - Rows: `10,000,000`
 - Build: `zig build -Dduckdb=false`
+- Query path: `specialized` (`ZIGHOUSE_QUERY_PATH=specialized`)
 - Mode: `ZIGHOUSE_CLICKBENCH_SUBMIT=1`
 - Repeats: 3, using medians
-- Import total: `7.398315s`
-- Import wall: `7.40s`
-- Query `warm_best_sum`: `1.303544s`
-- Store size: `1121101092` bytes
-- Queries: `43`
-- Nulls: `0`
+- Import total: ~`7.21s`
+- Query `warm_best_sum`: ~`1.26s`
+- Store size: `1121101103` bytes
+- Queries: `43`, Nulls: `0`
 
-## Phase 1: Isolate ClickBench-Specific Logic
+## Completed Work
 
-Goal: move ClickBench-specific boundaries without changing behavior.
+### Phase A: Schema-Driven Operator Generalization (v0.6 era)
 
-Tasks:
+- PR-A5/A6/A7/A9: introduced `CapabilityTag`, `BoundColumn`, `PlanShape`,
+  `bindColumn`; dropped dead reducers; folded `length(URL)` into native column
+  binding; schema-driven filter rewrite via `asGroup`/`ReduceFilterColumn`.
 
-- Add a ClickBench query module such as `src/clickbench.zig` or `src/clickbench_queries.zig`.
-- Move ClickBench query matcher and dispatch shell out of `native.zig` where possible.
-- Keep execution kernels unchanged at first.
-- Keep query dispatch order unchanged, especially q34/q35 memoization and q37-q40 paths.
+### Phase B: Physical Column Adapter Layer
 
-Acceptance:
+- PR-B2a/B2b: `BoundColumn` → physical `Column` adapter, dedup
+  `GenericColumn`/`bindGenericColumn`.
+- PR-B3a: extracted late-materialize core + Q21/Q34 to
+  `src/clickbench/late_materialize.zig`.
 
-- `zig build -Dduckdb=false` passes.
-- `zig build test` passes.
-- 10M performance compare passes.
-- ClickBench correctness remains unchanged.
+### Phase G: DuckDB Parser + Generic Parquet Streaming Executor
 
-Risks:
+- PR-G1: allow non-`hits` table names in generic SQL parser.
+- PR-G2: DuckDB-backed SQL parser via `json_serialize_sql`.
+- PR-G3a: singleton DuckDB parser connection (2.8 ms → ~66 µs per parse).
+- PR-G5: generic executor with `WhereNode`, date comparison, scan path; arena
+  leak fix in `readMetadataFromFile`.
+- PR-G6/G6b: generic parquet-streaming executor; enable generic fallback for
+  q28/q36/q43; smoke tests against `fixture_hits.parquet`.
 
-- Dispatch order changes can affect cached state and memoization.
-- Moving helpers too aggressively can cause inlining or allocation changes.
+Result: 43/43 ClickBench queries hit the specialized path with byte-identical
+output; arbitrary `hits`-table SQL falls through to the generic Parquet executor.
 
-## Phase 2: General Store Manifest and Table Schema
+## Roadmap
 
-Goal: move from fixed `hits_columns` toward self-describing stores.
+### Next: Phase H – General Table Import
 
-Tasks:
-
-- Introduce `TableSchema`: table name, columns, logical types, physical encodings, nullability, row count.
-- Introduce `StoreManifest`: format version, tables, columns, segment size, import source.
-- Keep existing ClickBench manifest compatibility while adding the new catalog path.
-- Make `store-info` report table and column metadata.
-
-Acceptance:
-
-- Existing ClickBench stores still load.
-- New manifest can describe the `hits` table.
-- Performance compare passes.
-
-## Phase 3: General Physical Operators
-
-Goal: turn current specialized kernels into reusable operators.
-
-Path modes during migration:
-
-- `ZIGHOUSE_QUERY_PATH=specialized`: current default fast path.
-- `ZIGHOUSE_QUERY_PATH=generic`: generic operators when available.
-- `ZIGHOUSE_QUERY_PATH=compare`: run both paths for supported queries, log correctness/timing to stderr, and return specialized output.
-
-The first generic slice covers simple fixed-column queries: row count, filtered count, sum/count/avg, avg, and min/max. This path is intentionally simpler and slower than SIMD-specialized kernels; it is a correctness and evolution path, not the default performance path yet.
-
-Initial operators:
-
-- `ColumnScan`
-- `Predicate`
-- `Projection`
-- `HashAggregate`
-- `TopK`
-- `SortLimit`
-- `LateMaterialize`
-- `StringContains`
-- `DictDecode`
-- `CountDistinct`
-
-Tasks:
-
-- Create `src/engine/` or equivalent modules.
-- Wrap hashmap/top-k/SIMD scan/parallel fan-out as reusable APIs.
-- Gradually route low-risk ClickBench query classes through operators.
-- Keep specialized fallback when generic operators are measurably slower.
-
-Acceptance:
-
-- Migrate low-risk query classes first, such as numeric aggregates and simple group-by/top-k.
-- Run performance checks after each migration.
-
-## Phase 4: Minimal SQL AST and Planner
-
-Goal: support a practical analytical SQL subset without implementing full SQL.
-
-Initial SQL subset:
-
-- `SELECT expr... FROM table`
-- `WHERE` with `=`, `<>`, `<`, `<=`, `>`, `>=`, `AND`, `IN`, `BETWEEN`, and `LIKE '%literal%'`
-- `COUNT(*)`, `SUM`, `AVG`, `MIN`, `MAX`, `COUNT(DISTINCT)`
-- `GROUP BY`
-- `ORDER BY`
-- `LIMIT`
-- `OFFSET`
-
-Tasks:
-
-- Add parser and AST.
-- Convert AST to physical plans.
-- Support single-table queries first.
-- Return clear unsupported-query errors for everything outside the subset.
-
-Acceptance:
-
-- Non-ClickBench SQL examples execute through the generic path.
-- DuckDB differential tests pass for supported SQL.
-- ClickBench performance remains within the agreed gates or trade-offs are reviewed.
-
-## Phase 5: General Parquet Import
-
-Goal: import arbitrary flat Parquet tables.
-
-First version constraints:
-
-- Flat schema only.
-- No nested/list/map types.
-- INT16/INT32/INT64, Date, Timestamp, and BYTE_ARRAY strings.
-- Dictionary/plain encoding and Snappy.
-- Nullable support can start minimal or explicitly reject unsupported encodings.
-
-CLI target:
-
-```sh
-zighouse import-parquet <file.parquet> <store_dir> <table_name>
-```
-
-Tasks:
+Goal: import arbitrary flat Parquet tables via `zighouse import-parquet`.
 
 - Infer schema from Parquet metadata.
 - Use import-time sampling to choose physical encoding.
-- Materialize fixed-width numeric columns eagerly.
-- Dictionary-encode low-cardinality strings.
-- Use lazy/blob/hash policy for high-cardinality strings.
-- Write generic table manifest.
+- Write generic table manifest (complement to ClickBench-specific sidecar).
+- Materialized fixed-width numeric columns; dictionary-encoded low-cardinality
+  strings; lazy/hash for high-cardinality strings.
 
 Acceptance:
+- `zighouse import-parquet <file.parquet> <store_dir> <table_name>` works on
+  arbitrary flat Parquet.
+- Generic SQL executor can query the resulting store.
+- ClickBench specialized path unaffected.
 
-- Import ClickBench `hits.parquet` as `hits` through the generic path.
-- Import small flat Parquet fixtures.
-- Supported SQL subset works on generic imports.
+### Phase I – Encoding Policy
 
-## Phase 6: Encoding Policy
+Replace hardcoded storage hints with a deterministic policy driven by import-time
+sampling.  Record policy in manifest.  Allow ClickBench-specific profile overrides.
 
-Goal: replace hardcoded storage hints with deterministic policy.
+### Phase J – Correctness and Differential Testing
 
-Initial policy:
-
-- Fixed-width numeric: eager fixed column.
-- Low-cardinality string: dictionary id plus string table.
-- Medium-cardinality string: dictionary or blob based on sample.
-- High-cardinality string: lazy/blob/hash-only.
-- Segment stats: min, max, null count, row count.
-
-Tasks:
-
-- Add import sampling.
-- Record physical encoding policy in manifest.
-- Pick operators based on physical encoding.
-- Allow ClickBench-specific profile overrides.
-
-Acceptance:
-
-- Policy is deterministic for the same input.
-- Store size does not unexpectedly grow.
-- Performance compare passes.
-
-## Phase 7: Correctness and Differential Testing
-
-Goal: build safety nets for generalization.
-
-Test types:
-
-- Parser snapshot tests.
-- Planner tests.
-- Operator unit tests.
-- Parquet fixture tests.
-- DuckDB differential tests.
-- ClickBench integration tests.
-- Performance regression tests.
-
-Acceptance:
-
-- `zig build test` covers parser/planner/operator basics.
-- Differential tests can run independently.
-- Performance baseline remains part of the development loop.
-
-## Version Plan
-
-- `v0.7`: ClickBench-specific logic isolation.
-- `v0.8`: General schema/catalog/manifest.
-- `v0.9`: Initial reusable physical operators.
-- `v0.10`: SQL AST and planner subset.
-- `v0.11`: Generic `import-parquet`.
-- `v0.12`: DuckDB differential testing and wider generic coverage.
+Expand DuckDB differential tests beyond ClickBench.  Add operator unit tests,
+parser snapshot tests, planner tests.
 
 ## Development Workflow
 
@@ -263,8 +122,5 @@ scripts/perf-baseline.sh data/hits.parquet /tmp/zighouse-after-store /tmp/zighou
 scripts/perf-compare.py perf/baselines/local-10m-submit.json /tmp/zighouse-after.json
 ```
 
-6. If performance fails, determine whether it is noise, a bug, or an intentional generality trade-off. Do not merge accidental regressions.
-
-## Immediate Next Task
-
-Start Phase 1 with the lowest-risk extraction: isolate ClickBench query dispatch helpers from `native.zig` while preserving the exact execution order and behavior.
+6. If performance fails, determine whether it is noise, a bug, or an intentional
+   generality trade-off.  Do not merge accidental regressions.
