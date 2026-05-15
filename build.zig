@@ -360,6 +360,11 @@ pub fn build(b: *std.Build) void {
     }
     // Other test targets that use @import("schema") but not ch_part/lz4:
     generic_executor_tests.root_module.addImport("schema", schema_mod);
+    generic_executor_tests.root_module.addImport("ch_part", ch_part_mod);
+    generic_executor_tests.root_module.addIncludePath(.{ .cwd_relative = lz4_include });
+    generic_executor_tests.root_module.addLibraryPath(.{ .cwd_relative = lz4_lib });
+    generic_executor_tests.root_module.addRPath(.{ .cwd_relative = lz4_lib });
+    generic_executor_tests.root_module.linkSystemLibrary("lz4", .{});
     schema_infer_tests.root_module.addImport("schema", schema_mod);
     generic_store_tests.root_module.addImport("schema", schema_mod);
 

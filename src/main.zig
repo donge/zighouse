@@ -199,13 +199,24 @@ fn runCommand(init: std.process.Init, allocator: std.mem.Allocator, args: *std.p
         );
         defer allocator.free(manifest_content);
         const parquet_path = parseCatalogField(manifest_content, "parquet") orelse return error.MissingParquetInManifest;
+        const part_format_str = parseCatalogField(manifest_content, "part_format") orelse "generic";
         // Infer schema from Parquet file.
         var inferred = try schema_infer.inferSchema(allocator, init.io, parquet_path, table_name);
         defer inferred.deinit();
+        // Determine data source from part_format.
+        const part_dir_buf: ?[]u8 = if (std.mem.eql(u8, part_format_str, "ch_mergetree"))
+            try std.fmt.allocPrint(allocator, "{s}/{s}/parts/all_1_1_0", .{ store_dir, table_name })
+        else
+            null;
+        defer if (part_dir_buf) |b| allocator.free(b);
+        const source: generic_executor.Source = if (part_dir_buf) |d|
+            .{ .ch_part = d }
+        else
+            .{ .parquet = parquet_path };
         // Parse and run the query.
         const plan = (try generic_sql.parse(allocator, sql)) orelse return error.UnsupportedGenericQuery;
         defer generic_sql.deinit(allocator, plan);
-        const output = try generic_executor.run(allocator, init.io, plan, parquet_path, &inferred.table);
+        const output = try generic_executor.runWithSource(allocator, init.io, plan, source, &inferred.table);
         defer allocator.free(output);
         try writeOut(init.io, output);
     } else if (std.mem.eql(u8, command, "import-clickbench-csv-hot")) {

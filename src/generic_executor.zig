@@ -28,13 +28,49 @@ const parquet = @import("parquet.zig");
 const clickbench_schema = schema.clickbench;
 const schema = @import("schema");
 const build_options = @import("build_options");
+const ch_part = @import("ch_part");
 
-// ── Public entry point ────────────────────────────────────────────────────────
+// ── Data source ───────────────────────────────────────────────────────────────
 
-/// Execute `plan` against `parquet_path` and return the result as a
+/// Describes where the executor reads row data from.
+pub const Source = union(enum) {
+    /// Stream rows directly from a Parquet file (ZigDB path).
+    parquet: []const u8,
+    /// Read from a CH MergeTree part directory (ZigHouse path).
+    /// The string is the part directory path (e.g. `<store>/<table>/parts/all_1_1_0`).
+    ch_part: []const u8,
+};
+
+// ── Public entry points ───────────────────────────────────────────────────────
+
+/// Execute `plan` against a data `source` and return the result as a
 /// CSV-formatted string (header row + data rows, comma-separated).
-/// `table` is used to resolve column names to Parquet column indices and types.
+/// `table` is used to resolve column names to column indices and types.
 /// Returns `error.UnsupportedGenericQuery` when the plan shape is not handled.
+pub fn runWithSource(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    plan: generic_sql.Plan,
+    source: Source,
+    table: *const schema.Table,
+) anyerror![]u8 {
+    const exec = Executor{
+        .allocator = allocator,
+        .io = io,
+        .plan = plan,
+        .source = source,
+        .table = table,
+    };
+
+    const has_group = plan.group_by != null;
+    const all_agg = allAggregates(plan.projections);
+
+    if (!has_group and all_agg) return exec.runScalarAgg();
+    if (has_group) return exec.runGroupBy();
+    return exec.runScan();
+}
+
+/// Backward-compatible entry point: execute `plan` against a Parquet file.
 pub fn run(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -42,22 +78,7 @@ pub fn run(
     parquet_path: []const u8,
     table: *const schema.Table,
 ) anyerror![]u8 {
-    const exec = Executor{
-        .allocator = allocator,
-        .io = io,
-        .plan = plan,
-        .parquet_path = parquet_path,
-        .table = table,
-    };
-
-    // Dispatch based on plan shape
-    const has_group = plan.group_by != null;
-    const all_agg = allAggregates(plan.projections);
-
-    if (!has_group and all_agg) return exec.runScalarAgg();
-    if (has_group) return exec.runGroupBy();
-    // No group, not all aggregates: projection / filtered scan
-    return exec.runScan();
+    return runWithSource(allocator, io, plan, .{ .parquet = parquet_path }, table);
 }
 
 // ── Column descriptor ─────────────────────────────────────────────────────────
@@ -358,7 +379,7 @@ const Executor = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     plan: generic_sql.Plan,
-    parquet_path: []const u8,
+    source: Source,
     table: *const schema.Table,
 
     // ── Scalar aggregate ─────────────────────────────────────────────────────
@@ -403,7 +424,7 @@ const Executor = struct {
 
     // ── Generic row streamer ──────────────────────────────────────────────────
     //
-    // Reads all needed columns from the Parquet file, assembles a RowCtx per
+    // Reads all needed columns from the data source, assembles a RowCtx per
     // row, and calls `callback(context, row)`.
     //
     // Strategy: separate fixed-int columns (multi-column batch API) and
@@ -413,6 +434,19 @@ const Executor = struct {
 
     fn streamRows(
         self: Executor,
+        needed: *const std.ArrayList([]const u8),
+        context: anytype,
+        comptime callback: fn (@TypeOf(context), *const RowCtx) anyerror!void,
+    ) anyerror!void {
+        switch (self.source) {
+            .parquet => |path| return self.streamRowsParquet(path, needed, context, callback),
+            .ch_part => |part_dir| return self.streamRowsChPart(part_dir, needed, context, callback),
+        }
+    }
+
+    fn streamRowsParquet(
+        self: Executor,
+        parquet_path: []const u8,
         needed: *const std.ArrayList([]const u8),
         context: anytype,
         comptime callback: fn (@TypeOf(context), *const RowCtx) anyerror!void,
@@ -450,7 +484,7 @@ const Executor = struct {
             };
             var sc = StrCtx{ .data = col_data, .str_alloc = str_alloc };
             _ = try parquet.streamByteArrayColumnPath(
-                self.allocator, self.io, self.parquet_path,
+                self.allocator, self.io, parquet_path,
                 desc.index, null, &sc, StrCtx.cb,
             );
         }
@@ -564,10 +598,97 @@ const Executor = struct {
         };
 
         _ = try parquet.streamFixedColumnsTypedPath(
-            self.allocator, self.io, self.parquet_path,
+            self.allocator, self.io, parquet_path,
             fixed_indices, fixed_targets, null,
             &fsc, FixedStreamCtx.batchCb,
         );
+    }
+
+    // ── CH MergeTree part row streamer ────────────────────────────────────────
+    //
+    // Opens the part directory, reads each needed column fully into memory,
+    // then assembles per-row RowCtx values and calls the callback.
+
+    fn streamRowsChPart(
+        self: Executor,
+        part_dir: []const u8,
+        needed: *const std.ArrayList([]const u8),
+        context: anytype,
+        comptime callback: fn (@TypeOf(context), *const RowCtx) anyerror!void,
+    ) anyerror!void {
+        // Build a Table with only the needed columns using table metadata.
+        var opened = try ch_part.OpenedPart.open(self.io, self.allocator, part_dir, self.table.*);
+        defer opened.deinit();
+        const row_count: usize = @intCast(opened.row_count);
+
+        // Classify columns
+        var fixed_descs: std.ArrayList(ColDesc) = .empty;
+        defer fixed_descs.deinit(self.allocator);
+        var str_descs: std.ArrayList(ColDesc) = .empty;
+        defer str_descs.deinit(self.allocator);
+
+        for (needed.items) |name| {
+            const desc = lookupColumn(self.table, name) orelse continue;
+            switch (desc.kind) {
+                .string => try str_descs.append(self.allocator, desc),
+                else    => try fixed_descs.append(self.allocator, desc),
+            }
+        }
+
+        // Load all string columns fully into an arena.
+        var str_arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer str_arena.deinit();
+        const str_alloc = str_arena.allocator();
+
+        const str_data = try str_alloc.alloc(std.ArrayList([]const u8), str_descs.items.len);
+        for (str_data) |*col| col.* = .empty;
+
+        for (str_descs.items, str_data) |desc, *col_data| {
+            var cr = try opened.columnReader(desc.index);
+            defer cr.deinit();
+            const StrCtx = struct {
+                data: *std.ArrayList([]const u8),
+                alloc: std.mem.Allocator,
+                fn cb(ctx: *@This(), bytes: []const u8) !void {
+                    const owned = try ctx.alloc.dupe(u8, bytes);
+                    try ctx.data.append(ctx.alloc, owned);
+                }
+            };
+            var sc = StrCtx{ .data = col_data, .alloc = str_alloc };
+            _ = try cr.readStrings(row_count, &sc, StrCtx.cb);
+        }
+
+        // Load all fixed columns fully into arrays.
+        const fixed_bufs = try str_alloc.alloc([]i64, fixed_descs.items.len);
+        for (fixed_descs.items, fixed_bufs) |desc, *buf| {
+            buf.* = try str_alloc.alloc(i64, row_count);
+            var cr = try opened.columnReader(desc.index);
+            defer cr.deinit();
+            _ = try cr.readFixed(buf.*);
+        }
+
+        // Row names: fixed first, then string
+        const total_cols = fixed_descs.items.len + str_descs.items.len;
+        const all_names = try str_alloc.alloc([]const u8, total_cols);
+        for (fixed_descs.items, 0..) |d, i| all_names[i] = d.name;
+        for (str_descs.items, 0..) |d, i| all_names[fixed_descs.items.len + i] = d.name;
+
+        const vals = try self.allocator.alloc(Value, total_cols);
+        defer self.allocator.free(vals);
+
+        for (0..row_count) |row_idx| {
+            for (fixed_bufs, 0..) |buf, fi| {
+                vals[fi] = Value{ .i64 = buf[row_idx] };
+            }
+            for (str_data, 0..) |col_data, si| {
+                vals[fixed_descs.items.len + si] = if (row_idx < col_data.items.len)
+                    Value{ .str = col_data.items[row_idx] }
+                else
+                    Value{ .null_val = {} };
+            }
+            const row = RowCtx{ .names = all_names, .values = vals };
+            try callback(context, &row);
+        }
     }
 };
 
