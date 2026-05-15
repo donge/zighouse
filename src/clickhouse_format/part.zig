@@ -49,6 +49,9 @@ const ColumnWriter = struct {
     buf: std.ArrayList(u8),
     /// Compressed bytes accumulated for this column's .bin file.
     bin_data: std.ArrayList(u8),
+    /// All uncompressed bytes flushed so far (for uncompressed_hash in checksums.txt).
+    /// TODO: replace with streaming hash when column data is large.
+    uncompressed_buf: std.ArrayList(u8),
     /// Mark entries accumulated so far.
     mark_list: std.ArrayList(marks.Mark),
     /// Byte offset in .bin where the current compressed block starts.
@@ -65,6 +68,7 @@ const ColumnWriter = struct {
         return .{
             .buf = .empty,
             .bin_data = .empty,
+            .uncompressed_buf = .empty,
             .mark_list = .empty,
             .bin_offset = 0,
             .granule_rows = 0,
@@ -77,11 +81,13 @@ const ColumnWriter = struct {
     fn deinit(self: *ColumnWriter) void {
         self.buf.deinit(self.allocator);
         self.bin_data.deinit(self.allocator);
+        self.uncompressed_buf.deinit(self.allocator);
         self.mark_list.deinit(self.allocator);
     }
 
     fn appendFixed(self: *ColumnWriter, bytes: []const u8) !void {
         try self.buf.appendSlice(self.allocator, bytes);
+        try self.uncompressed_buf.appendSlice(self.allocator, bytes);
         self.granule_rows += 1;
         self.total_rows += 1;
         if (self.granule_rows >= GRANULE_SIZE or self.buf.items.len >= MAX_BLOCK_BYTES) {
@@ -97,6 +103,8 @@ const ColumnWriter = struct {
         const vlen = std.Io.Writer.buffered(&vw);
         try self.buf.appendSlice(self.allocator, vlen);
         try self.buf.appendSlice(self.allocator, s);
+        try self.uncompressed_buf.appendSlice(self.allocator, vlen);
+        try self.uncompressed_buf.appendSlice(self.allocator, s);
         self.granule_rows += 1;
         self.total_rows += 1;
         if (self.granule_rows >= GRANULE_SIZE or self.buf.items.len >= MAX_BLOCK_BYTES) {
@@ -317,15 +325,15 @@ pub const Part = struct {
             try writeFile(self.io, bin_path, cw.bin_data.items);
 
             const file_hash = cityhash.cityHash128(cw.bin_data.items);
-            // TODO PR-CH4+: track uncompressed hash during flushBlock
-            const uncompressed_hash: u128 = 0;
+            const uncompressed_hash = cityhash.cityHash128(cw.uncompressed_buf.items);
+            const uncompressed_size = cw.uncompressed_buf.items.len;
 
             try checksum_entries.append(self.allocator, .{
                 .name = bin_name,
                 .file_size = cw.bin_data.items.len,
                 .file_hash = file_hash,
                 .is_compressed = true,
-                .uncompressed_size = cw.total_rows * (types.chFixedWidth(col.ty) orelse 0),
+                .uncompressed_size = uncompressed_size,
                 .uncompressed_hash = uncompressed_hash,
             });
 

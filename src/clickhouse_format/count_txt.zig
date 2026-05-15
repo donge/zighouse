@@ -1,15 +1,15 @@
-/// Read/write `count.txt` for a ClickHouse MergeTree part.
+/// Write/read `count.txt` for a ClickHouse MergeTree part.
 ///
-/// Format: just the ASCII decimal row count followed by a newline.
-///   <N>\n
+/// Format: just the ASCII decimal row count, NO trailing newline.
+///   <N>
 ///
-/// Reference: MergeTreeData.cpp loadDataPart
+/// Reference: MergeTreeData.cpp loadDataPart (uses parseFromString which expects no trailing newline)
 
 const std = @import("std");
 
 /// Write count.txt containing `row_count` to `writer`.
 pub fn write(writer: *std.Io.Writer, row_count: u64) !void {
-    try writer.print("{d}\n", .{row_count});
+    try writer.print("{d}", .{row_count});
 }
 
 /// Read row count from a count.txt file at `path`.
@@ -27,7 +27,7 @@ test "count_txt write" {
     var w = std.Io.Writer.fixed(&buf);
     try write(&w, 10_000_000);
     const got = std.Io.Writer.buffered(&w);
-    try std.testing.expectEqualStrings("10000000\n", got);
+    try std.testing.expectEqualStrings("10000000", got);
 }
 
 test "count_txt write zero" {
@@ -35,7 +35,7 @@ test "count_txt write zero" {
     var w = std.Io.Writer.fixed(&buf);
     try write(&w, 0);
     const got = std.Io.Writer.buffered(&w);
-    try std.testing.expectEqualStrings("0\n", got);
+    try std.testing.expectEqualStrings("0", got);
 }
 
 test "count_txt readPath round-trip" {
