@@ -1,3 +1,7 @@
+/// Re-export so consumers that import schema as a named module can access
+/// the ClickBench hits schema without a separate @import.
+pub const clickbench = @import("clickbench/schema.zig");
+
 pub const ColumnType = enum {
     int16,
     int32,
@@ -315,7 +319,7 @@ test "capabilityTag derives from physical/ty" {
 
 test "capabilityTag covers ClickBench hits 105 columns without panic" {
     const std = @import("std");
-    const hits_schema = @import("clickbench/schema.zig");
+    const hits_schema = clickbench;
 
     var counts = [_]usize{0} ** @typeInfo(CapabilityTag).@"enum".fields.len;
 

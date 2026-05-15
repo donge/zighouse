@@ -25,7 +25,7 @@
 
 const std = @import("std");
 const parquet = @import("parquet.zig");
-const schema = @import("schema.zig");
+const schema = @import("schema");
 
 // Parquet physical type constants (Thrift enum order)
 const PT_BOOLEAN: i32 = 0;

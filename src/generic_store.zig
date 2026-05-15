@@ -19,7 +19,7 @@
 /// skip them until PR-H4 adds string writing).
 
 const std = @import("std");
-const schema = @import("schema.zig");
+const schema = @import("schema");
 
 pub const part_dir_name = "all_1_1_0";
 pub const columns_txt_name = "columns.txt";

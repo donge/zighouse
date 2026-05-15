@@ -17,7 +17,7 @@
 //! schema lookup helpers; runtime binding lives next to its data source.
 
 const std = @import("std");
-const schema = @import("../schema.zig");
+const schema = @import("schema");
 const lowcard = @import("../lowcard.zig");
 
 /// Source handle for hash_text columns (URL/Title/...). The actual byte

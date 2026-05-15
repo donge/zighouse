@@ -1,7 +1,7 @@
 const std = @import("std");
 const build_options = @import("build_options");
 const backend = @import("backend.zig");
-const clickbench_schema = @import("clickbench/schema.zig");
+const clickbench_schema = schema.clickbench;
 const catalog = @import("catalog.zig");
 const schema_infer = @import("schema_infer.zig");
 const loader = @import("loader.zig");
@@ -10,7 +10,7 @@ const generic_sql = @import("generic_sql.zig");
 const duckdb = if (build_options.duckdb) @import("duckdb.zig") else @import("duckdb_stub.zig");
 const parquet = @import("parquet.zig");
 const storage = @import("storage.zig");
-const schema = @import("schema.zig");
+const schema = @import("schema");
 const bind = @import("exec/bind.zig");
 const shape = @import("exec/shape.zig");
 
@@ -151,16 +151,32 @@ fn runCommand(init: std.process.Init, allocator: std.mem.Allocator, args: *std.p
         defer selected.deinit();
         try selected.importParquet(parquet_path);
         try printOut(init.io, "imported hot columns {s} -> {s}\n", .{ parquet_path, data_dir });
-    } else if (std.mem.eql(u8, command, "import-parquet")) {
+     } else if (std.mem.eql(u8, command, "import-parquet")) {
         // Generic Parquet import: infer schema, write generic_part store, write catalog manifest.
-        // Usage: zighouse import-parquet <parquet_path> <store_dir> <table_name>
-        const parquet_path = args.next() orelse return error.MissingParquetPath;
+        // Usage: zighouse import-parquet [--format=<generic|ch>] <parquet_path> <store_dir> <table_name>
+        var format: enum { generic, ch } = .generic;
+        const parquet_path = blk: {
+            const first = args.next() orelse return error.MissingParquetPath;
+            if (std.mem.startsWith(u8, first, "--format=")) {
+                const fmt = first["--format=".len..];
+                if (std.mem.eql(u8, fmt, "ch")) format = .ch;
+                break :blk args.next() orelse return error.MissingParquetPath;
+            }
+            break :blk first;
+        };
         const store_dir = args.next() orelse return error.MissingDataDir;
         const table_name = args.next() orelse return error.MissingTableName;
         var inferred = try schema_infer.inferSchema(allocator, init.io, parquet_path, table_name);
         defer inferred.deinit();
-        const row_count = try loader.importParquet(allocator, init.io, parquet_path, store_dir, inferred.table);
-        try catalog.Catalog.writeManifest(init.io, allocator, store_dir, table_name, parquet_path);
+        const row_count = switch (format) {
+            .generic => try loader.importParquet(allocator, init.io, parquet_path, store_dir, inferred.table),
+            .ch => try loader.importParquetCH(allocator, init.io, parquet_path, store_dir, inferred.table),
+        };
+        const part_fmt: catalog.PartFormat = switch (format) {
+            .generic => .generic,
+            .ch => .ch_mergetree,
+        };
+        try catalog.Catalog.writeManifest(init.io, allocator, store_dir, table_name, parquet_path, part_fmt);
         try printOut(init.io, "imported {d} rows {s} -> {s}/{s}\n", .{ row_count, parquet_path, store_dir, table_name });
     } else if (std.mem.eql(u8, command, "generic-query")) {
         // Query a generic_part store.

@@ -16,15 +16,24 @@
 /// unchanged.
 
 const std = @import("std");
-const schema = @import("schema.zig");
+const schema = @import("schema");
 const schema_infer = @import("schema_infer.zig");
-const clickbench_schema = @import("clickbench/schema.zig");
+const clickbench_schema = schema.clickbench;
 
 /// Name of the per-table catalog manifest file stored inside the part dir.
 /// Format:
 ///   table=<name>\n
 ///   parquet=<absolute_or_relative_path>\n
+///   part_format=<generic|ch_mergetree>\n
 pub const catalog_manifest_name = "catalog.zig-house";
+
+/// Part storage format tag.
+pub const PartFormat = enum {
+    /// ZigHouse generic store: raw LE binary, no compression, no marks.
+    generic,
+    /// ClickHouse MergeTree-compatible: LZ4 compressed .bin, .mrk2, checksums.txt.
+    ch_mergetree,
+};
 
 pub const StoreLayout = enum {
     /// Legacy ZigHouse ClickBench hot-column files (hot_*.bin, *.id, *.dict.tsv …)
@@ -38,6 +47,7 @@ pub const TableEntry = struct {
     /// Directory where this table's store lives.  null for in-memory / not-yet-imported tables.
     store_dir: ?[]const u8,
     layout: StoreLayout,
+    part_format: PartFormat = .generic,
 };
 
 pub const Catalog = struct {
@@ -60,6 +70,11 @@ pub const Catalog = struct {
 
     /// Register a table.  Duplicates (same name, case-insensitive) are replaced.
     pub fn register(self: *Catalog, table: schema.Table, store_dir: ?[]const u8, layout: StoreLayout) !void {
+        try self.registerFmt(table, store_dir, layout, .generic);
+    }
+
+    /// Register a table with explicit part format.
+    pub fn registerFmt(self: *Catalog, table: schema.Table, store_dir: ?[]const u8, layout: StoreLayout, part_format: PartFormat) !void {
         const dir_copy = if (store_dir) |d| try self.allocator.dupe(u8, d) else null;
         errdefer if (dir_copy) |d| self.allocator.free(d);
 
@@ -70,10 +85,11 @@ pub const Catalog = struct {
                 entry.table = table;
                 entry.store_dir = dir_copy;
                 entry.layout = layout;
+                entry.part_format = part_format;
                 return;
             }
         }
-        try self.entries.append(self.allocator, .{ .table = table, .store_dir = dir_copy, .layout = layout });
+        try self.entries.append(self.allocator, .{ .table = table, .store_dir = dir_copy, .layout = layout, .part_format = part_format });
     }
 
     /// Look up a table by name (case-insensitive).  Returns null if not found.
@@ -94,14 +110,15 @@ pub const Catalog = struct {
 
     /// Write a catalog manifest for a generic_part table into
     ///   <store_dir>/<table_name>/parts/all_1_1_0/catalog.zig-house
-    /// The manifest records the table name and the original parquet source path
-    /// so that `restoreFromStore` can reconstruct the catalog entry.
+    /// The manifest records the table name, original parquet source path, and
+    /// part format so that `restoreFromStore` can reconstruct the catalog entry.
     pub fn writeManifest(
         io: std.Io,
         allocator: std.mem.Allocator,
         store_dir: []const u8,
         table_name: []const u8,
         parquet_path: []const u8,
+        part_format: PartFormat,
     ) !void {
         const manifest_path = try std.fmt.allocPrint(
             allocator,
@@ -110,10 +127,14 @@ pub const Catalog = struct {
         );
         defer allocator.free(manifest_path);
 
+        const fmt_str: []const u8 = switch (part_format) {
+            .generic => "generic",
+            .ch_mergetree => "ch_mergetree",
+        };
         const content = try std.fmt.allocPrint(
             allocator,
-            "table={s}\nparquet={s}\n",
-            .{ table_name, parquet_path },
+            "table={s}\nparquet={s}\npart_format={s}\n",
+            .{ table_name, parquet_path, fmt_str },
         );
         defer allocator.free(content);
 
@@ -158,10 +179,16 @@ pub const Catalog = struct {
 
             const parquet_path = parseManifestField(content, "parquet") orelse continue;
 
+            const fmt_str = parseManifestField(content, "part_format") orelse "generic";
+            const part_format: PartFormat = if (std.mem.eql(u8, fmt_str, "ch_mergetree"))
+                .ch_mergetree
+            else
+                .generic;
+
             var inferred = schema_infer.inferSchema(allocator, io, parquet_path, table_name) catch continue;
             defer inferred.deinit();
 
-            self.register(inferred.table, store_dir, .generic_part) catch continue;
+            self.registerFmt(inferred.table, store_dir, .generic_part, part_format) catch continue;
         }
     }
 };

@@ -18,8 +18,9 @@
 ///   part.deinit();
 
 const std = @import("std");
+// schema and types: use named module when available (standalone tests),
+// falling back handled via build.zig addImport("schema", ...).
 const schema = @import("schema");
-const block = @import("block.zig");
 const types = @import("types");
 const columns_txt = @import("columns_txt.zig");
 const count_txt = @import("count_txt.zig");
@@ -28,6 +29,7 @@ const primary_idx = @import("primary_idx.zig");
 const checksums = @import("checksums.zig");
 const string_codec = @import("string_codec.zig");
 const cityhash = @import("cityhash.zig");
+const block = @import("block.zig");
 
 pub const GRANULE_SIZE: u64 = 8192;
 /// Maximum uncompressed bytes per LZ4 block (~1 MiB, matching CH default).
@@ -219,6 +221,74 @@ pub const Part = struct {
         }
 
         self.row_count += 1;
+    }
+
+    /// Append a batch of i64 values to a fixed-width column by index.
+    /// Used for columnar import (e.g. from Parquet streaming).
+    /// `col_idx` must identify a fixed-width column (int16/int32/int64/date/timestamp).
+    /// Values are cast from i64 to the column's native width.
+    pub fn appendFixedBatch(self: *Part, col_idx: usize, values: []const i64) !void {
+        const col = self.table.columns[col_idx];
+        const cw = &self.column_writers[col_idx];
+        for (values) |v| {
+            switch (col.ty) {
+                .int16 => {
+                    var buf: [2]u8 = undefined;
+                    std.mem.writeInt(i16, &buf, @intCast(v), .little);
+                    try cw.appendFixed(&buf);
+                },
+                .int32, .date => {
+                    var buf: [4]u8 = undefined;
+                    std.mem.writeInt(i32, &buf, @intCast(v), .little);
+                    try cw.appendFixed(&buf);
+                },
+                .int64, .timestamp => {
+                    var buf: [8]u8 = undefined;
+                    std.mem.writeInt(i64, &buf, v, .little);
+                    try cw.appendFixed(&buf);
+                },
+                else => return error.NotAFixedColumn,
+            }
+        }
+        // Track row_count from the first column (pk_col_idx); update pk_entries
+        if (col_idx == self.pk_col_idx) {
+            for (values, 0..) |v, i| {
+                const abs_row = self.row_count + i;
+                if (abs_row % GRANULE_SIZE == 0) {
+                    const pk_entry: primary_idx.PkValue = switch (col.ty) {
+                        .int16 => .{ .i16 = @intCast(v) },
+                        .int32, .date => .{ .i32 = @intCast(v) },
+                        .int64, .timestamp => .{ .i64 = v },
+                        else => return error.NotAFixedColumn,
+                    };
+                    try self.pk_entries.append(self.allocator, pk_entry);
+                }
+            }
+            self.row_count += values.len;
+        }
+    }
+
+    /// Append a batch of string values to a string column by index.
+    /// Used for columnar import.
+    pub fn appendStrBatch(self: *Part, col_idx: usize, strings: []const []const u8) !void {
+        const cw = &self.column_writers[col_idx];
+        for (strings) |s| try cw.appendStr(s);
+        if (col_idx == self.pk_col_idx) {
+            for (strings, 0..) |s, i| {
+                const abs_row = self.row_count + i;
+                if (abs_row % GRANULE_SIZE == 0) {
+                    try self.pk_entries.append(self.allocator, .{ .str = s });
+                }
+            }
+            self.row_count += strings.len;
+        }
+    }
+
+    /// Set total row count explicitly — call after all columnar batches are written,
+    /// before finish().  Required when using appendFixedBatch/appendStrBatch since
+    /// non-PK columns don't update row_count.
+    pub fn setRowCount(self: *Part, n: u64) void {
+        self.row_count = n;
     }
 
     /// Flush all column data and write the part metadata files.

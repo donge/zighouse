@@ -226,7 +226,6 @@ pub fn build(b: *std.Build) void {
     const lz4_prefix = b.option([]const u8, "lz4-prefix", "LZ4 installation prefix") orelse "/opt/homebrew/opt/lz4";
     const lz4_include = b.fmt("{s}/include", .{lz4_prefix});
     const lz4_lib = b.fmt("{s}/lib", .{lz4_prefix});
-
     const ch_block_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/clickhouse_format/block.zig"),
@@ -342,6 +341,27 @@ pub fn build(b: *std.Build) void {
         .root_module = ch_part_mod,
     });
     const ch_part_test_cmd = b.addRunArtifact(ch_part_tests);
+
+    // ── Wire schema_mod + ch_part_mod + lz4 into exe and all test targets ──────
+    // All src/ files now use @import("schema") named module. Inject schema_mod
+    // into every target whose root (or transitive imports) uses @import("schema").
+    const lz4_targets = [_]*std.Build.Module{
+        exe.root_module,
+        unit_tests.root_module,
+        loader_tests.root_module,
+    };
+    for (lz4_targets) |mod| {
+        mod.addImport("schema", schema_mod);
+        mod.addImport("ch_part", ch_part_mod);
+        mod.addIncludePath(.{ .cwd_relative = lz4_include });
+        mod.addLibraryPath(.{ .cwd_relative = lz4_lib });
+        mod.addRPath(.{ .cwd_relative = lz4_lib });
+        mod.linkSystemLibrary("lz4", .{});
+    }
+    // Other test targets that use @import("schema") but not ch_part/lz4:
+    generic_executor_tests.root_module.addImport("schema", schema_mod);
+    schema_infer_tests.root_module.addImport("schema", schema_mod);
+    generic_store_tests.root_module.addImport("schema", schema_mod);
 
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&test_cmd.step);

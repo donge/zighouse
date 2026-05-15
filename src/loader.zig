@@ -22,8 +22,9 @@
 
 const std = @import("std");
 const parquet = @import("parquet.zig");
-const schema = @import("schema.zig");
+const schema = @import("schema");
 const generic_store = @import("generic_store.zig");
+const ch_part = @import("ch_part");
 
 /// Import a Parquet file into the generic part store.
 ///
@@ -61,6 +62,136 @@ pub fn importParquet(
     try generic_store.writeCountTxt(io, allocator, part, total_rows);
 
     return total_rows;
+}
+
+/// Import a Parquet file into a ClickHouse MergeTree-compatible part directory.
+///
+/// Writes:
+///   <store_dir>/<table_name>/parts/all_1_1_0/
+///     columns.txt, count.txt, primary.idx, checksums.txt
+///     <col>.bin  (LZ4 compressed)
+///     <col>.mrk2 (mark file)
+///
+/// Each column is streamed independently from the Parquet file.
+pub fn importParquetCH(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    parquet_path: []const u8,
+    store_dir: []const u8,
+    table: schema.Table,
+) !u64 {
+    const total_rows: u64 = try parquet.rowCountPath(allocator, io, parquet_path);
+
+    const part_dir = try std.fmt.allocPrint(
+        allocator,
+        "{s}/{s}/parts/all_1_1_0",
+        .{ store_dir, table.name },
+    );
+    defer allocator.free(part_dir);
+
+    var part = try ch_part.Part.open(io, allocator, part_dir, table);
+    defer part.deinit();
+
+    // Stream each column independently into the Part's ColumnWriter.
+    for (table.columns, 0..) |col, col_idx| {
+        switch (col.ty) {
+            .text, .char => try importCHStringColumn(allocator, io, parquet_path, &part, col_idx, total_rows),
+            .int16 => try importCHFixedColumn(i16, allocator, io, parquet_path, &part, col_idx),
+            .int32, .date => try importCHFixedColumn(i32, allocator, io, parquet_path, &part, col_idx),
+            .int64, .timestamp => try importCHFixedColumn(i64, allocator, io, parquet_path, &part, col_idx),
+        }
+    }
+
+    // Make sure row_count is set (driven by pk column, col_idx=0)
+    // If col_idx 0 is not the pk column or was a string col, ensure row_count is correct.
+    part.setRowCount(total_rows);
+
+    try part.finish();
+    return total_rows;
+}
+
+fn importCHFixedColumn(
+    comptime T: type,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    parquet_path: []const u8,
+    part: *ch_part.Part,
+    col_idx: usize,
+) !void {
+    const ctx = CHFixedCtx(T){ .part = part, .col_idx = col_idx };
+    _ = try parquet.streamFixedColumnPath(
+        allocator,
+        io,
+        parquet_path,
+        col_idx,
+        null,
+        ctx,
+        chFixedBatch(T),
+    );
+}
+
+fn CHFixedCtx(comptime T: type) type {
+    _ = T;
+    return struct { part: *ch_part.Part, col_idx: usize };
+}
+
+fn chFixedBatch(comptime T: type) fn (CHFixedCtx(T), []const i64) anyerror!void {
+    return struct {
+        fn cb(ctx: CHFixedCtx(T), values: []const i64) anyerror!void {
+            try ctx.part.appendFixedBatch(ctx.col_idx, values);
+        }
+    }.cb;
+}
+
+fn importCHStringColumn(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    parquet_path: []const u8,
+    part: *ch_part.Part,
+    col_idx: usize,
+    total_rows: u64,
+) !void {
+    // Collect all strings into memory, then feed to Part.
+    // TODO: streaming approach for very large string columns.
+    const strings = try allocator.alloc([]u8, total_rows);
+    defer {
+        for (strings) |s| allocator.free(s);
+        allocator.free(strings);
+    }
+
+    var row_idx: usize = 0;
+    const ctx = CHStrCollectCtx{
+        .allocator = allocator,
+        .strings = strings,
+        .row = &row_idx,
+    };
+    _ = try parquet.streamByteArrayColumnPath(
+        allocator,
+        io,
+        parquet_path,
+        col_idx,
+        null,
+        ctx,
+        chCollectStr,
+    );
+
+    // Build const-slice view
+    const const_strings = try allocator.alloc([]const u8, total_rows);
+    defer allocator.free(const_strings);
+    for (strings, const_strings) |s, *cs| cs.* = s;
+
+    try part.appendStrBatch(col_idx, const_strings);
+}
+
+const CHStrCollectCtx = struct {
+    allocator: std.mem.Allocator,
+    strings: [][]u8,
+    row: *usize,
+};
+
+fn chCollectStr(ctx: CHStrCollectCtx, value: []const u8) anyerror!void {
+    ctx.strings[ctx.row.*] = try ctx.allocator.dupe(u8, value);
+    ctx.row.* += 1;
 }
 
 // ── Column import ─────────────────────────────────────────────────────────────

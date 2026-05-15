@@ -25,8 +25,8 @@
 const std = @import("std");
 const generic_sql = @import("generic_sql.zig");
 const parquet = @import("parquet.zig");
-const clickbench_schema = @import("clickbench/schema.zig");
-const schema = @import("schema.zig");
+const clickbench_schema = schema.clickbench;
+const schema = @import("schema");
 const build_options = @import("build_options");
 
 // ── Public entry point ────────────────────────────────────────────────────────

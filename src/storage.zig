@@ -1,6 +1,6 @@
 const std = @import("std");
-const clickbench_schema = @import("clickbench/schema.zig");
-const schema = @import("schema.zig");
+const clickbench_schema = schema.clickbench;
+const schema = @import("schema");
 
 pub const segment_rows = 64 * 1024;
 pub const manifest_name = "manifest.zig-house";

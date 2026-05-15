@@ -16,7 +16,7 @@
 //!     data — only schema metadata.
 
 const std = @import("std");
-const schema = @import("../schema.zig");
+const schema = @import("schema");
 const generic_sql = @import("../generic_sql.zig");
 const bind = @import("bind.zig");
 
