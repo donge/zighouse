@@ -1299,7 +1299,17 @@ const ByteArrayColumnIterator = struct {
                 }
                 const encoding = data_header.encoding orelse return error.InvalidParquetMetadata;
                 if (encoding == 0) {
+                    // PLAIN BYTE_ARRAY: for OPTIONAL columns, skip def-level section
+                    // (same 4-byte length prefix as used by FixedWidthColumnIterator).
+                    var payload_start: usize = 0;
+                    if (self.is_optional and page.payload.len >= 4) {
+                        const def_len = std.mem.readInt(u32, page.payload[0..4], .little);
+                        if (4 + def_len < page.payload.len) {
+                            payload_start = 4 + @as(usize, def_len);
+                        }
+                    }
                     self.plain_payload = page.payload;
+                    self.plain_pos = payload_start;
                     self.page_remaining = @intCast(data_header.num_values);
                     self.page_mode = .plain;
                     return;

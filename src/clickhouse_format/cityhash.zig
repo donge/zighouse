@@ -206,7 +206,10 @@ fn cityMurmur(s: []const u8, seed_lo: u64, seed_hi: u64) [2]u64 {
         d = hashLen16(b +% s.len, c +% fetch64(s[s.len - 16 ..]));
         a +%= d;
         var offset: usize = 0;
-        while (l > 16) : (l -= 16) {
+        // C original is do-while(len > 16): body runs at least once, then
+        // continues while more than 16 bytes remain after consuming 16.
+        // Equivalent: run while l > 0 (decremented by 16 each iteration).
+        while (true) {
             a ^= shiftMix(fetch64(s[offset..]) *% k1) *% k1;
             a *%= k1;
             b ^= a;
@@ -214,6 +217,8 @@ fn cityMurmur(s: []const u8, seed_lo: u64, seed_hi: u64) [2]u64 {
             c *%= k1;
             d ^= c;
             offset += 16;
+            l -= 16;
+            if (l <= 0) break;
         }
     }
     a = hashLen16(a, c);

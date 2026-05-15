@@ -154,9 +154,57 @@ echo "=== Step 6: Verify row count ==="
 COUNT=$(ch "SELECT count() FROM default.$TABLE")
 echo "Row count: $COUNT"
 
-if [ "$COUNT" = "1" ]; then
-    echo "PASS: interop test succeeded"
-else
+if [ "$COUNT" != "1" ]; then
     echo "FAIL: expected 1 row, got $COUNT"
     exit 1
 fi
+
+echo "=== Step 7: Verify string column values ==="
+FAIL=0
+
+check_col() {
+    local col="$1"
+    local expected="$2"
+    local actual
+    actual=$(ch "SELECT $col FROM default.$TABLE")
+    if [ "$actual" = "$expected" ]; then
+        echo "  PASS $col = '$actual'"
+    else
+        echo "  FAIL $col: expected '$expected', got '$actual'"
+        FAIL=1
+    fi
+}
+
+check_col "Title"           "Google title"
+check_col "URL"             "https://example.com/google/page"
+check_col "Referer"         "https://www.google.com/search?q=zighouse"
+check_col "HitColor"        "A"
+check_col "BrowserLanguage" "en"
+check_col "BrowserCountry"  "US"
+check_col "PageCharset"     "utf-8"
+check_col "OriginalURL"     "https://example.com/google/page"
+
+# Verify EventTime unix timestamp (timezone-independent)
+ET=$(ch "SELECT toUnixTimestamp(EventTime) FROM default.$TABLE")
+if [ "$ET" = "1372636800" ]; then
+    echo "  PASS EventTime unix=$ET"
+else
+    echo "  FAIL EventTime unix: expected 1372636800, got $ET"
+    FAIL=1
+fi
+
+# Verify EventDate
+ED=$(ch "SELECT toString(EventDate) FROM default.$TABLE")
+if [ "$ED" = "2013-07-01" ]; then
+    echo "  PASS EventDate=$ED"
+else
+    echo "  FAIL EventDate: expected 2013-07-01, got $ED"
+    FAIL=1
+fi
+
+if [ "$FAIL" = "1" ]; then
+    echo "FAIL: one or more column value checks failed"
+    exit 1
+fi
+
+echo "PASS: interop test succeeded (row count + all column values correct)"

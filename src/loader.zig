@@ -190,6 +190,7 @@ const CHStrCollectCtx = struct {
 };
 
 fn chCollectStr(ctx: CHStrCollectCtx, value: []const u8) anyerror!void {
+    std.debug.print("[chCollectStr] row={d} len={d} val={s}\n", .{ctx.row.*, value.len, value});
     ctx.strings[ctx.row.*] = try ctx.allocator.dupe(u8, value);
     ctx.row.* += 1;
 }
