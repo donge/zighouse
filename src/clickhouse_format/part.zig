@@ -442,6 +442,166 @@ fn checksumLessThan(_: void, a: checksums.FileChecksum, b: checksums.FileChecksu
     return std.mem.lessThan(u8, a.name, b.name);
 }
 
+// ── Read path ─────────────────────────────────────────────────────────────────
+
+/// Open an existing MergeTree part directory for reading.
+///
+/// `part_dir` and `table` must outlive the `OpenedPart`.
+pub const OpenedPart = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    part_dir: []const u8,
+    table: schema.Table,
+    row_count: u64,
+
+    pub fn open(
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        part_dir: []const u8,
+        table: schema.Table,
+    ) !OpenedPart {
+        const count_path = try std.fmt.allocPrint(allocator, "{s}/count.txt", .{part_dir});
+        defer allocator.free(count_path);
+        const row_count = try count_txt.readPath(allocator, io, count_path);
+        return .{
+            .allocator = allocator,
+            .io = io,
+            .part_dir = part_dir,
+            .table = table,
+            .row_count = row_count,
+        };
+    }
+
+    pub fn deinit(_: *OpenedPart) void {}
+
+    /// Return a ColumnReader for column at `col_idx`.
+    /// The caller owns the returned ColumnReader and must call deinit() on it.
+    pub fn columnReader(self: *OpenedPart, col_idx: usize) !ColumnReader {
+        const col = self.table.columns[col_idx];
+        const bin_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}.bin", .{ self.part_dir, col.name });
+        defer self.allocator.free(bin_path);
+        const mrk_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}.mrk2", .{ self.part_dir, col.name });
+        defer self.allocator.free(mrk_path);
+
+        // Load .mrk2
+        const mrk_bytes = try std.Io.Dir.cwd().readFileAlloc(self.io, mrk_path, self.allocator, .limited(std.math.maxInt(usize)));
+        defer self.allocator.free(mrk_bytes);
+        var mrk_r = std.Io.Reader.fixed(mrk_bytes);
+        const mark_list = try marks.readAllMarks(self.allocator, &mrk_r);
+        defer self.allocator.free(mark_list);
+
+        // Load .bin and decompress all blocks into a single contiguous buffer
+        const bin_bytes = try std.Io.Dir.cwd().readFileAlloc(self.io, bin_path, self.allocator, .limited(std.math.maxInt(usize)));
+        defer self.allocator.free(bin_bytes);
+
+        var data: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer data.deinit(self.allocator);
+
+        if (bin_bytes.len > 0) {
+            var bin_r = std.Io.Reader.fixed(bin_bytes);
+            while (true) {
+                const chunk = block.readBlock(self.allocator, &bin_r) catch |e| switch (e) {
+                    error.TruncatedBlock => break,
+                    else => return e,
+                };
+                defer self.allocator.free(chunk);
+                try data.appendSlice(self.allocator, chunk);
+            }
+        }
+
+        return ColumnReader{
+            .allocator = self.allocator,
+            .col = col,
+            .row_count = self.row_count,
+            .data = try data.toOwnedSlice(self.allocator),
+            .cursor = 0,
+            .rows_read = 0,
+        };
+    }
+};
+
+/// A cursor for reading decoded column values from a MergeTree part.
+///
+/// Data is fully decompressed on construction (全量加载).
+/// String slices returned via `readStrings` callbacks point into the internal
+/// buffer and are valid only for the duration of that callback invocation.
+pub const ColumnReader = struct {
+    allocator: std.mem.Allocator,
+    col: schema.Column,
+    row_count: u64,
+    /// Fully decompressed column payload (owned).
+    data: []u8,
+    /// Byte cursor into `data`.
+    cursor: usize,
+    rows_read: u64,
+
+    pub fn deinit(self: *ColumnReader) void {
+        self.allocator.free(self.data);
+    }
+
+    /// Read up to `out.len` values from a fixed-width column, cast to i64.
+    /// Returns the number of rows actually read.
+    pub fn readFixed(self: *ColumnReader, out: []i64) !usize {
+        const width: usize = types.chFixedWidth(self.col.ty) orelse return error.NotAFixedColumn;
+        const remaining = self.row_count - self.rows_read;
+        const n = @min(out.len, remaining);
+        if (n == 0) return 0;
+        const needed = n * width;
+        if (self.cursor + needed > self.data.len) return error.UnexpectedEndOfData;
+        for (0..n) |i| {
+            const slice = self.data[self.cursor + i * width ..][0..width];
+            out[i] = switch (self.col.ty) {
+                .int16 => @as(i64, std.mem.readInt(i16, slice[0..2], .little)),
+                .int32, .date => @as(i64, std.mem.readInt(i32, slice[0..4], .little)),
+                .int64, .timestamp => std.mem.readInt(i64, slice[0..8], .little),
+                else => return error.NotAFixedColumn,
+            };
+        }
+        self.cursor += needed;
+        self.rows_read += n;
+        return n;
+    }
+
+    /// Read up to `n` strings from a string column, invoking `callback(ctx, []const u8)`
+    /// for each.  The slice passed to callback is valid only for that call.
+    /// Returns the number of rows actually read.
+    pub fn readStrings(
+        self: *ColumnReader,
+        n: usize,
+        ctx: anytype,
+        callback: anytype,
+    ) !usize {
+        switch (self.col.ty) {
+            .text, .char => {},
+            else => return error.NotAStringColumn,
+        }
+        const remaining_rows = self.row_count - self.rows_read;
+        const count = @min(n, remaining_rows);
+        var read: usize = 0;
+        while (read < count) : (read += 1) {
+            // Decode LEB128 varint length inline
+            var len: u64 = 0;
+            var shift: u6 = 0;
+            while (true) {
+                if (self.cursor >= self.data.len) return error.UnexpectedEndOfData;
+                const b = self.data[self.cursor];
+                self.cursor += 1;
+                len |= @as(u64, b & 0x7F) << shift;
+                if (b & 0x80 == 0) break;
+                shift += 7;
+                if (shift > 63) return error.VarintOverflow;
+            }
+            if (len > string_codec.MAX_STRING_LEN) return error.StringTooLarge;
+            if (self.cursor + len > self.data.len) return error.UnexpectedEndOfData;
+            const s = self.data[self.cursor .. self.cursor + len];
+            self.cursor += len;
+            try callback(ctx, s);
+        }
+        self.rows_read += count;
+        return count;
+    }
+};
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 test "part write and verify files exist" {
@@ -477,4 +637,92 @@ test "part write and verify files exist" {
     _ = try cwd.openFile(io, part_dir ++ "/CounterID.bin", .{});
     _ = try cwd.openFile(io, part_dir ++ "/CounterID.mrk2", .{});
     _ = try cwd.openFile(io, part_dir ++ "/checksums.txt", .{});
+}
+
+test "Part write + OpenedPart read round-trips fixed and string columns" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const part_dir = "/tmp/zig_test_part_roundtrip";
+
+    const cols = [_]schema.Column{
+        .{ .name = "ID", .ty = .int32 },
+        .{ .name = "Name", .ty = .text },
+    };
+    const table = schema.Table{ .name = "test_rt", .columns = &cols };
+
+    const N = 20;
+
+    // ── Write ──────────────────────────────────────────────────────────────────
+    {
+        var part = try Part.open(io, allocator, part_dir, table);
+        defer part.deinit();
+
+        // Write fixed column (col 0 = PK, drives row_count)
+        var fixed_vals: [N]i64 = undefined;
+        for (0..N) |i| fixed_vals[i] = @intCast(i + 1);
+        try part.appendFixedBatch(0, &fixed_vals);
+
+        // Write string column (col 1)
+        const strings = [N][]const u8{
+            "alice", "bob", "carol", "dave", "eve",
+            "frank", "grace", "hank", "iris", "jack",
+            "karen", "liam", "mia", "ned", "olivia",
+            "paul", "quinn", "rose", "sam", "tina",
+        };
+        try part.appendStrBatch(1, &strings);
+        part.setRowCount(N);
+        try part.finish();
+    }
+
+    // ── Read fixed ─────────────────────────────────────────────────────────────
+    {
+        var op = try OpenedPart.open(io, allocator, part_dir, table);
+        defer op.deinit();
+
+        try std.testing.expectEqual(@as(u64, N), op.row_count);
+
+        var cr = try op.columnReader(0);
+        defer cr.deinit();
+
+        var out: [N]i64 = undefined;
+        const n = try cr.readFixed(&out);
+        try std.testing.expectEqual(N, n);
+        for (0..N) |i| {
+            try std.testing.expectEqual(@as(i64, @intCast(i + 1)), out[i]);
+        }
+    }
+
+    // ── Read strings ───────────────────────────────────────────────────────────
+    {
+        var op = try OpenedPart.open(io, allocator, part_dir, table);
+        defer op.deinit();
+
+        var cr = try op.columnReader(1);
+        defer cr.deinit();
+
+        const expected = [N][]const u8{
+            "alice", "bob", "carol", "dave", "eve",
+            "frank", "grace", "hank", "iris", "jack",
+            "karen", "liam", "mia", "ned", "olivia",
+            "paul", "quinn", "rose", "sam", "tina",
+        };
+
+        const Ctx = struct {
+            idx: usize = 0,
+            expected: *const [N][]const u8,
+            failed: bool = false,
+
+            fn cb(self: *@This(), s: []const u8) anyerror!void {
+                if (self.idx >= N) { self.failed = true; return; }
+                if (!std.mem.eql(u8, s, self.expected[self.idx])) self.failed = true;
+                self.idx += 1;
+            }
+        };
+        var ctx = Ctx{ .expected = &expected };
+        const n = try cr.readStrings(N, &ctx, Ctx.cb);
+        try std.testing.expectEqual(N, n);
+        try std.testing.expect(!ctx.failed);
+        try std.testing.expectEqual(N, ctx.idx);
+    }
 }
