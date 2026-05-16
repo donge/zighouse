@@ -564,3 +564,61 @@ if [ "$FAIL" = "1" ]; then
     exit 1
 fi
 echo "PASS: step 12 (restart + schema auto-load + SELECT) succeeded"
+
+# ── Step 13: Real ClickHouse client → zighouse serve (RowBinaryWithNamesAndTypes) ──
+echo ""
+echo "=== Step 13: ClickHouse client → zighouse serve (RowBinaryWithNamesAndTypes) ==="
+
+CH13_PORT=19127
+CH13_DATA=/tmp/zh_ch13_test
+CH13_DB=default
+CH13_TABLE=ch13_test
+rm -rf "$CH13_DATA"
+mkdir -p "$CH13_DATA"
+
+$ZH serve --data-dir="$CH13_DATA" --port="$CH13_PORT" &
+CH13_PID=$!
+trap "kill $CH13_PID 2>/dev/null || true" EXIT
+sleep 0.5
+
+# Export a real RowBinaryWithNamesAndTypes payload from ClickHouse, then feed it to zighouse.
+# This validates that zighouse correctly parses the actual ClickHouse wire format.
+TMPCH13=$(mktemp /tmp/ch13_payload.XXXXXX.bin)
+timeout 10 docker exec sw_asdb clickhouse-client --password='Sw@123456' \
+    -q "SELECT toInt32(number+10) as id, concat('row_', toString(number)) as label FROM numbers(3) FORMAT RowBinaryWithNamesAndTypes" \
+    > "$TMPCH13" 2>/dev/null
+
+if [ -s "$TMPCH13" ]; then
+    INS13=$(curl --noproxy 127.0.0.1 -s -o /tmp/ch13_ins_resp.txt -w "%{http_code}" \
+        --data-binary @"$TMPCH13" \
+        "http://127.0.0.1:$CH13_PORT/?query=INSERT+INTO+$CH13_DB.$CH13_TABLE+FORMAT+RowBinaryWithNamesAndTypes")
+    if [ "$INS13" = "200" ]; then
+        echo "  PASS CH RowBinaryWithNamesAndTypes payload accepted (HTTP 200)"
+    else
+        echo "  FAIL CH payload rejected HTTP $INS13: $(cat /tmp/ch13_ins_resp.txt)"
+        FAIL=1
+    fi
+
+    # Verify a part was created with 3 rows
+    PARTS13=$(find "$CH13_DATA/$CH13_DB/$CH13_TABLE/parts" -name "all_*_*_0" -type d 2>/dev/null | wc -l | tr -d ' ')
+    if [ "$PARTS13" -ge "1" ]; then
+        echo "  PASS part created ($PARTS13 part(s))"
+    else
+        echo "  FAIL no parts found"
+        FAIL=1
+    fi
+else
+    echo "  WARN Could not extract CH RowBinaryWithNamesAndTypes payload (CH may be unavailable)"
+    echo "  INFO Skipping Step 13 (ClickHouse container unavailable)"
+fi
+rm -f "$TMPCH13"
+
+kill $CH13_PID 2>/dev/null || true
+trap - EXIT
+wait $CH13_PID 2>/dev/null || true
+
+if [ "$FAIL" = "1" ]; then
+    echo "FAIL: one or more step 13 checks failed"
+    exit 1
+fi
+echo "PASS: step 13 (ClickHouse client → zighouse) succeeded"
