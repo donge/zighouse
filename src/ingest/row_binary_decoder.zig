@@ -360,3 +360,73 @@ test "decodeWithHeader: Int32 + String two rows" {
     try std.testing.expectEqualSlices(u8, "alice", result.decoder.columns[1].str_vals.items[0]);
     try std.testing.expectEqualSlices(u8, "bob",   result.decoder.columns[1].str_vals.items[1]);
 }
+
+test "decodeWithHeader: truncated header triggers errdefer (no leak)" {
+    // Provide only the num_cols byte — no names follow.
+    // The errdefer path must clean up without double-free or leak.
+    const allocator = std.testing.allocator;
+    const data = [_]u8{0x02}; // num_cols=2, then EOF
+    try std.testing.expectError(error.UnexpectedEndOfData, decodeWithHeader(allocator, &data));
+}
+
+test "decodeWithHeader: partial name triggers errdefer (no leak)" {
+    // num_cols=1, name_len=5 but only 3 bytes of name provided.
+    const allocator = std.testing.allocator;
+    const data = [_]u8{ 0x01, 0x05, 'a', 'b', 'c' };
+    try std.testing.expectError(error.UnexpectedEndOfData, decodeWithHeader(allocator, &data));
+}
+
+test "decodeWithHeader: unsupported type triggers errdefer (no leak)" {
+    // num_cols=1, name="x", type="Float64" (unsupported)
+    const allocator = std.testing.allocator;
+    var buf: [64]u8 = undefined;
+    var pos: usize = 0;
+    buf[pos] = 1; pos += 1;           // num_cols=1
+    buf[pos] = 1; pos += 1; buf[pos] = 'x'; pos += 1; // name="x"
+    buf[pos] = 7; pos += 1;
+    @memcpy(buf[pos..][0..7], "Float64"); pos += 7;   // type="Float64"
+    try std.testing.expectError(error.UnsupportedColumnType, decodeWithHeader(allocator, buf[0..pos]));
+}
+
+test "decodeWithHeader: zero columns returns error" {
+    const allocator = std.testing.allocator;
+    const data = [_]u8{0x00}; // num_cols=0
+    try std.testing.expectError(error.NoColumnsInHeader, decodeWithHeader(allocator, &data));
+}
+
+test "decodeWithHeader: all Phase-1 types" {
+    // Build payload: num_cols=5, names+types for all fixed types, then one row.
+    const allocator = std.testing.allocator;
+    var buf: [256]u8 = undefined;
+    var pos: usize = 0;
+
+    buf[pos] = 5; pos += 1; // num_cols
+    // names (all first)
+    const names = [_][]const u8{ "i16", "i32", "i64", "d", "ts" };
+    for (names) |n| {
+        buf[pos] = @intCast(n.len); pos += 1;
+        @memcpy(buf[pos..][0..n.len], n); pos += n.len;
+    }
+    // types
+    const types = [_][]const u8{ "Int16", "Int32", "Int64", "Date", "DateTime" };
+    for (types) |t| {
+        buf[pos] = @intCast(t.len); pos += 1;
+        @memcpy(buf[pos..][0..t.len], t); pos += t.len;
+    }
+    // one row: i16=1, i32=2, i64=3, d=4 (UInt16 days), ts=5 (UInt32 secs)
+    std.mem.writeInt(i16, buf[pos..][0..2], 1, .little); pos += 2;
+    std.mem.writeInt(i32, buf[pos..][0..4], 2, .little); pos += 4;
+    std.mem.writeInt(i64, buf[pos..][0..8], 3, .little); pos += 8;
+    std.mem.writeInt(i32, buf[pos..][0..4], 4, .little); pos += 4; // Date stored as i32 in RowBinary
+    std.mem.writeInt(i64, buf[pos..][0..8], 5, .little); pos += 8; // DateTime stored as i64
+
+    var result = try decodeWithHeader(allocator, buf[0..pos]);
+    defer result.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 5), result.table.columns.len);
+    try std.testing.expectEqual(schema.ColumnType.int16,     result.table.columns[0].ty);
+    try std.testing.expectEqual(schema.ColumnType.int32,     result.table.columns[1].ty);
+    try std.testing.expectEqual(schema.ColumnType.int64,     result.table.columns[2].ty);
+    try std.testing.expectEqual(schema.ColumnType.date,      result.table.columns[3].ty);
+    try std.testing.expectEqual(schema.ColumnType.timestamp, result.table.columns[4].ty);
+}

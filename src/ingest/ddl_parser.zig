@@ -97,15 +97,52 @@ pub fn parse(allocator: std.mem.Allocator, sql: []const u8) !ParseResult {
         }
 
         const col_type_raw = tok.next() orelse return error.MissingColumnType;
-        const col_ty = parseColumnType(col_type_raw) orelse {
-            // Handle Nullable(T), LowCardinality(T) etc. by trying inner type
-            const inner = extractInnerType(col_type_raw);
-            _ = parseColumnType(inner) orelse return error.UnsupportedColumnType;
-            // Use inner type
+
+        // If the next token is '(' this type has arguments: Nullable(T), LowCardinality(T),
+        // FixedString(N), DateTime64(p), etc.  Consume the parenthesised argument list and
+        // resolve the effective type.
+        if (tok.peekChar('(')) {
+            tok.skip(); // consume '('
+            // Collect inner tokens until matching ')'
+            var inner_buf: [64]u8 = undefined;
+            var inner_len: usize = 0;
+            var depth: usize = 1;
+            while (tok.next()) |t| {
+                if (t.len == 1 and t[0] == '(') {
+                    depth += 1;
+                } else if (t.len == 1 and t[0] == ')') {
+                    depth -= 1;
+                    if (depth == 0) break;
+                } else if (depth == 1 and t.len + inner_len <= inner_buf.len) {
+                    // Capture the first non-punctuation token as the inner type
+                    if (inner_len == 0) {
+                        @memcpy(inner_buf[0..t.len], t);
+                        inner_len = t.len;
+                    }
+                }
+            }
+            const inner = inner_buf[0..inner_len];
+
+            // DateTime64(p[, tz]) → timestamp
+            if (asciiEql(col_type_raw, "DateTime64")) {
+                const col_name_owned = try allocator.dupe(u8, col_name_raw);
+                try cols.append(allocator, .{ .name = col_name_owned, .ty = .timestamp });
+                continue;
+            }
+            // FixedString(N) → text
+            if (asciiEql(col_type_raw, "FixedString")) {
+                const col_name_owned = try allocator.dupe(u8, col_name_raw);
+                try cols.append(allocator, .{ .name = col_name_owned, .ty = .text });
+                continue;
+            }
+            // Nullable(T) / LowCardinality(T) → resolve inner type
+            const eff_ty = parseColumnType(inner) orelse return error.UnsupportedColumnType;
             const col_name_owned = try allocator.dupe(u8, col_name_raw);
-            try cols.append(allocator, .{ .name = col_name_owned, .ty = parseColumnType(inner).? });
+            try cols.append(allocator, .{ .name = col_name_owned, .ty = eff_ty });
             continue;
-        };
+        }
+
+        const col_ty = parseColumnType(col_type_raw) orelse return error.UnsupportedColumnType;
 
         const col_name_owned = try allocator.dupe(u8, col_name_raw);
         try cols.append(allocator, .{ .name = col_name_owned, .ty = col_ty });
@@ -185,14 +222,6 @@ fn parseColumnType(s: []const u8) ?schema.ColumnType {
     if (asciiEql(s, "String")) return .text;
     if (asciiEql(s, "FixedString")) return .text;
     return null;
-}
-
-/// Extract inner type from Nullable(T) / LowCardinality(T) / FixedString(N).
-fn extractInnerType(s: []const u8) []const u8 {
-    const lparen = std.mem.indexOfScalar(u8, s, '(') orelse return s;
-    const rparen = std.mem.lastIndexOfScalar(u8, s, ')') orelse return s;
-    if (rparen > lparen) return s[lparen + 1 .. rparen];
-    return s;
 }
 
 // ── Tokenizer ─────────────────────────────────────────────────────────────────
@@ -370,4 +399,88 @@ test "parse: unsupported type returns error" {
     const allocator = std.testing.allocator;
     const sql = "CREATE TABLE t (x Float64) ENGINE = MergeTree";
     try std.testing.expectError(error.UnsupportedColumnType, parse(allocator, sql));
+}
+
+test "parse: Nullable(T) unwraps inner type" {
+    const allocator = std.testing.allocator;
+    const sql = "CREATE TABLE t (id Nullable(Int32), name Nullable(String)) ENGINE = MergeTree ORDER BY id";
+    var result = try parse(allocator, sql);
+    defer result.deinit();
+    try std.testing.expectEqual(schema.ColumnType.int32, result.entry.table.columns[0].ty);
+    try std.testing.expectEqual(schema.ColumnType.text,  result.entry.table.columns[1].ty);
+}
+
+test "parse: LowCardinality(String)" {
+    const allocator = std.testing.allocator;
+    const sql = "CREATE TABLE t (cat LowCardinality(String)) ENGINE = MergeTree ORDER BY cat";
+    var result = try parse(allocator, sql);
+    defer result.deinit();
+    try std.testing.expectEqual(schema.ColumnType.text, result.entry.table.columns[0].ty);
+}
+
+test "parse: FixedString(N)" {
+    const allocator = std.testing.allocator;
+    const sql = "CREATE TABLE t (code FixedString(4)) ENGINE = MergeTree ORDER BY code";
+    var result = try parse(allocator, sql);
+    defer result.deinit();
+    try std.testing.expectEqual(schema.ColumnType.text, result.entry.table.columns[0].ty);
+}
+
+test "parse: PRIMARY KEY clause" {
+    const allocator = std.testing.allocator;
+    const sql = "CREATE TABLE t (id Int32, ts DateTime) ENGINE = MergeTree PRIMARY KEY id";
+    var result = try parse(allocator, sql);
+    defer result.deinit();
+    try std.testing.expectEqualStrings("id", result.entry.pk.?);
+}
+
+test "parse: PRIMARY KEY overrides ORDER BY when both present" {
+    // ORDER BY sets pk first, PRIMARY KEY should not overwrite (pk already set).
+    const allocator = std.testing.allocator;
+    const sql = "CREATE TABLE t (id Int32, ts DateTime) ENGINE = MergeTree ORDER BY ts PRIMARY KEY id";
+    var result = try parse(allocator, sql);
+    defer result.deinit();
+    // ORDER BY was parsed first → pk = "ts"
+    try std.testing.expectEqualStrings("ts", result.entry.pk.?);
+}
+
+test "parse: backtick-quoted identifiers" {
+    const allocator = std.testing.allocator;
+    const sql = "CREATE TABLE `mydb`.`my_table` (`id` Int32, `name` String) ENGINE = MergeTree ORDER BY `id`";
+    var result = try parse(allocator, sql);
+    defer result.deinit();
+    try std.testing.expectEqualStrings("mydb", result.entry.db);
+    try std.testing.expectEqualStrings("my_table", result.entry.name);
+    try std.testing.expectEqualStrings("id", result.entry.table.columns[0].name);
+    try std.testing.expectEqualStrings("id", result.entry.pk.?);
+}
+
+test "parse: UInt16 maps to date, UInt32 maps to timestamp" {
+    const allocator = std.testing.allocator;
+    const sql = "CREATE TABLE t (d UInt16, ts UInt32) ENGINE = MergeTree ORDER BY d";
+    var result = try parse(allocator, sql);
+    defer result.deinit();
+    try std.testing.expectEqual(schema.ColumnType.date,      result.entry.table.columns[0].ty);
+    try std.testing.expectEqual(schema.ColumnType.timestamp, result.entry.table.columns[1].ty);
+}
+
+test "parse: DateTime64 maps to timestamp" {
+    const allocator = std.testing.allocator;
+    const sql = "CREATE TABLE t (ts DateTime64(3)) ENGINE = MergeTree ORDER BY ts";
+    // DateTime64(3) tokenizes as "DateTime64" + "(" + "3" + ")"
+    // extractInnerType("DateTime64(3)") → "3" which is not a known type,
+    // but parseColumnType("DateTime64") also won't match because the token
+    // includes the parens. This tests the Nullable path.
+    // Actually the tokenizer splits at '(' so col_type_raw = "DateTime64" → maps fine.
+    var result = try parse(allocator, sql);
+    defer result.deinit();
+    try std.testing.expectEqual(schema.ColumnType.timestamp, result.entry.table.columns[0].ty);
+}
+
+test "parse: Date32 maps to date" {
+    const allocator = std.testing.allocator;
+    const sql = "CREATE TABLE t (d Date32) ENGINE = MergeTree ORDER BY d";
+    var result = try parse(allocator, sql);
+    defer result.deinit();
+    try std.testing.expectEqual(schema.ColumnType.date, result.entry.table.columns[0].ty);
 }

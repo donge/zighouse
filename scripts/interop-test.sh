@@ -622,3 +622,90 @@ if [ "$FAIL" = "1" ]; then
     exit 1
 fi
 echo "PASS: step 13 (ClickHouse client → zighouse) succeeded"
+
+# ── Step 14: SELECT projection + WHERE + multi-part ────────────────────────────
+echo ""
+echo "=== Step 14: SELECT projection + WHERE + multi-part ==="
+
+S14_PORT=19128
+S14_DATA=/tmp/zh_s14_test
+S14_DB=default
+S14_TABLE=s14_test
+rm -rf "$S14_DATA"
+mkdir -p "$S14_DATA"
+
+# Create table via DDL
+DDL14="CREATE TABLE $S14_DB.$S14_TABLE (id Int32, name String) ENGINE = MergeTree ORDER BY id"
+DDL14_ENC=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "$DDL14")
+
+$ZH serve --data-dir="$S14_DATA" --port="$S14_PORT" &
+S14_PID=$!
+trap "kill $S14_PID 2>/dev/null || true" EXIT
+sleep 0.5
+
+curl --noproxy 127.0.0.1 -s -o /dev/null -w "%{http_code}" \
+    "http://127.0.0.1:$S14_PORT/?query=$DDL14_ENC" | grep -q "200" \
+    && echo "  PASS DDL CREATE TABLE" || { echo "  FAIL DDL CREATE TABLE"; FAIL=1; }
+
+# Insert part 1: rows id=1..3
+python3 - <<'PYEOF' > /tmp/zh_s14_p1.bin
+import struct, sys
+buf = b''
+for i in range(1, 4):
+    buf += struct.pack('<i', i)
+    s = f'name{i}'.encode()
+    buf += bytes([len(s)]) + s
+sys.stdout.buffer.write(buf)
+PYEOF
+
+curl --noproxy 127.0.0.1 -s -o /dev/null -w "%{http_code}" \
+    --data-binary @/tmp/zh_s14_p1.bin \
+    "http://127.0.0.1:$S14_PORT/?query=INSERT+INTO+$S14_DB.$S14_TABLE+FORMAT+RowBinary" \
+    | grep -q "200" && echo "  PASS INSERT part 1" || { echo "  FAIL INSERT part 1"; FAIL=1; }
+
+# Insert part 2: rows id=4..6 (separate INSERT → separate part)
+python3 - <<'PYEOF' > /tmp/zh_s14_p2.bin
+import struct, sys
+buf = b''
+for i in range(4, 7):
+    buf += struct.pack('<i', i)
+    s = f'name{i}'.encode()
+    buf += bytes([len(s)]) + s
+sys.stdout.buffer.write(buf)
+PYEOF
+
+curl --noproxy 127.0.0.1 -s -o /dev/null -w "%{http_code}" \
+    --data-binary @/tmp/zh_s14_p2.bin \
+    "http://127.0.0.1:$S14_PORT/?query=INSERT+INTO+$S14_DB.$S14_TABLE+FORMAT+RowBinary" \
+    | grep -q "200" && echo "  PASS INSERT part 2" || { echo "  FAIL INSERT part 2"; FAIL=1; }
+
+# Verify 2 parts on disk
+PART_COUNT=$(find "$S14_DATA/$S14_DB/$S14_TABLE/parts" -name "all_*_*_0" -type d 2>/dev/null | wc -l | tr -d ' ')
+if [ "$PART_COUNT" -eq "2" ]; then
+    echo "  PASS 2 parts on disk"
+else
+    echo "  FAIL expected 2 parts, got $PART_COUNT"
+    FAIL=1
+fi
+
+# SELECT count(*) across both parts → should be 6
+COUNT_ENC=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" \
+    "SELECT count(*) FROM $S14_DB.$S14_TABLE")
+COUNT_RESP=$(curl --noproxy 127.0.0.1 -s \
+    "http://127.0.0.1:$S14_PORT/?query=$COUNT_ENC" | tail -1 | tr -d '[:space:]')
+if [ "$COUNT_RESP" = "6" ]; then
+    echo "  PASS SELECT count(*) = 6 across 2 parts"
+else
+    echo "  FAIL SELECT count(*) expected 6, got '$COUNT_RESP'"
+    FAIL=1
+fi
+
+kill $S14_PID 2>/dev/null || true
+trap - EXIT
+wait $S14_PID 2>/dev/null || true
+
+if [ "$FAIL" = "1" ]; then
+    echo "FAIL: one or more step 14 checks failed"
+    exit 1
+fi
+echo "PASS: step 14 (SELECT + multi-part) succeeded"

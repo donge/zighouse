@@ -274,3 +274,93 @@ test "find: returns null for unknown table" {
     try std.testing.expect(cfg.find("default", "missing") == null);
     try std.testing.expect(cfg.find("other", "t") == null);
 }
+
+test "addEntry: deep-copies strings, original can be freed" {
+    // Verify that addEntry dupes all strings into its arena so the caller
+    // can free the original without corrupting the registry.
+    const allocator = std.testing.allocator;
+    const json = \\{"tables": []}
+    ;
+    var cfg = try loadFromSlice(allocator, json);
+    defer cfg.deinit();
+
+    // Build entry with heap-allocated strings that we will free afterwards.
+    const db_copy = try allocator.dupe(u8, "testdb");
+    const name_copy = try allocator.dupe(u8, "testtable");
+    const col_name_copy = try allocator.dupe(u8, "col1");
+    const col_name_copy2 = try allocator.dupe(u8, "col2");
+    const cols = try allocator.alloc(schema.Column, 2);
+    cols[0] = .{ .name = col_name_copy, .ty = .int32 };
+    cols[1] = .{ .name = col_name_copy2, .ty = .text };
+
+    const entry = TableEntry{
+        .db = db_copy,
+        .name = name_copy,
+        .pk = null,
+        .table = .{ .name = name_copy, .columns = cols },
+    };
+    try cfg.addEntry(allocator, entry);
+
+    // Free the originals — registry must be unaffected.
+    allocator.free(col_name_copy);
+    allocator.free(col_name_copy2);
+    allocator.free(cols);
+    allocator.free(db_copy);
+    allocator.free(name_copy);
+
+    // Registry should still return a valid entry.
+    const found = cfg.find("testdb", "testtable").?;
+    try std.testing.expectEqualStrings("testdb", found.db);
+    try std.testing.expectEqualStrings("testtable", found.name);
+    try std.testing.expectEqual(@as(usize, 2), found.table.columns.len);
+    try std.testing.expectEqualStrings("col1", found.table.columns[0].name);
+    try std.testing.expectEqualStrings("col2", found.table.columns[1].name);
+}
+
+test "addEntry: replaces existing entry with same db+name" {
+    const allocator = std.testing.allocator;
+    const json = \\{"tables": [{"db": "default", "name": "t", "columns": [{"name": "id", "type": "Int32"}]}]}
+    ;
+    var cfg = try loadFromSlice(allocator, json);
+    defer cfg.deinit();
+
+    const new_cols = [_]schema.Column{
+        .{ .name = "id", .ty = .int64 },
+        .{ .name = "ts", .ty = .timestamp },
+    };
+    const entry = TableEntry{
+        .db = "default",
+        .name = "t",
+        .pk = "id",
+        .table = .{ .name = "t", .columns = &new_cols },
+    };
+    try cfg.addEntry(allocator, entry);
+
+    const found = cfg.find("default", "t").?;
+    try std.testing.expectEqual(@as(usize, 2), found.table.columns.len);
+    try std.testing.expectEqual(schema.ColumnType.int64, found.table.columns[0].ty);
+    try std.testing.expectEqualStrings("id", found.pk.?);
+}
+
+test "addEntry: multiple tables" {
+    const allocator = std.testing.allocator;
+    const json = \\{"tables": []}
+    ;
+    var cfg = try loadFromSlice(allocator, json);
+    defer cfg.deinit();
+
+    const cols_a = [_]schema.Column{.{ .name = "x", .ty = .int16 }};
+    const cols_b = [_]schema.Column{.{ .name = "y", .ty = .text }};
+    try cfg.addEntry(allocator, .{
+        .db = "db", .name = "a", .pk = null,
+        .table = .{ .name = "a", .columns = &cols_a },
+    });
+    try cfg.addEntry(allocator, .{
+        .db = "db", .name = "b", .pk = null,
+        .table = .{ .name = "b", .columns = &cols_b },
+    });
+
+    try std.testing.expect(cfg.find("db", "a") != null);
+    try std.testing.expect(cfg.find("db", "b") != null);
+    try std.testing.expect(cfg.find("db", "c") == null);
+}

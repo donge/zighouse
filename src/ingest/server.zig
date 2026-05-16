@@ -568,3 +568,58 @@ test "splitDbTable: bare table" {
     try std.testing.expectEqualStrings("default", r.db);
     try std.testing.expectEqualStrings("hits", r.table);
 }
+
+test "parseInsertTarget: RowBinaryWithNamesAndTypes" {
+    const r = parseInsertTarget("INSERT INTO default.my_table FORMAT RowBinaryWithNamesAndTypes").?;
+    try std.testing.expectEqualStrings("default", r.db_table.db);
+    try std.testing.expectEqualStrings("my_table", r.db_table.table);
+    try std.testing.expect(r.with_names_and_types);
+}
+
+test "parseInsertTarget: RowBinary sets with_names_and_types=false" {
+    const r = parseInsertTarget("INSERT INTO t FORMAT RowBinary").?;
+    try std.testing.expect(!r.with_names_and_types);
+}
+
+test "parseInsertTarget: case-insensitive keywords" {
+    const r = parseInsertTarget("insert into db.t format RowBinary").?;
+    try std.testing.expectEqualStrings("db", r.db_table.db);
+    try std.testing.expectEqualStrings("t", r.db_table.table);
+    try std.testing.expect(!r.with_names_and_types);
+}
+
+test "schemasCompatible: identical schemas" {
+    const cols = [_]schema.Column{
+        .{ .name = "id", .ty = .int32 },
+        .{ .name = "name", .ty = .text },
+    };
+    const t = schema.Table{ .name = "t", .columns = &cols };
+    try std.testing.expect(schemasCompatible(t, t));
+}
+
+test "schemasCompatible: different column count" {
+    const cols1 = [_]schema.Column{.{ .name = "id", .ty = .int32 }};
+    const cols2 = [_]schema.Column{
+        .{ .name = "id", .ty = .int32 },
+        .{ .name = "name", .ty = .text },
+    };
+    const t1 = schema.Table{ .name = "t", .columns = &cols1 };
+    const t2 = schema.Table{ .name = "t", .columns = &cols2 };
+    try std.testing.expect(!schemasCompatible(t1, t2));
+}
+
+test "schemasCompatible: different column name" {
+    const cols1 = [_]schema.Column{.{ .name = "id", .ty = .int32 }};
+    const cols2 = [_]schema.Column{.{ .name = "uid", .ty = .int32 }};
+    const t1 = schema.Table{ .name = "t", .columns = &cols1 };
+    const t2 = schema.Table{ .name = "t", .columns = &cols2 };
+    try std.testing.expect(!schemasCompatible(t1, t2));
+}
+
+test "schemasCompatible: different column type" {
+    const cols1 = [_]schema.Column{.{ .name = "id", .ty = .int32 }};
+    const cols2 = [_]schema.Column{.{ .name = "id", .ty = .int64 }};
+    const t1 = schema.Table{ .name = "t", .columns = &cols1 };
+    const t2 = schema.Table{ .name = "t", .columns = &cols2 };
+    try std.testing.expect(!schemasCompatible(t1, t2));
+}
