@@ -79,6 +79,7 @@ pub const SchemaConfig = struct {
         for (entry.table.columns, cols_copy) |src, *dst| {
             dst.* = src;
             dst.name = try a.dupe(u8, src.name);
+            if (src.ch_type) |ct| dst.ch_type = try a.dupe(u8, ct);
         }
         const table_name_copy = try a.dupe(u8, entry.table.name);
         const new_entry = TableEntry{
@@ -184,7 +185,7 @@ pub fn loadFromSlice(allocator: std.mem.Allocator, json_bytes: []const u8) !Sche
             };
 
             const ty = parseColumnType(col_type_str) orelse return error.UnknownColumnType;
-            col.* = .{ .name = col_name, .ty = ty };
+            col.* = .{ .name = col_name, .ty = ty, .ch_type = col_type_str };
         }
 
         entry.* = .{

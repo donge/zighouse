@@ -147,6 +147,10 @@ pub const StringCapabilities = struct {
 pub const Column = struct {
     name: []const u8,
     ty: ColumnType,
+    /// Original ClickHouse type string as received on the wire (e.g. "Array(String)",
+    /// "Map(String, Float64)", "LowCardinality(String)", "IPv6").
+    /// null means unknown / use schemaTypeToChType(ty) fallback.
+    ch_type: ?[]const u8 = null,
     cardinality: CardinalityHint = .none,
     storage: StorageHint = .auto,
     string_encoding: StringEncoding = .none,

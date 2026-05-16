@@ -29,7 +29,10 @@ pub const ParseResult = struct {
     allocator: std.mem.Allocator,
 
     pub fn deinit(self: *ParseResult) void {
-        for (self.columns) |col| self.allocator.free(col.name);
+        for (self.columns) |col| {
+            self.allocator.free(col.name);
+            if (col.ch_type) |ct| self.allocator.free(ct);
+        }
         self.allocator.free(self.columns);
         self.allocator.free(self.entry.db);
         self.allocator.free(self.entry.name);
@@ -76,7 +79,10 @@ pub fn parse(allocator: std.mem.Allocator, sql: []const u8) !ParseResult {
     // Column definitions: name Type [, name Type ...]
     var cols: std.ArrayListUnmanaged(schema.Column) = .empty;
     errdefer {
-        for (cols.items) |col| allocator.free(col.name);
+        for (cols.items) |col| {
+            allocator.free(col.name);
+            if (col.ch_type) |ct| allocator.free(ct);
+        }
         cols.deinit(allocator);
     }
 
@@ -97,6 +103,8 @@ pub fn parse(allocator: std.mem.Allocator, sql: []const u8) !ParseResult {
         }
 
         const col_type_raw = tok.next() orelse return error.MissingColumnType;
+        // Record the start offset in the source so we can reconstruct the raw type string.
+        const type_src_start = @intFromPtr(col_type_raw.ptr) - @intFromPtr(tok.src.ptr);
 
         // If the next token is '(' this type has arguments: Nullable(T), LowCardinality(T),
         // FixedString(N), DateTime64(p), etc.  Consume the parenthesised argument list and
@@ -122,39 +130,43 @@ pub fn parse(allocator: std.mem.Allocator, sql: []const u8) !ParseResult {
                 }
             }
             const inner = inner_buf[0..inner_len];
+            // Raw type string: from type_src_start up to current tok.pos
+            const ch_type_raw = std.mem.trim(u8, tok.src[type_src_start..tok.pos], " \t\r\n");
+            const ch_type_owned = try allocator.dupe(u8, ch_type_raw);
+            errdefer allocator.free(ch_type_owned);
 
             // DateTime64(p[, tz]) → timestamp
             if (asciiEql(col_type_raw, "DateTime64")) {
                 const col_name_owned = try allocator.dupe(u8, col_name_raw);
-                try cols.append(allocator, .{ .name = col_name_owned, .ty = .timestamp });
+                try cols.append(allocator, .{ .name = col_name_owned, .ty = .timestamp, .ch_type = ch_type_owned });
                 if (tok.peekKeyword("DEFAULT") or tok.peekKeyword("COMMENT") or tok.peekKeyword("CODEC")) tok.skipToColumnDelimiter();
                 continue;
             }
             // FixedString(N) → text
             if (asciiEql(col_type_raw, "FixedString")) {
                 const col_name_owned = try allocator.dupe(u8, col_name_raw);
-                try cols.append(allocator, .{ .name = col_name_owned, .ty = .text });
+                try cols.append(allocator, .{ .name = col_name_owned, .ty = .text, .ch_type = ch_type_owned });
                 if (tok.peekKeyword("DEFAULT") or tok.peekKeyword("COMMENT") or tok.peekKeyword("CODEC")) tok.skipToColumnDelimiter();
                 continue;
             }
             // Array(...) → text (blob)
             if (asciiEql(col_type_raw, "Array")) {
                 const col_name_owned = try allocator.dupe(u8, col_name_raw);
-                try cols.append(allocator, .{ .name = col_name_owned, .ty = .text });
+                try cols.append(allocator, .{ .name = col_name_owned, .ty = .text, .ch_type = ch_type_owned });
                 if (tok.peekKeyword("DEFAULT") or tok.peekKeyword("COMMENT") or tok.peekKeyword("CODEC")) tok.skipToColumnDelimiter();
                 continue;
             }
             // Map(...) → text (blob)
             if (asciiEql(col_type_raw, "Map")) {
                 const col_name_owned = try allocator.dupe(u8, col_name_raw);
-                try cols.append(allocator, .{ .name = col_name_owned, .ty = .text });
+                try cols.append(allocator, .{ .name = col_name_owned, .ty = .text, .ch_type = ch_type_owned });
                 if (tok.peekKeyword("DEFAULT") or tok.peekKeyword("COMMENT") or tok.peekKeyword("CODEC")) tok.skipToColumnDelimiter();
                 continue;
             }
             // Nullable(T) / LowCardinality(T) → resolve inner type
             const eff_ty = parseColumnType(inner) orelse return error.UnsupportedColumnType;
             const col_name_owned = try allocator.dupe(u8, col_name_raw);
-            try cols.append(allocator, .{ .name = col_name_owned, .ty = eff_ty });
+            try cols.append(allocator, .{ .name = col_name_owned, .ty = eff_ty, .ch_type = ch_type_owned });
             if (tok.peekKeyword("DEFAULT") or tok.peekKeyword("COMMENT") or tok.peekKeyword("CODEC")) tok.skipToColumnDelimiter();
             continue;
         }
@@ -167,7 +179,9 @@ pub fn parse(allocator: std.mem.Allocator, sql: []const u8) !ParseResult {
         }
 
         const col_name_owned = try allocator.dupe(u8, col_name_raw);
-        try cols.append(allocator, .{ .name = col_name_owned, .ty = col_ty });
+        // For simple types, ch_type = col_type_raw (already a slice of tok.src — dupe it).
+        const ch_type_owned = try allocator.dupe(u8, col_type_raw);
+        try cols.append(allocator, .{ .name = col_name_owned, .ty = col_ty, .ch_type = ch_type_owned });
     }
 
     // ')' already consumed by peekChar/break — consume it

@@ -574,7 +574,7 @@ pub const Server = struct {
         for (entry.table.columns, 0..) |col, i| {
             rows[i] = .{
                 .name = col.name,
-                .type_name = schemaTypeToChType(col.ty),
+                .type_name = col.ch_type orelse schemaTypeToChType(col.ty),
             };
         }
 

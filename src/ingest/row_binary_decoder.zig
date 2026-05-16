@@ -190,7 +190,10 @@ pub const WithHeaderResult = struct {
     decoder: RowBinaryDecoder,
 
     pub fn deinit(self: *WithHeaderResult, allocator: std.mem.Allocator) void {
-        for (self.table.columns) |col| allocator.free(col.name);
+        for (self.table.columns) |col| {
+            allocator.free(col.name);
+            if (col.ch_type) |ct| allocator.free(ct);
+        }
         allocator.free(self.table.columns);
         self.decoder.deinit();
     }
@@ -298,7 +301,10 @@ pub fn decodeNativeBlock(allocator: std.mem.Allocator, data: []const u8) !WithHe
     const columns = try allocator.alloc(schema.Column, num_cols);
     var cols_inited: usize = 0;
     errdefer {
-        for (columns[0..cols_inited]) |col| allocator.free(col.name);
+        for (columns[0..cols_inited]) |col| {
+            allocator.free(col.name);
+            if (col.ch_type) |ct| allocator.free(ct);
+        }
         allocator.free(columns);
     }
 
@@ -340,7 +346,11 @@ pub fn decodeNativeBlock(allocator: std.mem.Allocator, data: []const u8) !WithHe
             pos += 8; // skip the state prefix value (we don't validate it)
         }
 
-        columns[ci] = .{ .name = name_owned, .ty = col_ty };
+        // Dupe the original CH type string so we can persist it in the schema.
+        const ch_type_owned = try allocator.dupe(u8, type_str);
+        errdefer allocator.free(ch_type_owned);
+
+        columns[ci] = .{ .name = name_owned, .ty = col_ty, .ch_type = ch_type_owned };
         name_transferred = true;
         cols_inited += 1;
 
@@ -621,7 +631,9 @@ fn measureNativeValue(type_str: []const u8, data: []const u8, pos: usize) !usize
 /// Decode `num_rows` values from a Native Block for a .text-mapped column.
 /// Stores each row's raw bytes as a blob in col_buf.str_bytes / str_vals.
 /// For plain String: stores only the content bytes (no length prefix).
-/// For IPv4/IPv6/FixedString/Array/Map: stores the full raw bytes (including any headers).
+/// For Array(T) columns in Native format: offsets[N]uint64 + flat element data.
+/// For Map(K,V) columns in Native format: offsets[N]uint64 + flat keys + flat values.
+/// For IPv4/IPv6/FixedString: stores fixed-width raw bytes.
 fn consumeNativeTextRows(
     allocator: std.mem.Allocator,
     type_str: []const u8,
@@ -633,7 +645,6 @@ fn consumeNativeTextRows(
     // Plain String / UUID: read varUInt(len) + content; store ONLY content.
     const is_plain_string = chTypeEql(type_str, "String") or chTypeEql(type_str, "UUID");
     if (is_plain_string) {
-        // Pre-scan to compute total content bytes for capacity reservation.
         {
             var scan = pos.*;
             var total: usize = 0;
@@ -660,8 +671,87 @@ fn consumeNativeTextRows(
         return;
     }
 
-    // Fixed-width types (IPv4=4, IPv6=16, FixedString(N)=N) and compound
-    // types (Array, Map): pre-scan total bytes then store raw blobs.
+    // Array(T) columns in ClickHouse Native format use offset-based encoding:
+    //   uint64[num_rows] cumulative end-offsets into element array
+    //   element data (all rows concatenated)
+    if (chTypeStartsWith(type_str, "Array(")) {
+        const inner = extractInner(type_str);
+        if (pos.* + num_rows * 8 > data.len) return error.UnexpectedEndOfData;
+        const offsets_start = pos.*;
+        pos.* += num_rows * 8;
+        // Measure element positions using offsets
+        var ep = pos.*; // start of element data
+        var prev_off: u64 = 0;
+        for (0..num_rows) |i| {
+            const off = std.mem.readInt(u64, data[offsets_start + i * 8..][0..8], .little);
+            const count = off - prev_off;
+            const row_start = ep;
+            for (0..count) |_| ep += try measureNativeValue(inner, data, ep);
+            const start = col_buf.str_bytes.items.len;
+            try col_buf.str_bytes.appendSlice(allocator, data[row_start..ep]);
+            try col_buf.str_vals.append(allocator, col_buf.str_bytes.items[start..]);
+            prev_off = off;
+        }
+        pos.* = ep;
+        return;
+    }
+
+    // Map(K,V) columns in ClickHouse Native format:
+    //   uint64[num_rows] cumulative end-offsets into pair array
+    //   key data (all rows concatenated)
+    //   value data (all rows concatenated)
+    if (chTypeStartsWith(type_str, "Map(")) {
+        const inner = extractInner(type_str);
+        var ktype: []const u8 = inner;
+        var vtype: []const u8 = "";
+        {
+            var depth: usize = 0;
+            for (inner, 0..) |c, ii| {
+                if (c == '(') depth += 1
+                else if (c == ')') depth -= 1
+                else if (c == ',' and depth == 0) {
+                    ktype = std.mem.trim(u8, inner[0..ii], " ");
+                    vtype = std.mem.trim(u8, inner[ii+1..], " ");
+                    break;
+                }
+            }
+        }
+        if (pos.* + num_rows * 8 > data.len) return error.UnexpectedEndOfData;
+        const offsets_start = pos.*;
+        pos.* += num_rows * 8;
+        const total_pairs: u64 = if (num_rows > 0)
+            std.mem.readInt(u64, data[offsets_start + (num_rows - 1) * 8..][0..8], .little)
+        else 0;
+        // Advance through all keys
+        const keys_start = pos.*;
+        for (0..total_pairs) |_| pos.* += try measureNativeValue(ktype, data, pos.*);
+        const vals_start = pos.*;
+        for (0..total_pairs) |_| pos.* += try measureNativeValue(vtype, data, pos.*);
+        const vals_end = pos.*;
+        // Re-traverse per row to build per-row blobs
+        var kp = keys_start;
+        var vp = vals_start;
+        var prev_off2: u64 = 0;
+        for (0..num_rows) |i| {
+            const off = std.mem.readInt(u64, data[offsets_start + i * 8..][0..8], .little);
+            const count = off - prev_off2;
+            const k_row_start = kp;
+            const v_row_start = vp;
+            for (0..count) |_| {
+                kp += try measureNativeValue(ktype, data, kp);
+                vp += try measureNativeValue(vtype, data, vp);
+            }
+            const start = col_buf.str_bytes.items.len;
+            try col_buf.str_bytes.appendSlice(allocator, data[k_row_start..kp]);
+            try col_buf.str_bytes.appendSlice(allocator, data[v_row_start..vp]);
+            try col_buf.str_vals.append(allocator, col_buf.str_bytes.items[start..]);
+            prev_off2 = off;
+        }
+        pos.* = vals_end;
+        return;
+    }
+
+    // Fixed-width types (IPv4=4, IPv6=16, FixedString(N)=N): raw blobs.
     var total: usize = 0;
     {
         var scan = pos.*;

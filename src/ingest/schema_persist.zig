@@ -61,7 +61,12 @@ pub fn save(
         try buf.appendSlice(allocator, "    {\"name\": \"");
         try writeJsonString(&buf, allocator, col.name);
         try buf.appendSlice(allocator, "\", \"type\": \"");
-        try buf.appendSlice(allocator, columnTypeName(col.ty));
+        // Prefer the original CH type string if available (preserves Array/Map/LowCardinality).
+        if (col.ch_type) |ct| {
+            try writeJsonString(&buf, allocator, ct);
+        } else {
+            try buf.appendSlice(allocator, columnTypeName(col.ty));
+        }
         try buf.appendSlice(allocator, "\"}");
         if (i + 1 < entry.table.columns.len) try buf.append(allocator, ',');
         try buf.append(allocator, '\n');
