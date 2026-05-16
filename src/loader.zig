@@ -79,6 +79,7 @@ pub fn importParquetCH(
     parquet_path: []const u8,
     store_dir: []const u8,
     table: schema.Table,
+    pk_col_name: ?[]const u8,
 ) !u64 {
     const total_rows: u64 = try parquet.rowCountPath(allocator, io, parquet_path);
 
@@ -89,59 +90,132 @@ pub fn importParquetCH(
     );
     defer allocator.free(part_dir);
 
-    var part = try ch_part.Part.open(io, allocator, part_dir, table);
+    var part = try ch_part.Part.open(io, allocator, part_dir, table, pk_col_name);
     defer part.deinit();
 
-    // Stream each column independently into the Part's ColumnWriter.
+    // Build separate index lists for fixed vs string columns.
+    var fixed_indices: std.ArrayListUnmanaged(usize) = .empty;
+    defer fixed_indices.deinit(allocator);
+    var str_indices: std.ArrayListUnmanaged(usize) = .empty;
+    defer str_indices.deinit(allocator);
+    // Map from str_slot -> col_idx in the Part
+    var str_col_map: std.ArrayListUnmanaged(usize) = .empty;
+    defer str_col_map.deinit(allocator);
+    // Map from fixed_slot -> col_idx in the Part
+    var fixed_col_map: std.ArrayListUnmanaged(usize) = .empty;
+    defer fixed_col_map.deinit(allocator);
+
     for (table.columns, 0..) |col, col_idx| {
         switch (col.ty) {
-            .text, .char => try importCHStringColumn(allocator, io, parquet_path, &part, col_idx, total_rows),
-            .int16 => try importCHFixedColumn(i16, allocator, io, parquet_path, &part, col_idx),
-            .int32, .date => try importCHFixedColumn(i32, allocator, io, parquet_path, &part, col_idx),
-            .int64, .timestamp => try importCHFixedColumn(i64, allocator, io, parquet_path, &part, col_idx),
+            .text, .char => {
+                try str_indices.append(allocator, col_idx);
+                try str_col_map.append(allocator, col_idx);
+            },
+            else => {
+                try fixed_indices.append(allocator, col_idx);
+                try fixed_col_map.append(allocator, col_idx);
+            },
         }
     }
 
-    // Make sure row_count is set (driven by pk column, col_idx=0)
-    // If col_idx 0 is not the pk column or was a string col, ensure row_count is correct.
-    part.setRowCount(total_rows);
+    const ctx = CHAllColsCtx{
+        .part = &part,
+        .fixed_col_map = fixed_col_map.items,
+        .str_col_map = str_col_map.items,
+    };
 
+    _ = try parquet.streamAllColumnsPath(
+        allocator,
+        io,
+        parquet_path,
+        fixed_indices.items,
+        str_indices.items,
+        ctx,
+        chAllFixedBatch,
+        chAllStrValue,
+    );
+
+    part.setRowCount(total_rows);
     try part.finish();
     return total_rows;
 }
 
-fn importCHFixedColumn(
-    comptime T: type,
+const CHAllColsCtx = struct {
+    part: *ch_part.Part,
+    fixed_col_map: []const usize, // slot -> part col_idx
+    str_col_map: []const usize,   // slot -> part col_idx
+};
+
+fn chAllFixedBatch(ctx: CHAllColsCtx, slot_start: usize, batches: []const []const i64) anyerror!void {
+    for (ctx.fixed_col_map[slot_start..][0..batches.len], batches) |col_idx, batch| {
+        try ctx.part.appendFixedBatch(col_idx, batch);
+    }
+}
+
+fn chAllStrValue(ctx: CHAllColsCtx, slot: usize, value: []const u8) anyerror!void {
+    try ctx.part.appendStrOne(ctx.str_col_map[slot], value);
+}
+
+/// Scan a Parquet file using the CH import path (streamAllColumnsPath),
+/// but discard all data — only count rows and verify all columns decode OK.
+/// Prints progress every 1M rows.
+pub fn scanParquet(
     allocator: std.mem.Allocator,
     io: std.Io,
     parquet_path: []const u8,
-    part: *ch_part.Part,
-    col_idx: usize,
-) !void {
-    const ctx = CHFixedCtx(T){ .part = part, .col_idx = col_idx };
-    _ = try parquet.streamFixedColumnPath(
+    table: schema.Table,
+) !u64 {
+    // Build separate index lists for fixed vs string columns.
+    var fixed_indices: std.ArrayListUnmanaged(usize) = .empty;
+    defer fixed_indices.deinit(allocator);
+    var str_indices: std.ArrayListUnmanaged(usize) = .empty;
+    defer str_indices.deinit(allocator);
+
+    for (table.columns, 0..) |col, col_idx| {
+        switch (col.ty) {
+            .text, .char => try str_indices.append(allocator, col_idx),
+            else => try fixed_indices.append(allocator, col_idx),
+        }
+    }
+
+    var ctx = ScanCtx{ .rows = 0, .str_cols = str_indices.items.len };
+
+    const total = try parquet.streamAllColumnsPath(
         allocator,
         io,
         parquet_path,
-        col_idx,
-        null,
-        ctx,
-        chFixedBatch(T),
+        fixed_indices.items,
+        str_indices.items,
+        &ctx,
+        scanFixedBatch,
+        scanStrValue,
     );
+
+    return total;
 }
 
-fn CHFixedCtx(comptime T: type) type {
-    _ = T;
-    return struct { part: *ch_part.Part, col_idx: usize };
+const ScanCtx = struct {
+    rows: u64,
+    str_cols: usize,
+    str_in_row: usize = 0,
+};
+
+fn scanFixedBatch(ctx: *ScanCtx, slot_start: usize, batches: []const []const i64) anyerror!void {
+    _ = slot_start;
+    if (batches.len == 0) return;
+    const n = batches[0].len;
+    ctx.rows += n;
+    if (ctx.rows % 1_000_000 < n) {
+        std.debug.print("  scanned {}M rows...\n", .{ctx.rows / 1_000_000});
+    }
 }
 
-fn chFixedBatch(comptime T: type) fn (CHFixedCtx(T), []const i64) anyerror!void {
-    return struct {
-        fn cb(ctx: CHFixedCtx(T), values: []const i64) anyerror!void {
-            try ctx.part.appendFixedBatch(ctx.col_idx, values);
-        }
-    }.cb;
+fn scanStrValue(ctx: *ScanCtx, slot: usize, value: []const u8) anyerror!void {
+    _ = ctx;
+    _ = slot;
+    _ = value;
 }
+
 
 fn importCHStringColumn(
     allocator: std.mem.Allocator,
@@ -151,20 +225,10 @@ fn importCHStringColumn(
     col_idx: usize,
     total_rows: u64,
 ) !void {
-    // Collect all strings into memory, then feed to Part.
-    // TODO: streaming approach for very large string columns.
-    const strings = try allocator.alloc([]u8, total_rows);
-    defer {
-        for (strings) |s| allocator.free(s);
-        allocator.free(strings);
-    }
-
-    var row_idx: usize = 0;
-    const ctx = CHStrCollectCtx{
-        .allocator = allocator,
-        .strings = strings,
-        .row = &row_idx,
-    };
+    // Stream strings directly into the Part one-by-one to avoid buffering
+    // all rows in memory (critical for large datasets like 10M-row hits.parquet).
+    _ = total_rows;
+    const ctx = CHStrStreamCtx{ .part = part, .col_idx = col_idx };
     _ = try parquet.streamByteArrayColumnPath(
         allocator,
         io,
@@ -172,27 +236,17 @@ fn importCHStringColumn(
         col_idx,
         null,
         ctx,
-        chCollectStr,
+        chStreamStr,
     );
-
-    // Build const-slice view
-    const const_strings = try allocator.alloc([]const u8, total_rows);
-    defer allocator.free(const_strings);
-    for (strings, const_strings) |s, *cs| cs.* = s;
-
-    try part.appendStrBatch(col_idx, const_strings);
 }
 
-const CHStrCollectCtx = struct {
-    allocator: std.mem.Allocator,
-    strings: [][]u8,
-    row: *usize,
+const CHStrStreamCtx = struct {
+    part: *ch_part.Part,
+    col_idx: usize,
 };
 
-fn chCollectStr(ctx: CHStrCollectCtx, value: []const u8) anyerror!void {
-    std.debug.print("[chCollectStr] row={d} len={d} val={s}\n", .{ctx.row.*, value.len, value});
-    ctx.strings[ctx.row.*] = try ctx.allocator.dupe(u8, value);
-    ctx.row.* += 1;
+fn chStreamStr(ctx: CHStrStreamCtx, value: []const u8) anyerror!void {
+    try ctx.part.appendStrOne(ctx.col_idx, value);
 }
 
 // ── Column import ─────────────────────────────────────────────────────────────

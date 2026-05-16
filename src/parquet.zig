@@ -2241,3 +2241,137 @@ test "rle bit-packed decoder" {
     try std.testing.expectEqual(@as(usize, 5), try decoder.next());
     for (0..8) |i| try std.testing.expectEqual(i, try decoder.next());
 }
+
+// ── streamAllColumnsPath ──────────────────────────────────────────────────────
+//
+// streamAllColumnsPath: row-group-aware multi-column import.
+//
+// For each row group, processes fixed columns in batches of FIXED_BATCH_COLS,
+// then string columns one at a time.  Each sub-pass seeks back to the same
+// row group region, so the OS page cache keeps it hot.
+//
+// Memory per row group: max(FIXED_BATCH_COLS * dict, 1 string dict) — much
+// lower than holding all 105 column iterators simultaneously.
+//
+// Callbacks:
+//   fixed_cb(context, batches: []const []const i64)
+//     — one entry per column in the current fixed sub-batch (≤ FIXED_BATCH_COLS)
+//   str_cb(context, slot: usize, value: []const u8)
+//     — called once per (row, string-column); slot = index into str_col_indices
+pub fn streamAllColumnsPath(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    fixed_col_indices: []const usize,
+    str_col_indices: []const usize,
+    context: anytype,
+    fixed_cb: anytype,
+    str_cb: anytype,
+) !usize {
+    const BATCH: usize = 4096;
+    const FIXED_BATCH_COLS: usize = 8; // iterators open at once for fixed cols
+
+    var file = if (std.fs.path.isAbsolute(path))
+        try std.Io.Dir.openFileAbsolute(io, path, .{})
+    else
+        try std.Io.Dir.cwd().openFile(io, path, .{});
+    defer file.close(io);
+
+    const stat = try file.stat(io);
+    var loaded = try readMetadataFromFile(allocator, io, &file, stat.size);
+    defer loaded.deinit();
+    const meta = loaded.meta;
+    if (meta.row_groups.len == 0) return error.InvalidParquetMetadata;
+    const n_cols = meta.row_groups[0].columns.len;
+
+    // Validate and determine widths for fixed columns
+    const fixed_widths = try allocator.alloc(usize, fixed_col_indices.len);
+    defer allocator.free(fixed_widths);
+    for (fixed_col_indices, 0..) |ci, i| {
+        if (ci >= n_cols) return error.InvalidColumn;
+        const t = meta.row_groups[0].columns[ci].type_ orelse return error.InvalidParquetMetadata;
+        fixed_widths[i] = switch (t) {
+            1 => 4,
+            2 => 8,
+            else => return error.UnsupportedParquetType,
+        };
+    }
+
+    const header_buf = try allocator.alloc(u8, 64 * 1024);
+    defer allocator.free(header_buf);
+
+    // Value buffer for one sub-batch of fixed cols: FIXED_BATCH_COLS * BATCH i64s
+    const flat_buf = try allocator.alloc(i64, FIXED_BATCH_COLS * BATCH);
+    defer allocator.free(flat_buf);
+    const batches = try allocator.alloc([]const i64, FIXED_BATCH_COLS);
+    defer allocator.free(batches);
+
+    // Fixed iterators for current sub-batch
+    const fix_iters = try allocator.alloc(FixedDictColumnIterator, FIXED_BATCH_COLS);
+    defer allocator.free(fix_iters);
+
+    var total_count: usize = 0;
+
+    for (meta.row_groups) |rg| {
+        const rows_in_group: usize = @intCast(@max(rg.num_rows, 0));
+        if (rows_in_group == 0) continue;
+
+        // ── Fixed columns: process in sub-batches of FIXED_BATCH_COLS ─────────
+        var fi: usize = 0;
+        while (fi < fixed_col_indices.len) {
+            const fe = @min(fi + FIXED_BATCH_COLS, fixed_col_indices.len);
+            const sub = fixed_col_indices[fi..fe];
+            const sub_widths = fixed_widths[fi..fe];
+            const n = fe - fi;
+
+            // Init iterators for this sub-batch
+            var init_count: usize = 0;
+            errdefer for (fix_iters[0..init_count]) |*it| it.deinit();
+            for (sub, 0..) |ci, i| {
+                if (ci >= rg.columns.len) return error.InvalidColumn;
+                fix_iters[i] = try FixedDictColumnIterator.init(
+                    allocator, io, &file, stat.size, rg.columns[ci], sub_widths[i], header_buf,
+                );
+                init_count += 1;
+            }
+
+            // Stream rows in BATCH chunks
+            var group_done: usize = 0;
+            while (group_done < rows_in_group) {
+                const want = @min(BATCH, rows_in_group - group_done);
+                for (fix_iters[0..n], 0..) |*it, i| {
+                    const buf = flat_buf[i * BATCH ..][0..want];
+                    const got = try it.next(buf);
+                    if (got != want) return error.InvalidParquetMetadata;
+                    batches[i] = buf;
+                }
+                try fixed_cb(context, fi, batches[0..n]);
+                group_done += want;
+            }
+
+            for (fix_iters[0..init_count]) |*it| it.deinit();
+            fi = fe;
+        }
+
+        // ── String columns: one iterator at a time ───────────────────────────
+        for (str_col_indices, 0..) |ci, slot| {
+            if (ci >= rg.columns.len) return error.InvalidColumn;
+            const col = rg.columns[ci];
+            if ((col.type_ orelse -1) != 6) return error.UnsupportedParquetType;
+            var iter = try ByteArrayColumnIterator.init(
+                allocator, io, &file, stat.size, col, header_buf,
+            );
+            defer iter.deinit();
+
+            for (0..rows_in_group) |_| {
+                const val = (try iter.next()) orelse return error.InvalidParquetMetadata;
+                try str_cb(context, slot, val);
+            }
+        }
+
+        // Only count rows once (fixed pass drives the count)
+        total_count += rows_in_group;
+    }
+
+    return total_count;
+}

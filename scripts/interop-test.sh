@@ -25,7 +25,7 @@ zig build
 
 echo "=== Step 2: import fixture ==="
 rm -rf "$STORE_DIR"
-$ZH import-parquet --format=ch "$FIXTURE" "$STORE_DIR" "$TABLE"
+$ZH import-parquet --format=ch --pk=WatchID "$FIXTURE" "$STORE_DIR" "$TABLE"
 
 echo "=== Step 3: create table in CH ==="
 ch "DROP TABLE IF EXISTS default.$TABLE"
@@ -202,9 +202,41 @@ else
     FAIL=1
 fi
 
+echo "=== Step 8: Verify WHERE queries (primary index granule skipping regression) ==="
+# Regression: pk_col_idx mismatch caused CANNOT_READ_ALL_DATA when CH used
+# primary.idx for granule skipping.  Any WHERE on any column must not crash.
+
+check_where() {
+    local desc="$1"
+    local query="$2"
+    local result
+    if result=$(ch "$query" 2>&1); then
+        echo "  PASS $desc"
+    else
+        echo "  FAIL $desc: $result"
+        FAIL=1
+    fi
+}
+
+# WHERE on PK column (triggers granule skipping via primary.idx)
+check_where "WHERE WatchID > 0" \
+    "SELECT count() FROM default.$TABLE WHERE WatchID > 0"
+
+# WHERE on non-PK fixed column (full scan, no skipping)
+check_where "WHERE CounterID >= 0" \
+    "SELECT count() FROM default.$TABLE WHERE CounterID >= 0"
+
+# WHERE on String column
+check_where "WHERE Title != ''" \
+    "SELECT count() FROM default.$TABLE WHERE Title != ''"
+
+# WHERE + aggregation mixing fixed and string columns
+check_where "WHERE + mixed aggregation" \
+    "SELECT sum(length(URL)), min(EventDate) FROM default.$TABLE WHERE WatchID > 0"
+
 if [ "$FAIL" = "1" ]; then
     echo "FAIL: one or more column value checks failed"
     exit 1
 fi
 
-echo "PASS: interop test succeeded (row count + all column values correct)"
+echo "PASS: interop test succeeded (row count + all column values + WHERE queries correct)"

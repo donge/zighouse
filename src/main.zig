@@ -36,7 +36,7 @@ const usage =
     \\  zighouse parquet-page-inspect <hits.parquet> <row_group> <column> [max_pages]
     \\  zighouse parquet-decode-fixed <hits.parquet> <row_group> <column> [limit_values]
     \\  zighouse parquet-decode-byte-array <hits.parquet> <row_group> <column> [limit_values]
-    \\  zighouse parquet-scan-fixed <hits.parquet> <column> [limit_rows]
+    \\  zighouse parquet-scan-all <hits.parquet> <table_name>
     \\  zighouse parquet-scan-byte-array <hits.parquet> <column> [limit_rows]
     \\  zighouse duckdb-vector-smoke <hits.parquet> [limit_rows]
     \\  zighouse import-hot-extra <hits.parquet> <data_dir>
@@ -153,14 +153,23 @@ fn runCommand(init: std.process.Init, allocator: std.mem.Allocator, args: *std.p
         try printOut(init.io, "imported hot columns {s} -> {s}\n", .{ parquet_path, data_dir });
      } else if (std.mem.eql(u8, command, "import-parquet")) {
         // Generic Parquet import: infer schema, write generic_part store, write catalog manifest.
-        // Usage: zighouse import-parquet [--format=<generic|ch>] <parquet_path> <store_dir> <table_name>
+        // Usage: zighouse import-parquet [--format=<generic|ch>] [--pk=<col>] <parquet_path> <store_dir> <table_name>
         var format: enum { generic, ch } = .generic;
+        var pk_col_name: ?[]const u8 = null;
         const parquet_path = blk: {
-            const first = args.next() orelse return error.MissingParquetPath;
-            if (std.mem.startsWith(u8, first, "--format=")) {
-                const fmt = first["--format=".len..];
-                if (std.mem.eql(u8, fmt, "ch")) format = .ch;
-                break :blk args.next() orelse return error.MissingParquetPath;
+            var first = args.next() orelse return error.MissingParquetPath;
+            // Parse optional flags before positional args
+            while (true) {
+                if (std.mem.startsWith(u8, first, "--format=")) {
+                    const fmt = first["--format=".len..];
+                    if (std.mem.eql(u8, fmt, "ch")) format = .ch;
+                    first = args.next() orelse return error.MissingParquetPath;
+                } else if (std.mem.startsWith(u8, first, "--pk=")) {
+                    pk_col_name = first["--pk=".len..];
+                    first = args.next() orelse return error.MissingParquetPath;
+                } else {
+                    break;
+                }
             }
             break :blk first;
         };
@@ -170,7 +179,7 @@ fn runCommand(init: std.process.Init, allocator: std.mem.Allocator, args: *std.p
         defer inferred.deinit();
         const row_count = switch (format) {
             .generic => try loader.importParquet(allocator, init.io, parquet_path, store_dir, inferred.table),
-            .ch => try loader.importParquetCH(allocator, init.io, parquet_path, store_dir, inferred.table),
+            .ch => try loader.importParquetCH(allocator, init.io, parquet_path, store_dir, inferred.table, pk_col_name),
         };
         const part_fmt: catalog.PartFormat = switch (format) {
             .generic => .generic,
@@ -295,6 +304,29 @@ fn runCommand(init: std.process.Init, allocator: std.mem.Allocator, args: *std.p
         const output = try parquet.decodeFixedDictionaryPath(allocator, init.io, parquet_path, row_group, column, limit_values);
         defer allocator.free(output);
         try writeOut(init.io, output);
+    } else if (std.mem.eql(u8, command, "parquet-scan-all")) {
+        const parquet_path = args.next() orelse return error.MissingParquetPath;
+        const table_name = args.next() orelse return error.MissingTableName;
+        var inferred = try schema_infer.inferSchema(allocator, init.io, parquet_path, table_name);
+        defer inferred.deinit();
+        const t0 = wallNow();
+        std.debug.print("scanning {s}: {} cols ({} fixed, {} string)\n", .{
+            parquet_path,
+            inferred.table.columns.len,
+            blk: {
+                var n: usize = 0;
+                for (inferred.table.columns) |c| if (c.ty != .text and c.ty != .char) { n += 1; };
+                break :blk n;
+            },
+            blk: {
+                var n: usize = 0;
+                for (inferred.table.columns) |c| if (c.ty == .text or c.ty == .char) { n += 1; };
+                break :blk n;
+            },
+        });
+        const rows = try loader.scanParquet(allocator, init.io, parquet_path, inferred.table);
+        const elapsed_ms = @divTrunc(wallNow() - t0, 1_000_000);
+        std.debug.print("done: {} rows in {}ms\n", .{ rows, elapsed_ms });
     } else if (std.mem.eql(u8, command, "parquet-decode-byte-array")) {
         const parquet_path = args.next() orelse return error.MissingParquetPath;
         const row_group = try std.fmt.parseInt(usize, args.next() orelse return error.MissingRowGroup, 10);
