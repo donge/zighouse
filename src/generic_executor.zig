@@ -23,8 +23,8 @@
 /// the first pass and then referenced by index for filter and projection.
 
 const std = @import("std");
-const generic_sql = @import("generic_sql.zig");
-const parquet = @import("parquet.zig");
+const generic_sql = @import("generic_sql");
+const parquet = @import("parquet");
 const clickbench_schema = schema.clickbench;
 const schema = @import("schema");
 const build_options = @import("build_options");
@@ -39,6 +39,9 @@ pub const Source = union(enum) {
     /// Read from a CH MergeTree part directory (ZigHouse path).
     /// The string is the part directory path (e.g. `<store>/<table>/parts/all_1_1_0`).
     ch_part: []const u8,
+    /// Read from multiple CH MergeTree part directories (multi-part ZigHouse path).
+    /// Rows are streamed sequentially across all parts.
+    ch_parts: []const []const u8,
 };
 
 // ── Public entry points ───────────────────────────────────────────────────────
@@ -441,6 +444,11 @@ const Executor = struct {
         switch (self.source) {
             .parquet => |path| return self.streamRowsParquet(path, needed, context, callback),
             .ch_part => |part_dir| return self.streamRowsChPart(part_dir, needed, context, callback),
+            .ch_parts => |part_dirs| {
+                for (part_dirs) |part_dir| {
+                    try self.streamRowsChPart(part_dir, needed, context, callback);
+                }
+            },
         }
     }
 

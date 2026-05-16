@@ -1,5 +1,5 @@
 const std = @import("std");
-const generic_sql = @import("../generic_sql.zig");
+const generic_sql = @import("generic_sql");
 
 pub const Fallback = union(enum) {
     client_ip_agg_top: ClientIpAggTop,

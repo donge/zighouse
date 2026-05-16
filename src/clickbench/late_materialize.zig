@@ -16,7 +16,7 @@ const build_options = @import("build_options");
 const duckdb = if (build_options.duckdb) @import("../duckdb.zig") else @import("../duckdb_stub.zig");
 const io_map = @import("../io_map.zig");
 const native_group = @import("../exec/group.zig");
-const parquet = @import("../parquet.zig");
+const parquet = @import("parquet");
 const storage = @import("../storage.zig");
 
 pub const UrlHashCount = native_group.UrlHashCount;

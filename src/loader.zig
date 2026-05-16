@@ -21,7 +21,7 @@
 /// compatible table from the same file.
 
 const std = @import("std");
-const parquet = @import("parquet.zig");
+const parquet = @import("parquet");
 const schema = @import("schema");
 const generic_store = @import("generic_store.zig");
 const ch_part = @import("ch_part");

@@ -22,6 +22,9 @@ pub fn build(b: *std.Build) void {
     options.addOption(bool, "duckdb", enable_duckdb);
     const fixture_parquet_path = b.fmt("{s}/data/fixture_hits.parquet", .{b.build_root.path orelse "."});
     options.addOption([]const u8, "fixture_parquet_path", fixture_parquet_path);
+    // Single shared module for build_options to avoid duplicate-module errors
+    // when generic_executor_mod / generic_sql_mod are imported into exe.root_module.
+    const options_mod = options.createModule();
 
     // Shared schema module (used by clickhouse_format test targets)
     const schema_mod = b.createModule(.{
@@ -41,7 +44,7 @@ pub fn build(b: *std.Build) void {
     if (b.option(bool, "strip", "Strip debug symbols from installed executable") orelse false) {
         exe.root_module.strip = true;
     }
-    exe.root_module.addOptions("build_options", options);
+    exe.root_module.addImport("build_options", options_mod);
     exe.root_module.link_libc = true;
     if (enable_duckdb) {
         const duckdb_include = b.fmt("{s}/include", .{duckdb_prefix});
@@ -70,7 +73,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
-    unit_tests.root_module.addOptions("build_options", options);
+    unit_tests.root_module.addImport("build_options", options_mod);
     unit_tests.root_module.link_libc = true;
     if (enable_duckdb) {
         const duckdb_include = b.fmt("{s}/include", .{duckdb_prefix});
@@ -134,7 +137,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
-    generic_sql_tests.root_module.addOptions("build_options", options);
+    generic_sql_tests.root_module.addImport("build_options", options_mod);
     generic_sql_tests.root_module.link_libc = true;
     if (enable_duckdb) {
         const duckdb_include = b.fmt("{s}/include", .{duckdb_prefix});
@@ -180,7 +183,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
-    generic_executor_tests.root_module.addOptions("build_options", options);
+    generic_executor_tests.root_module.addImport("build_options", options_mod);
     generic_executor_tests.root_module.link_libc = true;
     if (enable_duckdb) {
         const duckdb_include = b.fmt("{s}/include", .{duckdb_prefix});
@@ -212,6 +215,30 @@ pub fn build(b: *std.Build) void {
     generic_store_tests.root_module.link_libc = true;
     const generic_store_test_cmd = b.addRunArtifact(generic_store_tests);
 
+    // parquet_mod: used by loader, schema_infer, native, main, and generic_executor
+    const parquet_mod = b.createModule(.{
+        .root_source_file = b.path("src/parquet.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // generic_sql_mod: named module for generic_executor and ingest_server
+    const generic_sql_mod = b.createModule(.{
+        .root_source_file = b.path("src/generic_sql.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    generic_sql_mod.addImport("build_options", options_mod);
+    generic_sql_mod.link_libc = true;
+    if (enable_duckdb) {
+        const duckdb_include_path = b.fmt("{s}/include", .{duckdb_prefix});
+        const duckdb_lib_path = b.fmt("{s}/lib", .{duckdb_prefix});
+        generic_sql_mod.addIncludePath(.{ .cwd_relative = duckdb_include_path });
+        generic_sql_mod.addLibraryPath(.{ .cwd_relative = duckdb_lib_path });
+        generic_sql_mod.addRPath(.{ .cwd_relative = duckdb_lib_path });
+        generic_sql_mod.linkSystemLibrary("duckdb", .{});
+    }
+
     const loader_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/loader.zig"),
@@ -220,6 +247,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     loader_tests.root_module.link_libc = true;
+    loader_tests.root_module.addImport("parquet", parquet_mod);
     const loader_test_cmd = b.addRunArtifact(loader_tests);
 
     // ── clickhouse_format tests ─────────────────────────────────────────────
@@ -361,12 +389,145 @@ pub fn build(b: *std.Build) void {
     // Other test targets that use @import("schema") but not ch_part/lz4:
     generic_executor_tests.root_module.addImport("schema", schema_mod);
     generic_executor_tests.root_module.addImport("ch_part", ch_part_mod);
+    generic_executor_tests.root_module.addImport("generic_sql", generic_sql_mod);
+    generic_executor_tests.root_module.addImport("parquet", parquet_mod);
     generic_executor_tests.root_module.addIncludePath(.{ .cwd_relative = lz4_include });
     generic_executor_tests.root_module.addLibraryPath(.{ .cwd_relative = lz4_lib });
     generic_executor_tests.root_module.addRPath(.{ .cwd_relative = lz4_lib });
     generic_executor_tests.root_module.linkSystemLibrary("lz4", .{});
     schema_infer_tests.root_module.addImport("schema", schema_mod);
+    schema_infer_tests.root_module.addImport("parquet", parquet_mod);
     generic_store_tests.root_module.addImport("schema", schema_mod);
+
+    // ── ingest module tests ─────────────────────────────────────────────────
+    const row_binary_decoder_mod = b.createModule(.{
+        .root_source_file = b.path("src/ingest/row_binary_decoder.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    row_binary_decoder_mod.addImport("schema", schema_mod);
+    const row_binary_decoder_tests = b.addTest(.{ .root_module = row_binary_decoder_mod });
+    const row_binary_decoder_test_cmd = b.addRunArtifact(row_binary_decoder_tests);
+
+    const schema_config_mod = b.createModule(.{
+        .root_source_file = b.path("src/ingest/schema_config.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    schema_config_mod.addImport("schema", schema_mod);
+    const schema_config_tests = b.addTest(.{ .root_module = schema_config_mod });
+    const schema_config_test_cmd = b.addRunArtifact(schema_config_tests);
+
+    const part_writer_session_mod = b.createModule(.{
+        .root_source_file = b.path("src/ingest/part_writer_session.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    part_writer_session_mod.addImport("schema", schema_mod);
+    part_writer_session_mod.addImport("ch_part", ch_part_mod);
+    part_writer_session_mod.addImport("row_binary_decoder", row_binary_decoder_mod);
+    part_writer_session_mod.link_libc = true;
+    part_writer_session_mod.addIncludePath(.{ .cwd_relative = lz4_include });
+    part_writer_session_mod.addLibraryPath(.{ .cwd_relative = lz4_lib });
+    part_writer_session_mod.addRPath(.{ .cwd_relative = lz4_lib });
+    part_writer_session_mod.linkSystemLibrary("lz4", .{});
+    const part_writer_session_tests = b.addTest(.{ .root_module = part_writer_session_mod });
+    const part_writer_session_test_cmd = b.addRunArtifact(part_writer_session_tests);
+
+    const schema_persist_mod = b.createModule(.{
+        .root_source_file = b.path("src/ingest/schema_persist.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    schema_persist_mod.addImport("schema", schema_mod);
+    schema_persist_mod.addImport("schema_config", schema_config_mod);
+    const schema_persist_tests = b.addTest(.{ .root_module = schema_persist_mod });
+    const schema_persist_test_cmd = b.addRunArtifact(schema_persist_tests);
+
+    const part_scanner_mod = b.createModule(.{
+        .root_source_file = b.path("src/ingest/part_scanner.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const part_scanner_tests = b.addTest(.{ .root_module = part_scanner_mod });
+    const part_scanner_test_cmd = b.addRunArtifact(part_scanner_tests);
+
+    // generic_sql and generic_executor as named modules for server dependency.
+    const generic_executor_mod = b.createModule(.{
+        .root_source_file = b.path("src/generic_executor.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    generic_executor_mod.addImport("build_options", options_mod);
+    generic_executor_mod.link_libc = true;
+    generic_executor_mod.addImport("schema", schema_mod);
+    generic_executor_mod.addImport("ch_part", ch_part_mod);
+    generic_executor_mod.addImport("generic_sql", generic_sql_mod);
+    generic_executor_mod.addImport("parquet", parquet_mod);
+    generic_executor_mod.addIncludePath(.{ .cwd_relative = lz4_include });
+    generic_executor_mod.addLibraryPath(.{ .cwd_relative = lz4_lib });
+    generic_executor_mod.addRPath(.{ .cwd_relative = lz4_lib });
+    generic_executor_mod.linkSystemLibrary("lz4", .{});
+    if (enable_duckdb) {
+        const duckdb_include_path = b.fmt("{s}/include", .{duckdb_prefix});
+        const duckdb_lib_path = b.fmt("{s}/lib", .{duckdb_prefix});
+        generic_executor_mod.addIncludePath(.{ .cwd_relative = duckdb_include_path });
+        generic_executor_mod.addLibraryPath(.{ .cwd_relative = duckdb_lib_path });
+        generic_executor_mod.addRPath(.{ .cwd_relative = duckdb_lib_path });
+        generic_executor_mod.linkSystemLibrary("duckdb", .{});
+    }
+
+    const ddl_parser_mod = b.createModule(.{
+        .root_source_file = b.path("src/ingest/ddl_parser.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    ddl_parser_mod.addImport("schema", schema_mod);
+    ddl_parser_mod.addImport("schema_config", schema_config_mod);
+    const ddl_parser_tests = b.addTest(.{ .root_module = ddl_parser_mod });
+    const ddl_parser_test_cmd = b.addRunArtifact(ddl_parser_tests);
+
+    const ingest_server_mod = b.createModule(.{
+        .root_source_file = b.path("src/ingest/server.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    ingest_server_mod.addImport("schema", schema_mod);
+    ingest_server_mod.addImport("schema_config", schema_config_mod);
+    ingest_server_mod.addImport("schema_persist", schema_persist_mod);
+    ingest_server_mod.addImport("part_scanner", part_scanner_mod);
+    ingest_server_mod.addImport("row_binary_decoder", row_binary_decoder_mod);
+    ingest_server_mod.addImport("part_writer_session", part_writer_session_mod);
+    ingest_server_mod.addImport("generic_executor", generic_executor_mod);
+    ingest_server_mod.addImport("generic_sql", generic_sql_mod);
+    ingest_server_mod.addImport("ddl_parser", ddl_parser_mod);
+    ingest_server_mod.link_libc = true;
+    ingest_server_mod.addIncludePath(.{ .cwd_relative = lz4_include });
+    ingest_server_mod.addLibraryPath(.{ .cwd_relative = lz4_lib });
+    ingest_server_mod.addRPath(.{ .cwd_relative = lz4_lib });
+    ingest_server_mod.linkSystemLibrary("lz4", .{});
+    if (enable_duckdb) {
+        const duckdb_include_path = b.fmt("{s}/include", .{duckdb_prefix});
+        const duckdb_lib_path = b.fmt("{s}/lib", .{duckdb_prefix});
+        ingest_server_mod.addIncludePath(.{ .cwd_relative = duckdb_include_path });
+        ingest_server_mod.addLibraryPath(.{ .cwd_relative = duckdb_lib_path });
+        ingest_server_mod.addRPath(.{ .cwd_relative = duckdb_lib_path });
+        ingest_server_mod.linkSystemLibrary("duckdb", .{});
+    }
+    const ingest_server_tests = b.addTest(.{ .root_module = ingest_server_mod });
+    const ingest_server_test_cmd = b.addRunArtifact(ingest_server_tests);
+
+    // Wire ingest modules into main exe and unit tests
+    exe.root_module.addImport("ingest_server", ingest_server_mod);
+    exe.root_module.addImport("ingest_schema_config", schema_config_mod);
+    exe.root_module.addImport("generic_executor", generic_executor_mod);
+    exe.root_module.addImport("generic_sql", generic_sql_mod);
+    exe.root_module.addImport("parquet", parquet_mod);
+    unit_tests.root_module.addImport("ingest_server", ingest_server_mod);
+    unit_tests.root_module.addImport("ingest_schema_config", schema_config_mod);
+    unit_tests.root_module.addImport("generic_executor", generic_executor_mod);
+    unit_tests.root_module.addImport("generic_sql", generic_sql_mod);
+    unit_tests.root_module.addImport("parquet", parquet_mod);
 
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&test_cmd.step);
@@ -392,6 +553,13 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&ch_checksums_test_cmd.step);
     test_step.dependOn(&ch_string_codec_test_cmd.step);
     test_step.dependOn(&ch_part_test_cmd.step);
+    test_step.dependOn(&row_binary_decoder_test_cmd.step);
+    test_step.dependOn(&schema_config_test_cmd.step);
+    test_step.dependOn(&schema_persist_test_cmd.step);
+    test_step.dependOn(&part_scanner_test_cmd.step);
+    test_step.dependOn(&part_writer_session_test_cmd.step);
+    test_step.dependOn(&ddl_parser_test_cmd.step);
+    test_step.dependOn(&ingest_server_test_cmd.step);
 
     if (!install_bench_tools) return;
 

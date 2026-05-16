@@ -5,10 +5,10 @@ const clickbench_schema = schema.clickbench;
 const catalog = @import("catalog.zig");
 const schema_infer = @import("schema_infer.zig");
 const loader = @import("loader.zig");
-const generic_executor = @import("generic_executor.zig");
-const generic_sql = @import("generic_sql.zig");
+const generic_executor = @import("generic_executor");
+const generic_sql = @import("generic_sql");
 const duckdb = if (build_options.duckdb) @import("duckdb.zig") else @import("duckdb_stub.zig");
-const parquet = @import("parquet.zig");
+const parquet = @import("parquet");
 const storage = @import("storage.zig");
 const schema = @import("schema");
 const bind = @import("exec/bind.zig");
@@ -24,6 +24,7 @@ const usage =
     \\  zighouse import <hits.parquet> <data_dir>
     \\  zighouse import-hot <hits.parquet> <data_dir>
     \\  zighouse import-parquet [--format=generic|ch|ch-http] [--pk=<col>] <parquet_path> <store_dir> <table_name>
+    \\  zighouse serve --data-dir=<dir> [--schemas=<schemas.json>] [--port=<port>]
     \\  zighouse generic-query <store_dir> <table_name> <sql>
     \\  zighouse import-clickbench-csv-hot <hits.csv> <data_dir>
     \\  zighouse import-clickbench-parquet-hot <hits.parquet> <data_dir> [limit_rows]
@@ -605,6 +606,40 @@ fn runCommand(init: std.process.Init, allocator: std.mem.Allocator, args: *std.p
         var selected = backend.Backend.init(allocator, init.io, data_dir, options);
         defer selected.deinit();
         try selected.bench(queries_path, .{ .first = first, .limit = limit });
+    } else if (std.mem.eql(u8, command, "serve")) {
+        // HTTP RowBinary ingest + query server.
+        // Usage: zighouse serve --data-dir=<dir> [--schemas=<schemas.json>] [--port=<port>]
+        //
+        // Schemas are auto-loaded from <data_dir>/<db>/<table>/schema.json on startup.
+        // Use --schemas to seed new tables before any data has been written.
+        var data_dir: ?[]const u8 = null;
+        var schemas_path: ?[]const u8 = null;
+        var port: u16 = 8123;
+        while (args.next()) |flag| {
+            if (std.mem.startsWith(u8, flag, "--data-dir=")) {
+                data_dir = flag["--data-dir=".len..];
+            } else if (std.mem.startsWith(u8, flag, "--schemas=")) {
+                schemas_path = flag["--schemas=".len..];
+            } else if (std.mem.startsWith(u8, flag, "--port=")) {
+                port = std.fmt.parseInt(u16, flag["--port=".len..], 10) catch return error.InvalidPort;
+            }
+        }
+        const dd = data_dir orelse return error.MissingDataDir;
+        const ingest_server = @import("ingest_server");
+        const ingest_schema_config = @import("ingest_schema_config");
+        // Optional: load extra schemas from --schemas file.
+        var extra_cfg: ?ingest_schema_config.SchemaConfig = null;
+        defer if (extra_cfg) |*c| c.deinit();
+        if (schemas_path) |sp| {
+            extra_cfg = try ingest_schema_config.loadFromFile(allocator, init.io, sp);
+        }
+        var srv = try ingest_server.Server.init(allocator, init.io, .{
+            .data_dir = dd,
+            .port = port,
+            .extra_schemas = if (extra_cfg) |*c| c else null,
+        });
+        defer srv.deinit();
+        try srv.run();
     } else if (std.mem.eql(u8, command, "help") or std.mem.eql(u8, command, "--help") or std.mem.eql(u8, command, "-h")) {
         try printUsage(init.io);
     } else {

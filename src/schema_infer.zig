@@ -24,7 +24,7 @@
 /// `allocator`.  Free with `freeInferredSchema`.
 
 const std = @import("std");
-const parquet = @import("parquet.zig");
+const parquet = @import("parquet");
 const schema = @import("schema");
 
 // Parquet physical type constants (Thrift enum order)

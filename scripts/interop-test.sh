@@ -240,3 +240,327 @@ if [ "$FAIL" = "1" ]; then
 fi
 
 echo "PASS: interop test succeeded (row count + all column values + WHERE queries correct)"
+
+# ── Step 9: HTTP RowBinary ingest server integration test ──────────────────────
+echo ""
+echo "=== Step 9: zighouse serve RowBinary ingest ==="
+
+SERVE_PORT=19123
+SERVE_DATA=/tmp/zh_serve_test
+SERVE_TABLE=serve_test
+SERVE_DB=default
+SERVE_SCHEMA=/tmp/zh_serve_schema.json
+SERVE_PART_DIR="$SERVE_DATA/$SERVE_DB/$SERVE_TABLE/parts"
+
+# Create schemas JSON
+cat > "$SERVE_SCHEMA" <<'EOF'
+{
+  "tables": [
+    {
+      "db": "default",
+      "name": "serve_test",
+      "pk": "id",
+      "columns": [
+        {"name": "id",   "type": "Int32"},
+        {"name": "name", "type": "String"}
+      ]
+    }
+  ]
+}
+EOF
+
+# Clean previous run
+rm -rf "$SERVE_DATA"
+mkdir -p "$SERVE_DATA"
+
+# Start server in background
+$ZH serve --data-dir="$SERVE_DATA" --schemas="$SERVE_SCHEMA" --port="$SERVE_PORT" &
+SERVE_PID=$!
+trap "kill $SERVE_PID 2>/dev/null || true" EXIT
+
+# Wait for server to start
+sleep 0.5
+
+# Build a 2-row RowBinary payload: row1=(1,"alice"), row2=(2,"bob")
+# Int32 LE + varUInt(len) + bytes
+python3 - <<'PYEOF' > /tmp/zh_serve_payload.bin
+import struct, sys
+buf = b''
+# row 1: id=1, name="alice"
+buf += struct.pack('<i', 1)
+buf += bytes([5]) + b'alice'
+# row 2: id=2, name="bob"
+buf += struct.pack('<i', 2)
+buf += bytes([3]) + b'bob'
+sys.stdout.buffer.write(buf)
+PYEOF
+
+# Send to zighouse serve
+HTTP_RESP=$(curl -s -o /dev/null -w "%{http_code}" \
+    --data-binary @/tmp/zh_serve_payload.bin \
+    "http://127.0.0.1:$SERVE_PORT/?query=INSERT+INTO+default.serve_test+FORMAT+RowBinary")
+
+if [ "$HTTP_RESP" = "200" ]; then
+    echo "  PASS zighouse serve returned HTTP 200"
+else
+    echo "  FAIL zighouse serve returned HTTP $HTTP_RESP"
+    FAIL=1
+fi
+
+# Verify a part was created
+PART_COUNT=$(find "$SERVE_PART_DIR" -name "all_*_*_0" -type d 2>/dev/null | wc -l | tr -d ' ')
+if [ "$PART_COUNT" -ge "1" ]; then
+    echo "  PASS part directory created ($PART_COUNT part(s))"
+else
+    echo "  FAIL no part directories found under $SERVE_PART_DIR"
+    FAIL=1
+fi
+
+# Stop server
+kill $SERVE_PID 2>/dev/null || true
+trap - EXIT
+wait $SERVE_PID 2>/dev/null || true
+
+# Optionally: ATTACH the part to CH and verify via SELECT
+SERVE_PART_NAME=$(ls "$SERVE_PART_DIR" 2>/dev/null | head -1)
+if [ -n "$SERVE_PART_NAME" ]; then
+    ch "DROP TABLE IF EXISTS $SERVE_DB.$SERVE_TABLE"
+    ch "CREATE TABLE $SERVE_DB.$SERVE_TABLE (id Int32, name String) ENGINE = MergeTree() ORDER BY id SETTINGS min_bytes_for_wide_part=0, min_rows_for_wide_part=0"
+
+    DETACHED="$CH_DATA/$SERVE_TABLE/detached/$SERVE_PART_NAME"
+    docker exec sw_asdb mkdir -p "$DETACHED"
+    docker cp "$SERVE_PART_DIR/$SERVE_PART_NAME/." "sw_asdb:$DETACHED/"
+    docker exec sw_asdb chown -R clickhouse:clickhouse "$CH_DATA/$SERVE_TABLE/detached"
+    ch "ALTER TABLE $SERVE_DB.$SERVE_TABLE ATTACH PART '$SERVE_PART_NAME'"
+
+    SERVE_COUNT=$(ch "SELECT count() FROM $SERVE_DB.$SERVE_TABLE")
+    if [ "$SERVE_COUNT" = "2" ]; then
+        echo "  PASS serve_test row count = 2"
+    else
+        echo "  FAIL serve_test row count expected 2, got $SERVE_COUNT"
+        FAIL=1
+    fi
+
+    ALICE=$(ch "SELECT name FROM $SERVE_DB.$SERVE_TABLE WHERE id = 1")
+    if [ "$ALICE" = "alice" ]; then
+        echo "  PASS name='alice' for id=1"
+    else
+        echo "  FAIL name expected 'alice', got '$ALICE'"
+        FAIL=1
+    fi
+fi
+
+if [ "$FAIL" = "1" ]; then
+    echo "FAIL: one or more step 9 checks failed"
+    exit 1
+fi
+echo "PASS: step 9 (zighouse serve RowBinary ingest) succeeded"
+
+# ── Step 10: DDL CREATE TABLE via HTTP ─────────────────────────────────────────
+echo ""
+echo "=== Step 10: zighouse serve DDL CREATE TABLE ==="
+
+DDL_PORT=19124
+DDL_DATA=/tmp/zh_ddl_test
+DDL_DB=default
+DDL_TABLE=ddl_test
+DDL_PART_DIR="$DDL_DATA/$DDL_DB/$DDL_TABLE/parts"
+rm -rf "$DDL_DATA"
+mkdir -p "$DDL_DATA"
+
+$ZH serve --data-dir="$DDL_DATA" --port="$DDL_PORT" &
+DDL_PID=$!
+trap "kill $DDL_PID 2>/dev/null || true" EXIT
+sleep 0.5
+
+# Create table via DDL (pass query as URL parameter)
+DDL_SQL="CREATE TABLE IF NOT EXISTS $DDL_DB.$DDL_TABLE (id Int32, val String) ENGINE = MergeTree ORDER BY id"
+DDL_SQL_ENC=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "$DDL_SQL")
+DDL_RESP=$(curl -s -o /tmp/zh_ddl_resp.txt -w "%{http_code}" \
+    "http://127.0.0.1:$DDL_PORT/?query=$DDL_SQL_ENC")
+if [ "$DDL_RESP" = "200" ]; then
+    echo "  PASS CREATE TABLE returned HTTP 200"
+else
+    echo "  FAIL CREATE TABLE returned HTTP $DDL_RESP ($(cat /tmp/zh_ddl_resp.txt))"
+    FAIL=1
+fi
+
+# Idempotent: second CREATE TABLE should also return 200
+DDL_RESP2=$(curl -s -o /dev/null -w "%{http_code}" \
+    "http://127.0.0.1:$DDL_PORT/?query=$DDL_SQL_ENC")
+if [ "$DDL_RESP2" = "200" ]; then
+    echo "  PASS idempotent CREATE TABLE returned HTTP 200"
+else
+    echo "  FAIL idempotent CREATE TABLE returned HTTP $DDL_RESP2"
+    FAIL=1
+fi
+
+# Verify schema.json was persisted
+SCHEMA_FILE="$DDL_DATA/$DDL_DB/$DDL_TABLE/schema.json"
+if [ -f "$SCHEMA_FILE" ]; then
+    echo "  PASS schema.json persisted"
+else
+    echo "  FAIL schema.json not found at $SCHEMA_FILE"
+    FAIL=1
+fi
+
+# Now insert via RowBinary (schema must exist from DDL)
+python3 - <<'PYEOF' > /tmp/zh_ddl_payload.bin
+import struct, sys
+buf = b''
+buf += struct.pack('<i', 10)
+buf += bytes([3]) + b'foo'
+buf += struct.pack('<i', 20)
+buf += bytes([3]) + b'bar'
+sys.stdout.buffer.write(buf)
+PYEOF
+
+INS_RESP=$(curl -s -o /dev/null -w "%{http_code}" \
+    --data-binary @/tmp/zh_ddl_payload.bin \
+    "http://127.0.0.1:$DDL_PORT/?query=INSERT+INTO+$DDL_DB.$DDL_TABLE+FORMAT+RowBinary")
+if [ "$INS_RESP" = "200" ]; then
+    echo "  PASS RowBinary INSERT after DDL returned HTTP 200"
+else
+    echo "  FAIL RowBinary INSERT after DDL returned HTTP $INS_RESP"
+    FAIL=1
+fi
+
+kill $DDL_PID 2>/dev/null || true
+trap - EXIT
+wait $DDL_PID 2>/dev/null || true
+
+if [ "$FAIL" = "1" ]; then
+    echo "FAIL: one or more step 10 checks failed"
+    exit 1
+fi
+echo "PASS: step 10 (DDL CREATE TABLE + RowBinary INSERT) succeeded"
+
+# ── Step 11: RowBinaryWithNamesAndTypes auto-create table ─────────────────────
+echo ""
+echo "=== Step 11: zighouse serve RowBinaryWithNamesAndTypes auto-create ==="
+
+WNHT_PORT=19125
+WNHT_DATA=/tmp/zh_wnht_test
+WNHT_DB=default
+WNHT_TABLE=wnht_test
+rm -rf "$WNHT_DATA"
+mkdir -p "$WNHT_DATA"
+
+$ZH serve --data-dir="$WNHT_DATA" --port="$WNHT_PORT" &
+WNHT_PID=$!
+trap "kill $WNHT_PID 2>/dev/null || true" EXIT
+sleep 0.5
+
+# Build RowBinaryWithNamesAndTypes payload: 2 cols (id Int32, label String), 2 rows
+python3 - <<'PYEOF' > /tmp/zh_wnht_payload.bin
+import struct, sys
+
+def varuint(n):
+    buf = b''
+    while True:
+        b = n & 0x7F
+        n >>= 7
+        if n:
+            buf += bytes([b | 0x80])
+        else:
+            buf += bytes([b])
+            break
+    return buf
+
+def string(s):
+    b = s.encode()
+    return varuint(len(b)) + b
+
+out = b''
+# header: num_columns, then all names, then all types (ClickHouse format)
+out += varuint(2)
+out += string('id')
+out += string('label')
+out += string('Int32')
+out += string('String')
+# row 1: id=100, label="hello"
+out += struct.pack('<i', 100)
+out += string('hello')
+# row 2: id=200, label="world"
+out += struct.pack('<i', 200)
+out += string('world')
+
+sys.stdout.buffer.write(out)
+PYEOF
+
+WNHT_RESP=$(curl -s -o /tmp/zh_wnht_resp.txt -w "%{http_code}" \
+    --data-binary @/tmp/zh_wnht_payload.bin \
+    "http://127.0.0.1:$WNHT_PORT/?query=INSERT+INTO+$WNHT_DB.$WNHT_TABLE+FORMAT+RowBinaryWithNamesAndTypes")
+if [ "$WNHT_RESP" = "200" ]; then
+    echo "  PASS RowBinaryWithNamesAndTypes INSERT returned HTTP 200"
+else
+    echo "  FAIL RowBinaryWithNamesAndTypes INSERT returned HTTP $WNHT_RESP ($(cat /tmp/zh_wnht_resp.txt))"
+    FAIL=1
+fi
+
+# Verify schema.json was auto-persisted
+WNHT_SCHEMA="$WNHT_DATA/$WNHT_DB/$WNHT_TABLE/schema.json"
+if [ -f "$WNHT_SCHEMA" ]; then
+    echo "  PASS schema.json auto-persisted for wnht_test"
+else
+    echo "  FAIL schema.json not found at $WNHT_SCHEMA"
+    FAIL=1
+fi
+
+# Verify a part was created
+WNHT_PARTS=$(find "$WNHT_DATA/$WNHT_DB/$WNHT_TABLE/parts" -name "all_*_*_0" -type d 2>/dev/null | wc -l | tr -d ' ')
+if [ "$WNHT_PARTS" -ge "1" ]; then
+    echo "  PASS part created ($WNHT_PARTS part(s))"
+else
+    echo "  FAIL no parts found"
+    FAIL=1
+fi
+
+kill $WNHT_PID 2>/dev/null || true
+trap - EXIT
+wait $WNHT_PID 2>/dev/null || true
+
+if [ "$FAIL" = "1" ]; then
+    echo "FAIL: one or more step 11 checks failed"
+    exit 1
+fi
+echo "PASS: step 11 (RowBinaryWithNamesAndTypes auto-create) succeeded"
+
+# ── Step 12: Restart server and query persisted schema ─────────────────────────
+echo ""
+echo "=== Step 12: restart server, schema auto-load, SELECT ==="
+
+# Re-use the DDL_DATA dir from step 10 which has schema.json + a part
+RESTART_PORT=19126
+$ZH serve --data-dir="$DDL_DATA" --port="$RESTART_PORT" &
+RESTART_PID=$!
+trap "kill $RESTART_PID 2>/dev/null || true" EXIT
+sleep 0.5
+
+# SELECT count(*) — should return 2 (the two rows inserted in step 10)
+SELECT_RESP=$(curl -s -o /tmp/zh_select_resp.txt -w "%{http_code}" \
+    "http://127.0.0.1:$RESTART_PORT/?query=SELECT+count(*)+FROM+$DDL_DB.$DDL_TABLE")
+if [ "$SELECT_RESP" = "200" ]; then
+    echo "  PASS SELECT returned HTTP 200"
+else
+    echo "  FAIL SELECT returned HTTP $SELECT_RESP ($(cat /tmp/zh_select_resp.txt))"
+    FAIL=1
+fi
+
+COUNT_VAL=$(cat /tmp/zh_select_resp.txt | tail -1 | tr -d '[:space:]')
+if [ "$COUNT_VAL" = "2" ]; then
+    echo "  PASS SELECT count() = 2 after restart"
+else
+    echo "  FAIL SELECT count() expected 2, got '$COUNT_VAL'"
+    FAIL=1
+fi
+
+kill $RESTART_PID 2>/dev/null || true
+trap - EXIT
+wait $RESTART_PID 2>/dev/null || true
+
+if [ "$FAIL" = "1" ]; then
+    echo "FAIL: one or more step 12 checks failed"
+    exit 1
+fi
+echo "PASS: step 12 (restart + schema auto-load + SELECT) succeeded"

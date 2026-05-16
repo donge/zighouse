@@ -17,7 +17,7 @@
 
 const std = @import("std");
 const schema = @import("schema");
-const generic_sql = @import("../generic_sql.zig");
+const generic_sql = @import("generic_sql");
 const bind = @import("bind.zig");
 
 /// Coarse physical execution shape. See docs/architecture.md §2.3.

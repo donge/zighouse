@@ -1,6 +1,6 @@
 const std = @import("std");
 const agg = @import("../agg.zig");
-const generic_sql = @import("../generic_sql.zig");
+const generic_sql = @import("generic_sql");
 const hashmap = @import("../hashmap.zig");
 const native_reduce = @import("reduce.zig");
 const parallel = @import("../parallel.zig");
