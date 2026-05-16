@@ -23,7 +23,7 @@ const usage =
     \\  zighouse init <data_dir>
     \\  zighouse import <hits.parquet> <data_dir>
     \\  zighouse import-hot <hits.parquet> <data_dir>
-    \\  zighouse import-parquet <hits.parquet> <store_dir> <table_name>
+    \\  zighouse import-parquet [--format=generic|ch|ch-http] [--pk=<col>] <parquet_path> <store_dir> <table_name>
     \\  zighouse generic-query <store_dir> <table_name> <sql>
     \\  zighouse import-clickbench-csv-hot <hits.csv> <data_dir>
     \\  zighouse import-clickbench-parquet-hot <hits.parquet> <data_dir> [limit_rows]
@@ -154,7 +154,7 @@ fn runCommand(init: std.process.Init, allocator: std.mem.Allocator, args: *std.p
      } else if (std.mem.eql(u8, command, "import-parquet")) {
         // Generic Parquet import: infer schema, write generic_part store, write catalog manifest.
         // Usage: zighouse import-parquet [--format=<generic|ch>] [--pk=<col>] <parquet_path> <store_dir> <table_name>
-        var format: enum { generic, ch } = .generic;
+        var format: enum { generic, ch, ch_http } = .generic;
         var pk_col_name: ?[]const u8 = null;
         const parquet_path = blk: {
             var first = args.next() orelse return error.MissingParquetPath;
@@ -162,7 +162,8 @@ fn runCommand(init: std.process.Init, allocator: std.mem.Allocator, args: *std.p
             while (true) {
                 if (std.mem.startsWith(u8, first, "--format=")) {
                     const fmt = first["--format=".len..];
-                    if (std.mem.eql(u8, fmt, "ch")) format = .ch;
+                    if (std.mem.eql(u8, fmt, "ch")) format = .ch
+                    else if (std.mem.eql(u8, fmt, "ch-http")) format = .ch_http;
                     first = args.next() orelse return error.MissingParquetPath;
                 } else if (std.mem.startsWith(u8, first, "--pk=")) {
                     pk_col_name = first["--pk=".len..];
@@ -180,12 +181,33 @@ fn runCommand(init: std.process.Init, allocator: std.mem.Allocator, args: *std.p
         const row_count = switch (format) {
             .generic => try loader.importParquet(allocator, init.io, parquet_path, store_dir, inferred.table),
             .ch => try loader.importParquetCH(allocator, init.io, parquet_path, store_dir, inferred.table, pk_col_name),
+            .ch_http => blk: {
+                // Parse optional CH HTTP params from env / args (already consumed above)
+                const ch_host = std.c.getenv("ZIGHOUSE_CH_HOST") orelse "127.0.0.1";
+                const ch_port_str = std.c.getenv("ZIGHOUSE_CH_PORT") orelse "8123";
+                const ch_db = std.c.getenv("ZIGHOUSE_CLICKHOUSE_DATABASE") orelse "default";
+                const ch_user = std.c.getenv("ZIGHOUSE_CH_USER") orelse "default";
+                const ch_pass = std.c.getenv("ZIGHOUSE_CLICKHOUSE_PASSWORD") orelse "";
+                const ch_port = std.fmt.parseInt(u16, std.mem.span(ch_port_str), 10) catch 8123;
+                const opts = @import("clickhouse_native/http_client.zig").Options{
+                    .host = std.mem.span(ch_host),
+                    .port = ch_port,
+                    .database = std.mem.span(ch_db),
+                    .user = std.mem.span(ch_user),
+                    .password = std.mem.span(ch_pass),
+                };
+                break :blk try loader.importParquetCHHttp(allocator, init.io, parquet_path, inferred.table, opts, table_name);
+            },
         };
         const part_fmt: catalog.PartFormat = switch (format) {
             .generic => .generic,
             .ch => .ch_mergetree,
+            .ch_http => .ch_mergetree, // no local part, but record it
         };
-        try catalog.Catalog.writeManifest(init.io, allocator, store_dir, table_name, parquet_path, part_fmt);
+        // For ch-http, don't write a local catalog manifest (data is in CH directly)
+        if (format != .ch_http) {
+            try catalog.Catalog.writeManifest(init.io, allocator, store_dir, table_name, parquet_path, part_fmt);
+        }
         try printOut(init.io, "imported {d} rows {s} -> {s}/{s}\n", .{ row_count, parquet_path, store_dir, table_name });
     } else if (std.mem.eql(u8, command, "generic-query")) {
         // Query a generic_part store.
