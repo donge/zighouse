@@ -52,6 +52,12 @@ pub const ColumnBinWriter = struct {
         return .{ .io = io, .file = file, .count = 0 };
     }
 
+    pub fn writeI8(self: *ColumnBinWriter, value: i8) !void {
+        const buf = [1]u8{@bitCast(value)};
+        try self.file.writeStreamingAll(self.io, &buf);
+        self.count += 1;
+    }
+
     pub fn writeI16(self: *ColumnBinWriter, value: i16) !void {
         var buf: [2]u8 = undefined;
         std.mem.writeInt(i16, &buf, value, .little);

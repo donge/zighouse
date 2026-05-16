@@ -468,9 +468,12 @@ fn importColumn(
 ) !void {
     switch (col.ty) {
         .text, .char => try importStringColumn(allocator, io, parquet_path, part, col.name, col_idx, total_rows),
+        .int8 => try importFixedColumn(i8, allocator, io, parquet_path, part, col.name, col_idx),
         .int16 => try importFixedColumn(i16, allocator, io, parquet_path, part, col.name, col_idx),
         .int32, .date => try importFixedColumn(i32, allocator, io, parquet_path, part, col.name, col_idx),
         .int64, .timestamp => try importFixedColumn(i64, allocator, io, parquet_path, part, col.name, col_idx),
+        .float32 => try importFixedColumn(f32, allocator, io, parquet_path, part, col.name, col_idx),
+        .float64 => try importFixedColumn(f64, allocator, io, parquet_path, part, col.name, col_idx),
     }
 }
 
@@ -513,11 +516,21 @@ fn writeFixedBatch(comptime T: type) fn (FixedWriteCtx(T), []const i64) anyerror
     return struct {
         fn cb(ctx: FixedWriteCtx(T), values: []const i64) anyerror!void {
             for (values) |v| {
-                const cast: T = @intCast(v);
                 switch (T) {
-                    i16 => try ctx.writer.writeI16(cast),
-                    i32 => try ctx.writer.writeI32(cast),
-                    i64 => try ctx.writer.writeI64(cast),
+                    i8 => try ctx.writer.writeI8(@intCast(v)),
+                    i16 => try ctx.writer.writeI16(@intCast(v)),
+                    i32 => try ctx.writer.writeI32(@intCast(v)),
+                    i64 => try ctx.writer.writeI64(v),
+                    f32 => {
+                        // Parquet stores f32 as i64 with lower 32 bits = raw float bits
+                        const bits: i32 = @bitCast(@as(u32, @intCast(v & 0xFFFF_FFFF)));
+                        try ctx.writer.writeI32(bits);
+                    },
+                    f64 => {
+                        // Parquet stores f64 as i64 = raw float bits
+                        const bits: i64 = v;
+                        try ctx.writer.writeI64(bits);
+                    },
                     else => @compileError("unsupported fixed type"),
                 }
             }

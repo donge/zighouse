@@ -709,3 +709,87 @@ if [ "$FAIL" = "1" ]; then
     exit 1
 fi
 echo "PASS: step 14 (SELECT + multi-part) succeeded"
+
+# ── Step 15: Float32/Float64 end-to-end ──────────────────────────────────────
+echo "=== Step 15: Float32/Float64 end-to-end ==="
+FAIL=0
+S15_PORT=19825
+S15_DATA=/tmp/zh_s15_data
+S15_DB=default
+S15_TABLE=s15_float_test
+rm -rf "$S15_DATA"
+mkdir -p "$S15_DATA"
+
+$ZH serve --data-dir="$S15_DATA" --port="$S15_PORT" &
+S15_PID=$!
+trap "kill $S15_PID 2>/dev/null || true" EXIT
+sleep 0.5
+
+# Create table with Float32 and Float64 via RowBinaryWithNamesAndTypes
+python3 - <<'PYEOF' > /tmp/zh_s15.bin
+import struct, sys
+
+names = ['id', 'fval', 'dval']
+types = ['Int32', 'Float32', 'Float64']
+
+# RowBinaryWithNamesAndTypes header: all names then all types (CH wire format)
+buf = b''
+buf += bytes([len(names)])
+for n in names:
+    buf += bytes([len(n)]) + n.encode()
+for t in types:
+    buf += bytes([len(t)]) + t.encode()
+
+# 3 rows
+rows = [
+    (1, 1.5,   3.14),
+    (2, -0.5,  2.71828),
+    (3,  100.0, 0.0),
+]
+for (id_, fv, dv) in rows:
+    buf += struct.pack('<i', id_)
+    buf += struct.pack('<f', fv)
+    buf += struct.pack('<d', dv)
+
+sys.stdout.buffer.write(buf)
+PYEOF
+
+curl --noproxy 127.0.0.1 -s -o /dev/null -w "%{http_code}" \
+    --data-binary @/tmp/zh_s15.bin \
+    "http://127.0.0.1:$S15_PORT/?query=INSERT+INTO+$S15_DB.$S15_TABLE+FORMAT+RowBinaryWithNamesAndTypes" \
+    | grep -q "200" && echo "  PASS INSERT RowBinaryWithNamesAndTypes (float)" \
+    || { echo "  FAIL INSERT RowBinaryWithNamesAndTypes (float)"; FAIL=1; }
+
+# SELECT count(*) → 3
+COUNT_ENC=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" \
+    "SELECT count(*) FROM $S15_DB.$S15_TABLE")
+COUNT_RESP=$(curl --noproxy 127.0.0.1 -s \
+    "http://127.0.0.1:$S15_PORT/?query=$COUNT_ENC" | tail -1 | tr -d '[:space:]')
+if [ "$COUNT_RESP" = "3" ]; then
+    echo "  PASS SELECT count(*) = 3"
+else
+    echo "  FAIL SELECT count(*) expected 3, got '$COUNT_RESP'"
+    FAIL=1
+fi
+
+# SELECT sum(id) → 6
+SUM_ENC=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" \
+    "SELECT sum(id) FROM $S15_DB.$S15_TABLE")
+SUM_RESP=$(curl --noproxy 127.0.0.1 -s \
+    "http://127.0.0.1:$S15_PORT/?query=$SUM_ENC" | tail -1 | tr -d '[:space:]')
+if [ "$SUM_RESP" = "6" ]; then
+    echo "  PASS SELECT sum(id) = 6"
+else
+    echo "  FAIL SELECT sum(id) expected 6, got '$SUM_RESP'"
+    FAIL=1
+fi
+
+kill $S15_PID 2>/dev/null || true
+trap - EXIT
+wait $S15_PID 2>/dev/null || true
+
+if [ "$FAIL" = "1" ]; then
+    echo "FAIL: one or more step 15 checks failed"
+    exit 1
+fi
+echo "PASS: step 15 (Float32/Float64 end-to-end) succeeded"

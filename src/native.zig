@@ -3672,7 +3672,7 @@ fn writeQ24NativeRow(allocator: std.mem.Allocator, out: *std.ArrayList(u8), cell
                 .int64 => |v| try writeTimestampSeconds(allocator, out, v),
                 else => return error.CorruptHotColumns,
             },
-            .int16, .int32 => switch (cell) {
+            .int8, .int16, .int32 => switch (cell) {
                 .int32 => |v| try out.print(allocator, "{d}", .{v}),
                 else => return error.CorruptHotColumns,
             },
@@ -3680,6 +3680,7 @@ fn writeQ24NativeRow(allocator: std.mem.Allocator, out: *std.ArrayList(u8), cell
                 .int64 => |v| try out.print(allocator, "{d}", .{v}),
                 else => return error.CorruptHotColumns,
             },
+            .float32, .float64 => return error.CorruptHotColumns,
         }
     }
     try out.append(allocator, '\n');

@@ -3,6 +3,7 @@
 pub const clickbench = @import("clickbench/schema.zig");
 
 pub const ColumnType = enum {
+    int8,
     int16,
     int32,
     int64,
@@ -10,13 +11,15 @@ pub const ColumnType = enum {
     timestamp,
     text,
     char,
+    float32,
+    float64,
 
     pub fn fixedWidth(self: ColumnType) ?usize {
         return switch (self) {
+            .int8, .char => 1,
             .int16 => 2,
-            .int32, .date => 4,
-            .int64, .timestamp => 8,
-            .char => 1,
+            .int32, .date, .float32 => 4,
+            .int64, .timestamp, .float64 => 8,
             .text => null,
         };
     }
@@ -219,12 +222,14 @@ pub fn capabilityTag(col: Column) CapabilityTag {
         .lazy_text => .lazy_text,
         .derived => .derived,
         .fixed => |f| switch (f.ty) {
+            .int8 => .fixed_i16,  // treat int8 as i16 for ClickBench dispatch
             .int16 => .fixed_i16,
             .int32 => .fixed_i32,
             .int64 => .fixed_i64,
             .date => .fixed_date,
             .timestamp => .fixed_timestamp,
             .char => .fixed_char,
+            .float32, .float64 => @panic("capabilityTag: float type in fixed physical is not supported for ClickBench"),
             .text => @panic("capabilityTag: fixed physical with text ty is invalid"),
         },
         .none => switch (col.ty) {

@@ -43,6 +43,7 @@ const part_writer_session = @import("part_writer_session");
 const generic_executor = @import("generic_executor");
 const generic_sql = @import("generic_sql");
 const ddl_parser = @import("ddl_parser");
+const native_block = @import("native_block");
 
 /// Server configuration.
 pub const Config = struct {
@@ -137,29 +138,97 @@ pub const Server = struct {
     fn handleRequest(self: *Server, request: *std.http.Server.Request, out: *std.Io.Writer) !void {
         const target = request.head.target;
 
+        // Handle /ping — health check endpoint (GET or POST, no body needed).
+        if (std.mem.startsWith(u8, target, "/ping")) {
+            try sendResponse(request, out, .ok, "Ok.\n");
+            return;
+        }
+
         // Extract the `query` parameter from the URL.
-        const query_param = extractQueryParam(target, "query") orelse {
-            try sendResponse(request, out, .bad_request, "Missing 'query' parameter\n");
-            return;
-        };
+        // clickhouse-go HTTP mode sends the SQL in the POST body (no ?query= param).
+        var decoded_buf: [64 * 1024]u8 = undefined;
 
-        // URL-decode.
-        var decoded_buf: [16 * 1024]u8 = undefined;
-        const decoded_query = urlDecode(query_param, &decoded_buf) catch {
-            try sendResponse(request, out, .bad_request, "Failed to decode query parameter\n");
-            return;
-        };
+        if (extractQueryParam(target, "query")) |query_param| {
+            // Classic ?query=... path (curl, our scripts).
+            const decoded = urlDecode(query_param, &decoded_buf) catch {
+                try sendResponse(request, out, .bad_request, "Failed to decode query parameter\n");
+                return;
+            };
+            const trimmed = std.mem.trim(u8, decoded, " \t\r\n");
+            try self.dispatchSql(request, out, trimmed);
+        } else {
+            // clickhouse-go sends SQL in POST body.
+            // The body may contain: just the SQL (DDL/SELECT), or SQL\ndata (INSERT).
+            // We read the full body and split at first newline if it's an INSERT.
+            var body_buf: [4096]u8 = undefined;
+            const body_reader = request.readerExpectNone(&body_buf);
+            const max_body = 256 * 1024 * 1024;
+            const body_len: usize = if (request.head.content_length) |cl|
+                @min(@as(usize, cl), max_body)
+            else
+                max_body;
+            const body = try body_reader.readAlloc(self.allocator, body_len);
+            defer self.allocator.free(body);
 
-        // Route by SQL verb.
-        const trimmed = std.mem.trim(u8, decoded_query, " \t\r\n");
+            // Split SQL from optional data payload only for INSERT with FORMAT.
+            // clickhouse-go sends INSERT as: "INSERT INTO ... FORMAT ...\n<binary data>"
+            // INSERT with VALUES uses the entire body as SQL (multi-line allowed).
+            // For SELECT/CREATE the entire body is SQL (may contain newlines).
+            const trimmed_check = std.mem.trim(u8, body, " \t\r\n");
+            const is_insert = asciiStartsWith(trimmed_check, "INSERT");
+            // Only split at first newline if there's a FORMAT keyword on the first line.
+            const first_nl = std.mem.indexOfScalar(u8, body, '\n');
+            const has_format = if (first_nl) |nl_pos| blk: {
+                const first_line = body[0..nl_pos];
+                break :blk std.mem.indexOf(u8, first_line, "FORMAT") != null;
+            } else false;
+            const nl = if (is_insert and has_format) first_nl else null;
+            const sql_part = if (nl) |n| body[0..n] else body;
+            const data_part = if (nl) |n| body[n + 1 ..] else body[body.len..];
+
+            const trimmed = std.mem.trim(u8, sql_part, " \t\r\n");
+            if (trimmed.len == 0) {
+                try sendResponse(request, out, .bad_request, "Empty query\n");
+                return;
+            }
+            try self.dispatchSqlWithData(request, out, trimmed, data_part);
+        }
+    }
+
+    fn dispatchSql(self: *Server, request: *std.http.Server.Request, out: *std.Io.Writer, trimmed: []const u8) !void {
         if (asciiStartsWith(trimmed, "INSERT")) {
             try self.handleInsert(request, out, trimmed);
         } else if (asciiStartsWith(trimmed, "SELECT")) {
             try self.handleSelect(request, out, trimmed);
         } else if (asciiStartsWith(trimmed, "CREATE")) {
             try self.handleCreate(request, out, trimmed);
+        } else if (asciiStartsWith(trimmed, "TRUNCATE")) {
+            // TRUNCATE TABLE <name> — no-op
+            try sendResponse(request, out, .ok, "");
         } else {
             try sendResponse(request, out, .bad_request, "Only CREATE TABLE, INSERT and SELECT are supported\n");
+        }
+    }
+
+    /// Like dispatchSql but for body-SQL mode where data_part holds INSERT payload.
+    fn dispatchSqlWithData(self: *Server, request: *std.http.Server.Request, out: *std.Io.Writer, trimmed: []const u8, data_part: []const u8) !void {
+        if (asciiStartsWith(trimmed, "INSERT")) {
+            try self.handleInsertBodyData(request, out, trimmed, data_part);
+        } else if (asciiStartsWith(trimmed, "SELECT")) {
+            try self.handleSelectSimple(request, out, trimmed);
+        } else if (asciiStartsWith(trimmed, "CREATE")) {
+            try self.handleCreateSimple(request, out, trimmed);
+        } else if (asciiStartsWith(trimmed, "DESCRIBE")) {
+            try self.handleDescribeSimple(request, out, trimmed);
+        } else if (asciiStartsWith(trimmed, "TRUNCATE")) {
+            // TRUNCATE TABLE <name> — no-op (ZigHouse uses append-only parts)
+            const empty = try native_block.encodeEmpty(self.allocator);
+            defer self.allocator.free(empty);
+            try sendNativeBlock(self.allocator, request, out, empty);
+        } else {
+            const empty = try native_block.encodeEmpty(self.allocator);
+            defer self.allocator.free(empty);
+            try sendNativeBlock(self.allocator, request, out, empty);
         }
     }
 
@@ -169,6 +238,24 @@ pub const Server = struct {
         // Drain body (DDL has no body).
         var body_buf: [64]u8 = undefined;
         _ = request.readerExpectNone(&body_buf);
+
+        var it2 = std.mem.tokenizeAny(u8, sql, " \t\r\n");
+        _ = it2.next(); // CREATE
+        const second2 = it2.next() orelse "";
+        const third2  = it2.next() orelse "";
+
+        // CREATE DATABASE — no-op.
+        if (asciiEql(second2, "DATABASE")) {
+            try sendResponse(request, out, .ok, "");
+            return;
+        }
+        // CREATE [OR REPLACE] FUNCTION — no-op.
+        if (asciiEql(second2, "FUNCTION") or
+            (asciiEql(second2, "OR") and asciiEql(third2, "REPLACE")))
+        {
+            try sendResponse(request, out, .ok, "");
+            return;
+        }
 
         var parsed = ddl_parser.parse(self.allocator, sql) catch |err| {
             const msg = try std.fmt.allocPrint(self.allocator, "DDL parse error: {s}\n", .{@errorName(err)});
@@ -206,15 +293,11 @@ pub const Server = struct {
             return;
         };
 
-        // Read body.
+        // Read body — use allocRemaining for correct chunked TE handling.
         var body_buf: [256]u8 = undefined;
         const body_reader = request.readerExpectNone(&body_buf);
-        const max_body = 256 * 1024 * 1024;
-        const body_len: usize = if (request.head.content_length) |cl|
-            @min(@as(usize, cl), max_body)
-        else
-            max_body;
-        const body = try body_reader.readAlloc(self.allocator, body_len);
+        const max_body: usize = 256 * 1024 * 1024;
+        const body = try body_reader.allocRemaining(self.allocator, .limited(max_body));
         defer self.allocator.free(body);
 
         if (body.len == 0) {
@@ -222,7 +305,9 @@ pub const Server = struct {
             return;
         }
 
-        if (insert_info.with_names_and_types) {
+        if (insert_info.native_fmt) {
+            try self.handleInsertNative(request, out, insert_info.db_table, body);
+        } else if (insert_info.with_names_and_types) {
             try self.handleInsertWithHeader(request, out, insert_info.db_table, body);
         } else {
             try self.handleInsertRowBinary(request, out, insert_info.db_table, body);
@@ -262,6 +347,53 @@ pub const Server = struct {
 
         try self.writePart(db_table, entry, dec.columns);
         try sendResponse(request, out, .ok, "");
+    }
+
+    fn handleInsertNative(
+        self: *Server,
+        request: *std.http.Server.Request,
+        out: *std.Io.Writer,
+        db_table: DbTable,
+        body: []const u8,
+    ) !void {
+        // Decode Native Block body (columnar format with metadata).
+        var decoded = row_binary_decoder.decodeNativeBlock(self.allocator, body) catch |err| {
+            const msg = try std.fmt.allocPrint(self.allocator,
+                "Native Block decode error: {s}\n", .{@errorName(err)});
+            defer self.allocator.free(msg);
+            try sendResponse(request, out, .bad_request, msg);
+            return;
+        };
+        defer decoded.deinit(self.allocator);
+
+        if (decoded.table.columns.len == 0) {
+            const empty = try native_block.encodeEmpty(self.allocator);
+            defer self.allocator.free(empty);
+            try sendNativeBlock(self.allocator, request, out, empty);
+            return;
+        }
+
+        if (self.schemas.find(db_table.db, db_table.table)) |existing| {
+            try self.writePart(db_table, existing, decoded.decoder.columns);
+        } else {
+            // Auto-register schema
+            const new_entry = schema_config.TableEntry{
+                .db = db_table.db,
+                .table = .{ .name = db_table.table, .columns = decoded.table.columns },
+                .name = db_table.table,
+                .pk = null,
+            };
+            try self.schemas.addEntry(self.allocator, new_entry);
+            const stored = self.schemas.find(db_table.db, db_table.table).?;
+            schema_persist.save(self.io, self.allocator, self.config.data_dir, stored.db, stored) catch |err| {
+                std.debug.print("schema_persist.save warning: {s}\n", .{@errorName(err)});
+            };
+            try self.writePart(db_table, stored, decoded.decoder.columns);
+        }
+
+        const empty = try native_block.encodeEmpty(self.allocator);
+        defer self.allocator.free(empty);
+        try sendNativeBlock(self.allocator, request, out, empty);
     }
 
     fn handleInsertWithHeader(
@@ -332,7 +464,25 @@ pub const Server = struct {
         );
         defer sess.deinit();
 
-        try sess.writeColumns(columns);
+        // Reorder decoded columns to match the registered schema column order.
+        // The client may send columns in a different order than the schema.
+        const schema_cols = entry.table.columns;
+        const reordered = try self.allocator.alloc(row_binary_decoder.ColumnBuffer, schema_cols.len);
+        defer self.allocator.free(reordered);
+
+        // Build a null-initialized empty ColumnBuffer for missing columns.
+        const empty_col = row_binary_decoder.ColumnBuffer.initEmpty;
+        for (schema_cols, reordered) |sc, *out_col| {
+            out_col.* = empty_col(sc);
+            for (columns) |*inc| {
+                if (std.ascii.eqlIgnoreCase(inc.col.name, sc.name)) {
+                    out_col.* = inc.*;
+                    break;
+                }
+            }
+        }
+
+        try sess.writeColumns(reordered);
         try sess.finish();
     }
 
@@ -371,8 +521,15 @@ pub const Server = struct {
         defer parts.deinit();
 
         if (parts.dirs().len == 0) {
-            // No data yet — return empty result (just header row).
-            try sendResponse(request, out, .ok, "");
+            // No data yet — run the plan against empty source so aggregates return 0.
+            const result = try generic_executor.runWithSource(
+                self.allocator, self.io,
+                plan,
+                .{ .ch_parts = &.{} },
+                &entry.table,
+            );
+            defer self.allocator.free(result);
+            try sendResponse(request, out, .ok, result);
             return;
         }
 
@@ -387,6 +544,518 @@ pub const Server = struct {
 
         try sendResponse(request, out, .ok, result);
     }
+
+    // ── Body-SQL mode handlers (clickhouse-go HTTP) ────────────────────────────
+
+    /// DESCRIBE TABLE handler for body-SQL mode.
+    /// clickhouse-go sends "DESCRIBE TABLE db.table" to discover column types before INSERT batch.
+    fn handleDescribeSimple(self: *Server, request: *std.http.Server.Request, out: *std.Io.Writer, sql: []const u8) !void {
+        // Parse: DESCRIBE TABLE [db.]table
+        var it = std.mem.tokenizeAny(u8, sql, " \t\r\n");
+        _ = it.next(); // DESCRIBE
+        _ = it.next(); // TABLE
+        const tbl_name = it.next() orelse {
+            const empty = try native_block.encodeEmpty(self.allocator);
+            defer self.allocator.free(empty);
+            try sendNativeBlock(self.allocator, request, out, empty);
+            return;
+        };
+        const db_table = splitDbTable(tbl_name);
+        const entry = self.schemas.find(db_table.db, db_table.table) orelse {
+            const empty = try native_block.encodeEmpty(self.allocator);
+            defer self.allocator.free(empty);
+            try sendNativeBlock(self.allocator, request, out, empty);
+            return;
+        };
+
+        // Build describe rows from schema
+        var rows = try self.allocator.alloc(native_block.DescribeRow, entry.table.columns.len);
+        defer self.allocator.free(rows);
+        for (entry.table.columns, 0..) |col, i| {
+            rows[i] = .{
+                .name = col.name,
+                .type_name = schemaTypeToChType(col.ty),
+            };
+        }
+
+        const bytes = try native_block.encodeDescribeTable(self.allocator, rows);
+        defer self.allocator.free(bytes);
+        try sendNativeBlock(self.allocator, request, out, bytes);
+    }
+
+    /// SELECT handler for body-SQL mode.
+    /// Handles clickhouse-go handshake and generic SELECTs.
+    fn handleSelectSimple(self: *Server, request: *std.http.Server.Request, out: *std.Io.Writer, sql: []const u8) !void {
+        // clickhouse-go handshake: SELECT displayName(), version(), revision(), timezone()
+        // Must return a Native Block (clickhouse-go uses default_format=Native).
+        if (std.mem.indexOf(u8, sql, "displayName()") != null or
+            std.mem.indexOf(u8, sql, "version()") != null)
+        {
+            const cols = [_]native_block.Col{
+                .{ .name = "displayName()", .kind = .string, .str_val = "ZigHouse" },
+                .{ .name = "version()",     .kind = .string, .str_val = "24.8.0" },
+                .{ .name = "revision()",    .kind = .uint32, .u32_val = 54460 },
+                .{ .name = "timezone()",    .kind = .string, .str_val = "UTC" },
+            };
+            const bytes = try native_block.encodeOneRow(self.allocator, &cols);
+            defer self.allocator.free(bytes);
+            try sendNativeBlock(self.allocator, request, out, bytes);
+            return;
+        }
+        // SELECT 1 → return a single-row Native Block with column "1" Int64 value 1.
+        if (std.mem.eql(u8, sql, "SELECT 1") or std.mem.eql(u8, sql, "select 1")) {
+            const cols = [_]native_block.Col{
+                .{ .name = "1", .kind = .int64, .i64_val = 1 },
+            };
+            const bytes = try native_block.encodeOneRow(self.allocator, &cols);
+            defer self.allocator.free(bytes);
+            try sendNativeBlock(self.allocator, request, out, bytes);
+            return;
+        }
+        // Generic SELECT: route through normal path (body already consumed).
+        try self.handleSelectNoDrain(request, out, sql);
+    }
+
+    /// SELECT that doesn't drain the body (already consumed by handleRequest).
+    fn handleSelectNoDrain(self: *Server, request: *std.http.Server.Request, out: *std.Io.Writer, sql: []const u8) !void {
+        // Parse SQL into a Plan.
+        const plan = (try generic_sql.parse(self.allocator, sql)) orelse {
+            try sendResponse(request, out, .bad_request, "Cannot parse SELECT query\n");
+            return;
+        };
+        defer generic_sql.deinit(self.allocator, plan);
+
+        const db_table = splitDbTable(plan.table);
+
+        const entry = self.schemas.find(db_table.db, db_table.table) orelse {
+            // Unknown table: synthesise a zero-row result.
+            // For scalar aggregate queries (e.g. SELECT count() FROM unknown)
+            // we must return a properly-shaped block; otherwise return empty block.
+            const fake_table = schema.Table{ .name = "", .columns = &.{} };
+            if (generic_executor.runWithSource(
+                self.allocator, self.io,
+                plan,
+                .{ .ch_parts = &.{} },
+                &fake_table,
+            )) |fake_result| {
+                defer self.allocator.free(fake_result);
+                const nb = try csvToNativeBlock(self.allocator, fake_result);
+                defer self.allocator.free(nb);
+                try sendNativeBlock(self.allocator, request, out, nb);
+            } else |_| {
+                const nb = try native_block.encodeEmpty(self.allocator);
+                defer self.allocator.free(nb);
+                try sendNativeBlock(self.allocator, request, out, nb);
+            }
+            return;
+        };
+
+        var parts = try part_scanner.scan(
+            self.allocator, self.io,
+            self.config.data_dir, db_table.db, db_table.table,
+        );
+        defer parts.deinit();
+
+        if (parts.dirs().len == 0) {
+            // No data yet — run the plan against an empty source so scalar aggregates
+            // (e.g. SELECT count() → 0) return a properly-shaped block.
+            if (generic_executor.runWithSource(
+                self.allocator, self.io,
+                plan,
+                .{ .ch_parts = &.{} },
+                &entry.table,
+            )) |empty_result| {
+                defer self.allocator.free(empty_result);
+                const nb = try csvToNativeBlockWithSchema(self.allocator, empty_result, &entry.table);
+                defer self.allocator.free(nb);
+                try sendNativeBlock(self.allocator, request, out, nb);
+            } else |_| {
+                const nb = try native_block.encodeEmpty(self.allocator);
+                defer self.allocator.free(nb);
+                try sendNativeBlock(self.allocator, request, out, nb);
+            }
+            return;
+        }
+
+        const result = try generic_executor.runWithSource(
+            self.allocator, self.io,
+            plan,
+            .{ .ch_parts = parts.dirs() },
+            &entry.table,
+        );
+        defer self.allocator.free(result);
+
+        // Wrap CSV result in Native Block so clickhouse-go can parse it.
+        const nb = try csvToNativeBlockWithSchema(self.allocator, result, &entry.table);
+        defer self.allocator.free(nb);
+        try sendNativeBlock(self.allocator, request, out, nb);
+    }
+
+    /// CREATE handler for body-SQL mode.
+    fn handleCreateSimple(self: *Server, request: *std.http.Server.Request, out: *std.Io.Writer, sql: []const u8) !void {
+        // Classify by second (and possibly third) token.
+        var it = std.mem.tokenizeAny(u8, sql, " \t\r\n");
+        _ = it.next(); // CREATE
+        const second = it.next() orelse "";
+        const third  = it.next() orelse "";
+
+        // CREATE DATABASE — no-op.
+        if (asciiEql(second, "DATABASE")) {
+            const empty = try native_block.encodeEmpty(self.allocator);
+            defer self.allocator.free(empty);
+            try sendNativeBlock(self.allocator, request, out, empty);
+            return;
+        }
+
+        // CREATE OR REPLACE FUNCTION / CREATE FUNCTION — no-op.
+        if (asciiEql(second, "FUNCTION") or
+            (asciiEql(second, "OR") and asciiEql(third, "REPLACE")))
+        {
+            const empty = try native_block.encodeEmpty(self.allocator);
+            defer self.allocator.free(empty);
+            try sendNativeBlock(self.allocator, request, out, empty);
+            return;
+        }
+
+        var parsed = ddl_parser.parse(self.allocator, sql) catch |err| {
+            const msg = try std.fmt.allocPrint(self.allocator, "DDL parse error: {s}\n", .{@errorName(err)});
+            defer self.allocator.free(msg);
+            try sendResponse(request, out, .bad_request, msg);
+            return;
+        };
+        defer parsed.deinit();
+
+        if (self.schemas.find(parsed.entry.db, parsed.entry.name) == null) {
+            try self.schemas.addEntry(self.allocator, parsed.entry);
+            const stored = self.schemas.find(parsed.entry.db, parsed.entry.name).?;
+            schema_persist.save(self.io, self.allocator, self.config.data_dir, stored.db, stored) catch |err| {
+                std.debug.print("schema_persist.save warning: {s}\n", .{@errorName(err)});
+            };
+        }
+
+        const empty = try native_block.encodeEmpty(self.allocator);
+        defer self.allocator.free(empty);
+        try sendNativeBlock(self.allocator, request, out, empty);
+    }
+
+    /// INSERT handler for body-SQL mode.
+    /// clickhouse-go sends: "INSERT INTO db.table FORMAT RowBinaryWithNamesAndTypes\n<binary data>"
+    fn handleInsertBodyData(self: *Server, request: *std.http.Server.Request, out: *std.Io.Writer, sql: []const u8, data: []const u8) !void {
+        const insert_info = parseInsertTarget(sql) orelse {
+            try sendResponse(request, out, .bad_request,
+                "Expected: INSERT INTO <db>.<table> FORMAT RowBinary[WithNamesAndTypes]\n");
+            return;
+        };
+
+        if (data.len == 0) {
+            const empty = try native_block.encodeEmpty(self.allocator);
+            defer self.allocator.free(empty);
+            try sendNativeBlock(self.allocator, request, out, empty);
+            return;
+        }
+
+        if (insert_info.native_fmt) {
+            try self.handleInsertNativeData(request, out, insert_info.db_table, data);
+        } else if (insert_info.with_names_and_types) {
+            try self.handleInsertWithHeaderData(request, out, insert_info.db_table, data);
+        } else if (insert_info.values_fmt) {
+            // SQL VALUES INSERT — entire sql string contains the full statement.
+            try self.handleInsertValues(request, out, sql);
+        } else {
+            try self.handleInsertRowBinaryData(request, out, insert_info.db_table, data);
+        }
+    }
+
+    /// SQL VALUES INSERT: INSERT INTO db.table (cols) VALUES (v1, v2, ...) [, (...), ...]
+    /// Parses the VALUES clause and writes each row as a part.
+    fn handleInsertValues(
+        self: *Server,
+        request: *std.http.Server.Request,
+        out: *std.Io.Writer,
+        sql: []const u8,
+    ) !void {
+        // Parse: INSERT INTO [db.]table [(col1,...)] VALUES (v1,...) [,(v2,...)]
+        var it = SqlValuesParser{ .src = sql, .pos = 0 };
+        it.skipWs();
+        it.consumeKeyword("INSERT") catch {
+            try sendResponse(request, out, .bad_request, "VALUES INSERT parse error\n");
+            return;
+        };
+        it.skipWs();
+        it.consumeKeyword("INTO") catch {
+            try sendResponse(request, out, .bad_request, "VALUES INSERT parse error\n");
+            return;
+        };
+        it.skipWs();
+        const table_tok = it.nextToken() orelse {
+            try sendResponse(request, out, .bad_request, "VALUES INSERT: missing table\n");
+            return;
+        };
+        var db_name: []const u8 = "default";
+        var table_name: []const u8 = table_tok;
+        if (std.mem.indexOfScalar(u8, table_tok, '.')) |dot| {
+            db_name = table_tok[0..dot];
+            table_name = table_tok[dot + 1 ..];
+        }
+
+        // Optional column list
+        it.skipWs();
+        var col_indices: ?[]usize = null;
+        defer if (col_indices) |ci| self.allocator.free(ci);
+
+        if (it.peekChar() == '(') {
+            it.pos += 1;
+            var col_name_list: std.ArrayListUnmanaged([]const u8) = .empty;
+            defer col_name_list.deinit(self.allocator);
+            while (true) {
+                it.skipWs();
+                if (it.peekChar() == ')') { it.pos += 1; break; }
+                if (it.peekChar() == ',') { it.pos += 1; continue; }
+                const cn = it.nextToken() orelse break;
+                try col_name_list.append(self.allocator, cn);
+            }
+            // Resolve column names to indices in entry schema
+            const entry = self.schemas.find(db_name, table_name) orelse {
+                try sendResponse(request, out, .bad_request, "VALUES INSERT: unknown table\n");
+                return;
+            };
+            var indices = try self.allocator.alloc(usize, col_name_list.items.len);
+            for (col_name_list.items, 0..) |cn, i| {
+                var found = false;
+                for (entry.table.columns, 0..) |col, j| {
+                    if (std.mem.eql(u8, col.name, cn)) {
+                        indices[i] = j;
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) {
+                    self.allocator.free(indices);
+                    try sendResponse(request, out, .bad_request, "VALUES INSERT: unknown column\n");
+                    return;
+                }
+            }
+            col_indices = indices;
+        }
+
+        it.skipWs();
+        it.consumeKeyword("VALUES") catch {
+            try sendResponse(request, out, .bad_request, "VALUES INSERT: missing VALUES\n");
+            return;
+        };
+
+        const entry = self.schemas.find(db_name, table_name) orelse {
+            try sendResponse(request, out, .bad_request, "VALUES INSERT: unknown table\n");
+            return;
+        };
+        const n_cols = if (col_indices) |ci| ci.len else entry.table.columns.len;
+
+        // Parse and write each row
+        while (true) {
+            it.skipWs();
+            if (it.pos >= it.src.len) break;
+            if (it.peekChar() == ',') { it.pos += 1; continue; }
+            if (it.peekChar() == ';') break;
+            if (it.peekChar() != '(') break;
+            it.pos += 1; // consume '('
+
+            // Build ColumnBuffers for this row
+            const col_bufs = try self.allocator.alloc(row_binary_decoder.ColumnBuffer, entry.table.columns.len);
+            for (col_bufs, entry.table.columns) |*buf, col| {
+                buf.* = row_binary_decoder.ColumnBuffer{
+                    .col = col,
+                    .fixed_vals = .empty,
+                    .str_vals = .empty,
+                    .str_bytes = .empty,
+                };
+            }
+            defer {
+                for (col_bufs) |*buf| buf.deinit(self.allocator);
+                self.allocator.free(col_bufs);
+            }
+
+            var val_count: usize = 0;
+            while (val_count < n_cols) {
+                it.skipWs();
+                if (it.peekChar() == ')') break;
+                if (it.peekChar() == ',') { it.pos += 1; continue; }
+                const val_str = try it.parseValue(self.allocator);
+                defer self.allocator.free(val_str);
+
+                const col_idx = if (col_indices) |ci| ci[val_count] else val_count;
+                if (col_idx < col_bufs.len) {
+                    const col_ty = entry.table.columns[col_idx].ty;
+                    var buf = &col_bufs[col_idx];
+                    switch (col_ty) {
+                        .text, .char => {
+                            const start = buf.str_bytes.items.len;
+                            try buf.str_bytes.appendSlice(self.allocator, val_str);
+                            const end = buf.str_bytes.items.len;
+                            try buf.str_vals.append(self.allocator, buf.str_bytes.items[start..end]);
+                        },
+                        else => {
+                            const iv: i64 = if (val_str.len == 0) 0 else
+                                std.fmt.parseInt(i64, val_str, 10) catch
+                                @as(i64, @intFromFloat(std.fmt.parseFloat(f64, val_str) catch 0.0));
+                            try buf.fixed_vals.append(self.allocator, iv);
+                        },
+                    }
+                }
+                val_count += 1;
+            }
+            it.skipWs();
+            if (it.peekChar() == ')') it.pos += 1;
+
+            // Fill any columns with 0 empty values not set
+            for (col_bufs) |*buf| {
+                if (buf.rowCount() == 0) {
+                    switch (buf.col.ty) {
+                        .text, .char => {
+                            const start = buf.str_bytes.items.len;
+                            _ = start;
+                            try buf.str_vals.append(self.allocator, buf.str_bytes.items[0..0]);
+                        },
+                        else => try buf.fixed_vals.append(self.allocator, 0),
+                    }
+                }
+            }
+
+            // Write the part
+            const db_table = DbTable{ .db = db_name, .table = table_name };
+            try self.writePart(db_table, entry, col_bufs);
+        }
+
+        const empty = try native_block.encodeEmpty(self.allocator);
+        defer self.allocator.free(empty);
+        try sendNativeBlock(self.allocator, request, out, empty);
+    }
+
+    /// Native Block INSERT for body-SQL mode (data already split from SQL line).
+    fn handleInsertNativeData(
+        self: *Server,
+        request: *std.http.Server.Request,
+        out: *std.Io.Writer,
+        db_table: DbTable,
+        data: []const u8,
+    ) !void {
+        var decoded = row_binary_decoder.decodeNativeBlock(self.allocator, data) catch |err| {
+            const msg = try std.fmt.allocPrint(self.allocator,
+                "Native Block decode error: {s}\n", .{@errorName(err)});
+            defer self.allocator.free(msg);
+            try sendResponse(request, out, .bad_request, msg);
+            return;
+        };
+        defer decoded.deinit(self.allocator);
+
+        if (decoded.table.columns.len == 0) {
+            const empty = try native_block.encodeEmpty(self.allocator);
+            defer self.allocator.free(empty);
+            try sendNativeBlock(self.allocator, request, out, empty);
+            return;
+        }
+
+        if (self.schemas.find(db_table.db, db_table.table)) |existing| {
+            try self.writePart(db_table, existing, decoded.decoder.columns);
+        } else {
+            const new_entry = schema_config.TableEntry{
+                .db = db_table.db,
+                .table = .{ .name = db_table.table, .columns = decoded.table.columns },
+                .name = db_table.table,
+                .pk = null,
+            };
+            try self.schemas.addEntry(self.allocator, new_entry);
+            const stored = self.schemas.find(db_table.db, db_table.table).?;
+            schema_persist.save(self.io, self.allocator, self.config.data_dir, stored.db, stored) catch |err| {
+                std.debug.print("schema_persist.save warning: {s}\n", .{@errorName(err)});
+            };
+            try self.writePart(db_table, stored, decoded.decoder.columns);
+        }
+
+        const empty = try native_block.encodeEmpty(self.allocator);
+        defer self.allocator.free(empty);
+        try sendNativeBlock(self.allocator, request, out, empty);
+    }
+
+    fn handleInsertWithHeaderData(
+        self: *Server,
+        request: *std.http.Server.Request,
+        out: *std.Io.Writer,
+        db_table: DbTable,
+        body: []const u8,
+    ) !void {
+        var decoded = row_binary_decoder.decodeWithHeader(self.allocator, body) catch |err| {
+            const msg = try std.fmt.allocPrint(self.allocator,
+                "RowBinaryWithNamesAndTypes decode error: {s}\n", .{@errorName(err)});
+            defer self.allocator.free(msg);
+            try sendResponse(request, out, .bad_request, msg);
+            return;
+        };
+        defer decoded.deinit(self.allocator);
+
+        if (self.schemas.find(db_table.db, db_table.table)) |existing| {
+            if (!schemasCompatible(existing.table, decoded.table)) {
+                try sendResponse(request, out, .bad_request,
+                    "Schema mismatch: incoming columns don't match registered schema\n");
+                return;
+            }
+            try self.writePart(db_table, existing, decoded.decoder.columns);
+        } else {
+            const new_entry = schema_config.TableEntry{
+                .db = db_table.db,
+                .table = .{ .name = db_table.table, .columns = decoded.table.columns },
+                .name = db_table.table,
+                .pk = null,
+            };
+            try self.schemas.addEntry(self.allocator, new_entry);
+            const stored = self.schemas.find(db_table.db, db_table.table).?;
+            schema_persist.save(self.io, self.allocator, self.config.data_dir, stored.db, stored) catch |err| {
+                std.debug.print("schema_persist.save warning: {s}\n", .{@errorName(err)});
+            };
+            try self.writePart(db_table, stored, decoded.decoder.columns);
+        }
+
+        const empty = try native_block.encodeEmpty(self.allocator);
+        defer self.allocator.free(empty);
+        try sendNativeBlock(self.allocator, request, out, empty);
+    }
+
+    fn handleInsertRowBinaryData(
+        self: *Server,
+        request: *std.http.Server.Request,
+        out: *std.Io.Writer,
+        db_table: DbTable,
+        body: []const u8,
+    ) !void {
+        const entry = self.schemas.find(db_table.db, db_table.table) orelse {
+            const msg = try std.fmt.allocPrint(self.allocator,
+                "Unknown table '{s}.{s}': use CREATE TABLE or RowBinaryWithNamesAndTypes first\n",
+                .{ db_table.db, db_table.table });
+            defer self.allocator.free(msg);
+            try sendResponse(request, out, .bad_request, msg);
+            return;
+        };
+
+        var dec = try row_binary_decoder.RowBinaryDecoder.init(self.allocator, entry.table);
+        defer dec.deinit();
+        const n_rows = dec.decode(body) catch |err| {
+            const msg = try std.fmt.allocPrint(self.allocator, "RowBinary decode error: {s}\n", .{@errorName(err)});
+            defer self.allocator.free(msg);
+            try sendResponse(request, out, .bad_request, msg);
+            return;
+        };
+
+        if (n_rows == 0) {
+            const empty = try native_block.encodeEmpty(self.allocator);
+            defer self.allocator.free(empty);
+            try sendNativeBlock(self.allocator, request, out, empty);
+            return;
+        }
+
+        try self.writePart(db_table, entry, dec.columns);
+        const empty = try native_block.encodeEmpty(self.allocator);
+        defer self.allocator.free(empty);
+        try sendNativeBlock(self.allocator, request, out, empty);
+    }
 };
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -396,8 +1065,22 @@ fn sendResponse(request: *std.http.Server.Request, out: *std.Io.Writer, status: 
         .status = status,
         .extra_headers = &.{
             .{ .name = "content-type", .value = "text/plain; charset=utf-8" },
+            .{ .name = "connection", .value = "close" },
         },
     });
+    try out.flush();
+}
+
+fn sendNativeBlock(allocator: std.mem.Allocator, request: *std.http.Server.Request, out: *std.Io.Writer, body: []const u8) !void {
+    try request.respond(body, .{
+        .status = .ok,
+        .extra_headers = &.{
+            .{ .name = "content-type", .value = "application/octet-stream" },
+            .{ .name = "x-clickhouse-format", .value = "Native" },
+            .{ .name = "connection", .value = "close" },
+        },
+    });
+    _ = allocator;
     try out.flush();
 }
 
@@ -453,7 +1136,7 @@ fn hexDigit(c: u8) ?u8 {
 }
 
 const DbTable = struct { db: []const u8, table: []const u8 };
-const InsertInfo = struct { db_table: DbTable, with_names_and_types: bool };
+const InsertInfo = struct { db_table: DbTable, with_names_and_types: bool, native_fmt: bool = false, values_fmt: bool = false };
 
 /// Split "db.table" → {db, table}.  If no dot, db = "default".
 fn splitDbTable(name: []const u8) DbTable {
@@ -463,26 +1146,46 @@ fn splitDbTable(name: []const u8) DbTable {
     return .{ .db = "default", .table = name };
 }
 
-/// Parse "INSERT INTO [db.]table FORMAT RowBinary[WithNamesAndTypes]"
+/// Parse "INSERT INTO [db.]table [(col1, col2, ...)] FORMAT RowBinary[WithNamesAndTypes|Native]"
 fn parseInsertTarget(q: []const u8) ?InsertInfo {
-    var tokens: [8][]const u8 = undefined;
-    var n: usize = 0;
     var it = std.mem.tokenizeAny(u8, q, " \t\r\n");
+    const t0 = it.next() orelse return null;
+    const t1 = it.next() orelse return null;
+    const t2 = it.next() orelse return null;
+    if (!asciiEql(t0, "INSERT")) return null;
+    if (!asciiEql(t1, "INTO")) return null;
+    // t2 is the table name (possibly db.table)
+    const db_table = splitDbTable(t2);
+    // Skip optional column list in parentheses: (col1, col2, ...)
+    // We scan remaining tokens until we find FORMAT
+    var found_format = false;
+    var fmt: []const u8 = "";
     while (it.next()) |tok| {
-        if (n >= tokens.len) break;
-        tokens[n] = tok;
-        n += 1;
+        if (asciiEql(tok, "FORMAT")) {
+            fmt = it.next() orelse return null;
+            found_format = true;
+            break;
+        }
+        // Otherwise skip (column list tokens, commas, etc.)
     }
-    if (n < 5) return null;
-    if (!asciiEql(tokens[0], "INSERT")) return null;
-    if (!asciiEql(tokens[1], "INTO")) return null;
-    if (!asciiEql(tokens[n - 2], "FORMAT")) return null;
-    const fmt = tokens[n - 1];
+    if (!found_format) {
+        // No FORMAT keyword — check for VALUES clause (SQL-syntax INSERT).
+        // INSERT INTO db.table [(cols...)] VALUES (v1, v2, ...)
+        // Signal this by returning a special InsertInfo with values_fmt = true.
+        return .{
+            .db_table = db_table,
+            .with_names_and_types = false,
+            .native_fmt = false,
+            .values_fmt = true,
+        };
+    }
     const with_header = asciiEql(fmt, "RowBinaryWithNamesAndTypes");
-    if (!with_header and !asciiEql(fmt, "RowBinary")) return null;
+    const native_fmt = asciiEql(fmt, "Native");
+    if (!with_header and !asciiEql(fmt, "RowBinary") and !native_fmt) return null;
     return .{
-        .db_table = splitDbTable(tokens[2]),
+        .db_table = db_table,
         .with_names_and_types = with_header,
+        .native_fmt = native_fmt,
     };
 }
 
@@ -497,6 +1200,21 @@ fn schemasCompatible(stored: schema.Table, incoming: schema.Table) bool {
     return true;
 }
 
+fn schemaTypeToChType(ty: schema.ColumnType) []const u8 {
+    return switch (ty) {
+        .int8    => "UInt8",   // UInt8 and Int8 both map to .int8; prefer UInt8 for output
+        .int16   => "Int16",
+        .int32   => "Int32",
+        .int64   => "Int64",
+        .float32 => "Float32",
+        .float64 => "Float64",
+        .text    => "String",
+        .char    => "String",
+        .date    => "Date",
+        .timestamp => "DateTime64(3)",
+    };
+}
+
 fn asciiEql(a: []const u8, b: []const u8) bool {
     if (a.len != b.len) return false;
     for (a, b) |ca, cb| {
@@ -507,9 +1225,344 @@ fn asciiEql(a: []const u8, b: []const u8) bool {
     return true;
 }
 
+/// Parser for SQL VALUES INSERT statements.
+const SqlValuesParser = struct {
+    src: []const u8,
+    pos: usize,
+
+    fn skipWs(self: *SqlValuesParser) void {
+        while (self.pos < self.src.len and isValuesWs(self.src[self.pos])) self.pos += 1;
+    }
+
+    fn peekChar(self: *SqlValuesParser) u8 {
+        if (self.pos >= self.src.len) return 0;
+        return self.src[self.pos];
+    }
+
+    fn consumeKeyword(self: *SqlValuesParser, kw: []const u8) !void {
+        self.skipWs();
+        if (self.pos + kw.len > self.src.len) return error.ExpectedKeyword;
+        if (!std.ascii.eqlIgnoreCase(self.src[self.pos..self.pos + kw.len], kw)) return error.ExpectedKeyword;
+        self.pos += kw.len;
+    }
+
+    fn nextToken(self: *SqlValuesParser) ?[]const u8 {
+        self.skipWs();
+        if (self.pos >= self.src.len) return null;
+        const start = self.pos;
+        while (self.pos < self.src.len) {
+            const c = self.src[self.pos];
+            if (isValuesWs(c) or c == ',' or c == '(' or c == ')' or c == ';') break;
+            self.pos += 1;
+        }
+        if (self.pos == start) return null;
+        return self.src[start..self.pos];
+    }
+
+    fn parseValue(self: *SqlValuesParser, allocator: std.mem.Allocator) ![]const u8 {
+        self.skipWs();
+        if (self.pos >= self.src.len) return error.UnexpectedEnd;
+        const c = self.src[self.pos];
+        if (c == '\'') {
+            self.pos += 1;
+            var buf: std.ArrayListUnmanaged(u8) = .empty;
+            errdefer buf.deinit(allocator);
+            while (self.pos < self.src.len) {
+                const ch = self.src[self.pos];
+                if (ch == '\'') {
+                    self.pos += 1;
+                    if (self.pos < self.src.len and self.src[self.pos] == '\'') {
+                        try buf.append(allocator, '\'');
+                        self.pos += 1;
+                    } else break;
+                } else { try buf.append(allocator, ch); self.pos += 1; }
+            }
+            return try buf.toOwnedSlice(allocator);
+        }
+        // NULL → empty
+        if (self.pos + 4 <= self.src.len and std.ascii.eqlIgnoreCase(self.src[self.pos..self.pos + 4], "NULL")) {
+            self.pos += 4;
+            return try allocator.dupe(u8, "");
+        }
+        // Number or bare token
+        const start = self.pos;
+        while (self.pos < self.src.len) {
+            const ch = self.src[self.pos];
+            if (isValuesWs(ch) or ch == ',' or ch == ')') break;
+            self.pos += 1;
+        }
+        return try allocator.dupe(u8, self.src[start..self.pos]);
+    }
+};
+
+fn isValuesWs(c: u8) bool {
+    return c == ' ' or c == '\t' or c == '\r' or c == '\n';
+}
+
 fn asciiStartsWith(s: []const u8, prefix: []const u8) bool {
     if (s.len < prefix.len) return false;
     return asciiEql(s[0..prefix.len], prefix);
+}
+
+/// Convert a CSV result (header\nvalues\n) from generic_executor into a Native Block.
+/// All columns are treated as either Int64 (parseable integer) or String.
+/// Supports multi-column results (scalar agg) and multi-row results (group-by, scan).
+fn csvToNativeBlock(allocator: std.mem.Allocator, csv: []const u8) ![]u8 {
+    return csvToNativeBlockWithSchema(allocator, csv, null);
+}
+
+fn csvToNativeBlockWithSchema(allocator: std.mem.Allocator, csv: []const u8, tbl: ?*const schema.Table) ![]u8 {
+    // Split into lines, skip trailing empty
+    var lines: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer lines.deinit(allocator);
+    var it = std.mem.splitScalar(u8, csv, '\n');
+    while (it.next()) |line| {
+        if (line.len > 0) try lines.append(allocator, line);
+    }
+    if (lines.items.len == 0) return native_block.encodeEmpty(allocator);
+
+    // Parse header (first line): comma-separated column names
+    var col_names: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer col_names.deinit(allocator);
+    var hdr_it = std.mem.splitScalar(u8, lines.items[0], ',');
+    while (hdr_it.next()) |name| try col_names.append(allocator, name);
+
+    const num_cols = col_names.items.len;
+    if (num_cols == 0) return native_block.encodeEmpty(allocator);
+
+    const num_rows = lines.items.len - 1;
+
+    // For each column, collect string values then determine type (Int64, Float64, or String)
+    const ColData = struct {
+        vals: [][]const u8,
+        is_int: bool,
+        is_float: bool,
+        has_negative: bool,
+    };
+    const col_data = try allocator.alloc(ColData, num_cols);
+    defer allocator.free(col_data);
+
+    for (0..num_cols) |ci| {
+        const vals = try allocator.alloc([]const u8, num_rows);
+        col_data[ci] = .{ .vals = vals, .is_int = true, .is_float = true, .has_negative = false };
+    }
+    defer for (col_data) |cd| allocator.free(cd.vals);
+
+    for (lines.items[1..], 0..) |line, ri| {
+        var val_it = std.mem.splitScalar(u8, line, ',');
+        var ci: usize = 0;
+        while (val_it.next()) |val| : (ci += 1) {
+            if (ci >= num_cols) break;
+            col_data[ci].vals[ri] = val;
+            // Try to parse as int
+            if (col_data[ci].is_int) {
+                const iv = std.fmt.parseInt(i64, val, 10) catch {
+                    col_data[ci].is_int = false;
+                    continue;
+                };
+                if (iv < 0) col_data[ci].has_negative = true;
+            }
+            // Try to parse as float (only if not int)
+            if (!col_data[ci].is_int and col_data[ci].is_float) {
+                _ = std.fmt.parseFloat(f64, val) catch {
+                    col_data[ci].is_float = false;
+                };
+            }
+        }
+        // Fill missing columns with empty string
+        while (ci < num_cols) : (ci += 1) {
+            col_data[ci].vals[ri] = "";
+            col_data[ci].is_int = false;
+            col_data[ci].is_float = false;
+        }
+    }
+
+    // Encode Native Block
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+
+    // Inline putUVarInt / putString helpers
+    const putV = struct {
+        fn f(b: *std.ArrayListUnmanaged(u8), a: std.mem.Allocator, v: u64) !void {
+            var x = v;
+            while (x >= 0x80) {
+                try b.append(a, @as(u8, @intCast((x & 0x7F) | 0x80)));
+                x >>= 7;
+            }
+            try b.append(a, @as(u8, @intCast(x)));
+        }
+    }.f;
+    const putS = struct {
+        fn f(b: *std.ArrayListUnmanaged(u8), a: std.mem.Allocator, s: []const u8) !void {
+            var x = s.len;
+            while (x >= 0x80) {
+                try b.append(a, @as(u8, @intCast((x & 0x7F) | 0x80)));
+                x >>= 7;
+            }
+            try b.append(a, @as(u8, @intCast(x)));
+            try b.appendSlice(a, s);
+        }
+    }.f;
+
+    // Block info
+    try putV(&buf, allocator, 1);
+    try buf.append(allocator, 0);
+    try putV(&buf, allocator, 2);
+    try buf.appendSlice(allocator, &[4]u8{ 0xFF, 0xFF, 0xFF, 0xFF });
+    try putV(&buf, allocator, 0);
+
+    try putV(&buf, allocator, num_cols);
+    try putV(&buf, allocator, num_rows);
+
+    for (0..num_cols) |ci| {
+        try putS(&buf, allocator, col_names.items[ci]);
+
+        // Determine actual type from schema if available
+        const schema_ty: ?schema.ColumnType = if (tbl) |t| blk: {
+            const idx = t.findColumn(col_names.items[ci]) orelse break :blk null;
+            break :blk t.columns[idx].ty;
+        } else null;
+
+        if (schema_ty) |sty| {
+            // Use schema type for precise encoding
+            switch (sty) {
+                .int8 => {
+                    try putS(&buf, allocator, "UInt8");
+                    try buf.append(allocator, 0);
+                    for (col_data[ci].vals) |val| {
+                        const iv = std.fmt.parseInt(u8, val, 10) catch 0;
+                        try buf.append(allocator, iv);
+                    }
+                },
+                .int16 => {
+                    try putS(&buf, allocator, "Int16");
+                    try buf.append(allocator, 0);
+                    for (col_data[ci].vals) |val| {
+                        const iv = std.fmt.parseInt(i16, val, 10) catch 0;
+                        var tmp: [2]u8 = undefined;
+                        std.mem.writeInt(i16, &tmp, iv, .little);
+                        try buf.appendSlice(allocator, &tmp);
+                    }
+                },
+                .int32 => {
+                    try putS(&buf, allocator, "Int32");
+                    try buf.append(allocator, 0);
+                    for (col_data[ci].vals) |val| {
+                        const iv = std.fmt.parseInt(i32, val, 10) catch 0;
+                        var tmp: [4]u8 = undefined;
+                        std.mem.writeInt(i32, &tmp, iv, .little);
+                        try buf.appendSlice(allocator, &tmp);
+                    }
+                },
+                .int64 => {
+                    try putS(&buf, allocator, "Int64");
+                    try buf.append(allocator, 0);
+                    for (col_data[ci].vals) |val| {
+                        const iv = std.fmt.parseInt(i64, val, 10) catch 0;
+                        var tmp: [8]u8 = undefined;
+                        std.mem.writeInt(i64, &tmp, iv, .little);
+                        try buf.appendSlice(allocator, &tmp);
+                    }
+                },
+                .date => {
+                    try putS(&buf, allocator, "Date");
+                    try buf.append(allocator, 0);
+                    for (col_data[ci].vals) |val| {
+                        const iv = std.fmt.parseInt(u16, val, 10) catch 0;
+                        var tmp: [2]u8 = undefined;
+                        std.mem.writeInt(u16, &tmp, iv, .little);
+                        try buf.appendSlice(allocator, &tmp);
+                    }
+                },
+                .timestamp => {
+                    try putS(&buf, allocator, "DateTime64(3)");
+                    try buf.append(allocator, 0);
+                    for (col_data[ci].vals) |val| {
+                        const iv = std.fmt.parseInt(i64, val, 10) catch 0;
+                        var tmp: [8]u8 = undefined;
+                        std.mem.writeInt(i64, &tmp, iv, .little);
+                        try buf.appendSlice(allocator, &tmp);
+                    }
+                },
+                .float32 => {
+                    try putS(&buf, allocator, "Float32");
+                    try buf.append(allocator, 0);
+                    for (col_data[ci].vals) |val| {
+                        const fv = std.fmt.parseFloat(f32, val) catch 0.0;
+                        const bits: u32 = @bitCast(fv);
+                        var tmp: [4]u8 = undefined;
+                        std.mem.writeInt(u32, &tmp, bits, .little);
+                        try buf.appendSlice(allocator, &tmp);
+                    }
+                },
+                .float64 => {
+                    try putS(&buf, allocator, "Float64");
+                    try buf.append(allocator, 0);
+                    for (col_data[ci].vals) |val| {
+                        const fv = std.fmt.parseFloat(f64, val) catch 0.0;
+                        const bits: u64 = @bitCast(fv);
+                        var tmp: [8]u8 = undefined;
+                        std.mem.writeInt(u64, &tmp, bits, .little);
+                        try buf.appendSlice(allocator, &tmp);
+                    }
+                },
+                .text, .char => {
+                    try putS(&buf, allocator, "String");
+                    try buf.append(allocator, 0);
+                    for (col_data[ci].vals) |val| {
+                        try putS(&buf, allocator, val);
+                    }
+                },
+            }
+        } else if (col_data[ci].is_int) {
+            if (col_data[ci].has_negative) {
+                try putS(&buf, allocator, "Int64");
+                try buf.append(allocator, 0);
+                for (col_data[ci].vals) |val| {
+                    const iv = std.fmt.parseInt(i64, val, 10) catch 0;
+                    var tmp: [8]u8 = undefined;
+                    std.mem.writeInt(i64, &tmp, iv, .little);
+                    try buf.appendSlice(allocator, &tmp);
+                }
+            } else {
+                try putS(&buf, allocator, "UInt64");
+                try buf.append(allocator, 0);
+                for (col_data[ci].vals) |val| {
+                    const iv = std.fmt.parseInt(u64, val, 10) catch 0;
+                    var tmp: [8]u8 = undefined;
+                    std.mem.writeInt(u64, &tmp, iv, .little);
+                    try buf.appendSlice(allocator, &tmp);
+                }
+            }
+        } else if (col_data[ci].is_float) {
+            try putS(&buf, allocator, "Float64");
+            try buf.append(allocator, 0); // custom_serialization=false
+            for (col_data[ci].vals) |val| {
+                const fv = std.fmt.parseFloat(f64, val) catch 0.0;
+                const bits: u64 = @bitCast(fv);
+                var tmp: [8]u8 = undefined;
+                std.mem.writeInt(u64, &tmp, bits, .little);
+                try buf.appendSlice(allocator, &tmp);
+            }
+        } else {
+            try putS(&buf, allocator, "String");
+            try buf.append(allocator, 0); // custom_serialization=false
+            for (col_data[ci].vals) |val| {
+                try putS(&buf, allocator, val);
+            }
+        }
+    }
+
+    // Empty terminator block
+    try putV(&buf, allocator, 1);
+    try buf.append(allocator, 0);
+    try putV(&buf, allocator, 2);
+    try buf.appendSlice(allocator, &[4]u8{ 0xFF, 0xFF, 0xFF, 0xFF });
+    try putV(&buf, allocator, 0);
+    try putV(&buf, allocator, 0);
+    try putV(&buf, allocator, 0);
+
+    return buf.toOwnedSlice(allocator);
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

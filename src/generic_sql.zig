@@ -103,13 +103,10 @@ pub fn parse(allocator: std.mem.Allocator, sql: []const u8) !?Plan {
         }
         // If the DuckDB-parsed plan passes the looser generic shape check, accept
         // it for the generic executor path (GROUP BY, HAVING, arithmetic expressions, etc.)
-        // Require at least a WHERE predicate tree, HAVING clause, or GROUP BY to avoid
-        // routing plain projections to the generic executor unnecessarily.
         // Exclude plans where DuckDB detected a DESC alias-based ORDER BY (those may
         // belong to a specialised path that uses the legacy parser's structure).
         const has_desc_alias_order = plan.order_by_alias != null and !plan.order_by_alias_asc;
-        if (order_ok and !has_desc_alias_order and
-            (plan.where_expr != null or plan.having_text != null or plan.group_by != null) and
+        if (!has_desc_alias_order and
             validGenericShape(plan.projections, plan.having_text, plan.group_by))
         {
             return plan;
@@ -156,7 +153,8 @@ fn parseLegacy(allocator: std.mem.Allocator, sql: []const u8) !?Plan {
     const order_by_pos = indexOfKeywordPair(after_from, "order", "by");
     const limit_pos = indexOfKeyword(after_from, "limit");
     const offset_pos = indexOfKeyword(after_from, "offset");
-    const table_end = minOptionalPos(where_pos, minOptionalPos(group_by_pos, minOptionalPos(having_pos, minOptionalPos(order_by_pos, minOptionalPos(limit_pos, offset_pos))))) orelse after_from.len;
+    const final_pos = indexOfKeyword(after_from, "final");
+    const table_end = minOptionalPos(where_pos, minOptionalPos(group_by_pos, minOptionalPos(having_pos, minOptionalPos(order_by_pos, minOptionalPos(limit_pos, minOptionalPos(offset_pos, final_pos)))))) orelse after_from.len;
     const table_text = std.mem.trim(u8, after_from[0..table_end], " \t\r\n");
     // Table name is passed through to Plan.table; callers validate it.
 
@@ -556,6 +554,7 @@ fn parseExpr(expr: []const u8) ?Expr {
     if (parseCall(expr, "count")) |arg| {
         const trimmed_arg = std.mem.trim(u8, arg, " \t\r\n");
         if (std.mem.eql(u8, trimmed_arg, "*")) return .{ .func = .count_star };
+        if (trimmed_arg.len == 0) return .{ .func = .count_star }; // count() == count(*)
         const distinct_kw = "distinct";
         if (startsWithKeyword(trimmed_arg, distinct_kw)) {
             const column = std.mem.trim(u8, trimmed_arg[distinct_kw.len..], " \t\r\n");
@@ -1043,8 +1042,11 @@ test "parses URL length by counter shape" {
     try std.testing.expectEqual(@as(?usize, 25), plan.limit);
 }
 
-test "rejects unsupported order by" {
-    try std.testing.expect((try parse(std.testing.allocator, "SELECT AdvEngineID, COUNT(*) FROM hits GROUP BY AdvEngineID ORDER BY AdvEngineID")) == null);
+test "accepts group by with arbitrary order by via generic path" {
+    // Previously rejected, now accepted by the generic executor path
+    const plan = (try parse(std.testing.allocator, "SELECT AdvEngineID, COUNT(*) FROM hits GROUP BY AdvEngineID ORDER BY AdvEngineID")).?;
+    defer deinit(std.testing.allocator, plan);
+    try std.testing.expectEqualStrings("AdvEngineID", plan.group_by.?);
 }
 
 test "parses not equal filter" {
@@ -1088,7 +1090,12 @@ test "parses two predicate and filter" {
 }
 
 test "rejects unsupported sql" {
-    try std.testing.expect((try parse(std.testing.allocator, "SELECT URL FROM hits")) == null);
+    // Since generic route was broadened, plain column projections are now valid.
+    // "SELECT URL FROM hits" should now parse successfully.
+    const plan_url = (try parse(std.testing.allocator, "SELECT URL FROM hits")).?;
+    defer deinit(std.testing.allocator, plan_url);
+    try std.testing.expectEqual(@as(usize, 1), plan_url.projections.len);
+
     // Non-"hits" table names are now parsed successfully; callers (e.g.
     // Native.executeGenericSql) validate the table name and return
     // error.UnknownTable for unrecognised tables.

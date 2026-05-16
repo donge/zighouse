@@ -477,6 +477,14 @@ pub fn build(b: *std.Build) void {
         generic_executor_mod.linkSystemLibrary("duckdb", .{});
     }
 
+    const native_block_mod = b.createModule(.{
+        .root_source_file = b.path("src/ingest/native_block.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const native_block_tests = b.addTest(.{ .root_module = native_block_mod });
+    const native_block_test_cmd = b.addRunArtifact(native_block_tests);
+
     const ddl_parser_mod = b.createModule(.{
         .root_source_file = b.path("src/ingest/ddl_parser.zig"),
         .target = target,
@@ -501,6 +509,7 @@ pub fn build(b: *std.Build) void {
     ingest_server_mod.addImport("generic_executor", generic_executor_mod);
     ingest_server_mod.addImport("generic_sql", generic_sql_mod);
     ingest_server_mod.addImport("ddl_parser", ddl_parser_mod);
+    ingest_server_mod.addImport("native_block", native_block_mod);
     ingest_server_mod.link_libc = true;
     ingest_server_mod.addIncludePath(.{ .cwd_relative = lz4_include });
     ingest_server_mod.addLibraryPath(.{ .cwd_relative = lz4_lib });
@@ -559,6 +568,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&part_scanner_test_cmd.step);
     test_step.dependOn(&part_writer_session_test_cmd.step);
     test_step.dependOn(&ddl_parser_test_cmd.step);
+    test_step.dependOn(&native_block_test_cmd.step);
     test_step.dependOn(&ingest_server_test_cmd.step);
 
     if (!install_bench_tools) return;

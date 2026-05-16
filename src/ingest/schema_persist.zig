@@ -168,12 +168,15 @@ pub fn loadAll(
 
 fn columnTypeName(ty: schema.ColumnType) []const u8 {
     return switch (ty) {
+        .int8 => "Int8",
         .int16 => "Int16",
         .int32 => "Int32",
         .int64 => "Int64",
         .date => "Date",
         .timestamp => "DateTime",
         .text, .char => "String",
+        .float32 => "Float32",
+        .float64 => "Float64",
     };
 }
 

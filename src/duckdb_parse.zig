@@ -322,7 +322,8 @@ fn translateWhere(allocator: std.mem.Allocator, val: std.json.Value) !*generic_s
             return node;
         }
 
-        allocator.free(col);
+        // Neither int nor string literal — unsupported.
+        // errdefer at line 307 will free `col`.
         return error.UnsupportedWhereNode;
     }
 
@@ -386,10 +387,7 @@ fn translateWhere(allocator: std.mem.Allocator, val: std.json.Value) !*generic_s
             }
             for (vals) |val_node| {
                 const iv = intLiteralValue(val_node) orelse {
-                    // Free already-built kids and col
-                    for (kids[0..n_built]) |k| generic_sql.freeWhereNode(allocator, k);
-                    allocator.free(kids);
-                    allocator.free(col);
+                    // errdefers at lines 384 and 378 will handle cleanup.
                     return error.UnsupportedWhereNode;
                 };
                 // Each child needs its own copy of col
@@ -400,11 +398,11 @@ fn translateWhere(allocator: std.mem.Allocator, val: std.json.Value) !*generic_s
                 kids[n_built] = kid;
                 n_built += 1;
             }
-            // Free the original col copy since each kid has its own
-            allocator.free(col);
+            // Create the node before freeing col (create can fail).
             const node = try allocator.create(generic_sql.WhereNode);
-            // IN → OR of equalities; NOT IN → AND of inequalities
             node.* = if (negate) .{ .and_ = kids } else .{ .or_ = kids };
+            // Free the original col copy since each kid has its own.
+            allocator.free(col);
             return node;
         }
     }
@@ -450,6 +448,15 @@ fn extractTableName(allocator: std.mem.Allocator, from: std.json.Value) !?[]u8 {
     const t = (obj.get("type") orelse return null).string;
     if (!std.mem.eql(u8, t, "BASE_TABLE")) return null;
     const name = (obj.get("table_name") orelse return null).string;
+    // If schema_name is set and non-empty and not "main", reconstruct "schema.table".
+    if (obj.get("schema_name")) |schema_val| {
+        if (schema_val == .string) {
+            const schema_str = schema_val.string;
+            if (schema_str.len > 0 and !std.mem.eql(u8, schema_str, "main")) {
+                return try std.fmt.allocPrint(allocator, "{s}.{s}", .{ schema_str, name });
+            }
+        }
+    }
     return try allocator.dupe(u8, name);
 }
 

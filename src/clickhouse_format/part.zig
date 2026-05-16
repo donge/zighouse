@@ -317,6 +317,10 @@ pub const Part = struct {
 
         for (self.column_writers, values, self.table.columns) |*cw, val, col| {
             switch (col.ty) {
+                .int8 => {
+                    const buf = [1]u8{@bitCast(@as(i8, @intCast(val.i16)))};
+                    try cw.appendFixed(&buf);
+                },
                 .int16 => {
                     var buf: [2]u8 = undefined;
                     std.mem.writeInt(i16, &buf, val.i16, .little);
@@ -328,6 +332,16 @@ pub const Part = struct {
                     try cw.appendFixed(&buf);
                 },
                 .int64, .timestamp => {
+                    var buf: [8]u8 = undefined;
+                    std.mem.writeInt(i64, &buf, val.i64, .little);
+                    try cw.appendFixed(&buf);
+                },
+                .float32 => {
+                    var buf: [4]u8 = undefined;
+                    std.mem.writeInt(i32, &buf, val.i32, .little);
+                    try cw.appendFixed(&buf);
+                },
+                .float64 => {
                     var buf: [8]u8 = undefined;
                     std.mem.writeInt(i64, &buf, val.i64, .little);
                     try cw.appendFixed(&buf);
@@ -362,6 +376,10 @@ pub const Part = struct {
         const cw = &self.column_writers[col_idx];
         for (values) |v| {
             switch (col.ty) {
+                .int8 => {
+                    const buf = [1]u8{@bitCast(@as(i8, @intCast(v)))};
+                    try cw.appendFixed(&buf);
+                },
                 .int16 => {
                     var buf: [2]u8 = undefined;
                     std.mem.writeInt(i16, &buf, @intCast(v), .little);
@@ -377,6 +395,18 @@ pub const Part = struct {
                     std.mem.writeInt(i64, &buf, v, .little);
                     try cw.appendFixed(&buf);
                 },
+                // float32: raw bits stored as lower 32 bits of i64
+                .float32 => {
+                    var buf: [4]u8 = undefined;
+                    std.mem.writeInt(u32, &buf, @intCast(v & 0xFFFF_FFFF), .little);
+                    try cw.appendFixed(&buf);
+                },
+                // float64: raw bits stored as i64
+                .float64 => {
+                    var buf: [8]u8 = undefined;
+                    std.mem.writeInt(u64, &buf, @bitCast(v), .little);
+                    try cw.appendFixed(&buf);
+                },
                 else => return error.NotAFixedColumn,
             }
         }
@@ -386,9 +416,13 @@ pub const Part = struct {
                 const abs_row = self.row_count + i;
                 if (abs_row % GRANULE_SIZE == 0) {
                     const pk_entry: primary_idx.PkValue = switch (col.ty) {
+                        .int8 => .{ .i16 = @intCast(v) },
                         .int16 => .{ .i16 = @intCast(v) },
                         .int32, .date => .{ .i32 = @intCast(v) },
                         .int64, .timestamp => .{ .i64 = v },
+                        // Floats as PK: store raw bits as i64 (unusual but valid)
+                        .float32 => .{ .i32 = @intCast(v & 0xFFFF_FFFF) },
+                        .float64 => .{ .i64 = v },
                         else => return error.NotAFixedColumn,
                     };
                     try self.pk_entries.append(self.allocator, pk_entry);
@@ -819,10 +853,17 @@ pub const ColumnReader = struct {
         for (0..n) |i| {
             const slice = self.data[self.cursor + i * width ..][0..width];
             out[i] = switch (self.col.ty) {
+                .int8 => @as(i64, @as(i8, @bitCast(slice[0]))),
                 .int16 => @as(i64, std.mem.readInt(i16, slice[0..2], .little)),
                 .int32, .date => @as(i64, std.mem.readInt(i32, slice[0..4], .little)),
                 .int64, .timestamp => std.mem.readInt(i64, slice[0..8], .little),
-                else => return error.NotAFixedColumn,
+                // float32: raw 4-byte bits stored as i64 (upper 32 bits zero)
+                .float32 => @as(i64, std.mem.readInt(u32, slice[0..4], .little)),
+                // float64: raw 8-byte bits reinterpreted as i64
+                .float64 => @bitCast(std.mem.readInt(u64, slice[0..8], .little)),
+                else => {
+                    return error.NotAFixedColumn;
+                },
             };
         }
         self.cursor += needed;

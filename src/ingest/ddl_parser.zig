@@ -127,22 +127,44 @@ pub fn parse(allocator: std.mem.Allocator, sql: []const u8) !ParseResult {
             if (asciiEql(col_type_raw, "DateTime64")) {
                 const col_name_owned = try allocator.dupe(u8, col_name_raw);
                 try cols.append(allocator, .{ .name = col_name_owned, .ty = .timestamp });
+                if (tok.peekKeyword("DEFAULT") or tok.peekKeyword("COMMENT") or tok.peekKeyword("CODEC")) tok.skipToColumnDelimiter();
                 continue;
             }
             // FixedString(N) → text
             if (asciiEql(col_type_raw, "FixedString")) {
                 const col_name_owned = try allocator.dupe(u8, col_name_raw);
                 try cols.append(allocator, .{ .name = col_name_owned, .ty = .text });
+                if (tok.peekKeyword("DEFAULT") or tok.peekKeyword("COMMENT") or tok.peekKeyword("CODEC")) tok.skipToColumnDelimiter();
+                continue;
+            }
+            // Array(...) → text (blob)
+            if (asciiEql(col_type_raw, "Array")) {
+                const col_name_owned = try allocator.dupe(u8, col_name_raw);
+                try cols.append(allocator, .{ .name = col_name_owned, .ty = .text });
+                if (tok.peekKeyword("DEFAULT") or tok.peekKeyword("COMMENT") or tok.peekKeyword("CODEC")) tok.skipToColumnDelimiter();
+                continue;
+            }
+            // Map(...) → text (blob)
+            if (asciiEql(col_type_raw, "Map")) {
+                const col_name_owned = try allocator.dupe(u8, col_name_raw);
+                try cols.append(allocator, .{ .name = col_name_owned, .ty = .text });
+                if (tok.peekKeyword("DEFAULT") or tok.peekKeyword("COMMENT") or tok.peekKeyword("CODEC")) tok.skipToColumnDelimiter();
                 continue;
             }
             // Nullable(T) / LowCardinality(T) → resolve inner type
             const eff_ty = parseColumnType(inner) orelse return error.UnsupportedColumnType;
             const col_name_owned = try allocator.dupe(u8, col_name_raw);
             try cols.append(allocator, .{ .name = col_name_owned, .ty = eff_ty });
+            if (tok.peekKeyword("DEFAULT") or tok.peekKeyword("COMMENT") or tok.peekKeyword("CODEC")) tok.skipToColumnDelimiter();
             continue;
         }
 
         const col_ty = parseColumnType(col_type_raw) orelse return error.UnsupportedColumnType;
+
+        // Skip optional DEFAULT <expr> clause (any tokens up to the next top-level ',' or ')')
+        if (tok.peekKeyword("DEFAULT") or tok.peekKeyword("MATERIALIZED") or tok.peekKeyword("ALIAS") or tok.peekKeyword("COMMENT") or tok.peekKeyword("CODEC")) {
+            tok.skipToColumnDelimiter();
+        }
 
         const col_name_owned = try allocator.dupe(u8, col_name_raw);
         try cols.append(allocator, .{ .name = col_name_owned, .ty = col_ty });
@@ -166,7 +188,10 @@ pub fn parse(allocator: std.mem.Allocator, sql: []const u8) !ParseResult {
             if (tok.peekChar('(')) {
                 tok.skip(); // consume '('
                 const first_col = tok.next() orelse break;
-                pk = try allocator.dupe(u8, first_col);
+                // ORDER BY tuple() means no meaningful pk — use default (col 0)
+                if (!asciiEql(first_col, "tuple")) {
+                    pk = try allocator.dupe(u8, first_col);
+                }
                 // drain rest of tuple
                 while (tok.next()) |t| {
                     if (t.len == 1 and t[0] == ')') break;
@@ -210,17 +235,24 @@ pub fn parse(allocator: std.mem.Allocator, sql: []const u8) !ParseResult {
 // ── Type mapping ──────────────────────────────────────────────────────────────
 
 fn parseColumnType(s: []const u8) ?schema.ColumnType {
+    if (asciiEql(s, "Int8"))  return .int8;
     if (asciiEql(s, "Int16")) return .int16;
     if (asciiEql(s, "Int32")) return .int32;
     if (asciiEql(s, "Int64")) return .int64;
-    if (asciiEql(s, "UInt16")) return .date;       // Date stored as UInt16
-    if (asciiEql(s, "UInt32")) return .timestamp;  // DateTime stored as UInt32
+    if (asciiEql(s, "UInt16")) return .int16;
+    if (asciiEql(s, "UInt32")) return .int32;
+    if (asciiEql(s, "UInt8"))  return .int8;
+    if (asciiEql(s, "UInt64")) return .int64;
     if (asciiEql(s, "Date")) return .date;
     if (asciiEql(s, "Date32")) return .date;
     if (asciiEql(s, "DateTime")) return .timestamp;
     if (asciiEql(s, "DateTime64")) return .timestamp;
     if (asciiEql(s, "String")) return .text;
     if (asciiEql(s, "FixedString")) return .text;
+    if (asciiEql(s, "IPv4")) return .text;
+    if (asciiEql(s, "IPv6")) return .text;
+    if (asciiEql(s, "Float32")) return .float32;
+    if (asciiEql(s, "Float64")) return .float64;
     return null;
 }
 
@@ -284,6 +316,25 @@ const Tokenizer = struct {
                 }
                 return self.src[start..self.pos];
             },
+        }
+    }
+
+    /// Consume tokens until a top-level ',' or ')' is the next token (not consumed).
+    /// Used to skip DEFAULT / MATERIALIZED / ALIAS / COMMENT / CODEC expressions.
+    fn skipToColumnDelimiter(self: *Tokenizer) void {
+        var depth: usize = 0;
+        while (true) {
+            // Peek at next char without modifying self (unless we decide to advance)
+            var tmp = self.*;
+            const tok = tmp.next() orelse return; // EOF
+            if (depth == 0 and tok.len == 1 and (tok[0] == ',' or tok[0] == ')')) return;
+            // Otherwise actually consume
+            _ = self.next();
+            if (tok.len == 1 and tok[0] == '(') depth += 1;
+            if (tok.len == 1 and tok[0] == ')') {
+                if (depth == 0) return; // shouldn't happen but be safe
+                depth -= 1;
+            }
         }
     }
 
@@ -397,8 +448,17 @@ test "parse: ORDER BY tuple" {
 
 test "parse: unsupported type returns error" {
     const allocator = std.testing.allocator;
-    const sql = "CREATE TABLE t (x Float64) ENGINE = MergeTree";
+    const sql = "CREATE TABLE t (x Decimal(10,2)) ENGINE = MergeTree";
     try std.testing.expectError(error.UnsupportedColumnType, parse(allocator, sql));
+}
+
+test "parse: Float32 and Float64 are supported" {
+    const allocator = std.testing.allocator;
+    const sql = "CREATE TABLE t (a Float32, b Float64) ENGINE = MergeTree";
+    var result = try parse(allocator, sql);
+    defer result.deinit();
+    try std.testing.expectEqual(schema.ColumnType.float32, result.entry.table.columns[0].ty);
+    try std.testing.expectEqual(schema.ColumnType.float64, result.entry.table.columns[1].ty);
 }
 
 test "parse: Nullable(T) unwraps inner type" {
@@ -455,13 +515,15 @@ test "parse: backtick-quoted identifiers" {
     try std.testing.expectEqualStrings("id", result.entry.pk.?);
 }
 
-test "parse: UInt16 maps to date, UInt32 maps to timestamp" {
+test "parse: UInt8 maps to int8, UInt16 to int16, UInt32 to int32, UInt64 to int64" {
     const allocator = std.testing.allocator;
-    const sql = "CREATE TABLE t (d UInt16, ts UInt32) ENGINE = MergeTree ORDER BY d";
+    const sql = "CREATE TABLE t (a UInt8, b UInt16, c UInt32, d UInt64) ENGINE = MergeTree ORDER BY a";
     var result = try parse(allocator, sql);
     defer result.deinit();
-    try std.testing.expectEqual(schema.ColumnType.date,      result.entry.table.columns[0].ty);
-    try std.testing.expectEqual(schema.ColumnType.timestamp, result.entry.table.columns[1].ty);
+    try std.testing.expectEqual(schema.ColumnType.int8,  result.entry.table.columns[0].ty);
+    try std.testing.expectEqual(schema.ColumnType.int16, result.entry.table.columns[1].ty);
+    try std.testing.expectEqual(schema.ColumnType.int32, result.entry.table.columns[2].ty);
+    try std.testing.expectEqual(schema.ColumnType.int64, result.entry.table.columns[3].ty);
 }
 
 test "parse: DateTime64 maps to timestamp" {
@@ -483,4 +545,64 @@ test "parse: Date32 maps to date" {
     var result = try parse(allocator, sql);
     defer result.deinit();
     try std.testing.expectEqual(schema.ColumnType.date, result.entry.table.columns[0].ty);
+}
+
+test "parse: DEFAULT clause is skipped" {
+    const allocator = std.testing.allocator;
+    const sql =
+        \\CREATE TABLE IF NOT EXISTS vprobe.scoring_rules (
+        \\    rule_id      String,
+        \\    protocol     LowCardinality(String) DEFAULT '*',
+        \\    feature      String,
+        \\    operator     LowCardinality(String),
+        \\    threshold    Float64 DEFAULT 0,
+        \\    weight       Float64 DEFAULT 0,
+        \\    enabled      UInt8 DEFAULT 1,
+        \\    note         String DEFAULT '',
+        \\    updated_at   DateTime64(3),
+        \\    version      UInt64
+        \\) ENGINE = ReplacingMergeTree(version)
+        \\ORDER BY (rule_id)
+    ;
+    var result = try parse(allocator, sql);
+    defer result.deinit();
+    try std.testing.expectEqualStrings("vprobe", result.entry.db);
+    try std.testing.expectEqualStrings("scoring_rules", result.entry.name);
+    try std.testing.expectEqual(@as(usize, 10), result.entry.table.columns.len);
+    try std.testing.expectEqual(schema.ColumnType.text,      result.entry.table.columns[0].ty); // rule_id
+    try std.testing.expectEqual(schema.ColumnType.text,      result.entry.table.columns[1].ty); // protocol
+    try std.testing.expectEqual(schema.ColumnType.text,      result.entry.table.columns[2].ty); // feature
+    try std.testing.expectEqual(schema.ColumnType.text,      result.entry.table.columns[3].ty); // operator
+    try std.testing.expectEqual(schema.ColumnType.float64,   result.entry.table.columns[4].ty); // threshold
+    try std.testing.expectEqual(schema.ColumnType.float64,   result.entry.table.columns[5].ty); // weight
+    try std.testing.expectEqual(schema.ColumnType.int8,      result.entry.table.columns[6].ty); // enabled
+    try std.testing.expectEqual(schema.ColumnType.text,      result.entry.table.columns[7].ty); // note
+    try std.testing.expectEqual(schema.ColumnType.timestamp, result.entry.table.columns[8].ty); // updated_at
+    try std.testing.expectEqual(schema.ColumnType.int64,     result.entry.table.columns[9].ty); // version
+    try std.testing.expectEqualStrings("rule_id", result.entry.pk.?);
+}
+
+test "parse: full scoring_rules with upper column" {
+    const allocator = std.testing.allocator;
+    const sql =
+        \\CREATE TABLE IF NOT EXISTS vprobe.scoring_rules (
+        \\    rule_id      String,
+        \\    protocol     LowCardinality(String) DEFAULT '*',
+        \\    feature      String,
+        \\    operator     LowCardinality(String),
+        \\    threshold    Float64 DEFAULT 0,
+        \\    upper        Float64 DEFAULT 0,
+        \\    weight       Float64 DEFAULT 0,
+        \\    enabled      UInt8 DEFAULT 1,
+        \\    note         String DEFAULT '',
+        \\    updated_at   DateTime64(3),
+        \\    version      UInt64
+        \\) ENGINE = ReplacingMergeTree(version)
+        \\ORDER BY (rule_id);
+    ;
+    var result = try parse(allocator, sql);
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 11), result.entry.table.columns.len);
+    try std.testing.expectEqual(schema.ColumnType.timestamp, result.entry.table.columns[9].ty); // updated_at
+    try std.testing.expectEqual(schema.ColumnType.int64,     result.entry.table.columns[10].ty); // version
 }

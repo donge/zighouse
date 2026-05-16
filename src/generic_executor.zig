@@ -86,7 +86,7 @@ pub fn run(
 
 // ── Column descriptor ─────────────────────────────────────────────────────────
 
-const ColKind = enum { fixed_i16, fixed_i32, fixed_i64, fixed_date, fixed_timestamp, string };
+const ColKind = enum { fixed_i16, fixed_i32, fixed_i64, fixed_date, fixed_timestamp, fixed_f32, fixed_f64, string };
 
 const ColDesc = struct {
     name: []const u8,    // original column name (case as in schema)
@@ -100,11 +100,13 @@ fn lookupColumn(tbl: *const schema.Table, name: []const u8) ?ColDesc {
     const idx = tbl.findColumn(name) orelse return null;
     const col = tbl.columns[idx];
     const kind: ColKind = switch (col.ty) {
-        .int16 => .fixed_i16,
+        .int8, .int16 => .fixed_i16,
         .int32 => .fixed_i32,
         .int64 => .fixed_i64,
         .date   => .fixed_date,
         .timestamp => .fixed_timestamp,
+        .float32 => .fixed_f32,
+        .float64 => .fixed_f64,
         .text, .char => .string,
     };
     return ColDesc{ .name = col.name, .index = idx, .kind = kind };
@@ -533,6 +535,8 @@ const Executor = struct {
                 .fixed_i16 => .i16,
                 .fixed_i32, .fixed_date => .i32,
                 .fixed_i64, .fixed_timestamp => .i64,
+                .fixed_f32 => .i32,  // f32 raw bits stored as 4 bytes
+                .fixed_f64 => .i64,  // f64 raw bits stored as 8 bytes
                 .string => unreachable,
             };
         }
@@ -685,8 +689,15 @@ const Executor = struct {
         defer self.allocator.free(vals);
 
         for (0..row_count) |row_idx| {
-            for (fixed_bufs, 0..) |buf, fi| {
-                vals[fi] = Value{ .i64 = buf[row_idx] };
+            for (fixed_bufs, fixed_descs.items, 0..) |buf, desc, fi| {
+                vals[fi] = switch (desc.kind) {
+                    .fixed_f32 => blk: {
+                        const bits: u32 = @intCast(buf[row_idx] & 0xFFFF_FFFF);
+                        break :blk Value{ .f64 = @as(f64, @floatCast(@as(f32, @bitCast(bits)))) };
+                    },
+                    .fixed_f64 => Value{ .f64 = @bitCast(buf[row_idx]) },
+                    else => Value{ .i64 = buf[row_idx] },
+                };
             }
             for (str_data, 0..) |col_data, si| {
                 vals[fixed_descs.items.len + si] = if (row_idx < col_data.items.len)
@@ -1267,6 +1278,7 @@ fn collectNeededColumns(
     // Ensure at least one column is present so streamRows can count rows.
     if (needed.items.len == 0) {
         // Fall back to first column in schema if "CounterID" is not available.
+        if (table.columns.len == 0) return; // empty/fake table: no columns to collect
         const fallback = if (table.findColumn("CounterID") != null) "CounterID" else table.columns[0].name;
         try add(allocator, &seen, needed, fallback, table);
     }

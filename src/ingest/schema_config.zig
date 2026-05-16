@@ -204,12 +204,19 @@ pub fn loadFromSlice(allocator: std.mem.Allocator, json_bytes: []const u8) !Sche
 }
 
 fn parseColumnType(s: []const u8) ?schema.ColumnType {
+    if (asciiEql(s, "Int8")) return .int8;
     if (asciiEql(s, "Int16")) return .int16;
     if (asciiEql(s, "Int32")) return .int32;
     if (asciiEql(s, "Int64")) return .int64;
+    if (asciiEql(s, "UInt8")) return .int8;
+    if (asciiEql(s, "UInt16")) return .int16;
+    if (asciiEql(s, "UInt32")) return .int32;
+    if (asciiEql(s, "UInt64")) return .int64;
     if (asciiEql(s, "Date")) return .date;
     if (asciiEql(s, "DateTime")) return .timestamp;
     if (asciiEql(s, "String")) return .text;
+    if (asciiEql(s, "Float32")) return .float32;
+    if (asciiEql(s, "Float64")) return .float64;
     return null;
 }
 
