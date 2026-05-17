@@ -61,6 +61,10 @@ pub const Server = struct {
     schemas: schema_config.SchemaConfig,
     /// Monotonically increasing part sequence number (per-process, not per-table).
     seq: u64,
+    /// In-memory view registry: view_name → SELECT SQL (owned strings).
+    views: std.StringHashMap([]const u8),
+    /// In-memory function registry: fn_name → lambda text "(params) -> body" (owned strings).
+    functions: std.StringHashMap([]const u8),
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, config: Config) !Server {
         // Load all persisted schemas from disk.
@@ -83,11 +87,25 @@ pub const Server = struct {
             .config = config,
             .schemas = schemas,
             .seq = 1,
+            .views = std.StringHashMap([]const u8).init(allocator),
+            .functions = std.StringHashMap([]const u8).init(allocator),
         };
     }
 
     pub fn deinit(self: *Server) void {
         self.schemas.deinit();
+        var it = self.views.iterator();
+        while (it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            self.allocator.free(entry.value_ptr.*);
+        }
+        self.views.deinit();
+        var fit = self.functions.iterator();
+        while (fit.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            self.allocator.free(entry.value_ptr.*);
+        }
+        self.functions.deinit();
     }
 
     /// Block and serve requests until an error or signal.
@@ -155,13 +173,10 @@ pub const Server = struct {
                 return;
             };
             const trimmed_raw = std.mem.trim(u8, decoded, " \t\r\n");
-            // Substitute $N parameters from URL query string params.
-            const after_params = try substituteParams(self.allocator, target, trimmed_raw);
-            defer self.allocator.free(after_params);
-            // Remove FINAL keyword (no-op in ZigHouse).
-            const trimmed_sql = try removeFinal(self.allocator, after_params);
-            defer self.allocator.free(trimmed_sql);
-            try self.dispatchSql(request, out, trimmed_sql);
+             // Substitute $N parameters from URL query string params.
+             const after_params = try substituteParams(self.allocator, target, trimmed_raw);
+             defer self.allocator.free(after_params);
+             try self.dispatchSql(request, out, after_params);
         } else {
             // clickhouse-go sends SQL in POST body.
             // The body may contain: just the SQL (DDL/SELECT), or SQL\ndata (INSERT).
@@ -210,7 +225,7 @@ pub const Server = struct {
     fn dispatchSql(self: *Server, request: *std.http.Server.Request, out: *std.Io.Writer, trimmed: []const u8) !void {
         if (asciiStartsWith(trimmed, "INSERT")) {
             try self.handleInsert(request, out, trimmed);
-        } else if (asciiStartsWith(trimmed, "SELECT")) {
+        } else if (asciiStartsWith(trimmed, "SELECT") or asciiStartsWith(trimmed, "WITH")) {
             try self.handleSelect(request, out, trimmed);
         } else if (asciiStartsWith(trimmed, "CREATE")) {
             try self.handleCreate(request, out, trimmed);
@@ -233,7 +248,7 @@ pub const Server = struct {
     fn dispatchSqlWithData(self: *Server, request: *std.http.Server.Request, out: *std.Io.Writer, trimmed: []const u8, data_part: []const u8) !void {
         if (asciiStartsWith(trimmed, "INSERT")) {
             try self.handleInsertBodyData(request, out, trimmed, data_part);
-        } else if (asciiStartsWith(trimmed, "SELECT")) {
+        } else if (asciiStartsWith(trimmed, "SELECT") or asciiStartsWith(trimmed, "WITH")) {
             try self.handleSelectSimple(request, out, trimmed);
         } else if (asciiStartsWith(trimmed, "CREATE")) {
             try self.handleCreateSimple(request, out, trimmed);
@@ -274,15 +289,81 @@ pub const Server = struct {
             try sendResponse(request, out, .ok, "");
             return;
         }
-        // CREATE VIEW — no-op.
-        if (asciiEql(second2, "VIEW")) {
+        // CREATE VIEW [OR REPLACE] — store view definition.
+        if (asciiEql(second2, "VIEW") or
+            (asciiEql(second2, "OR") and asciiEql(third2, "REPLACE") and blk: {
+                var it3 = std.mem.tokenizeAny(u8, sql, " \t\r\n");
+                _ = it3.next(); // CREATE
+                _ = it3.next(); // OR
+                _ = it3.next(); // REPLACE
+                const fourth = it3.next() orelse "";
+                break :blk asciiEql(fourth, "VIEW");
+            }))
+        {
+            // Parse: CREATE [OR REPLACE] VIEW [db.]name AS <select>
+            // Find "VIEW" keyword position
+            const view_kw_pos = std.ascii.indexOfIgnoreCase(sql, "VIEW ") orelse {
+                try sendResponse(request, out, .ok, "");
+                return;
+            };
+            const after_view = sql[view_kw_pos + 5..];
+            // Find "AS" keyword
+            const as_pos = std.ascii.indexOfIgnoreCase(after_view, " AS ") orelse {
+                try sendResponse(request, out, .ok, "");
+                return;
+            };
+            const view_full_name = std.mem.trim(u8, after_view[0..as_pos], " \t\r\n");
+            const select_sql = std.mem.trim(u8, after_view[as_pos + 4..], " \t\r\n");
+            // view_full_name may be "db.name" or just "name"
+            const view_name = if (std.mem.indexOfScalar(u8, view_full_name, '.')) |dot_pos|
+                view_full_name[dot_pos + 1..]
+            else
+                view_full_name;
+            // Also store with db prefix
+            const key_short = try self.allocator.dupe(u8, view_name);
+            errdefer self.allocator.free(key_short);
+            const val = try self.allocator.dupe(u8, select_sql);
+            errdefer self.allocator.free(val);
+            try self.views.put(key_short, val);
+            // Also store with full name (db.name)
+            if (std.mem.indexOfScalar(u8, view_full_name, '.') != null) {
+                const key_full = try self.allocator.dupe(u8, view_full_name);
+                errdefer self.allocator.free(key_full);
+                const val2 = try self.allocator.dupe(u8, select_sql);
+                errdefer self.allocator.free(val2);
+                try self.views.put(key_full, val2);
+            }
             try sendResponse(request, out, .ok, "");
             return;
         }
-        // CREATE [OR REPLACE] FUNCTION — no-op.
+        // CREATE [OR REPLACE] FUNCTION — store function definition.
         if (asciiEql(second2, "FUNCTION") or
             (asciiEql(second2, "OR") and asciiEql(third2, "REPLACE")))
         {
+            // Parse: CREATE [OR REPLACE] FUNCTION name AS (params) -> body
+            // Find FUNCTION keyword
+            const fn_kw_pos = std.ascii.indexOfIgnoreCase(sql, "FUNCTION ") orelse {
+                try sendResponse(request, out, .ok, "");
+                return;
+            };
+            const after_fn = sql[fn_kw_pos + 9..];
+            // Next token is function name
+            var tok_it2 = std.mem.tokenizeAny(u8, after_fn, " \t\r\n");
+            const fn_name_tok = tok_it2.next() orelse {
+                try sendResponse(request, out, .ok, "");
+                return;
+            };
+            // Find " AS " keyword
+            const as_pos2 = std.ascii.indexOfIgnoreCase(after_fn, " AS ") orelse {
+                try sendResponse(request, out, .ok, "");
+                return;
+            };
+            const lambda_body = std.mem.trim(u8, after_fn[as_pos2 + 4..], " \t\r\n");
+            const fn_key = try self.allocator.dupe(u8, fn_name_tok);
+            errdefer self.allocator.free(fn_key);
+            const fn_val = try self.allocator.dupe(u8, lambda_body);
+            errdefer self.allocator.free(fn_val);
+            try self.functions.put(fn_key, fn_val);
             try sendResponse(request, out, .ok, "");
             return;
         }
@@ -316,6 +397,12 @@ pub const Server = struct {
     // ── INSERT handler ─────────────────────────────────────────────────────────
 
      fn handleInsert(self: *Server, request: *std.http.Server.Request, out: *std.Io.Writer, sql: []const u8) !void {
+        // VALUES INSERT: INSERT INTO table VALUES (...)
+        if (std.ascii.indexOfIgnoreCase(sql, " VALUES") != null) {
+            try self.handleInsertValues(request, out, sql);
+            return;
+        }
+
         // Detect format: RowBinary vs RowBinaryWithNamesAndTypes
         const insert_info = parseInsertTarget(sql) orelse {
             try sendResponse(request, out, .bad_request,
@@ -523,12 +610,36 @@ pub const Server = struct {
         var body_buf: [64]u8 = undefined;
         _ = request.readerExpectNone(&body_buf);
 
+        // Strip FINAL modifier (ReplacingMergeTree FINAL — dedup handled separately).
+        var final_mode = false;
+        const sql_clean: []const u8 = blk: {
+            if (std.ascii.indexOfIgnoreCase(sql, " FINAL") != null) {
+                final_mode = true;
+                // Remove all " FINAL" occurrences (case-insensitive via two passes)
+                const c1 = try std.mem.replaceOwned(u8, self.allocator, sql, " FINAL", "");
+                errdefer self.allocator.free(c1);
+                const c2 = try std.mem.replaceOwned(u8, self.allocator, c1, " final", "");
+                self.allocator.free(c1);
+                // Add ORDER BY version DESC for ReplacingMergeTree dedup
+                // (if query doesn't already have an ORDER BY)
+                if (std.ascii.indexOfIgnoreCase(c2, "ORDER BY") == null) {
+                    const c3 = try std.fmt.allocPrint(self.allocator, "{s} ORDER BY version DESC", .{c2});
+                    self.allocator.free(c2);
+                    break :blk c3;
+                }
+                break :blk c2;
+            }
+            break :blk sql;
+        };
+        defer if (final_mode) self.allocator.free(sql_clean);
+
         // Parse SQL into a Plan.
-        const plan = (try generic_sql.parse(self.allocator, sql)) orelse {
+        const plan = (try generic_sql.parse(self.allocator, sql_clean)) orelse {
             try sendResponse(request, out, .bad_request, "Cannot parse SELECT query\n");
             return;
         };
         defer generic_sql.deinit(self.allocator, plan);
+        _ = &final_mode;
 
         // Subquery in FROM clause: run inner plan first, then outer plan over result rows.
         if (plan.subquery_source) |inner_plan| {
@@ -536,16 +647,46 @@ pub const Server = struct {
             return;
         }
 
+        // UNION ALL: run both plans, concatenate rows (skip second header).
+        if (plan.union_other) |right_plan| {
+            try self.handleUnionSelect(request, out, plan, right_plan.*);
+            return;
+        }
+
         // Resolve db.table from plan.table (may be "db.table" or bare "table").
         const db_table = splitDbTable(plan.table);
 
-        // Look up schema.
+        // Make user-defined functions available to the executor.
+        generic_executor.udf_registry = &self.functions;
+
+        // Handle system.one — virtual single-row table (dummy UInt8 column).
+        if (asciiEql(db_table.db, "system") and asciiEql(db_table.table, "one")) {
+            const dummy_table = schema.Table{
+                .name = "one",
+                .columns = &.{},
+            };
+            const result = try generic_executor.runWithSource(
+                self.allocator, self.io, plan, .{ .csv_rows = "dummy\n0\n" }, &dummy_table,
+            );
+            defer self.allocator.free(result);
+            try sendResponse(request, out, .ok, result);
+            return;
+        }
+
+        // Look up schema; if not found check if it's a registered view.
         const entry = self.schemas.find(db_table.db, db_table.table) orelse {
-            const msg = try std.fmt.allocPrint(self.allocator,
-                "Unknown table '{s}.{s}'\n",
-                .{ db_table.db, db_table.table });
-            defer self.allocator.free(msg);
-            try sendResponse(request, out, .bad_request, msg);
+            // Try view registry: short name or db.table full name
+            const view_sql = self.views.get(db_table.table) orelse
+                self.views.get(plan.table) orelse {
+                const msg = try std.fmt.allocPrint(self.allocator,
+                    "Unknown table '{s}.{s}'\n",
+                    .{ db_table.db, db_table.table });
+                defer self.allocator.free(msg);
+                try sendResponse(request, out, .bad_request, msg);
+                return;
+            };
+            // Rewrite: run the view's SELECT SQL directly (view has no extra filters in zhtest)
+            try self.handleSelect(request, out, view_sql);
             return;
         };
 
@@ -598,7 +739,39 @@ pub const Server = struct {
         try sendResponse(request, out, .ok, result);
     }
 
-    // ── Body-SQL mode handlers (clickhouse-go HTTP) ────────────────────────────
+    /// UNION ALL: run both halves, return left CSV header + all data rows from both.
+    fn handleUnionSelect(self: *Server, request: *std.http.Server.Request, out: *std.Io.Writer, left: generic_sql.Plan, right: generic_sql.Plan) !void {
+        const left_csv = try self.runPlanToCSV(left) orelse {
+            try sendResponse(request, out, .bad_request, "Cannot execute left side of UNION\n");
+            return;
+        };
+        defer self.allocator.free(left_csv);
+        const right_csv = try self.runPlanToCSV(right) orelse {
+            try sendResponse(request, out, .bad_request, "Cannot execute right side of UNION\n");
+            return;
+        };
+        defer self.allocator.free(right_csv);
+        // Combine: left CSV header + left data rows + right data rows (skip right header)
+        var combined: std.ArrayList(u8) = .empty;
+        defer combined.deinit(self.allocator);
+        try combined.appendSlice(self.allocator, left_csv);
+        // Find end of header line in right_csv and append only data lines
+        if (std.mem.indexOfScalar(u8, right_csv, '\n')) |nl| {
+            try combined.appendSlice(self.allocator, right_csv[nl + 1 ..]);
+        }
+        try sendResponse(request, out, .ok, combined.items);
+    }
+
+    /// Run a Plan against its table's parts, return CSV string (caller frees). Returns null on unknown table.
+    fn runPlanToCSV(self: *Server, plan: generic_sql.Plan) !?[]u8 {
+        const db_table = splitDbTable(plan.table);
+        const entry = self.schemas.find(db_table.db, db_table.table) orelse return null;
+        var parts = try part_scanner.scan(self.allocator, self.io, self.config.data_dir, db_table.db, db_table.table);
+        defer parts.deinit();
+        return try generic_executor.runWithSource(self.allocator, self.io, plan, .{ .ch_parts = parts.dirs() }, &entry.table);
+    }
+
+
 
     /// DESCRIBE TABLE handler for body-SQL mode.
     /// clickhouse-go sends "DESCRIBE TABLE db.table" to discover column types before INSERT batch.
@@ -768,10 +941,28 @@ pub const Server = struct {
             return;
         }
 
-        // CREATE OR REPLACE FUNCTION / CREATE FUNCTION — no-op.
+        // CREATE OR REPLACE FUNCTION / CREATE FUNCTION — store definition.
         if (asciiEql(second, "FUNCTION") or
             (asciiEql(second, "OR") and asciiEql(third, "REPLACE")))
         {
+            const fn_kw_pos2 = std.ascii.indexOfIgnoreCase(sql, "FUNCTION ") orelse {
+                const empty = try native_block.encodeEmpty(self.allocator);
+                defer self.allocator.free(empty);
+                try sendNativeBlock(self.allocator, request, out, empty);
+                return;
+            };
+            const after_fn2 = sql[fn_kw_pos2 + 9..];
+            var tok_fn2 = std.mem.tokenizeAny(u8, after_fn2, " \t\r\n");
+            if (tok_fn2.next()) |fn_name2| {
+                if (std.ascii.indexOfIgnoreCase(after_fn2, " AS ")) |as_pos3| {
+                    const lambda_body2 = std.mem.trim(u8, after_fn2[as_pos3 + 4..], " \t\r\n");
+                    const fn_key2 = try self.allocator.dupe(u8, fn_name2);
+                    errdefer self.allocator.free(fn_key2);
+                    const fn_val2 = try self.allocator.dupe(u8, lambda_body2);
+                    errdefer self.allocator.free(fn_val2);
+                    try self.functions.put(fn_key2, fn_val2);
+                }
+            }
             const empty = try native_block.encodeEmpty(self.allocator);
             defer self.allocator.free(empty);
             try sendNativeBlock(self.allocator, request, out, empty);

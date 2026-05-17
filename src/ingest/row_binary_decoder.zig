@@ -208,6 +208,20 @@ pub fn readVarUInt(buf: []const u8) ?struct { usize, usize } {
     return null;
 }
 
+/// Encode n as a LEB128 varint into buf (must be at least 10 bytes). Returns bytes written.
+fn encodeVarUInt(buf: []u8, n: usize) usize {
+    var v = n;
+    var i: usize = 0;
+    while (true) {
+        buf[i] = @intCast(v & 0x7F);
+        v >>= 7;
+        if (v == 0) { i += 1; break; }
+        buf[i] |= 0x80;
+        i += 1;
+    }
+    return i;
+}
+
 // ── RowBinaryWithNamesAndTypes ─────────────────────────────────────────────────
 
 pub const WithHeaderResult = struct {
@@ -714,7 +728,13 @@ fn decodeRowBinaryArrayOrMap(
         const end_pos = scan;
 
         // Build keys section then values section.
+        // Prepend varint N so that lookupMapBlob knows where keys end.
         const start = col_buf.str_bytes.items.len;
+        {
+            var nbuf: [10]u8 = undefined;
+            const nb = encodeVarUInt(&nbuf, count);
+            try col_buf.str_bytes.appendSlice(allocator, nbuf[0..nb]);
+        }
         // Keys pass: data[p] = k0,v0,k1,v1,...
         var kp = p;
         for (0..count) |i| {
@@ -854,6 +874,12 @@ fn consumeNativeTextRows(
                 vp += try measureNativeValue(vtype, data, vp);
             }
             const start = col_buf.str_bytes.items.len;
+            // Prepend varint N so lookupMapBlobTyped knows where keys end
+            {
+                var nbuf: [10]u8 = undefined;
+                const nb = encodeVarUInt(&nbuf, count);
+                try col_buf.str_bytes.appendSlice(allocator, nbuf[0..nb]);
+            }
             try col_buf.str_bytes.appendSlice(allocator, data[k_row_start..kp]);
             try col_buf.str_bytes.appendSlice(allocator, data[v_row_start..vp]);
             try col_buf.str_vals.append(allocator, col_buf.str_bytes.items[start..]);

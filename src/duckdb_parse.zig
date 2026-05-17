@@ -139,8 +139,26 @@ fn translateJsonInner(allocator: std.mem.Allocator, json: []const u8) !generic_s
     const stmt_node = stmts.items[0].object.get("node") orelse return error.Unsupported;
     const node_obj = stmt_node.object;
 
-    // Only handle plain SELECT (no UNION/INTERSECT/etc.)
+    // Only handle plain SELECT and UNION ALL
     const node_type = (node_obj.get("type") orelse return error.Unsupported).string;
+    if (std.mem.eql(u8, node_type, "SET_OPERATION_NODE")) {
+        // UNION ALL: translate left and right, link via union_other
+        const set_op = (node_obj.get("setop_type") orelse return error.Unsupported).string;
+        if (!std.mem.eql(u8, set_op, "UNION_ALL") and !std.mem.eql(u8, set_op, "UNION")) return error.Unsupported;
+        const left_val = node_obj.get("left") orelse return error.Unsupported;
+        const right_val = node_obj.get("right") orelse return error.Unsupported;
+        const left_type = (left_val.object.get("type") orelse return error.Unsupported).string;
+        const right_type = (right_val.object.get("type") orelse return error.Unsupported).string;
+        if (!std.mem.eql(u8, left_type, "SELECT_NODE")) return error.Unsupported;
+        if (!std.mem.eql(u8, right_type, "SELECT_NODE")) return error.Unsupported;
+        var left_plan = try translateSelectNode(allocator, left_val.object);
+        errdefer generic_sql.deinit(allocator, left_plan);
+        const right_plan_ptr = try allocator.create(generic_sql.Plan);
+        errdefer { allocator.destroy(right_plan_ptr); }
+        right_plan_ptr.* = try translateSelectNode(allocator, right_val.object);
+        left_plan.union_other = right_plan_ptr;
+        return left_plan;
+    }
     if (!std.mem.eql(u8, node_type, "SELECT_NODE")) return error.Unsupported;
 
     return translateSelectNode(allocator, node_obj);
@@ -154,6 +172,31 @@ fn translateSelectNode(allocator: std.mem.Allocator, node_obj: std.json.ObjectMa
     errdefer if (subquery_source) |sq| { generic_sql.deinit(allocator, sq.*); allocator.destroy(sq); };
     const table_name = try extractTableNameOrSubquery(allocator, from_table, &subquery_source) orelse return error.Unsupported;
     errdefer allocator.free(table_name);
+
+    // ── WITH / CTE support: if from_table is a CTE name, inline it as subquery ─
+    if (subquery_source == null) {
+        if (node_obj.get("cte_map")) |cte_map_val| {
+            if (cte_map_val == .object) {
+                if (cte_map_val.object.get("map")) |map_items| {
+                    for (map_items.array.items) |entry| {
+                        const key = (entry.object.get("key") orelse continue).string;
+                        if (std.ascii.eqlIgnoreCase(key, table_name)) {
+                            const cte_val = entry.object.get("value") orelse continue;
+                            const cte_query = (cte_val.object.get("query") orelse continue).object;
+                            const inner_node = cte_query.get("node") orelse continue;
+                            const inner_type = (inner_node.object.get("type") orelse continue).string;
+                            if (!std.mem.eql(u8, inner_type, "SELECT_NODE")) continue;
+                            const inner_plan = try translateSelectNode(allocator, inner_node.object);
+                            const sq = try allocator.create(generic_sql.Plan);
+                            sq.* = inner_plan;
+                            subquery_source = sq;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     // ── projections ─────────────────────────────────────────────────────────
     const select_list = (node_obj.get("select_list") orelse return error.Unsupported).array;
@@ -787,8 +830,12 @@ fn translateExpr(allocator: std.mem.Allocator, val: std.json.Value) !?generic_sq
             }
         }
         if (std.mem.eql(u8, fn_name, "length") and children.len == 1) {
-            const child_col = columnName(children[0]) orelse return null;
-            const col = try allocator.dupe(u8, child_col);
+            const child_col = columnName(children[0]) orelse {
+                // Complex inner expression — fall through to text rendering
+                const fn_text = try exprToText(allocator, val) orelse return null;
+                return .{ .func = .column_ref, .column = fn_text, .alias = alias };
+            };
+            const col = try std.fmt.allocPrint(allocator, "length({s})", .{child_col});
             return .{ .func = .column_ref, .column = col, .alias = alias };
         }
         // countIf(expr) — condition is the argument expression
@@ -865,19 +912,25 @@ fn translateExpr(allocator: std.mem.Allocator, val: std.json.Value) !?generic_sq
             return .{ .func = .any_val, .column = col, .alias = alias };
         }
         // date_trunc('minute'/'hour'/'day', EventTime) → column_ref "EventMinute"/"EventHour"/"EventDay"
+        // For non-EventTime columns, fall through to text rendering.
         if (std.mem.eql(u8, fn_name, "date_trunc") and children.len == 2) {
-            if (columnName(children[1])) |_| {
-                if (isConstantString(children[0], "minute")) {
-                    const col = try allocator.dupe(u8, "EventMinute");
-                    return .{ .func = .column_ref, .column = col, .alias = alias };
-                } else if (isConstantString(children[0], "hour")) {
-                    const col = try allocator.dupe(u8, "EventHour");
-                    return .{ .func = .column_ref, .column = col, .alias = alias };
-                } else if (isConstantString(children[0], "day")) {
-                    const col = try allocator.dupe(u8, "EventDay");
-                    return .{ .func = .column_ref, .column = col, .alias = alias };
+            if (columnName(children[1])) |col_name| {
+                if (std.ascii.eqlIgnoreCase(col_name, "EventTime")) {
+                    if (isConstantString(children[0], "minute")) {
+                        const col = try allocator.dupe(u8, "EventMinute");
+                        return .{ .func = .column_ref, .column = col, .alias = alias };
+                    } else if (isConstantString(children[0], "hour")) {
+                        const col = try allocator.dupe(u8, "EventHour");
+                        return .{ .func = .column_ref, .column = col, .alias = alias };
+                    } else if (isConstantString(children[0], "day")) {
+                        const col = try allocator.dupe(u8, "EventDay");
+                        return .{ .func = .column_ref, .column = col, .alias = alias };
+                    }
                 }
             }
+            // Non-EventTime or other unit: render as text for executor passthrough
+            const fn_text_dt = try exprToText(allocator, val) orelse return null;
+            return .{ .func = .column_ref, .column = fn_text_dt, .alias = alias };
         }
         // date_part('minute', EventTime) / extract(minute FROM EventTime) → EventMinuteOfHour
         if (std.mem.eql(u8, fn_name, "date_part") and children.len == 2) {
@@ -888,7 +941,236 @@ fn translateExpr(allocator: std.mem.Allocator, val: std.json.Value) !?generic_sq
                 }
             }
         }
-        // Fallback: render as text for executor passthrough
+        // Wrap-aggregate pattern: outerFn(groupUniqArray(col), ...) → group_uniq_array with post_fn
+        // Handles: arraySlice, arrayDistinct, arrayFilter, arrayMap, arrayConcat,
+        //          arrayFlatten, arrayExists, arrayReverse, arraySort, arrayUniq
+        const wrap_agg_fns = [_][]const u8{
+            "arrayslice", "arraydistinct", "arrayfilter", "arraymap",
+            "arrayconcat", "arrayflatten", "arrayexists", "arrayreverse",
+            "arraysort", "arrayuniq", "arrayreversesort", "arraymax", "arraymin",
+        };
+        const is_wrap = blk: {
+            for (wrap_agg_fns) |wf| {
+                if (std.mem.eql(u8, fn_name, wf)) break :blk true;
+            }
+            break :blk false;
+        };
+        if (is_wrap and children.len >= 1) {
+            // Special case: arrayConcat(groupUniqArray(A), groupUniqArray(B)) →
+            // collect all groupUniqArray children and combine into one via post_fn.
+            if (std.mem.eql(u8, fn_name, "arrayconcat") and children.len >= 2) {
+                // Check if ALL children are groupUniqArray calls
+                var all_gua = true;
+                for (children) |child| {
+                    const child_obj = if (child == .object) child.object else null;
+                    if (child_obj) |co| {
+                        const cls = if (co.get("class")) |cv| cv.string else "";
+                        const fname = if (co.get("function_name")) |fv| fv.string else "";
+                        if (!std.mem.eql(u8, cls, "FUNCTION") or
+                            (!std.mem.eql(u8, fname, "groupuniqarray") and !std.mem.eql(u8, fname, "grouparray")))
+                        {
+                            all_gua = false;
+                            break;
+                        }
+                    } else { all_gua = false; break; }
+                }
+                if (all_gua) {
+                    // Use the first groupUniqArray's column as the main agg,
+                    // collect all columns for a combined array via concat.
+                    // Build a "fake" concat column expression: each child's column name.
+                    var concat_cols: std.ArrayList(u8) = .empty;
+                    defer concat_cols.deinit(allocator);
+                    var first_col: ?[]const u8 = null;
+                    for (children, 0..) |child, ci| {
+                        const fo = child.object;
+                        const ic = if (fo.get("children")) |ch| ch.array.items else &[_]std.json.Value{};
+                        if (ic.len == 1) {
+                            const col_name = columnName(ic[0]) orelse continue;
+                            if (ci == 0) {
+                                first_col = col_name;
+                            } else {
+                                if (concat_cols.items.len > 0) try concat_cols.append(allocator, ',');
+                                try concat_cols.appendSlice(allocator, col_name);
+                            }
+                        }
+                    }
+                    if (first_col) |fc| {
+                        const col = try allocator.dupe(u8, fc);
+                        // post_fn: arrayConcat($, groupUniqArray(col2), groupUniqArray(col3)...)
+                        var post_buf: std.ArrayList(u8) = .empty;
+                        try post_buf.appendSlice(allocator, "arrayconcat($");
+                        // Add each extra col as groupUniqArray in post_fn text
+                        // The executor will see these as column refs (passthru)
+                        // Instead: just concat the columns arrays raw via \x0c separator
+                        // Simplest: post_fn = arrayconcat($,<col2_expr>) and handle in evalTextExpr
+                        for (children[1..]) |child| {
+                            const fo = child.object;
+                            const ic = if (fo.get("children")) |ch| ch.array.items else &[_]std.json.Value{};
+                            if (ic.len == 1) {
+                                if (columnName(ic[0])) |cn| {
+                                    try post_buf.appendSlice(allocator, ",groupUniqArray(");
+                                    try post_buf.appendSlice(allocator, cn);
+                                    try post_buf.append(allocator, ')');
+                                }
+                            }
+                        }
+                        try post_buf.append(allocator, ')');
+                        const post_fn = try post_buf.toOwnedSlice(allocator);
+                        const out_alias: ?[]const u8 = if (alias != null) alias else
+                            try exprToText(allocator, val) orelse try allocator.dupe(u8, col);
+                        return .{ .func = .group_uniq_array, .column = col, .alias = out_alias, .post_fn = post_fn };
+                    }
+                }
+            }
+
+            const first_child = children[0];
+            const first_obj = if (first_child == .object) first_child.object else null;
+            if (first_obj) |fo| {
+                const first_class = if (fo.get("class")) |cls| cls.string else "";
+                // Pattern: outerFn(lambda, groupUniqArray(col)) — lambda-first form
+                if (std.mem.eql(u8, first_class, "LAMBDA") and children.len >= 2) {
+                    const second_child = children[1];
+                    const second_obj = if (second_child == .object) second_child.object else null;
+                    if (second_obj) |so| {
+                        const second_class = if (so.get("class")) |cv| cv.string else "";
+                        const second_fn = if (so.get("function_name")) |fv| fv.string else "";
+                        if (std.mem.eql(u8, second_class, "FUNCTION") and
+                            (std.mem.eql(u8, second_fn, "groupuniqarray") or
+                             std.mem.eql(u8, second_fn, "grouparray")))
+                        {
+                            const inner_children = if (so.get("children")) |ch| ch.array.items else &[_]std.json.Value{};
+                            if (inner_children.len == 1) {
+                                const child_col = columnName(inner_children[0]) orelse {
+                                    const fn_text2 = try exprToText(allocator, val) orelse return null;
+                                    return .{ .func = .column_ref, .column = fn_text2, .alias = alias };
+                                };
+                                const col = try allocator.dupe(u8, child_col);
+                                // Lambda text: "x -> body_expr"
+                                const lambda_text = try exprToText(allocator, first_child) orelse "";
+                                // post_fn: outerFn(lambda, $) where $ = aggregate result sentinel
+                                var post_buf: std.ArrayList(u8) = .empty;
+                                try post_buf.appendSlice(allocator, fn_name);
+                                try post_buf.append(allocator, '(');
+                                try post_buf.appendSlice(allocator, lambda_text);
+                                try post_buf.appendSlice(allocator, ", $)");
+                                allocator.free(lambda_text);
+                                const post_fn = try post_buf.toOwnedSlice(allocator);
+                                const out_alias: ?[]const u8 = if (alias != null) alias else
+                                    try exprToText(allocator, val) orelse try allocator.dupe(u8, col);
+                                return .{ .func = .group_uniq_array, .column = col, .alias = out_alias, .post_fn = post_fn };
+                            }
+                        }
+                    }
+                }
+                if (std.mem.eql(u8, first_class, "FUNCTION")) {
+                    const first_fn = if (fo.get("function_name")) |f| f.string else "";
+                    if (std.mem.eql(u8, first_fn, "groupuniqarray") or
+                        std.mem.eql(u8, first_fn, "grouparray"))
+                    {
+                        const inner_children = if (fo.get("children")) |ch| ch.array.items else &[_]std.json.Value{};
+                        if (inner_children.len == 1) {
+                            const child_col = columnName(inner_children[0]) orelse {
+                                // Fall through to generic text fallback below
+                                const fn_text2 = try exprToText(allocator, val) orelse return null;
+                                return .{ .func = .column_ref, .column = fn_text2, .alias = alias };
+                            };
+                            const col = try allocator.dupe(u8, child_col);
+                            // Build the post_fn template: outerFn($, arg2, arg3, ...)
+                            // where $ is placeholder for the aggregate result.
+                            var post_buf: std.ArrayList(u8) = .empty;
+                            try post_buf.appendSlice(allocator, fn_name);
+                            try post_buf.append(allocator, '(');
+                            try post_buf.append(allocator, '$');
+                            for (children[1..]) |extra_child| {
+                                try post_buf.append(allocator, ',');
+                                if (try exprToText(allocator, extra_child)) |et| {
+                                    defer allocator.free(et);
+                                    try post_buf.appendSlice(allocator, et);
+                                }
+                            }
+                            try post_buf.append(allocator, ')');
+                            const post_fn = try post_buf.toOwnedSlice(allocator);
+                            // Use original expression text as alias for header (if no explicit alias)
+                            const out_alias: ?[]const u8 = if (alias != null) alias else
+                                try exprToText(allocator, val) orelse try allocator.dupe(u8, col);
+                            return .{ .func = .group_uniq_array, .column = col, .alias = out_alias, .post_fn = post_fn };
+                        }
+                    }
+                }
+            }
+        }
+        // Fallback: render as text for executor passthrough.
+        // But first: check if first_child is a wrap_agg function that itself wraps groupUniqArray.
+        // This handles: arrayMax(arrayMap(x->x, groupUniqArray(col))) etc.
+        if (is_wrap and children.len >= 1) {
+            const fc = children[0];
+            if (fc == .object) {
+                const fc_obj = fc.object;
+                const fc_class = if (fc_obj.get("class")) |cv| cv.string else "";
+                const fc_fn = if (fc_obj.get("function_name")) |fv| std.ascii.lowerString(
+                    @as([]u8, @constCast(fv.string)), fv.string) else "";
+                _ = fc_class;
+                // Check if fc_fn is a known wrap function
+                const fc_is_wrap = blk2: {
+                    for (wrap_agg_fns) |wf| {
+                        if (std.mem.eql(u8, fc_fn, wf)) break :blk2 true;
+                    }
+                    break :blk2 false;
+                };
+                if (fc_is_wrap) {
+                    const fc_children = if (fc_obj.get("children")) |ch| ch.array.items else &[_]std.json.Value{};
+                    // Find groupUniqArray in fc_children (lambda-first or direct)
+                    var gua_child_val: ?std.json.Value = null;
+                    var gua_col_name: ?[]const u8 = null;
+                    var lambda_text_opt: ?[]const u8 = null;
+                    for (fc_children, 0..) |fcc, fci| {
+                        if (fcc != .object) continue;
+                        const fcc_obj = fcc.object;
+                        const fcc_class = if (fcc_obj.get("class")) |cv| cv.string else "";
+                        const fcc_fn = if (fcc_obj.get("function_name")) |fv| fv.string else "";
+                        if (std.mem.eql(u8, fcc_class, "FUNCTION") and
+                            (std.mem.eql(u8, fcc_fn, "groupuniqarray") or std.mem.eql(u8, fcc_fn, "grouparray")))
+                        {
+                            gua_child_val = fcc;
+                            const gua_ic = if (fcc_obj.get("children")) |ch| ch.array.items else &[_]std.json.Value{};
+                            if (gua_ic.len == 1) gua_col_name = columnName(gua_ic[0]);
+                            // If prev child is a LAMBDA, capture it
+                            if (fci > 0 and fc_children[fci - 1] == .object) {
+                                const prev = fc_children[fci - 1].object;
+                                if (std.mem.eql(u8, if (prev.get("class")) |cv| cv.string else "", "LAMBDA")) {
+                                    lambda_text_opt = try exprToText(allocator, fc_children[fci - 1]);
+                                }
+                            }
+                            break;
+                        }
+                    }
+                    if (gua_col_name) |col_name| {
+                        const col = try allocator.dupe(u8, col_name);
+                        // Build inner post_fn: fc_fn(lambda?, $) or fc_fn($)
+                        var inner_pf: std.ArrayList(u8) = .empty;
+                        try inner_pf.appendSlice(allocator, fc_fn);
+                        try inner_pf.append(allocator, '(');
+                        if (lambda_text_opt) |lt| {
+                            try inner_pf.appendSlice(allocator, lt);
+                            allocator.free(lt);
+                            try inner_pf.appendSlice(allocator, ", $)");
+                        } else {
+                            try inner_pf.appendSlice(allocator, "$)");
+                        }
+                        const inner_pf_text = try inner_pf.toOwnedSlice(allocator);
+                        defer allocator.free(inner_pf_text);
+                        // Build outer post_fn: fn_name(__AGG__)
+                        // where __AGG__ is the result of inner_pf applied to the aggregate
+                        // We compose: post_fn = "fn_name(inner_pf($))"
+                        // Replace $ in inner_pf with __AGG__ to get the composed template
+                        const composed = try std.fmt.allocPrint(allocator, "{s}({s})", .{fn_name, inner_pf_text});
+                        const out_alias: ?[]const u8 = if (alias != null) alias else
+                            try exprToText(allocator, val) orelse try allocator.dupe(u8, col);
+                        return .{ .func = .group_uniq_array, .column = col, .alias = out_alias, .post_fn = composed };
+                    }
+                }
+            }
+        }
         const fn_text = try exprToText(allocator, val) orelse return null;
         return .{ .func = .column_ref, .column = fn_text, .alias = alias };
     }
@@ -915,7 +1197,8 @@ fn exprToText(allocator: std.mem.Allocator, val: std.json.Value) !?[]const u8 {
 
     if (std.mem.eql(u8, class, "CONSTANT")) {
         const v = obj.get("value").?.object;
-        const type_id = v.get("type").?.object.get("id").?.string;
+        const type_node = v.get("type").?.object;
+        const type_id = type_node.get("id").?.string;
         const is_null = v.get("is_null").?.bool;
         if (is_null) return try allocator.dupe(u8, "NULL");
         const raw_val = v.get("value") orelse return null;
@@ -925,6 +1208,30 @@ fn exprToText(allocator: std.mem.Allocator, val: std.json.Value) !?[]const u8 {
         {
             return try std.fmt.allocPrint(allocator, "'{s}'", .{raw_val.string});
         }
+        // DECIMAL: stored as integer scaled by 10^scale — reconstruct the decimal string
+        if (std.mem.eql(u8, type_id, "DECIMAL")) {
+            const raw_int: i64 = switch (raw_val) {
+                .integer => |i| i,
+                .float => |f| @as(i64, @intFromFloat(f)),
+                else => return null,
+            };
+            const scale: i64 = blk: {
+                if (type_node.get("type_info")) |ti| {
+                    if (ti == .object) {
+                        if (ti.object.get("scale")) |sn| {
+                            break :blk switch (sn) { .integer => |i| i, else => 0 };
+                        }
+                    }
+                }
+                break :blk 0;
+            };
+            if (scale <= 0) return try std.fmt.allocPrint(allocator, "{d}", .{raw_int});
+            // Build e.g. "0.9" from raw_int=9, scale=1
+            var divisor: f64 = 1.0;
+            for (0..@intCast(scale)) |_| divisor *= 10.0;
+            const fval: f64 = @as(f64, @floatFromInt(raw_int)) / divisor;
+            return try std.fmt.allocPrint(allocator, "{d}", .{fval});
+        }
         const sv: ?[]const u8 = switch (raw_val) {
             .integer => |i| try std.fmt.allocPrint(allocator, "{d}", .{i}),
             .float => |f| try std.fmt.allocPrint(allocator, "{d}", .{f}),
@@ -933,6 +1240,25 @@ fn exprToText(allocator: std.mem.Allocator, val: std.json.Value) !?[]const u8 {
             else => null,
         };
         return sv;
+    }
+
+    // CAST(expr AS type)
+    if (std.mem.eql(u8, class, "CAST")) {
+        const child = try exprToText(allocator, obj.get("child") orelse return null) orelse return null;
+        defer allocator.free(child);
+        const cast_type_id = obj.get("cast_type").?.object.get("id").?.string;
+        return try std.fmt.allocPrint(allocator, "CAST({s} AS {s})", .{ child, cast_type_id });
+    }
+
+    // LAMBDA: x -> expr  (used in arrayFilter, arrayMap, etc.)
+    if (std.mem.eql(u8, class, "LAMBDA")) {
+        const lhs_val = obj.get("lhs") orelse return null;
+        const expr_val = obj.get("expr") orelse return null;
+        const lhs_text = try exprToText(allocator, lhs_val) orelse return null;
+        defer allocator.free(lhs_text);
+        const expr_text = try exprToText(allocator, expr_val) orelse return null;
+        defer allocator.free(expr_text);
+        return try std.fmt.allocPrint(allocator, "{s} -> {s}", .{ lhs_text, expr_text });
     }
 
     if (std.mem.eql(u8, class, "COMPARISON")) {

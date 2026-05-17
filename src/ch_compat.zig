@@ -1,34 +1,291 @@
 /// ch_compat.zig — ClickHouse→DuckDB grammar rewrites (grammar-level blockers only).
-/// Unknown CH function names (uniqExact, dictHas, …) parse fine in DuckDB as-is.
+/// Only rewrites what DuckDB's parser cannot accept. Functions that DuckDB can parse
+/// as unknown FUNCTION nodes (uniqExact, arrayFilter, has, splitByChar, …) are left
+/// unchanged and handled by the executor at runtime.
 const std = @import("std");
 
-/// Rewrite CH grammar so DuckDB can parse. Returns owned slice or null (ARRAY JOIN).
-pub fn rewrite(allocator: std.mem.Allocator, sql: []const u8) !?[]u8 {
-    if (std.ascii.indexOfIgnoreCase(sql, "ARRAY JOIN") != null) return null;
-    var buf: std.ArrayListUnmanaged(u8) = .empty;
-    try buf.ensureTotalCapacity(allocator, sql.len + 64);
-    errdefer buf.deinit(allocator);
-    var i: usize = 0;
-    while (i < sql.len) {
-        const wb = i == 0 or !isIdent(sql[i - 1]);
-        if (wb) {
-            if (matchFn(sql, i, "multiIf"))        |r| { i = try rwMultiIf(allocator, &buf, sql, r); continue; }
-            if (matchFn(sql, i, "toString"))        |r| { i = try rwCast(allocator, &buf, sql, r, "AS VARCHAR"); continue; }
-            if (matchFn(sql, i, "toDate"))          |r| { i = try rwCast(allocator, &buf, sql, r, "AS DATE"); continue; }
-            if (matchFn(sql, i, "toStartOfMinute")) |r| { i = try rwTrunc(allocator, &buf, sql, r, "minute"); continue; }
-            if (matchFn(sql, i, "toStartOfHour"))   |r| { i = try rwTrunc(allocator, &buf, sql, r, "hour"); continue; }
-            if (matchFn(sql, i, "toStartOfDay"))    |r| { i = try rwTrunc(allocator, &buf, sql, r, "day"); continue; }
-            if (matchFn(sql, i, "any"))             |r| { try buf.appendSlice(allocator, "any_value("); i = r; continue; }
+// ── Rewrite rule table ────────────────────────────────────────────────────────
+// Each rule describes one CH construct that DuckDB's parser cannot accept.
+//
+// kind = .cast       → CAST(<args> AS <param>)
+// kind = .date_trunc → date_trunc('<param>', <args>)
+// kind = .rename     → <param><args>)   (param already includes the opening '(')
+// kind = .multiif    → handled by rwMultiIf (structural, cannot be a data row)
+
+const RewriteKind = enum { cast, date_trunc, rename, multiif };
+
+const RewriteRule = struct {
+    name:  []const u8,
+    kind:  RewriteKind,
+    param: []const u8 = "",
+};
+
+const rules = [_]RewriteRule{
+    // multiIf — structural rewrite, param unused (rwMultiIf handles it)
+    .{ .name = "multiIf",          .kind = .multiif                           },
+
+    // CH type-cast functions → CAST(x AS T)
+    // DuckDB does not recognise these names at the parser level.
+    .{ .name = "toString",         .kind = .cast,       .param = "AS VARCHAR"   },
+    .{ .name = "toDate",           .kind = .cast,       .param = "AS DATE"      },
+    .{ .name = "toDateTime",       .kind = .cast,       .param = "AS TIMESTAMP" },
+    .{ .name = "toUInt8",          .kind = .cast,       .param = "AS UTINYINT"  },
+    .{ .name = "toUInt16",         .kind = .cast,       .param = "AS USMALLINT" },
+    .{ .name = "toUInt32",         .kind = .cast,       .param = "AS UINTEGER"  },
+    .{ .name = "toUInt64",         .kind = .cast,       .param = "AS UBIGINT"   },
+    .{ .name = "toInt8",           .kind = .cast,       .param = "AS TINYINT"   },
+    .{ .name = "toInt16",          .kind = .cast,       .param = "AS SMALLINT"  },
+    .{ .name = "toInt32",          .kind = .cast,       .param = "AS INTEGER"   },
+    .{ .name = "toInt64",          .kind = .cast,       .param = "AS BIGINT"    },
+    .{ .name = "toFloat32",        .kind = .cast,       .param = "AS FLOAT"     },
+    .{ .name = "toFloat64",        .kind = .cast,       .param = "AS DOUBLE"    },
+
+    // CH time-truncation functions → date_trunc('unit', x)
+    // DuckDB does not recognise toStartOf* names.
+    .{ .name = "toStartOfMinute",  .kind = .date_trunc, .param = "minute"       },
+    .{ .name = "toStartOfHour",    .kind = .date_trunc, .param = "hour"         },
+    .{ .name = "toStartOfDay",     .kind = .date_trunc, .param = "day"          },
+    .{ .name = "toStartOfWeek",    .kind = .date_trunc, .param = "week"         },
+    .{ .name = "toStartOfMonth",   .kind = .date_trunc, .param = "month"        },
+    .{ .name = "toStartOfQuarter", .kind = .date_trunc, .param = "quarter"      },
+    .{ .name = "toStartOfYear",    .kind = .date_trunc, .param = "year"         },
+
+    // Renames — DuckDB treats these as reserved keywords or misparses them.
+    .{ .name = "any",              .kind = .rename,     .param = "any_value("   },
+    .{ .name = "lowerUTF8",        .kind = .rename,     .param = "lower("       },
+    .{ .name = "upperUTF8",        .kind = .rename,     .param = "upper("       },
+};
+
+// ── Public entry point ────────────────────────────────────────────────────────
+
+/// Rewrite ARRAY JOIN syntax into arrayJoin() function calls in the SELECT list.
+///
+/// Input:  SELECT a, b FROM t ARRAY JOIN expr1 AS al1, expr2 AS al2 WHERE cond
+/// Output: SELECT a, b, arrayJoin(expr1) AS al1, arrayJoin(expr2) AS al2 FROM t WHERE cond
+///
+/// Aliases that appear in the SELECT list are left as-is (they refer to the ARRAY JOIN result).
+/// Only the first ARRAY JOIN item is used for row expansion; others are kept as columns.
+fn rewriteArrayJoin(allocator: std.mem.Allocator, sql: []const u8) !?[]u8 {
+    // Find " ARRAY JOIN " position
+    const aj_pos = std.ascii.indexOfIgnoreCase(sql, " ARRAY JOIN ") orelse return null;
+    // Find the FROM keyword position (must come before ARRAY JOIN)
+    const from_pos = std.ascii.indexOfIgnoreCase(sql, " FROM ") orelse return null;
+    if (from_pos >= aj_pos) return null;
+
+    // Split the SQL into parts:
+    // pre_select = everything up to (but not including) " FROM "
+    // table_part = from " FROM " up to " ARRAY JOIN "
+    // aj_clause  = after " ARRAY JOIN " until WHERE/LIMIT/ORDER/GROUP or end
+    const pre_select = sql[0..from_pos];
+    const after_from = sql[from_pos..aj_pos]; // includes " FROM tablename"
+    const aj_clause_start = aj_pos + 12; // len(" ARRAY JOIN ") == 12
+    const aj_rest = sql[aj_clause_start..];
+
+    // Find end of ARRAY JOIN clause: WHERE, ORDER, GROUP, LIMIT, or end of string
+    var aj_end: usize = aj_rest.len;
+    for ([_][]const u8{ " WHERE ", " ORDER ", " GROUP ", " LIMIT ", " HAVING " }) |kw| {
+        if (std.ascii.indexOfIgnoreCase(aj_rest, kw)) |p| {
+            if (p < aj_end) aj_end = p;
         }
-        try buf.append(allocator, sql[i]);
+    }
+    const aj_clause = aj_rest[0..aj_end];
+    const suffix = aj_rest[aj_end..]; // WHERE ... or empty
+
+    // Parse ARRAY JOIN items: "expr1 AS alias1, expr2 AS alias2"
+    // Split by top-level comma
+    var items: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer items.deinit(allocator);
+    {
+        var depth: usize = 0;
+        var start: usize = 0;
+        for (aj_clause, 0..) |ch, ci| {
+            if (ch == '(' or ch == '[') depth += 1;
+            if (ch == ')' or ch == ']') { if (depth > 0) depth -= 1; }
+            if (ch == ',' and depth == 0) {
+                try items.append(allocator, std.mem.trim(u8, aj_clause[start..ci], " \t\r\n"));
+                start = ci + 1;
+            }
+        }
+        try items.append(allocator, std.mem.trim(u8, aj_clause[start..], " \t\r\n"));
+    }
+
+    // Build replacement SELECT expressions for each ARRAY JOIN item.
+    // Each item is "expr AS alias" → becomes "arrayJoin(expr) AS alias"
+    // Build replacement SELECT expressions for each ARRAY JOIN item.
+    // Each item is "expr AS alias" → becomes "arrayJoin(expr) AS alias"
+    // Collect alias names to know which SELECT columns to replace.
+    var alias_names: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer alias_names.deinit(allocator);
+    var extra_selects: std.ArrayListUnmanaged(u8) = .empty;
+    defer extra_selects.deinit(allocator);
+
+    for (items.items, 0..) |item, idx| {
+        if (idx > 0) try extra_selects.appendSlice(allocator, ", ");
+        const as_pos = std.ascii.indexOfIgnoreCase(item, " AS ") orelse {
+            try extra_selects.appendSlice(allocator, "arrayJoin(");
+            try extra_selects.appendSlice(allocator, item);
+            try extra_selects.append(allocator, ')');
+            continue;
+        };
+        const expr = std.mem.trim(u8, item[0..as_pos], " \t\r\n");
+        const alias = std.mem.trim(u8, item[as_pos + 4..], " \t\r\n");
+        try alias_names.append(allocator, alias);
+        try extra_selects.appendSlice(allocator, "arrayJoin(");
+        try extra_selects.appendSlice(allocator, expr);
+        try extra_selects.appendSlice(allocator, ") AS ");
+        try extra_selects.appendSlice(allocator, alias);
+    }
+
+    // Parse original SELECT list: "SELECT col1, col2" → ["col1", "col2"]
+    // pre_select is everything before " FROM "
+    // Check if it starts with SELECT
+    const select_kw = "SELECT ";
+    const pre_select_trimmed = std.mem.trim(u8, pre_select, " \t\r\n");
+    if (!std.ascii.startsWithIgnoreCase(pre_select_trimmed, select_kw)) return null;
+    const after_select = pre_select_trimmed[select_kw.len..];
+
+    // Split SELECT columns by top-level comma
+    var sel_cols: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer sel_cols.deinit(allocator);
+    {
+        var depth2: usize = 0;
+        var start2: usize = 0;
+        for (after_select, 0..) |ch, ci| {
+            if (ch == '(' or ch == '[') depth2 += 1;
+            if (ch == ')' or ch == ']') { if (depth2 > 0) depth2 -= 1; }
+            if (ch == ',' and depth2 == 0) {
+                try sel_cols.append(allocator, std.mem.trim(u8, after_select[start2..ci], " \t\r\n"));
+                start2 = ci + 1;
+            }
+        }
+        try sel_cols.append(allocator, std.mem.trim(u8, after_select[start2..], " \t\r\n"));
+    }
+
+    // Build final SELECT list: keep non-alias columns, replace alias ones with arrayJoin
+    var new_select: std.ArrayListUnmanaged(u8) = .empty;
+    defer new_select.deinit(allocator);
+    try new_select.appendSlice(allocator, "SELECT ");
+    var first_col = true;
+    for (sel_cols.items) |scol| {
+        // Check if this column matches any ARRAY JOIN alias
+        var is_alias = false;
+        for (alias_names.items) |aname| {
+            if (std.ascii.eqlIgnoreCase(scol, aname)) {
+                is_alias = true;
+                break;
+            }
+        }
+        if (is_alias) continue; // Will be added via extra_selects
+        if (!first_col) try new_select.appendSlice(allocator, ", ");
+        try new_select.appendSlice(allocator, scol);
+        first_col = false;
+    }
+    // Append arrayJoin expressions
+    if (!first_col and extra_selects.items.len > 0) try new_select.appendSlice(allocator, ", ");
+    if (first_col and extra_selects.items.len > 0) {} // already at start
+    try new_select.appendSlice(allocator, extra_selects.items);
+
+    // Rebuild: new_select + after_from + suffix
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, new_select.items);
+    try out.appendSlice(allocator, after_from);
+    try out.appendSlice(allocator, suffix);
+    return try out.toOwnedSlice(allocator);
+}
+
+/// Rewrite CH grammar so DuckDB can parse it.
+/// Returns an owned slice (caller frees), or null if the query is unsupported
+/// (currently: ARRAY JOIN).
+pub fn rewrite(allocator: std.mem.Allocator, sql: []const u8) !?[]u8 {
+    if (std.ascii.indexOfIgnoreCase(sql, "ARRAY JOIN") != null) {
+        return rewriteArrayJoin(allocator, sql);
+    }
+
+    // Pre-pass: rewrite CAST(expr, 'TypeName') → CAST(expr AS TypeName)
+    const sql2 = try rewriteCastStringType(allocator, sql);
+    defer if (sql2.ptr != sql.ptr) allocator.free(sql2);
+
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    try buf.ensureTotalCapacity(allocator, sql2.len + 64);
+    errdefer buf.deinit(allocator);
+
+    var i: usize = 0;
+    while (i < sql2.len) {
+        // Only attempt rewrites at word boundaries.
+        const wb = i == 0 or !isIdent(sql2[i - 1]);
+        if (wb) {
+            const matched = inline for (rules) |rule| {
+                if (matchFn(sql2, i, rule.name)) |r| {
+                    switch (rule.kind) {
+                        .multiif    => { i = try rwMultiIf(allocator, &buf, sql2, r);              break true; },
+                        .cast       => { i = try rwCast(allocator, &buf, sql2, r, rule.param);     break true; },
+                        .date_trunc => { i = try rwTrunc(allocator, &buf, sql2, r, rule.param);    break true; },
+                        .rename     => { try buf.appendSlice(allocator, rule.param); i = r;       break true; },
+                    }
+                }
+            } else false;
+            if (matched) continue;
+        }
+        try buf.append(allocator, sql2[i]);
         i += 1;
     }
     return @as(?[]u8, try buf.toOwnedSlice(allocator));
 }
 
+/// Rewrite CAST(expr, 'TypeName') → CAST(expr AS TypeName) (ClickHouse alternate syntax).
+fn rewriteCastStringType(allocator: std.mem.Allocator, sql: []const u8) ![]const u8 {
+    if (std.ascii.indexOfIgnoreCase(sql, "CAST(") == null and
+        std.ascii.indexOfIgnoreCase(sql, "CAST (") == null) return sql;
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    try buf.ensureTotalCapacity(allocator, sql.len + 16);
+    errdefer buf.deinit(allocator);
+    var i: usize = 0;
+    while (i < sql.len) {
+        const wb = i == 0 or !isIdent(sql[i - 1]);
+        if (wb) {
+            if (matchFn(sql, i, "CAST")) |after_paren| {
+            // Find the closing paren
+            const close = findClose(sql, after_paren) orelse {
+                try buf.appendSlice(allocator, sql[i..]);
+                break;
+            };
+            const inner = sql[after_paren..close];
+            // Split args — if exactly 2 args and second is a string literal, rewrite
+            const args = try splitArgs(allocator, inner, 0, inner.len);
+            defer allocator.free(args);
+            if (args.len == 2) {
+                const type_arg = std.mem.trim(u8, args[1], " \t\r\n");
+                if (type_arg.len >= 2 and type_arg[0] == '\'' and type_arg[type_arg.len - 1] == '\'') {
+                    const type_name = type_arg[1..type_arg.len - 1];
+                    const duckdb_type = chTypeToDuckdb(type_name);
+                    try buf.appendSlice(allocator, "CAST(");
+                    try buf.appendSlice(allocator, std.mem.trim(u8, args[0], " \t\r\n"));
+                    try buf.appendSlice(allocator, " AS ");
+                    try buf.appendSlice(allocator, duckdb_type);
+                    try buf.append(allocator, ')');
+                    i = close + 1;
+                    continue;
+                }
+            }
+            // No rewrite — copy CAST( as-is
+            try buf.appendSlice(allocator, "CAST(");
+            i = after_paren;
+            continue;
+            }
+        }
+        try buf.append(allocator, sql[i]);
+        i += 1;
+    }
+    return buf.toOwnedSlice(allocator);
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
 fn isIdent(ch: u8) bool { return std.ascii.isAlphanumeric(ch) or ch == '_'; }
 
-/// Match `name(` at sql[i]. Returns index after '(', or null.
+/// Match `name(` at sql[i] (word-boundary already checked by caller).
+/// Returns the index after '(', or null.
 fn matchFn(sql: []const u8, i: usize, name: []const u8) ?usize {
     if (i + name.len > sql.len) return null;
     if (!std.ascii.eqlIgnoreCase(sql[i .. i + name.len], name)) return null;
@@ -38,7 +295,7 @@ fn matchFn(sql: []const u8, i: usize, name: []const u8) ?usize {
     return j + 1;
 }
 
-/// Find matching ')' starting at `start` (depth=1). Returns index of ')'.
+/// Find matching ')' starting at `start` (depth already 1). Returns index of ')'.
 fn findClose(sql: []const u8, start: usize) ?usize {
     var depth: usize = 1;
     var k = start;
@@ -53,7 +310,7 @@ fn findClose(sql: []const u8, start: usize) ?usize {
     return null;
 }
 
-/// Split top-level args (inside already-found start..close range).
+/// Split top-level comma-separated args within sql[start..close].
 fn splitArgs(alloc: std.mem.Allocator, sql: []const u8, start: usize, close: usize) ![][]const u8 {
     var args: std.ArrayListUnmanaged([]const u8) = .empty;
     var depth: usize = 0;
@@ -61,8 +318,8 @@ fn splitArgs(alloc: std.mem.Allocator, sql: []const u8, start: usize, close: usi
     var k = start;
     while (k < close) : (k += 1) {
         switch (sql[k]) {
-            '(','[' => depth += 1,
-            ')',']' => depth -= 1,
+            '(', '[' => depth += 1,
+            ')', ']' => depth -= 1,
             '\'' => { k += 1; while (k < close and sql[k] != '\'') k += 1; },
             ',' => if (depth == 0) {
                 try args.append(alloc, std.mem.trim(u8, sql[s..k], " \t\r\n"));
@@ -74,6 +331,8 @@ fn splitArgs(alloc: std.mem.Allocator, sql: []const u8, start: usize, close: usi
     try args.append(alloc, std.mem.trim(u8, sql[s..close], " \t\r\n"));
     return args.toOwnedSlice(alloc);
 }
+
+// ── Structural rewriters ──────────────────────────────────────────────────────
 
 /// multiIf(c1,v1,...,else) → CASE WHEN c1 THEN v1 … ELSE else END
 fn rwMultiIf(alloc: std.mem.Allocator, buf: *std.ArrayListUnmanaged(u8), sql: []const u8, start: usize) !usize {
@@ -91,18 +350,42 @@ fn rwMultiIf(alloc: std.mem.Allocator, buf: *std.ArrayListUnmanaged(u8), sql: []
     return close + 1;
 }
 
-/// toString(x)→CAST(x AS VARCHAR), toDate(x)→CAST(x AS DATE)
+/// toString(x)→CAST(x AS VARCHAR), toDate(x)→CAST(x AS DATE), etc.
 fn rwCast(alloc: std.mem.Allocator, buf: *std.ArrayListUnmanaged(u8), sql: []const u8, start: usize, suffix: []const u8) !usize {
-    const close = findClose(sql, start) orelse { try buf.appendSlice(alloc, "toString("); return start; };
-    try buf.appendSlice(alloc, "CAST("); try buf.appendSlice(alloc, sql[start..close]);
-    try buf.append(alloc, ' '); try buf.appendSlice(alloc, suffix); try buf.append(alloc, ')');
+    const close = findClose(sql, start) orelse { try buf.appendSlice(alloc, "CAST("); return start; };
+    try buf.appendSlice(alloc, "CAST(");
+    try buf.appendSlice(alloc, sql[start..close]);
+    try buf.append(alloc, ' ');
+    try buf.appendSlice(alloc, suffix);
+    try buf.append(alloc, ')');
     return close + 1;
 }
 
-/// toStartOfHour(x)→date_trunc('hour', x)
+/// toStartOfHour(x)→date_trunc('hour', x), etc.
 fn rwTrunc(alloc: std.mem.Allocator, buf: *std.ArrayListUnmanaged(u8), sql: []const u8, start: usize, unit: []const u8) !usize {
-    const close = findClose(sql, start) orelse { try buf.appendSlice(alloc, "toStartOf("); return start; };
-    try buf.appendSlice(alloc, "date_trunc('"); try buf.appendSlice(alloc, unit);
-    try buf.appendSlice(alloc, "', "); try buf.appendSlice(alloc, sql[start..close]); try buf.append(alloc, ')');
+    const close = findClose(sql, start) orelse { try buf.appendSlice(alloc, "date_trunc("); return start; };
+    try buf.appendSlice(alloc, "date_trunc('");
+    try buf.appendSlice(alloc, unit);
+    try buf.appendSlice(alloc, "', ");
+    try buf.appendSlice(alloc, sql[start..close]);
+    try buf.append(alloc, ')');
     return close + 1;
+}
+
+/// Map ClickHouse type names to DuckDB equivalents for CAST.
+fn chTypeToDuckdb(ch_type: []const u8) []const u8 {
+    const t = std.mem.trim(u8, ch_type, " \t\r\n");
+    if (std.ascii.startsWithIgnoreCase(t, "Array(")) return "VARCHAR[]";
+    if (std.ascii.eqlIgnoreCase(t, "String")) return "VARCHAR";
+    if (std.ascii.eqlIgnoreCase(t, "UInt8"))  return "UTINYINT";
+    if (std.ascii.eqlIgnoreCase(t, "UInt16")) return "USMALLINT";
+    if (std.ascii.eqlIgnoreCase(t, "UInt32")) return "UINTEGER";
+    if (std.ascii.eqlIgnoreCase(t, "UInt64")) return "UBIGINT";
+    if (std.ascii.eqlIgnoreCase(t, "Int8"))   return "TINYINT";
+    if (std.ascii.eqlIgnoreCase(t, "Int16"))  return "SMALLINT";
+    if (std.ascii.eqlIgnoreCase(t, "Int32"))  return "INTEGER";
+    if (std.ascii.eqlIgnoreCase(t, "Int64"))  return "BIGINT";
+    if (std.ascii.eqlIgnoreCase(t, "Float32")) return "FLOAT";
+    if (std.ascii.eqlIgnoreCase(t, "Float64")) return "DOUBLE";
+    return t; // fallthrough: pass as-is
 }

@@ -32,6 +32,11 @@ pub const Expr = struct {
     cond: ?*CondExpr = null,
     /// Separator for group_uniq_array result (default ", "). Owned when plan.owned=true.
     sep: ?[]const u8 = null,
+    /// For group_uniq_array wrapped by an outer function (e.g. arraySlice, arrayDistinct).
+    /// Template where "$" is replaced by the aggregate result at eval time.
+    /// Example: "arraySlice($, 1, 5)"
+    /// Heap-allocated; freed in deinit when plan.owned=true.
+    post_fn: ?[]const u8 = null,
 };
 
 // ── WhereNode: generic predicate tree ─────────────────────────────────────────
@@ -111,6 +116,9 @@ pub const Plan = struct {
     /// When set, `table` is the subquery alias (or "__subquery__").
     /// Free with deinit(allocator, subquery_source.*) then destroy.
     subquery_source: ?*Plan = null,
+    /// UNION ALL right-hand side plan. When set, executor runs both plans and concatenates rows.
+    /// Free with deinit(allocator, union_other.*) then destroy.
+    union_other: ?*Plan = null,
     /// When true, all string fields (table, where_text, group_by, having_text,
     /// order_by_alias, order_by_text) were heap-allocated by the DuckDB parser
     /// and must be freed by deinit().  Legacy parser uses SQL slices (no free).
@@ -125,6 +133,7 @@ pub fn parse(allocator: std.mem.Allocator, sql: []const u8) !?Plan {
 
 pub fn deinit(allocator: std.mem.Allocator, plan: Plan) void {
     if (plan.subquery_source) |sq| { deinit(allocator, sq.*); allocator.destroy(sq); }
+    if (plan.union_other) |uo| { deinit(allocator, uo.*); allocator.destroy(uo); }
     if (plan.where_expr) |we| freeWhereNode(allocator, we);
     // Always free cond expressions in projections (they are always heap-allocated).
     for (plan.projections) |expr| {
@@ -147,6 +156,7 @@ pub fn deinit(allocator: std.mem.Allocator, plan: Plan) void {
             if (expr.alias) |a| allocator.free(a);
             if (expr.column) |col| allocator.free(col);
             if (expr.sep) |s| allocator.free(s);
+            if (expr.post_fn) |s| allocator.free(s);
         }
     }
     allocator.free(plan.projections);

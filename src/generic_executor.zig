@@ -30,6 +30,12 @@ const schema = @import("schema");
 const build_options = @import("build_options");
 const ch_part = @import("ch_part");
 
+// ── User-defined functions (set by server before calling executor) ────────────
+
+/// Thread-local registry of user-defined functions: name → lambda text "(params) -> body".
+/// Set by the server before each query execution.
+pub var udf_registry: ?*std.StringHashMap([]const u8) = null;
+
 // ── Data source ───────────────────────────────────────────────────────────────
 
 /// Describes where the executor reads row data from.
@@ -130,7 +136,12 @@ fn lookupColumn(tbl: *const schema.Table, name: []const u8) ?ColDesc {
 const Value = union(enum) {
     i64: i64,
     f64: f64,
-    str: []const u8,  // slice into arena; valid for lifetime of Executor.run call
+    /// Slice into arena; valid for the lifetime of the Executor.run call.
+    str: []const u8,
+    /// Heap-allocated string owned by this Value; caller must free with page_allocator.
+    str_owned: []u8,
+    /// Array of Values; elements are page_allocator-owned or arena slices.
+    array: []Value,
     null_val,
 
     fn isNull(self: Value) bool {
@@ -155,7 +166,8 @@ const Value = union(enum) {
 
     fn toStr(self: Value) ?[]const u8 {
         return switch (self) {
-            .str => |s| s,
+            .str      => |s| s,
+            .str_owned => |s| s,
             else => null,
         };
     }
@@ -172,10 +184,14 @@ const Value = union(enum) {
                 .f64 => |bv| return std.math.order(av, bv),
                 else => return .lt,
             },
-            .str => |av| switch (b) {
-                .str => |bv| return std.mem.order(u8, av, bv),
-                else => return .gt,
+            .str, .str_owned => {
+                const av = a.toStr().?;
+                switch (b) {
+                    .str, .str_owned => return std.mem.order(u8, av, b.toStr().?),
+                    else => return .gt,
+                }
             },
+            .array => return .lt,
             .null_val => return if (b == .null_val) .eq else .lt,
         }
     }
@@ -184,19 +200,26 @@ const Value = union(enum) {
         return order(a, b) == .eq;
     }
 
-    /// Write in CSV-compatible format (no surrounding quotes for ints).
+    /// Write in CSV-compatible format.
     fn writeCsv(self: Value, out: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
         switch (self) {
             .i64 => |v| try out.print(allocator, "{d}", .{v}),
             .f64 => |v| {
-                // Match existing generic output format: integer if whole number
                 if (v == @trunc(v) and @abs(v) < 1e15) {
                     try out.print(allocator, "{d}", .{@as(i64, @intFromFloat(v))});
                 } else {
                     try out.print(allocator, "{d}", .{v});
                 }
             },
-            .str => |s| try out.appendSlice(allocator, s),
+            .str      => |s| try out.appendSlice(allocator, s),
+            .str_owned => |s| try out.appendSlice(allocator, s),
+            .array    => |arr| {
+                // Render array as \f-separated list (matches internal array storage)
+                for (arr, 0..) |elem, i| {
+                    if (i > 0) try out.append(allocator, '\x0c');
+                    try elem.writeCsv(out, allocator);
+                }
+            },
             .null_val => {},
         }
     }
@@ -383,20 +406,33 @@ fn evalPlanFilter(plan: generic_sql.Plan, row: *const RowCtx) bool {
 const RowCtx = struct {
     names: []const []const u8,
     values: []const Value,
+    /// Optional parent row for lambda scopes (lambda param shadows parent columns).
+    parent: ?*const RowCtx = null,
+    /// Optional table schema for Map value-type dispatch.
+    table: ?*const schema.Table = null,
 
     fn get(self: *const RowCtx, name: []const u8) ?Value {
-        // Fast path: direct column name match
+        // Fast path: direct column name match in this scope
         for (self.names, self.values) |n, v| {
             if (std.ascii.eqlIgnoreCase(n, name)) return v;
         }
+        // Chain to parent scope (lambda bindings)
+        if (self.parent) |p| return p.get(name);
         // Slow path: Map subscript access like data['key'] or features['key']
         if (parseMapSubscript(name)) |sub| {
             for (self.names, self.values) |n, v| {
                 if (std.ascii.eqlIgnoreCase(n, sub.col)) {
-                    // v is a .str containing raw Map binary blob (key+value pairs)
                     const blob = v.toStr() orelse return Value{ .str = "" };
-                    const found = lookupMapBlob(blob, sub.key) orelse return Value{ .str = "" };
-                    return Value{ .str = found };
+                    // Determine value type from schema if available
+                    var val_ch_type: []const u8 = "String";
+                    if (self.table) |tbl| {
+                        if (tbl.findColumn(sub.col)) |ci| {
+                            if (tbl.columns[ci].ch_type) |ct| {
+                                val_ch_type = extractMapValueType(ct);
+                            }
+                        }
+                    }
+                    return lookupMapBlobTyped(blob, sub.key, val_ch_type);
                 }
             }
         }
@@ -415,6 +451,10 @@ fn parseMapSubscript(expr: []const u8) ?MapSubscript {
     if (close <= open + 2) return null;
     const col = std.mem.trim(u8, expr[0..open], " \t");
     if (col.len == 0) return null;
+    // Ensure col is a simple identifier (no parens, commas, spaces — not a function call)
+    for (col) |c| {
+        if (c == '(' or c == ')' or c == ',' or c == ' ' or c == '\t') return null;
+    }
     var inner = std.mem.trim(u8, expr[open + 1 .. close], " \t");
     // Strip surrounding quotes
     if (inner.len >= 2 and ((inner[0] == '\'' and inner[inner.len - 1] == '\'') or
@@ -437,41 +477,140 @@ fn parseMapSubscript(expr: []const u8) ?MapSubscript {
 ///   data[v_row_start..vp]  (all values varUInt-prefixed)
 /// We scan keys counting N, then scan values to find the Nth one.
 fn lookupMapBlob(blob: []const u8, key: []const u8) ?[]const u8 {
-    // First pass: collect key positions and count N.
-    var kp: usize = 0;
-    var count: usize = 0;
+    // Blob format (written by decodeRowBinaryArrayOrMap):
+    // varint N | N × (varint_len + key_bytes) | N × (varint_len + value_bytes)
+    if (blob.len == 0) return null;
+    const count, const cb = readVarUIntSlice(blob) orelse return null;
+    var kp: usize = cb;
     var match_idx: ?usize = null;
 
-    while (kp < blob.len) {
-        const len, const lb = readVarUIntSlice(blob[kp..]) orelse break;
-        if (kp + lb + len > blob.len) break;
+    for (0..count) |i| {
+        const len, const lb = readVarUIntSlice(blob[kp..]) orelse return null;
+        if (kp + lb + len > blob.len) return null;
         const k = blob[kp + lb .. kp + lb + len];
         if (match_idx == null and std.mem.eql(u8, k, key)) {
-            match_idx = count;
+            match_idx = i;
         }
-        count += 1;
         kp += lb + len;
     }
-    // kp is now the boundary between keys and values (since all key data is consumed)
     if (match_idx == null) return null;
     // kp now points to start of values section
-    const values_start = kp;
-    var vp: usize = values_start;
-    var vi: usize = 0;
-    while (vp < blob.len) {
-        const vlen, const vlb = readVarUIntSlice(blob[vp..]) orelse break;
-        if (vp + vlb + vlen > blob.len) break;
-        if (vi == match_idx.?) {
+    var vp: usize = kp;
+    for (0..count) |i| {
+        const vlen, const vlb = readVarUIntSlice(blob[vp..]) orelse return null;
+        if (vp + vlb + vlen > blob.len) return null;
+        if (i == match_idx.?) {
             return blob[vp + vlb .. vp + vlb + vlen];
         }
-        vi += 1;
         vp += vlb + vlen;
     }
     return null;
 }
 
+/// Extract the value type string from "Map(K, V)" → "V". Returns "String" on failure.
+fn extractMapValueType(ch_type: []const u8) []const u8 {
+    if (!std.mem.startsWith(u8, ch_type, "Map(")) return "String";
+    const inner = ch_type[4 .. ch_type.len - 1]; // strip "Map(" and ")"
+    var depth: usize = 0;
+    for (inner, 0..) |c, i| {
+        if (c == '(') depth += 1
+        else if (c == ')') depth -= 1
+        else if (c == ',' and depth == 0) {
+            return std.mem.trim(u8, inner[i+1..], " ");
+        }
+    }
+    return "String";
+}
+
+/// Fixed byte widths for CH numeric value types in Map blobs.
+fn mapValueFixedWidth(vtype: []const u8) ?usize {
+    if (std.mem.eql(u8, vtype, "Float32") or std.mem.eql(u8, vtype, "Int32") or std.mem.eql(u8, vtype, "UInt32")) return 4;
+    if (std.mem.eql(u8, vtype, "Float64") or std.mem.eql(u8, vtype, "Int64") or std.mem.eql(u8, vtype, "UInt64")) return 8;
+    if (std.mem.eql(u8, vtype, "Int16") or std.mem.eql(u8, vtype, "UInt16")) return 2;
+    if (std.mem.eql(u8, vtype, "Int8") or std.mem.eql(u8, vtype, "UInt8")) return 1;
+    return null;
+}
+
+/// Lookup a key in a Map blob, returning the correct Value type.
+/// Blob format: varint N | N×varint_key_bytes | N×value_bytes
+/// Value bytes format depends on val_ch_type (String → varint-prefixed, numeric → fixed-width).
+fn lookupMapBlobTyped(blob: []const u8, key: []const u8, val_ch_type: []const u8) Value {
+    if (blob.len == 0) return Value{ .str = "" };
+    const count, const cb = readVarUIntSlice(blob) orelse return Value{ .str = "" };
+    var kp: usize = cb;
+    var match_idx: ?usize = null;
+
+    for (0..count) |i| {
+        const len, const lb = readVarUIntSlice(blob[kp..]) orelse return Value{ .str = "" };
+        if (kp + lb + len > blob.len) return Value{ .str = "" };
+        const k = blob[kp + lb .. kp + lb + len];
+        if (match_idx == null and std.mem.eql(u8, k, key)) match_idx = i;
+        kp += lb + len;
+    }
+    if (match_idx == null) return Value{ .str = "" };
+
+    // Values section
+    const fix_w = mapValueFixedWidth(val_ch_type);
+    var vp: usize = kp;
+    for (0..count) |i| {
+        if (fix_w) |w| {
+            if (vp + w > blob.len) return Value{ .str = "" };
+            if (i == match_idx.?) {
+                const raw = blob[vp..vp+w];
+                if (w == 8) {
+                    const bits = std.mem.readInt(u64, raw[0..8], .little);
+                    return Value{ .f64 = @bitCast(bits) };
+                } else if (w == 4) {
+                    const bits = std.mem.readInt(u32, raw[0..4], .little);
+                    return Value{ .f64 = @as(f64, @floatCast(@as(f32, @bitCast(bits)))) };
+                }
+                // 1 or 2 byte integers
+                var ibuf = [_]u8{0} ** 8;
+                @memcpy(ibuf[0..w], raw[0..w]);
+                return Value{ .i64 = @intCast(std.mem.readInt(u64, &ibuf, .little)) };
+            }
+            vp += w;
+        } else {
+            // String (varint-prefixed)
+            const vlen, const vlb = readVarUIntSlice(blob[vp..]) orelse return Value{ .str = "" };
+            if (vp + vlb + vlen > blob.len) return Value{ .str = "" };
+            if (i == match_idx.?) return Value{ .str = blob[vp + vlb .. vp + vlb + vlen] };
+            vp += vlb + vlen;
+        }
+    }
+    return Value{ .str = "" };
+}
+
 /// Read a varint-prefixed length from a byte slice.
 /// Returns (length_value, bytes_consumed) or null if slice is empty/invalid.
+/// Convert 16-byte IPv6 raw bytes to a string. Returns page_allocator-owned string or null.
+/// Handles IPv4-mapped addresses (::ffff:a.b.c.d) specially.
+fn ipv6BytesToStr(b: []const u8) ?[]u8 {
+    if (b.len != 16) return null;
+    // Check IPv4-mapped: first 10 bytes zero, bytes 10-11 = 0xff 0xff
+    const is_ipv4_mapped = blk: {
+        for (b[0..10]) |c| if (c != 0) break :blk false;
+        break :blk b[10] == 0xff and b[11] == 0xff;
+    };
+    if (is_ipv4_mapped) {
+        return std.fmt.allocPrint(std.heap.page_allocator, "::ffff:{d}.{d}.{d}.{d}",
+            .{ b[12], b[13], b[14], b[15] }) catch null;
+    }
+    // Full IPv6: format as 8 groups of 4 hex digits
+    return std.fmt.allocPrint(std.heap.page_allocator,
+        "{x:0>4}:{x:0>4}:{x:0>4}:{x:0>4}:{x:0>4}:{x:0>4}:{x:0>4}:{x:0>4}",
+        .{
+            @as(u16, b[0]) << 8 | b[1],
+            @as(u16, b[2]) << 8 | b[3],
+            @as(u16, b[4]) << 8 | b[5],
+            @as(u16, b[6]) << 8 | b[7],
+            @as(u16, b[8]) << 8 | b[9],
+            @as(u16, b[10]) << 8 | b[11],
+            @as(u16, b[12]) << 8 | b[13],
+            @as(u16, b[14]) << 8 | b[15],
+        }) catch null;
+}
+
 fn readVarUIntSlice(data: []const u8) ?struct { usize, usize } {
     if (data.len == 0) return null;
     var val: usize = 0;
@@ -816,7 +955,7 @@ const Executor = struct {
                 else
                     Value{ .null_val = {} };
             }
-            const row = RowCtx{ .names = all_names, .values = vals };
+            const row = RowCtx{ .names = all_names, .values = vals, .table = self.table };
             try callback(context, &row);
         }
     }
@@ -965,9 +1104,12 @@ const AggState = struct {
             .min => self.min orelse Value{ .null_val = {} },
             .max => self.max orelse Value{ .null_val = {} },
             .group_uniq_array => blk: {
-                // Return as a separator-joined string (default ", ").
+                // Return as a separator-joined string.
+                // When post_fn is set, use \x0c separator so array functions
+                // (arraySlice, arrayDistinct, etc.) can parse the blob correctly.
+                // Otherwise use the user-specified sep (default ", ").
                 if (self.array_vals == null or self.array_vals.?.items.len == 0) break :blk Value{ .str = "" };
-                const sep: []const u8 = proj.sep orelse ", ";
+                const sep: []const u8 = if (proj.post_fn != null) "\x0c" else (proj.sep orelse ", ");
                 var buf: std.ArrayList(u8) = .empty;
                 for (self.array_vals.?.items, 0..) |s, i| {
                     if (i != 0) buf.appendSlice(alloc, sep) catch {};
@@ -1006,6 +1148,23 @@ const AggState = struct {
     }
 };
 
+/// Apply a post_fn template to an aggregate Value.
+/// The template uses "$" as placeholder for the aggregate result string.
+/// Example: "arraySlice($, 1, 5)" with value="\x0ca\x0cb\x0cc" → evalTextExpr result.
+fn applyPostFn(pf: []const u8, v: Value, allocator: std.mem.Allocator) Value {
+    // Pass the aggregate result as the special "$" column in a temporary row.
+    // Replace "$" placeholder in template with the special sentinel so evalTextExpr
+    // can look it up from the row.
+    const agg_sentinel = "__AGG__";
+    const substituted = std.mem.replaceOwned(u8, allocator, pf, "$", agg_sentinel) catch return v;
+    defer allocator.free(substituted);
+    // Build a temporary RowCtx with "$" → v
+    const names = [_][]const u8{agg_sentinel};
+    const values = [_]Value{v};
+    const tmp_row = RowCtx{ .names = &names, .values = &values };
+    return evalTextExpr(substituted, &tmp_row) orelse v;
+}
+
 /// Evaluate an optional inline condition (CondExpr) against the current row.
 fn evalCondExpr(cond: ?*const generic_sql.CondExpr, row: *const RowCtx) bool {
     const c = cond orelse return true; // no condition → always pass
@@ -1039,10 +1198,10 @@ fn evalCondExpr(cond: ?*const generic_sql.CondExpr, row: *const RowCtx) bool {
 /// Convert a Value to an owned string key (for string hash sets).
 fn valueToKey(alloc: std.mem.Allocator, v: Value) ![]u8 {
     return switch (v) {
-        .str => |s| try alloc.dupe(u8, s),
+        .str, .str_owned => try alloc.dupe(u8, v.toStr().?),
         .i64 => |i| try std.fmt.allocPrint(alloc, "{d}", .{i}),
         .f64 => |f| try std.fmt.allocPrint(alloc, "{d}", .{f}),
-        .null_val => try alloc.dupe(u8, ""),
+        .array, .null_val => try alloc.dupe(u8, ""),
     };
 }
 
@@ -1084,7 +1243,9 @@ const ScalarAggCtx = struct {
         // Values
         for (plan.projections, self.states, 0..) |proj, *state, i| {
             if (i != 0) try out.append(allocator, ',');
-            try state.result(proj, self.allocator).writeCsv(&out, allocator);
+            var v = state.result(proj, self.allocator);
+            if (proj.post_fn) |pf| v = applyPostFn(pf, v, allocator);
+            try v.writeCsv(&out, allocator);
         }
         try out.append(allocator, '\n');
         return out.toOwnedSlice(allocator);
@@ -1215,7 +1376,8 @@ const GroupByCtx = struct {
             for (self.group_exprs, key_values) |expr, *kv| {
                 const v = evalGroupKeyExpr(expr, row);
                 kv.* = switch (v) {
-                    .str => |s| Value{ .str = try self.allocator.dupe(u8, s) },
+                    .str      => |s| Value{ .str = try self.allocator.dupe(u8, s) },
+                    .str_owned => |s| Value{ .str = try self.allocator.dupe(u8, s) },
                     else => v,
                 };
             }
@@ -1372,13 +1534,15 @@ const GroupByCtx = struct {
                     }
                     if (!is_key) {
                         // Non-key column_ref in projection: output first value seen
-                        const v = state.result(proj, self.allocator);
+                        var v = state.result(proj, self.allocator);
+                        if (proj.post_fn) |pf| v = applyPostFn(pf, v, allocator);
                         try v.writeCsv(&out, allocator);
                     }
                 } else if (proj.func == .int_literal) {
                     try out.print(allocator, "{d}", .{proj.int_offset});
                 } else {
-                    const v = state.result(proj, self.allocator);
+                    var v = state.result(proj, self.allocator);
+                    if (proj.post_fn) |pf| v = applyPostFn(pf, v, allocator);
                     try v.writeCsv(&out, allocator);
                 }
                 col_written += 1;
@@ -1424,11 +1588,72 @@ const ScanCtx = struct {
 
         if (!has_order and self.rows.items.len >= limit + (self.plan.offset orelse 0)) return;
 
+        // Detect arrayJoin projection: expand into multiple rows.
+        // Find the first projection that is arrayJoin(expr).
+        const aj_prefix = "arrayjoin(";
+        var aj_col_idx: ?usize = null;
+        var aj_inner: []const u8 = "";
+        for (self.plan.projections, 0..) |proj, pi| {
+            const col = proj.column orelse proj.alias orelse continue;
+            if (col.len > aj_prefix.len and std.ascii.startsWithIgnoreCase(col, aj_prefix) and col[col.len - 1] == ')') {
+                aj_col_idx = pi;
+                aj_inner = col[aj_prefix.len .. col.len - 1];
+                break;
+            }
+        }
+
+        if (aj_col_idx) |aci| {
+            // Evaluate the inner expression to get an array, then emit one row per element.
+            const arr_val = evalTextExpr(aj_inner, row) orelse return;
+            const elems: []const Value = switch (arr_val) {
+                .array => |a| a,
+                else => blk: {
+                    // Single value — treat as 1-element array
+                    const s = self.arena.allocator().create(Value) catch return;
+                    s.* = arr_val;
+                    break :blk @as([]const Value, @as(*[1]Value, s));
+                },
+            };
+            for (elems) |elem| {
+                const vals = try self.arena.allocator().alloc(Value, self.plan.projections.len);
+                for (self.plan.projections, vals, 0..) |proj, *v, pi| {
+                    if (pi == aci) {
+                        v.* = switch (elem) {
+                            .str      => |s| Value{ .str = try self.arena.allocator().dupe(u8, s) },
+                            .str_owned => |s| Value{ .str = try self.arena.allocator().dupe(u8, s) },
+                            else => elem,
+                        };
+                    } else {
+                        const raw = evalProjectionExpr(proj, row);
+                        v.* = switch (raw) {
+                            .str      => |s| Value{ .str = try self.arena.allocator().dupe(u8, s) },
+                            .str_owned => |s| Value{ .str = try self.arena.allocator().dupe(u8, s) },
+                            else => raw,
+                        };
+                    }
+                }
+                try self.rows.append(self.allocator, vals);
+            }
+            return;
+        }
+
         const vals = try self.arena.allocator().alloc(Value, self.plan.projections.len);
         for (self.plan.projections, vals) |proj, *v| {
             const raw = evalProjectionExpr(proj, row);
             v.* = switch (raw) {
-                .str => |s| Value{ .str = try self.arena.allocator().dupe(u8, s) },
+                .str      => |s| Value{ .str = try self.arena.allocator().dupe(u8, s) },
+                .str_owned => |s| Value{ .str = try self.arena.allocator().dupe(u8, s) },
+                .array    => |arr| blk: {
+                    // Deep-copy array into arena: serialize as \x0c-separated string
+                    var buf: std.ArrayList(u8) = .empty;
+                    defer buf.deinit(self.allocator);
+                    for (arr, 0..) |elem, i| {
+                        if (i > 0) try buf.append(self.allocator, '\x0c');
+                        try elem.writeCsv(&buf, self.allocator);
+                    }
+                    const owned = try self.arena.allocator().dupe(u8, buf.items);
+                    break :blk Value{ .str = owned };
+                },
                 else => raw,
             };
         }
@@ -1439,21 +1664,44 @@ const ScanCtx = struct {
         // Sort if needed
         const has_order = plan.order_by_text != null or plan.order_by_count_desc or plan.order_by_alias != null;
         if (has_order) {
-            // Simple lexicographic sort on first column for now
-            // (covers ORDER BY EventTime, ORDER BY SearchPhrase, etc.)
+            // Determine sort column index and direction from order_by_text or defaults.
+            var sort_col_idx: usize = 0;
+            var sort_desc: bool = plan.order_by_count_desc;
+            if (plan.order_by_text) |obt| {
+                // Parse "col_name [ASC|DESC]" from order_by_text
+                var tok_it = std.mem.tokenizeAny(u8, obt, " \t\r\n");
+                if (tok_it.next()) |col_name| {
+                    // Find col_name in projections
+                    for (plan.projections, 0..) |proj, ci| {
+                        const alias = proj.alias orelse proj.column orelse "";
+                        if (std.ascii.eqlIgnoreCase(alias, col_name)) {
+                            sort_col_idx = ci;
+                            break;
+                        }
+                    }
+                    // Also check next token for ASC/DESC
+                    if (tok_it.next()) |dir| {
+                        sort_desc = std.ascii.eqlIgnoreCase(dir, "DESC");
+                    }
+                }
+            }
+            // Simple sort on sort_col_idx column
             const SortCtx = struct {
                 rows: [][]Value,
+                col: usize,
                 desc: bool,
                 fn lessThan(ctx: @This(), a: usize, b: usize) bool {
                     const ra = ctx.rows[a];
                     const rb = ctx.rows[b];
-                    if (ra.len == 0) return false;
-                    const ord = Value.order(ra[0], rb[0]);
+                    const ci = ctx.col;
+                    if (ra.len <= ci) return false;
+                    if (rb.len <= ci) return true;
+                    const ord = Value.order(ra[ci], rb[ci]);
                     if (ctx.desc) return ord == .gt;
                     return ord == .lt;
                 }
             };
-            const sc = SortCtx{ .rows = self.rows.items, .desc = plan.order_by_count_desc };
+            const sc = SortCtx{ .rows = self.rows.items, .col = sort_col_idx, .desc = sort_desc };
             const indices = try allocator.alloc(usize, self.rows.items.len);
             defer allocator.free(indices);
             for (indices, 0..) |*idx, i| idx.* = i;
@@ -1533,6 +1781,86 @@ fn collectWhereNodeColumns(
     }
 }
 
+/// AddFn type alias for passing the inner `add` closure to addFuncColumns.
+const AddFn = fn (
+    std.mem.Allocator,
+    *std.StringHashMap(void),
+    *std.ArrayList([]const u8),
+    []const u8,
+    *const schema.Table,
+) anyerror!void;
+
+/// Recursively extract leaf column references from a function-call expression
+/// text (e.g. "lower(protocol)", "concat(a, ':', b)", "arraySlice(col, 1, 5)")
+/// and add each real schema column to `needed`.
+fn addFuncColumns(
+    allocator: std.mem.Allocator,
+    seen: *std.StringHashMap(void),
+    needed: *std.ArrayList([]const u8),
+    expr: []const u8,
+    table: *const schema.Table,
+    add: *const AddFn,
+) anyerror!void {
+    const trimmed = std.mem.trim(u8, expr, " \t\r\n");
+    if (trimmed.len == 0) return;
+    // String literal: skip
+    if (trimmed.len >= 2 and trimmed[0] == '\'') return;
+    // Numeric literal: skip
+    if (std.fmt.parseInt(i64, trimmed, 10) catch null) |_| return;
+    if (std.fmt.parseFloat(f64, trimmed) catch null) |_| return;
+    // map subscript col['key'] → add the map column
+    if (parseMapSubscript(trimmed)) |sub| {
+        try add(allocator, seen, needed, sub.col, table);
+        return;
+    }
+    // Function call: find the opening paren and recurse into arguments
+    if (std.mem.indexOfScalar(u8, trimmed, '(')) |paren_pos| {
+        if (trimmed[trimmed.len - 1] == ')') {
+            const inner = trimmed[paren_pos + 1 .. trimmed.len - 1];
+            const args = splitTopLevelArgs(inner) catch return;
+            for (args.items[0..args.len]) |arg| {
+                const a = std.mem.trim(u8, arg, " \t\r\n");
+                if (a.len == 0) continue;
+                // Skip lambda arguments (e.g. "x -> x != ''") — lambda vars are not schema cols
+                if (std.mem.indexOf(u8, a, " -> ") != null) continue;
+                try addFuncColumns(allocator, seen, needed, a, table, add);
+            }
+            return;
+        }
+    }
+    // Leaf node: attempt to add as a schema column name.
+    // But first: if the expression contains spaces/operators (comparison, CASE WHEN, etc.),
+    // scan all word tokens and try each as a schema column.
+    if (std.mem.indexOfAny(u8, trimmed, " \t><=!") != null) {
+        // Tokenize by splitting on non-identifier characters and try each word
+        var i: usize = 0;
+        while (i < trimmed.len) {
+            // skip non-identifier chars
+            while (i < trimmed.len and !std.ascii.isAlphanumeric(trimmed[i]) and trimmed[i] != '_') i += 1;
+            if (i >= trimmed.len) break;
+            const start = i;
+            while (i < trimmed.len and (std.ascii.isAlphanumeric(trimmed[i]) or trimmed[i] == '_')) i += 1;
+            const token = trimmed[start..i];
+            if (token.len == 0) continue;
+            // Skip SQL keywords
+            const sql_kws = [_][]const u8{ "CASE", "WHEN", "THEN", "ELSE", "END", "AND", "OR", "NOT", "IN", "IS", "NULL", "LIKE", "BETWEEN" };
+            var is_kw = false;
+            for (sql_kws) |kw| {
+                if (std.ascii.eqlIgnoreCase(token, kw)) { is_kw = true; break; }
+            }
+            if (is_kw) continue;
+            // Skip string literals (tokens starting with ')  — already excluded by isAlphanumeric
+            // Skip numeric literals
+            if (std.fmt.parseInt(i64, token, 10) catch null) |_| continue;
+            if (std.fmt.parseFloat(f64, token) catch null) |_| continue;
+            // Try as schema column
+            try add(allocator, seen, needed, token, table);
+        }
+        return;
+    }
+    try add(allocator, seen, needed, trimmed, table);
+}
+
 fn collectNeededColumns(
     allocator: std.mem.Allocator,
     plan: generic_sql.Plan,
@@ -1559,6 +1887,11 @@ fn collectNeededColumns(
             } else if (parseMapSubscript(col)) |sub| {
                 // data['key'] → need the Map column (e.g. "data")
                 try add(allocator, &seen, needed, sub.col, table);
+            } else if (std.mem.indexOfScalar(u8, col, '(') != null or
+                       std.mem.indexOfAny(u8, col, " \t><=!") != null) {
+                // Function expression or complex expression (CASE WHEN, comparisons, etc.):
+                // recursively extract leaf column references
+                try addFuncColumns(allocator, &seen, needed, col, table, &add);
             } else {
                 try add(allocator, &seen, needed, col, table);
             }
@@ -1793,7 +2126,7 @@ fn evalProjectionExpr(proj: generic_sql.Expr, row: *const RowCtx) Value {
             if (parseLengthCall(col)) |inner_col| {
                 const v = row.get(inner_col) orelse return Value{ .null_val = {} };
                 return switch (v) {
-                    .str => |s| Value{ .i64 = @intCast(s.len) },
+                    .str, .str_owned => Value{ .i64 = @intCast(v.toStr().?.len) },
                     else => Value{ .null_val = {} },
                 };
             }
@@ -1804,91 +2137,995 @@ fn evalProjectionExpr(proj: generic_sql.Expr, row: *const RowCtx) Value {
     }
 }
 
+// ── comptime function dispatch table ─────────────────────────────────────────
+//
+// Each entry maps a CH function name (lowercase) to an EvalKind.
+// evalTextExpr uses `inline for` over this table so all prefix strings and
+// their lengths are computed at compile time — no hand-written byte offsets.
+//
+// Functions that DuckDB cannot parse (multiIf, toStartOf*, toString, …) are
+// handled in ch_compat.zig before reaching this layer.
+// Functions below are CH originals that DuckDB parses fine as unknown FUNCTION
+// nodes; the executor is responsible for evaluating them at runtime.
+
+const EvalKind = enum {
+    // Conditional
+    cond_if,           // if(cond, then, else)
+    // String → scalar
+    str_lower,         // lower(s), lowerUTF8 already rewritten to lower
+    str_upper,         // upper(s)
+    str_concat,        // concat(a, b, ...)
+    str_substring,     // substring(s, pos [, len]) — 1-based
+    str_starts_with,   // startsWith(s, prefix)
+    str_position_ci,   // positionCaseInsensitive(haystack, needle)
+    str_length,        // length(s or array) — byte len or element count
+    // Numeric
+    num_floor,         // floor(x)
+    num_round,         // round(x)
+    num_abs,           // abs(x)
+    num_greatest,      // greatest(a, b, ...)
+    num_least,         // least(a, b, ...)
+    // Date
+    date_yyyymmdd,     // toYYYYMMDD(x) → integer
+    date_trunc,        // date_trunc('unit', col) → truncated timestamp string
+    date_cast,         // CAST(x AS DATE) / toDate(x) → date string
+    // IP
+    ip_bool,           // isIPv4String / isIPv6String → 0 or 1
+    ip_to_num,         // IPv4StringToNumOrDefault(s) → uint32
+    // Cast
+    cast_expr,         // CAST(expr AS type)
+    str_tostring,      // toString(x) → string representation
+    fn_now,            // now() → current Unix timestamp (seconds)
+    // Array construction
+    arr_make,          // list_value(a, b, ...) / array(a, b, ...) → Value.array
+    arr_split_char,    // splitByChar(delim, str) → array
+    arr_split_str,     // splitByString(delim, str) → array
+    // Array predicates
+    arr_has,           // has(arr, val)
+    arr_has_any,       // hasAny(arr, [v1,v2,...])
+    arr_has_all,       // hasAll(arr, [v1,v2,...])
+    arr_index_of,      // indexOf(arr, val) → 1-based
+    // Array transforms
+    arr_filter,        // arrayFilter(x -> cond, arr)
+    arr_map,           // arrayMap(x -> expr, arr)
+    arr_exists,        // arrayExists(x -> cond, arr)
+    arr_flatten,       // arrayFlatten(arr)
+    arr_distinct,      // arrayDistinct(arr)
+    arr_concat,        // arrayConcat(a, b)
+    arr_max,           // arrayMax(arr)
+    arr_min,           // arrayMin(arr)
+    arr_slice,         // arraySlice(arr, off, len)
+    arr_str_join,      // arrayStringConcat(arr [, sep])
+    // Map
+    map_keys,          // mapKeys(m) → array of keys
+    map_values,        // mapValues(m) → array of values
+    // Dict stubs
+    stub_zero,         // dictHas, IPv6StringToNumOrDefault → 0
+    stub_empty_str,    // dictGet → ""
+    stub_null,         // dictGetOrNull → null
+    stub_default_arg4, // dictGetOrDefault → 4th arg
+    // Scalar passthrough (max in non-aggregate context)
+    scalar_passthru,   // max(expr) → evalTextExpr(inner)
+};
+
+const FuncEval = struct {
+    name: []const u8,  // lowercase CH function name (no trailing '(')
+    kind: EvalKind,
+};
+
+const func_evals = [_]FuncEval{
+    .{ .name = "if",                          .kind = .cond_if          },
+    .{ .name = "lower",                       .kind = .str_lower        },
+    .{ .name = "upper",                       .kind = .str_upper        },
+    .{ .name = "concat",                      .kind = .str_concat       },
+    .{ .name = "substring",                   .kind = .str_substring    },
+    .{ .name = "substr",                      .kind = .str_substring    },
+    .{ .name = "startswith",                  .kind = .str_starts_with  },
+    .{ .name = "positioncaseinsensitive",      .kind = .str_position_ci  },
+    .{ .name = "length",                      .kind = .str_length       },
+    .{ .name = "floor",                       .kind = .num_floor        },
+    .{ .name = "round",                       .kind = .num_round        },
+    .{ .name = "abs",                         .kind = .num_abs          },
+    .{ .name = "greatest",                    .kind = .num_greatest     },
+    .{ .name = "least",                       .kind = .num_least        },
+    .{ .name = "toyyyymmdd",                  .kind = .date_yyyymmdd    },
+    .{ .name = "date_trunc",                  .kind = .date_trunc       },
+    .{ .name = "isipv4string",                .kind = .ip_bool          },
+    .{ .name = "isipv6string",                .kind = .ip_bool          },
+    .{ .name = "ipv4stringtonumordefault",     .kind = .ip_to_num        },
+    .{ .name = "ipv6stringtonumordefault",     .kind = .stub_zero        },
+    .{ .name = "cast",                        .kind = .cast_expr        },
+    .{ .name = "tostring",                    .kind = .str_tostring     },
+    .{ .name = "now",                         .kind = .fn_now           },
+    .{ .name = "today",                       .kind = .fn_now           },
+    .{ .name = "list_value",                  .kind = .arr_make         },
+    .{ .name = "array",                       .kind = .arr_make         },
+    .{ .name = "splitbychar",                 .kind = .arr_split_char   },
+    .{ .name = "splitbystring",               .kind = .arr_split_str    },
+    .{ .name = "has",                         .kind = .arr_has          },
+    .{ .name = "hasany",                      .kind = .arr_has_any      },
+    .{ .name = "hasall",                      .kind = .arr_has_all      },
+    .{ .name = "indexof",                     .kind = .arr_index_of     },
+    .{ .name = "arrayfilter",                 .kind = .arr_filter       },
+    .{ .name = "arraymap",                    .kind = .arr_map          },
+    .{ .name = "arrayexists",                 .kind = .arr_exists       },
+    .{ .name = "arrayflatten",                .kind = .arr_flatten      },
+    .{ .name = "arraydistinct",               .kind = .arr_distinct     },
+    .{ .name = "arrayconcat",                 .kind = .arr_concat       },
+    .{ .name = "arraymax",                    .kind = .arr_max          },
+    .{ .name = "arraymin",                    .kind = .arr_min          },
+    .{ .name = "arrayslice",                  .kind = .arr_slice        },
+    .{ .name = "arraystringconcat",           .kind = .arr_str_join     },
+    .{ .name = "mapkeys",                     .kind = .map_keys         },
+    .{ .name = "map_keys",                    .kind = .map_keys         },
+    .{ .name = "mapvalues",                   .kind = .map_values       },
+    .{ .name = "map_values",                  .kind = .map_values       },
+    .{ .name = "dicthas",                     .kind = .stub_zero        },
+    .{ .name = "dictget",                     .kind = .stub_empty_str   },
+    .{ .name = "dictgetornull",               .kind = .stub_null        },
+    .{ .name = "dictgetordefault",            .kind = .stub_default_arg4},
+    .{ .name = "max",                         .kind = .scalar_passthru  },
+};
+
+// ── Helper: resolve a Value from an array stored as \f-separated string ───────
+
+/// Parse a \x0c-separated string into a []Value (page_allocator-owned).
+/// Handles both "a\x0cb" and "\x0ca\x0cb" (leading \x0c = element prefix) formats.
+fn parseArrayValue(s: []const u8) ?[]Value {
+    var list: std.ArrayListUnmanaged(Value) = .empty;
+    var it = std.mem.splitScalar(u8, s, '\x0c');
+    while (it.next()) |elem| {
+        // Skip the leading empty segment produced by a leading \x0c
+        if (elem.len == 0 and list.items.len == 0) continue;
+        list.append(std.heap.page_allocator, Value{ .str = elem }) catch return null;
+    }
+    return list.toOwnedSlice(std.heap.page_allocator) catch null;
+}
+
+/// Get the array elements from a Value (either .array or parse from .str/.str_owned).
+fn valueToArray(v: Value) ?[]Value {
+    return switch (v) {
+        .array     => |a| a,
+        .str, .str_owned => parseArrayValue(v.toStr().?),
+        else => null,
+    };
+}
+
+/// Evaluate lambda body: bind `param_name` → `elem` in a pseudo-row, eval `body`.
+/// Lambda text form is: "param -> body_expr" (produced by exprToText).
+fn evalLambdaBody(lambda_text: []const u8, elem: Value, row: *const RowCtx) ?Value {
+    const arrow = std.mem.indexOf(u8, lambda_text, " -> ") orelse return null;
+    const body = std.mem.trim(u8, lambda_text[arrow + 4 ..], " \t\r\n");
+    const param = std.mem.trim(u8, lambda_text[0..arrow], " \t\r\n");
+    // Build a temporary row that adds param → elem on top of existing row
+    var extra_names = [_][]const u8{param};
+    var extra_vals  = [_]Value{elem};
+    const inner_row = RowCtx{
+        .names  = &extra_names,
+        .values = &extra_vals,
+        .parent = row,
+    };
+    return evalTextExpr(body, &inner_row);
+}
+
+fn evalLambdaBool(lambda_text: []const u8, elem: Value, row: *const RowCtx) bool {
+    const arrow = std.mem.indexOf(u8, lambda_text, " -> ") orelse return false;
+    const body = std.mem.trim(u8, lambda_text[arrow + 4 ..], " \t\r\n");
+    const param = std.mem.trim(u8, lambda_text[0..arrow], " \t\r\n");
+    var extra_names = [_][]const u8{param};
+    var extra_vals  = [_]Value{elem};
+    const inner_row = RowCtx{
+        .names  = &extra_names,
+        .values = &extra_vals,
+        .parent = row,
+    };
+    // If body is a comparison/boolean expression, use bool evaluator.
+    // Detect by presence of comparison operators or logical keywords.
+    const has_cmp = std.mem.indexOf(u8, body, " != ") != null or
+                    std.mem.indexOf(u8, body, " <> ") != null or
+                    std.mem.indexOf(u8, body, " = ")  != null or
+                    std.mem.indexOf(u8, body, " < ")  != null or
+                    std.mem.indexOf(u8, body, " > ")  != null or
+                    std.mem.indexOf(u8, body, " >= ") != null or
+                    std.mem.indexOf(u8, body, " <= ") != null;
+    if (has_cmp) return evalTextBoolExpr(body, &inner_row);
+    const v = evalTextExpr(body, &inner_row) orelse return false;
+    return switch (v) {
+        .i64 => |i| i != 0,
+        .f64 => |f| f != 0,
+        .str, .str_owned => v.toStr().?.len > 0,
+        .array => |a| a.len > 0,
+        .null_val => false,
+    };
+}
+
+// ── IPv4 numeric conversion ───────────────────────────────────────────────────
+
+fn ipv4ToNum(s: []const u8) i64 {
+    var parts: [4]u8 = .{0, 0, 0, 0};
+    var pi: u8 = 0;
+    var acc: u16 = 0;
+    var has_digits = false;
+    for (s) |c| {
+        if (c == '.') {
+            if (pi >= 3 or !has_digits) return 0;
+            parts[pi] = @intCast(acc);
+            pi += 1;
+            acc = 0;
+            has_digits = false;
+        } else if (c >= '0' and c <= '9') {
+            acc = acc * 10 + (c - '0');
+            if (acc > 255) return 0;
+            has_digits = true;
+        } else return 0;
+    }
+    if (pi != 3 or !has_digits) return 0;
+    parts[3] = @intCast(acc);
+    return (@as(i64, parts[0]) << 24) | (@as(i64, parts[1]) << 16) |
+           (@as(i64, parts[2]) << 8)  |  @as(i64, parts[3]);
+}
+
+// ── evalTextExpr ─────────────────────────────────────────────────────────────
+
 /// Evaluate a text-encoded expression against a row.
-/// Handles: if(cond_expr, then_expr, else_expr), column references, string literals.
-/// Returns null if the expression cannot be evaluated.
+/// Returns null if the expression cannot be evaluated (unknown column or function).
 fn evalTextExpr(expr: []const u8, row: *const RowCtx) ?Value {
     const trimmed = std.mem.trim(u8, expr, " \t\r\n");
     if (trimmed.len == 0) return Value{ .str = "" };
 
-    // String literal: 'value'
-    if (trimmed.len >= 2 and trimmed[0] == '\'' and trimmed[trimmed.len - 1] == '\'') {
+    // ── literals ────────────────────────────────────────────────────
+    if (trimmed.len >= 2 and trimmed[0] == '\'' and trimmed[trimmed.len - 1] == '\'')
         return Value{ .str = trimmed[1 .. trimmed.len - 1] };
-    }
-
-    // Integer literal
-    if (std.fmt.parseInt(i64, trimmed, 10) catch null) |iv| {
+    if (std.fmt.parseInt(i64, trimmed, 10) catch null) |iv|
         return Value{ .i64 = iv };
+    if (std.fmt.parseFloat(f64, trimmed) catch null) |fv|
+        return Value{ .f64 = fv };
+    // ── array literal: ['a', 'b', ...] or [1, 2, ...] ──────────────
+    if (trimmed.len >= 2 and trimmed[0] == '[' and trimmed[trimmed.len - 1] == ']') {
+        const contents = trimmed[1 .. trimmed.len - 1];
+        const split_res = splitTopLevelArgs(contents) catch return Value{ .array = &.{} };
+        var list: std.ArrayListUnmanaged(Value) = .empty;
+        for (split_res.items[0..split_res.len]) |item| {
+            const t = std.mem.trim(u8, item, " \t\r\n");
+            const v = evalTextExpr(t, row) orelse continue;
+            list.append(std.heap.page_allocator, v) catch {};
+        }
+        return Value{ .array = list.toOwnedSlice(std.heap.page_allocator) catch return null };
     }
 
-    // if(cond, then, else) — split top-level args
-    if (std.ascii.startsWithIgnoreCase(trimmed, "if(") and trimmed[trimmed.len - 1] == ')') {
-        const inner = trimmed[3 .. trimmed.len - 1];
-        var args = splitTopLevelArgs(inner) catch return null;
-        defer args.deinit();
-        if (args.len == 3) {
-            const cond_expr = std.mem.trim(u8, args.items[0], " \t\r\n");
-            const then_expr = std.mem.trim(u8, args.items[1], " \t\r\n");
-            const else_expr = std.mem.trim(u8, args.items[2], " \t\r\n");
-            const cond_val = evalTextBoolExpr(cond_expr, row);
-            if (cond_val) {
-                return evalTextExpr(then_expr, row);
-            } else {
-                return evalTextExpr(else_expr, row);
+    // ── CASE WHEN … END (keyword-prefix, not a function call) ──────
+    if (std.ascii.startsWithIgnoreCase(trimmed, "CASE "))
+        return evalCaseWhen(trimmed, row);
+
+    // ── comptime function dispatch ───────────────────────────────────
+    // All function entries must end with ')'; we check this once here.
+    if (trimmed[trimmed.len - 1] == ')') {
+        inline for (func_evals) |entry| {
+            // comptime: build prefix = lowercase_name ++ "("
+            const prefix = entry.name ++ "(";
+            if (trimmed.len > prefix.len and
+                std.ascii.startsWithIgnoreCase(trimmed, prefix))
+            {
+                const inner = trimmed[prefix.len .. trimmed.len - 1];
+                return evalFunc(entry.kind, entry.name, inner, row);
+            }
+        }
+        // ── user-defined functions (registered via CREATE FUNCTION) ──
+        if (udf_registry) |udfs| {
+            // Extract function name from call: everything before "("
+            const paren_pos = std.mem.indexOfScalar(u8, trimmed, '(') orelse trimmed.len;
+            const call_name = trimmed[0..paren_pos];
+            const call_args_str = trimmed[paren_pos + 1 .. trimmed.len - 1];
+            if (udfs.get(call_name)) |lambda| {
+                // lambda is "(params) -> body"
+                if (lambda.len > 0 and lambda[0] == '(') {
+                    const close_paren = std.mem.indexOfScalar(u8, lambda, ')') orelse lambda.len;
+                    const params_str = lambda[1..close_paren];
+                    const arrow_pos = std.mem.indexOf(u8, lambda[close_paren..], "->") orelse 0;
+                    const body = std.mem.trim(u8, lambda[close_paren + arrow_pos + 2..], " \t\r\n");
+                    // Bind params → evaluated args in a child RowCtx
+                    var param_names_buf: [16][]const u8 = undefined;
+                    var param_vals_buf: [16]Value = undefined;
+                    var param_count: usize = 0;
+                    var param_it = std.mem.splitScalar(u8, params_str, ',');
+                    var arg_it = std.mem.splitScalar(u8, call_args_str, ',');
+                    while (param_it.next()) |param_raw| {
+                        const arg_raw = arg_it.next() orelse break;
+                        const param = std.mem.trim(u8, param_raw, " \t\r\n");
+                        const arg_expr = std.mem.trim(u8, arg_raw, " \t\r\n");
+                        const arg_val = evalTextExpr(arg_expr, row) orelse Value{ .str = "" };
+                        if (param_count < param_names_buf.len) {
+                            param_names_buf[param_count] = param;
+                            param_vals_buf[param_count] = arg_val;
+                            param_count += 1;
+                        }
+                    }
+                    const inner_row = RowCtx{
+                        .names = param_names_buf[0..param_count],
+                        .values = param_vals_buf[0..param_count],
+                        .parent = row,
+                        .table = row.table,
+                    };
+                    return evalTextExpr(body, &inner_row);
+                }
             }
         }
     }
 
-    // isIPv4String(col) → 0 or 1 (placeholder: always 0 without real IP parsing)
-    if (std.ascii.startsWithIgnoreCase(trimmed, "isipv4string(") and trimmed[trimmed.len - 1] == ')') {
-        const inner_col = std.mem.trim(u8, trimmed[13 .. trimmed.len - 1], " \t\r\n");
-        const v = row.get(inner_col) orelse return Value{ .i64 = 0 };
-        const sv = v.toStr() orelse return Value{ .i64 = 0 };
-        return Value{ .i64 = if (isIPv4String(sv)) 1 else 0 };
-    }
-    if (std.ascii.startsWithIgnoreCase(trimmed, "isipv6string(") and trimmed[trimmed.len - 1] == ')') {
-        const inner_col = std.mem.trim(u8, trimmed[13 .. trimmed.len - 1], " \t\r\n");
-        const v = row.get(inner_col) orelse return Value{ .i64 = 0 };
-        const sv = v.toStr() orelse return Value{ .i64 = 0 };
-        return Value{ .i64 = if (isIPv6String(sv)) 1 else 0 };
-    }
-
-    // dictHas(dict_name, key) → 0 (stub: no dict loaded)
-    if (std.ascii.startsWithIgnoreCase(trimmed, "dicthas(")) {
-        return Value{ .i64 = 0 };
-    }
-    // dictGetOrDefault(dict_name, attr, key, default) → default value
-    if (std.ascii.startsWithIgnoreCase(trimmed, "dictgetordefault(")) {
-        // Extract the default (4th arg) and return it
-        const inner = trimmed[17 .. trimmed.len - 1]; // strip "dictGetOrDefault(" and ")"
-        var args = splitTopLevelArgs(inner) catch return Value{ .str = "" };
-        defer args.deinit();
-        if (args.len >= 4) {
-            const default_expr = std.mem.trim(u8, args.items[3], " \t\r\n");
-            return evalTextExpr(default_expr, row) orelse Value{ .str = "" };
+    // ── arithmetic: expr op expr (top-level only) ───────────────────
+    // Scan for +, -, *, / at top level (not inside parens/brackets).
+    {
+        var depth: usize = 0;
+        var i: usize = trimmed.len;
+        // Scan right-to-left for lower-precedence operators first (+/-), then (*//)
+        // to approximate standard precedence.
+        var found_op: ?u8 = null;
+        var found_pos: usize = 0;
+        // First pass: find + or - at depth 0 (right-to-left to get correct associativity)
+        depth = 0;
+        i = trimmed.len;
+        while (i > 0) {
+            i -= 1;
+            const ch = trimmed[i];
+            if (ch == ')' or ch == ']') depth += 1;
+            if (ch == '(' or ch == '[') { if (depth > 0) depth -= 1; }
+            if (depth == 0 and (ch == '+' or ch == '-') and i > 0) {
+                found_op = ch;
+                found_pos = i;
+                break;
+            }
         }
-        return Value{ .str = "" };
-    }
-    // dictGet(dict_name, attr, key) → empty string (stub)
-    if (std.ascii.startsWithIgnoreCase(trimmed, "dictget(")) {
-        return Value{ .str = "" };
-    }
-    // dictGetOrNull(dict_name, attr, key) → null (stub)
-    if (std.ascii.startsWithIgnoreCase(trimmed, "dictgetornull(")) {
-        return Value{ .null_val = {} };
+        // Second pass (if no +/-): find * or /
+        if (found_op == null) {
+            depth = 0;
+            i = trimmed.len;
+            while (i > 0) {
+                i -= 1;
+                const ch = trimmed[i];
+                if (ch == ')' or ch == ']') depth += 1;
+                if (ch == '(' or ch == '[') { if (depth > 0) depth -= 1; }
+                if (depth == 0 and (ch == '*' or ch == '/') and i > 0) {
+                    found_op = ch;
+                    found_pos = i;
+                    break;
+                }
+            }
+        }
+        if (found_op) |op| {
+            const lhs_str = std.mem.trim(u8, trimmed[0..found_pos], " \t\r\n");
+            const rhs_str = std.mem.trim(u8, trimmed[found_pos + 1..], " \t\r\n");
+            if (lhs_str.len > 0 and rhs_str.len > 0) {
+                if (evalTextExpr(lhs_str, row)) |lv| {
+                    if (evalTextExpr(rhs_str, row)) |rv| {
+                        const la = lv.toF64() orelse return null;
+                        const ra = rv.toF64() orelse return null;
+                        const res: f64 = switch (op) {
+                            '+' => la + ra,
+                            '-' => la - ra,
+                            '*' => la * ra,
+                            '/' => if (ra == 0.0) 0.0 else la / ra,
+                            else => unreachable,
+                        };
+                        // Return as i64 if result is whole number
+                        if (res == @floor(res) and res >= @as(f64, @floatFromInt(std.math.minInt(i64))) and res <= @as(f64, @floatFromInt(std.math.maxInt(i64)))) {
+                            return Value{ .i64 = @intFromFloat(res) };
+                        }
+                        return Value{ .f64 = res };
+                    }
+                }
+            }
+        }
     }
 
-    // max(expr) scalar — for single-row contexts
-    if (std.ascii.startsWithIgnoreCase(trimmed, "max(") and trimmed[trimmed.len - 1] == ')') {
-        const inner_expr = std.mem.trim(u8, trimmed[4 .. trimmed.len - 1], " \t\r\n");
-        return evalTextExpr(inner_expr, row) orelse Value{ .null_val = {} };
-    }
-
-    // Direct column lookup (fallback)
+    // ── fallback: direct column lookup ──────────────────────────────
     return row.get(trimmed);
 }
 
-/// Evaluate a text-encoded boolean condition (for if() conditions).
+/// Dispatch to the concrete implementation for each EvalKind.
+fn evalFunc(kind: EvalKind, name: []const u8, inner: []const u8, row: *const RowCtx) ?Value {
+    switch (kind) {
+        // ── conditional ────────────────────────────────────────────
+        .cond_if => {
+            const args = splitTopLevelArgs(inner) catch return null;
+            if (args.len != 3) return null;
+            const cond = std.mem.trim(u8, args.items[0], " \t\r\n");
+            const then = std.mem.trim(u8, args.items[1], " \t\r\n");
+            const els  = std.mem.trim(u8, args.items[2], " \t\r\n");
+            return if (evalTextBoolExpr(cond, row)) evalTextExpr(then, row)
+                   else                             evalTextExpr(els,  row);
+        },
+        // ── string functions ───────────────────────────────────────
+        .str_lower => {
+            const v = evalTextExpr(inner, row) orelse return null;
+            const sv = v.toStr() orelse return v;
+            const r = std.ascii.allocLowerString(std.heap.page_allocator, sv) catch return v;
+            return Value{ .str_owned = r };
+        },
+        .str_upper => {
+            const v = evalTextExpr(inner, row) orelse return null;
+            const sv = v.toStr() orelse return v;
+            const r = std.ascii.allocUpperString(std.heap.page_allocator, sv) catch return v;
+            return Value{ .str_owned = r };
+        },
+        .str_concat => {
+            const args = splitTopLevelArgs(inner) catch return Value{ .str = "" };
+            var buf: std.ArrayListUnmanaged(u8) = .empty;
+            defer buf.deinit(std.heap.page_allocator);
+            for (args.items[0..args.len]) |arg| {
+                const a = std.mem.trim(u8, arg, " \t\r\n");
+                const v = evalTextExpr(a, row) orelse continue;
+                buf.appendSlice(std.heap.page_allocator, v.toStr() orelse continue) catch {};
+            }
+            const r = buf.toOwnedSlice(std.heap.page_allocator) catch return Value{ .str = "" };
+            return Value{ .str_owned = r };
+        },
+        .str_substring => {
+            const args = splitTopLevelArgs(inner) catch return null;
+            if (args.len < 2) return null;
+            const sv = (evalTextExpr(std.mem.trim(u8, args.items[0], " \t\r\n"), row) orelse return null).toStr() orelse return null;
+            const pos_raw = (evalTextExpr(std.mem.trim(u8, args.items[1], " \t\r\n"), row) orelse return null).toI64() orelse return null;
+            const pos = pos_raw - 1; // CH 1-based → 0-based
+            if (pos < 0 or @as(usize, @intCast(pos)) >= sv.len) return Value{ .str = "" };
+            const start: usize = @intCast(pos);
+            if (args.len >= 3) {
+                const len_v = (evalTextExpr(std.mem.trim(u8, args.items[2], " \t\r\n"), row) orelse return null).toI64() orelse return null;
+                if (len_v <= 0) return Value{ .str = "" };
+                return Value{ .str = sv[start..@min(start + @as(usize, @intCast(len_v)), sv.len)] };
+            }
+            return Value{ .str = sv[start..] };
+        },
+        .str_starts_with => {
+            const args = splitTopLevelArgs(inner) catch return Value{ .i64 = 0 };
+            if (args.len < 2) return Value{ .i64 = 0 };
+            const sv  = (evalTextExpr(std.mem.trim(u8, args.items[0], " \t\r\n"), row) orelse return Value{ .i64 = 0 }).toStr() orelse return Value{ .i64 = 0 };
+            const pfx = (evalTextExpr(std.mem.trim(u8, args.items[1], " \t\r\n"), row) orelse return Value{ .i64 = 0 }).toStr() orelse return Value{ .i64 = 0 };
+            return Value{ .i64 = if (std.mem.startsWith(u8, sv, pfx)) 1 else 0 };
+        },
+        .str_position_ci => {
+            const args = splitTopLevelArgs(inner) catch return Value{ .i64 = 0 };
+            if (args.len < 2) return Value{ .i64 = 0 };
+            const hay = (evalTextExpr(std.mem.trim(u8, args.items[0], " \t\r\n"), row) orelse return Value{ .i64 = 0 }).toStr() orelse return Value{ .i64 = 0 };
+            const ndl = (evalTextExpr(std.mem.trim(u8, args.items[1], " \t\r\n"), row) orelse return Value{ .i64 = 0 }).toStr() orelse return Value{ .i64 = 0 };
+            if (std.ascii.indexOfIgnoreCase(hay, ndl)) |pos| return Value{ .i64 = @intCast(pos + 1) };
+            return Value{ .i64 = 0 };
+        },
+        .str_length => {
+            const v = evalTextExpr(inner, row) orelse return Value{ .i64 = 0 };
+            switch (v) {
+                .array => |a| return Value{ .i64 = @intCast(a.len) },
+                .str, .str_owned => {
+                    const sv = v.toStr().?;
+                    if (std.mem.indexOfScalar(u8, sv, '\x0c') != null) {
+                        // \x0c-delimited array: each element is preceded by \x0c
+                        // so element count == number of \x0c characters
+                        var count: usize = 0;
+                        for (sv) |ch| if (ch == '\x0c') { count += 1; };
+                        return Value{ .i64 = @intCast(count) };
+                    }
+                    return Value{ .i64 = @intCast(sv.len) };
+                },
+                else => return Value{ .i64 = 0 },
+            }
+        },
+        // ── numeric functions ──────────────────────────────────────
+        .num_floor => {
+            const v = evalTextExpr(inner, row) orelse return null;
+            return Value{ .i64 = @intFromFloat(@floor(v.toF64() orelse return null)) };
+        },
+        .num_round => {
+            const v = evalTextExpr(inner, row) orelse return null;
+            return Value{ .i64 = @intFromFloat(@round(v.toF64() orelse return null)) };
+        },
+        .num_abs => {
+            const v = evalTextExpr(inner, row) orelse return null;
+            return switch (v) {
+                .i64 => |i| Value{ .i64 = @intCast(@abs(i)) },
+                .f64 => |f| Value{ .f64 = @abs(f) },
+                else => null,
+            };
+        },
+        .num_greatest => {
+            const args = splitTopLevelArgs(inner) catch return null;
+            if (args.len < 2) return null;
+            var best: f64 = -std.math.inf(f64);
+            for (args.items[0..args.len]) |arg| {
+                const fv = (evalTextExpr(std.mem.trim(u8, arg, " \t\r\n"), row) orelse continue).toF64() orelse continue;
+                if (fv > best) best = fv;
+            }
+            if (best == -std.math.inf(f64)) return null;
+            return Value{ .f64 = best };
+        },
+        .num_least => {
+            const args = splitTopLevelArgs(inner) catch return null;
+            if (args.len < 2) return null;
+            var best: f64 = std.math.inf(f64);
+            for (args.items[0..args.len]) |arg| {
+                const fv = (evalTextExpr(std.mem.trim(u8, arg, " \t\r\n"), row) orelse continue).toF64() orelse continue;
+                if (fv < best) best = fv;
+            }
+            if (best == std.math.inf(f64)) return null;
+            return Value{ .f64 = best };
+        },
+        // ── date functions ─────────────────────────────────────────
+        .date_yyyymmdd => {
+            const v = evalTextExpr(inner, row) orelse return null;
+            switch (v) {
+                .i64 => |ts| {
+                    const ts_s: u64 = @intCast(if (ts > 1_000_000_000_000) @divFloor(ts, 1000) else if (ts > 0) ts else 0);
+                    const epoch_s = std.time.epoch.EpochSeconds{ .secs = ts_s };
+                    const epoch_day = epoch_s.getEpochDay();
+                    const yad = epoch_day.calculateYearDay();
+                    const mad = yad.calculateMonthDay();
+                    return Value{ .i64 = @as(i64, yad.year) * 10000 +
+                        @as(i64, @intFromEnum(mad.month) + 1) * 100 +
+                        @as(i64, mad.day_index + 1) };
+                },
+                else => {
+                    const sv = v.toStr() orelse return null;
+                    if (sv.len >= 10 and sv[4] == '-' and sv[7] == '-') {
+                        var buf: [8]u8 = undefined;
+                        @memcpy(buf[0..4], sv[0..4]);
+                        @memcpy(buf[4..6], sv[5..7]);
+                        @memcpy(buf[6..8], sv[8..10]);
+                        return Value{ .i64 = std.fmt.parseInt(i64, &buf, 10) catch return null };
+                    }
+                    return null;
+                },
+            }
+        },
+        .date_trunc => {
+            // inner = "'unit', col_expr"
+            const args = splitTopLevelArgs(inner) catch return null;
+            if (args.len < 2) return null;
+            const unit_raw = std.mem.trim(u8, args.items[0], " \t'\"`");
+            const col_expr = std.mem.trim(u8, args.items[1], " \t\r\n");
+            const v = evalTextExpr(col_expr, row) orelse return null;
+            // Convert timestamp to "YYYY-MM-DD HH:MM:SS" string first
+            const ts_str: []const u8 = switch (v) {
+                .i64 => |ts| blk: {
+                    const ts_s: u64 = @intCast(if (ts > 1_000_000_000_000) @divFloor(ts, 1000) else if (ts > 0) ts else 0);
+                    const epoch_s = std.time.epoch.EpochSeconds{ .secs = ts_s };
+                    const epoch_day = epoch_s.getEpochDay();
+                    const yad = epoch_day.calculateYearDay();
+                    const mad = yad.calculateMonthDay();
+                    const hour = @divFloor(ts_s % 86400, 3600);
+                    const minute = @divFloor(ts_s % 3600, 60);
+                    break :blk std.fmt.allocPrint(std.heap.page_allocator, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:00", .{
+                        yad.year, @as(u32, @intFromEnum(mad.month)) + 1, @as(u32, mad.day_index) + 1, hour, minute,
+                    }) catch return null;
+                },
+                else => v.toStr() orelse return null,
+            };
+            if (ts_str.len < 10) return Value{ .str = ts_str };
+            if (std.ascii.eqlIgnoreCase(unit_raw, "day")) {
+                return Value{ .str = ts_str[0..10] };
+            } else if (std.ascii.eqlIgnoreCase(unit_raw, "hour")) {
+                if (ts_str.len >= 13) return Value{ .str = ts_str[0..13] };
+                return Value{ .str = ts_str[0..10] };
+            } else if (std.ascii.eqlIgnoreCase(unit_raw, "minute")) {
+                if (ts_str.len >= 16) return Value{ .str = ts_str[0..16] };
+                return Value{ .str = ts_str[0..10] };
+            } else if (std.ascii.eqlIgnoreCase(unit_raw, "month")) {
+                if (ts_str.len >= 7) return Value{ .str = ts_str[0..7] };
+                return Value{ .str = ts_str[0..10] };
+            } else if (std.ascii.eqlIgnoreCase(unit_raw, "year")) {
+                return Value{ .str = ts_str[0..4] };
+            }
+            return Value{ .str = ts_str[0..10] };
+        },
+        .date_cast => {
+            const v = evalTextExpr(inner, row) orelse return null;
+            const sv = v.toStr() orelse return null;
+            if (sv.len >= 10) return Value{ .str = sv[0..10] };
+            return Value{ .str = sv };
+        },
+        // ── IP functions ───────────────────────────────────────────
+        .ip_bool => {
+            const v = evalTextExpr(inner, row) orelse return Value{ .i64 = 0 };
+            const sv = v.toStr() orelse return Value{ .i64 = 0 };
+            const ok = if (std.ascii.eqlIgnoreCase(name, "isipv4string")) isIPv4String(sv)
+                       else isIPv6String(sv);
+            return Value{ .i64 = if (ok) 1 else 0 };
+        },
+        .ip_to_num => {
+            const v = evalTextExpr(inner, row) orelse return Value{ .i64 = 0 };
+            return Value{ .i64 = ipv4ToNum(v.toStr() orelse return Value{ .i64 = 0 }) };
+        },
+        // ── CAST ───────────────────────────────────────────────────
+        .fn_now => {
+            var ts: std.posix.timespec = undefined;
+            _ = std.posix.system.clock_gettime(.REALTIME, &ts);
+            return Value{ .i64 = ts.sec };
+        },
+        .str_tostring => {
+            const v = evalTextExpr(inner, row) orelse return Value{ .str = "" };
+            switch (v) {
+                .str, .str_owned => {
+                    const s = v.toStr().?;
+                    if (s.len == 16) {
+                        if (ipv6BytesToStr(s)) |ip_str| return Value{ .str_owned = ip_str };
+                    }
+                    return v;
+                },
+                .i64 => |n| return Value{ .str_owned = std.fmt.allocPrint(std.heap.page_allocator, "{d}", .{n}) catch return null },
+                .f64 => |f| return Value{ .str_owned = std.fmt.allocPrint(std.heap.page_allocator, "{d}", .{f}) catch return null },
+                else => return Value{ .str = "" },
+            }
+        },
+        .cast_expr => {
+            const as_pos = std.ascii.indexOfIgnoreCase(inner, " AS ") orelse return null;
+            const expr_part = std.mem.trim(u8, inner[0..as_pos], " \t\r\n");
+            const type_part = std.mem.trim(u8, inner[as_pos + 4 ..], " \t\r\n");
+            const v = evalTextExpr(expr_part, row) orelse return null;
+            if (std.ascii.eqlIgnoreCase(type_part, "VARCHAR") or
+                std.ascii.eqlIgnoreCase(type_part, "STRING"))
+            {
+                const s = v.toStr() orelse return Value{ .str = "" };
+                // If this looks like a 16-byte IPv6 raw blob, format it
+                if (s.len == 16) {
+                    if (ipv6BytesToStr(s)) |ip_str| return Value{ .str_owned = ip_str };
+                }
+                return Value{ .str = s };
+            }
+            if (std.ascii.eqlIgnoreCase(type_part, "DATE")) {
+                // Handle both string timestamps and integer Unix timestamps
+                switch (v) {
+                    .i64 => |ts| {
+                        // Convert Unix ms/us to date string
+                        const ts_s: u64 = @intCast(if (ts > 1_000_000_000_000) @divFloor(ts, 1000) else if (ts > 0) ts else 0);
+                        const epoch_s = std.time.epoch.EpochSeconds{ .secs = ts_s };
+                        const epoch_day = epoch_s.getEpochDay();
+                        const yad = epoch_day.calculateYearDay();
+                        const mad = yad.calculateMonthDay();
+                        const s = std.fmt.allocPrint(std.heap.page_allocator, "{d:0>4}-{d:0>2}-{d:0>2}", .{
+                            yad.year, @as(u32, @intFromEnum(mad.month)) + 1, @as(u32, mad.day_index) + 1,
+                        }) catch return null;
+                        return Value{ .str_owned = s };
+                    },
+                    else => return Value{ .str = v.toStr() orelse return null },
+                }
+            }
+            // For array/list types, serialize as a bracket-enclosed comma-separated string
+            if (std.ascii.startsWithIgnoreCase(type_part, "VARCHAR[]") or
+                std.ascii.eqlIgnoreCase(type_part, "LIST"))
+            {
+                switch (v) {
+                    .array => |arr| {
+                        var sb: std.ArrayList(u8) = .empty;
+                        sb.append(std.heap.page_allocator, '[') catch return Value{ .str = "[]" };
+                        for (arr, 0..) |elem, ei| {
+                            if (ei > 0) sb.append(std.heap.page_allocator, ',') catch {};
+                            const s = elem.toStr() orelse "";
+                            sb.appendSlice(std.heap.page_allocator, s) catch {};
+                        }
+                        sb.append(std.heap.page_allocator, ']') catch {};
+                        return Value{ .str_owned = sb.toOwnedSlice(std.heap.page_allocator) catch return Value{ .str = "[]" } };
+                    },
+                    else => {},
+                }
+            }
+            return v;
+        },
+        .arr_make => {
+            // list_value(a, b, ...) / array(a, b, ...) → Value.array
+            const args = splitTopLevelArgs(inner) catch return Value{ .array = &.{} };
+            var list: std.ArrayListUnmanaged(Value) = .empty;
+            for (args.items[0..args.len]) |item| {
+                const t = std.mem.trim(u8, item, " \t\r\n");
+                const v = evalTextExpr(t, row) orelse continue;
+                list.append(std.heap.page_allocator, v) catch {};
+            }
+            return Value{ .array = list.toOwnedSlice(std.heap.page_allocator) catch return null };
+        },
+        .arr_split_char, .arr_split_str => {
+            // splitByChar(delim, str) / splitByString(delim, str)
+            const args = splitTopLevelArgs(inner) catch return null;
+            if (args.len < 2) return null;
+            const delim = (evalTextExpr(std.mem.trim(u8, args.items[0], " \t\r\n"), row) orelse return null).toStr() orelse return null;
+            const s     = (evalTextExpr(std.mem.trim(u8, args.items[1], " \t\r\n"), row) orelse return null).toStr() orelse return null;
+            var list: std.ArrayListUnmanaged(Value) = .empty;
+            var it = std.mem.splitSequence(u8, s, delim);
+            while (it.next()) |part|
+                list.append(std.heap.page_allocator, Value{ .str = part }) catch {};
+            return Value{ .array = list.toOwnedSlice(std.heap.page_allocator) catch return null };
+        },
+        // ── Array predicates ───────────────────────────────────────
+        .arr_has => {
+            const args = splitTopLevelArgs(inner) catch return Value{ .i64 = 0 };
+            if (args.len < 2) return Value{ .i64 = 0 };
+            const arr_v = evalTextExpr(std.mem.trim(u8, args.items[0], " \t\r\n"), row) orelse return Value{ .i64 = 0 };
+            const val_v = evalTextExpr(std.mem.trim(u8, args.items[1], " \t\r\n"), row) orelse return Value{ .i64 = 0 };
+            const arr = valueToArray(arr_v) orelse return Value{ .i64 = 0 };
+            for (arr) |elem| if (Value.eql(elem, val_v)) return Value{ .i64 = 1 };
+            return Value{ .i64 = 0 };
+        },
+        .arr_has_any => {
+            const args = splitTopLevelArgs(inner) catch return Value{ .i64 = 0 };
+            if (args.len < 2) return Value{ .i64 = 0 };
+            const arr_v  = evalTextExpr(std.mem.trim(u8, args.items[0], " \t\r\n"), row) orelse return Value{ .i64 = 0 };
+            const vals_v = evalTextExpr(std.mem.trim(u8, args.items[1], " \t\r\n"), row) orelse return Value{ .i64 = 0 };
+            const arr  = valueToArray(arr_v)  orelse return Value{ .i64 = 0 };
+            const vals = valueToArray(vals_v) orelse return Value{ .i64 = 0 };
+            for (vals) |needle| for (arr) |elem| if (Value.eql(elem, needle)) return Value{ .i64 = 1 };
+            return Value{ .i64 = 0 };
+        },
+        .arr_has_all => {
+            const args = splitTopLevelArgs(inner) catch return Value{ .i64 = 0 };
+            if (args.len < 2) return Value{ .i64 = 0 };
+            const arr_v  = evalTextExpr(std.mem.trim(u8, args.items[0], " \t\r\n"), row) orelse return Value{ .i64 = 0 };
+            const vals_v = evalTextExpr(std.mem.trim(u8, args.items[1], " \t\r\n"), row) orelse return Value{ .i64 = 0 };
+            const arr  = valueToArray(arr_v)  orelse return Value{ .i64 = 0 };
+            const vals = valueToArray(vals_v) orelse return Value{ .i64 = 0 };
+            for (vals) |needle| {
+                var found = false;
+                for (arr) |elem| if (Value.eql(elem, needle)) { found = true; break; };
+                if (!found) return Value{ .i64 = 0 };
+            }
+            return Value{ .i64 = 1 };
+        },
+        .arr_index_of => {
+            const args = splitTopLevelArgs(inner) catch return Value{ .i64 = 0 };
+            if (args.len < 2) return Value{ .i64 = 0 };
+            const arr_v = evalTextExpr(std.mem.trim(u8, args.items[0], " \t\r\n"), row) orelse return Value{ .i64 = 0 };
+            const val_v = evalTextExpr(std.mem.trim(u8, args.items[1], " \t\r\n"), row) orelse return Value{ .i64 = 0 };
+            const arr = valueToArray(arr_v) orelse return Value{ .i64 = 0 };
+            for (arr, 0..) |elem, i| if (Value.eql(elem, val_v)) return Value{ .i64 = @intCast(i + 1) };
+            return Value{ .i64 = 0 };
+        },
+        // ── Array transforms ───────────────────────────────────────
+        .arr_filter => {
+            // arrayFilter(x -> cond, arr)
+            const args = splitTopLevelArgs(inner) catch return null;
+            if (args.len < 2) return null;
+            const lambda = std.mem.trim(u8, args.items[0], " \t\r\n");
+            const arr_v  = evalTextExpr(std.mem.trim(u8, args.items[1], " \t\r\n"), row) orelse return null;
+            const arr = valueToArray(arr_v) orelse return null;
+            var out: std.ArrayListUnmanaged(Value) = .empty;
+            for (arr) |elem| if (evalLambdaBool(lambda, elem, row)) out.append(std.heap.page_allocator, elem) catch {};
+            return Value{ .array = out.toOwnedSlice(std.heap.page_allocator) catch return null };
+        },
+        .arr_map => {
+            // arrayMap(x -> expr, arr)
+            const args = splitTopLevelArgs(inner) catch return null;
+            if (args.len < 2) return null;
+            const lambda = std.mem.trim(u8, args.items[0], " \t\r\n");
+            const arr_v  = evalTextExpr(std.mem.trim(u8, args.items[1], " \t\r\n"), row) orelse return null;
+            const arr = valueToArray(arr_v) orelse return null;
+            var out: std.ArrayListUnmanaged(Value) = .empty;
+            for (arr) |elem| {
+                const mapped = evalLambdaBody(lambda, elem, row) orelse Value{ .null_val = {} };
+                out.append(std.heap.page_allocator, mapped) catch {};
+            }
+            return Value{ .array = out.toOwnedSlice(std.heap.page_allocator) catch return null };
+        },
+        .arr_exists => {
+            // arrayExists(x -> cond, arr) → 1 if any element satisfies cond
+            const args = splitTopLevelArgs(inner) catch return Value{ .i64 = 0 };
+            if (args.len < 2) return Value{ .i64 = 0 };
+            const lambda = std.mem.trim(u8, args.items[0], " \t\r\n");
+            const arr_v  = evalTextExpr(std.mem.trim(u8, args.items[1], " \t\r\n"), row) orelse return Value{ .i64 = 0 };
+            const arr = valueToArray(arr_v) orelse return Value{ .i64 = 0 };
+            for (arr) |elem| if (evalLambdaBool(lambda, elem, row)) return Value{ .i64 = 1 };
+            return Value{ .i64 = 0 };
+        },
+        .arr_flatten => {
+            const arr_v = evalTextExpr(inner, row) orelse return null;
+            const arr = valueToArray(arr_v) orelse return null;
+            var out: std.ArrayListUnmanaged(Value) = .empty;
+            for (arr) |elem| {
+                switch (elem) {
+                    .array => |inner_arr| for (inner_arr) |e| out.append(std.heap.page_allocator, e) catch {},
+                    .str, .str_owned => {
+                        // nested \f-separated sub-array stored as string
+                        const sub = valueToArray(elem) orelse { out.append(std.heap.page_allocator, elem) catch {}; continue; };
+                        for (sub) |e| out.append(std.heap.page_allocator, e) catch {};
+                    },
+                    else => out.append(std.heap.page_allocator, elem) catch {},
+                }
+            }
+            return Value{ .array = out.toOwnedSlice(std.heap.page_allocator) catch return null };
+        },
+        .arr_distinct => {
+            const arr_v = evalTextExpr(inner, row) orelse return null;
+            const arr = valueToArray(arr_v) orelse return null;
+            var out: std.ArrayListUnmanaged(Value) = .empty;
+            outer: for (arr) |elem| {
+                for (out.items) |existing| if (Value.eql(existing, elem)) continue :outer;
+                out.append(std.heap.page_allocator, elem) catch {};
+            }
+            return Value{ .array = out.toOwnedSlice(std.heap.page_allocator) catch return null };
+        },
+        .arr_max => {
+            const v = evalTextExpr(inner, row) orelse return null;
+            const arr = valueToArray(v) orelse return null;
+            if (arr.len == 0) return Value{ .null_val = {} };
+            var best = arr[0];
+            for (arr[1..]) |e| {
+                const ef = e.toF64() orelse continue;
+                const bf = best.toF64() orelse continue;
+                if (ef > bf) best = e;
+            }
+            return best;
+        },
+        .arr_min => {
+            const v = evalTextExpr(inner, row) orelse return null;
+            const arr = valueToArray(v) orelse return null;
+            if (arr.len == 0) return Value{ .null_val = {} };
+            var best = arr[0];
+            for (arr[1..]) |e| {
+                const ef = e.toF64() orelse continue;
+                const bf = best.toF64() orelse continue;
+                if (ef < bf) best = e;
+            }
+            return best;
+        },
+        .arr_concat => {
+            const args = splitTopLevelArgs(inner) catch return null;
+            if (args.len < 2) return null;
+            var out: std.ArrayListUnmanaged(Value) = .empty;
+            for (args.items[0..args.len]) |arg| {
+                const v = evalTextExpr(std.mem.trim(u8, arg, " \t\r\n"), row) orelse continue;
+                const sub = valueToArray(v) orelse { out.append(std.heap.page_allocator, v) catch {}; continue; };
+                for (sub) |e| out.append(std.heap.page_allocator, e) catch {};
+            }
+            return Value{ .array = out.toOwnedSlice(std.heap.page_allocator) catch return null };
+        },
+        .arr_slice => {
+            // arraySlice(arr, offset, length) — 1-based offset, length count
+            const args = splitTopLevelArgs(inner) catch return null;
+            if (args.len < 2) return null;
+            const arr_v = evalTextExpr(std.mem.trim(u8, args.items[0], " \t\r\n"), row) orelse return null;
+            const arr = valueToArray(arr_v) orelse return null;
+            const off_raw = (evalTextExpr(std.mem.trim(u8, args.items[1], " \t\r\n"), row) orelse return null).toI64() orelse return null;
+            const off: usize = if (off_raw <= 0) 0 else @intCast(off_raw - 1);
+            if (off >= arr.len) return Value{ .array = &.{} };
+            const rest = arr[off..];
+            if (args.len >= 3) {
+                const len_raw = (evalTextExpr(std.mem.trim(u8, args.items[2], " \t\r\n"), row) orelse return null).toI64() orelse return null;
+                const take: usize = if (len_raw <= 0) 0 else @min(@as(usize, @intCast(len_raw)), rest.len);
+                return Value{ .array = rest[0..take] };
+            }
+            return Value{ .array = rest };
+        },
+        .arr_str_join => {
+            // arrayStringConcat(arr [, sep])
+            const args = splitTopLevelArgs(inner) catch return Value{ .str = "" };
+            if (args.len < 1) return Value{ .str = "" };
+            const arr_v = evalTextExpr(std.mem.trim(u8, args.items[0], " \t\r\n"), row) orelse return Value{ .str = "" };
+            const arr = valueToArray(arr_v) orelse return Value{ .str = "" };
+            const sep: []const u8 = if (args.len >= 2) blk: {
+                const sv = evalTextExpr(std.mem.trim(u8, args.items[1], " \t\r\n"), row) orelse break :blk "";
+                break :blk sv.toStr() orelse "";
+            } else "";
+            var buf: std.ArrayListUnmanaged(u8) = .empty;
+            for (arr, 0..) |elem, i| {
+                if (i > 0) buf.appendSlice(std.heap.page_allocator, sep) catch {};
+                buf.appendSlice(std.heap.page_allocator, elem.toStr() orelse "") catch {};
+            }
+            return Value{ .str_owned = buf.toOwnedSlice(std.heap.page_allocator) catch return Value{ .str = "" } };
+        },
+        // ── Map functions ─────────────────────────────────────────
+        .map_keys => {
+            const v = evalTextExpr(inner, row) orelse return null;
+            const blob = v.toStr() orelse return null;
+            // Map blob: varint N | N×(varint_len+key_bytes) | N×value_bytes
+            if (blob.len == 0) return Value{ .array = &.{} };
+            const count, const cb = readVarUIntSlice(blob) orelse return null;
+            var kp: usize = cb;
+            var out: std.ArrayListUnmanaged(Value) = .empty;
+            for (0..count) |_| {
+                const klen, const klb = readVarUIntSlice(blob[kp..]) orelse break;
+                if (kp + klb + klen > blob.len) break;
+                out.append(std.heap.page_allocator, Value{ .str = blob[kp + klb .. kp + klb + klen] }) catch {};
+                kp += klb + klen;
+            }
+            return Value{ .array = out.toOwnedSlice(std.heap.page_allocator) catch return null };
+        },
+        .map_values => {
+            const v = evalTextExpr(inner, row) orelse return null;
+            const blob = v.toStr() orelse return null;
+            if (blob.len == 0) return Value{ .array = &.{} };
+            const count, const cb = readVarUIntSlice(blob) orelse return null;
+            var kp: usize = cb;
+            // Skip all keys first
+            for (0..count) |_| {
+                const klen, const klb = readVarUIntSlice(blob[kp..]) orelse return null;
+                kp += klb + klen;
+            }
+            // Detect if values are fixed-width: remaining bytes == count * 8 (Float64)
+            const remaining_total = blob.len - kp;
+            const is_f64 = (count > 0 and remaining_total == count * 8);
+            var out: std.ArrayListUnmanaged(Value) = .empty;
+            for (0..count) |_| {
+                if (kp >= blob.len) break;
+                if (is_f64) {
+                    if (kp + 8 > blob.len) break;
+                    const bits = std.mem.readInt(u64, blob[kp..][0..8], .little);
+                    out.append(std.heap.page_allocator, Value{ .f64 = @bitCast(bits) }) catch {};
+                    kp += 8;
+                } else {
+                    const vlen, const vlb = readVarUIntSlice(blob[kp..]) orelse break;
+                    if (kp + vlb + vlen > blob.len) break;
+                    out.append(std.heap.page_allocator, Value{ .str = blob[kp + vlb .. kp + vlb + vlen] }) catch {};
+                    kp += vlb + vlen;
+                }
+            }
+            return Value{ .array = out.toOwnedSlice(std.heap.page_allocator) catch return null };
+        },
+        // ── Dict stubs ─────────────────────────────────────────────
+        .stub_zero       => return Value{ .i64 = 0 },
+        .stub_empty_str  => return Value{ .str = "" },
+        .stub_null       => return Value{ .null_val = {} },
+        .stub_default_arg4 => {
+            const args = splitTopLevelArgs(inner) catch return Value{ .str = "" };
+            if (args.len >= 4)
+                return evalTextExpr(std.mem.trim(u8, args.items[3], " \t\r\n"), row) orelse Value{ .str = "" };
+            return Value{ .str = "" };
+        },
+        // ── Scalar passthrough ─────────────────────────────────────
+        .scalar_passthru => return evalTextExpr(inner, row) orelse Value{ .null_val = {} },
+    }
+}
+
+/// Evaluate CASE WHEN c1 THEN v1 … [ELSE vN] END
+fn evalCaseWhen(trimmed: []const u8, row: *const RowCtx) ?Value {
+    // Simple token scanner: find WHEN/THEN/ELSE/END at depth 0
+    var pos: usize = 5; // skip "CASE "
+    while (pos < trimmed.len) {
+        // skip whitespace
+        while (pos < trimmed.len and (trimmed[pos] == ' ' or trimmed[pos] == '\t')) pos += 1;
+        if (pos >= trimmed.len) break;
+        // check keyword
+        if (std.ascii.startsWithIgnoreCase(trimmed[pos..], "WHEN ")) {
+            pos += 5;
+            // Extract WHEN expression up to " THEN "
+            const when_start = pos;
+            var depth: usize = 0;
+            while (pos < trimmed.len) {
+                if (trimmed[pos] == '(') depth += 1
+                else if (trimmed[pos] == ')') { if (depth > 0) depth -= 1; }
+                else if (trimmed[pos] == '\'') {
+                    pos += 1;
+                    while (pos < trimmed.len and trimmed[pos] != '\'') pos += 1;
+                } else if (depth == 0 and std.ascii.startsWithIgnoreCase(trimmed[pos..], " THEN ")) break;
+                if (pos < trimmed.len) pos += 1;
+            }
+            const when_expr = std.mem.trim(u8, trimmed[when_start..pos], " \t");
+            pos += 6; // skip " THEN "
+            // Extract THEN expression up to next " WHEN " / " ELSE " / " END"
+            const then_start = pos;
+            depth = 0;
+            while (pos < trimmed.len) {
+                if (trimmed[pos] == '(') depth += 1
+                else if (trimmed[pos] == ')') { if (depth > 0) depth -= 1; }
+                else if (trimmed[pos] == '\'') {
+                    pos += 1;
+                    while (pos < trimmed.len and trimmed[pos] != '\'') pos += 1;
+                } else if (depth == 0 and (
+                    std.ascii.startsWithIgnoreCase(trimmed[pos..], " WHEN ") or
+                    std.ascii.startsWithIgnoreCase(trimmed[pos..], " ELSE ") or
+                    std.ascii.startsWithIgnoreCase(trimmed[pos..], " END"))) break;
+                if (pos < trimmed.len) pos += 1;
+            }
+            const then_expr = std.mem.trim(u8, trimmed[then_start..pos], " \t");
+            if (evalTextBoolExpr(when_expr, row))
+                return evalTextExpr(then_expr, row);
+            // else continue to next WHEN/ELSE
+        } else if (std.ascii.startsWithIgnoreCase(trimmed[pos..], "ELSE ")) {
+            const else_expr = std.mem.trim(u8, trimmed[pos + 5 ..], " \t");
+            // strip trailing END
+            const end_pos = std.ascii.indexOfIgnoreCase(else_expr, " END") orelse else_expr.len;
+            return evalTextExpr(else_expr[0..end_pos], row);
+        } else if (std.ascii.startsWithIgnoreCase(trimmed[pos..], "END")) {
+            break;
+        } else {
+            pos += 1;
+        }
+    }
+    return Value{ .null_val = {} };
+}
+
+/// Evaluate a text-encoded boolean condition (for if() conditions and WHERE).
 fn evalTextBoolExpr(expr: []const u8, row: *const RowCtx) bool {
     const trimmed = std.mem.trim(u8, expr, " \t\r\n");
 
@@ -1905,28 +3142,8 @@ fn evalTextBoolExpr(expr: []const u8, row: *const RowCtx) bool {
         return evalTextBoolExpr(trimmed[pos + 2 ..], row);
     }
 
-    // isIPv4String(col) or isIPv6String(col)
-    if (std.ascii.startsWithIgnoreCase(trimmed, "isipv4string(") and trimmed[trimmed.len - 1] == ')') {
-        const inner_col = std.mem.trim(u8, trimmed[13 .. trimmed.len - 1], " \t\r\n");
-        const v = row.get(inner_col) orelse return false;
-        const sv = v.toStr() orelse return false;
-        return isIPv4String(sv);
-    }
-    if (std.ascii.startsWithIgnoreCase(trimmed, "isipv6string(") and trimmed[trimmed.len - 1] == ')') {
-        const inner_col = std.mem.trim(u8, trimmed[13 .. trimmed.len - 1], " \t\r\n");
-        const v = row.get(inner_col) orelse return false;
-        const sv = v.toStr() orelse return false;
-        return isIPv6String(sv);
-    }
-
-    // dictHas(dict_name, key) → false (stub: no dict loaded)
-    if (std.ascii.startsWithIgnoreCase(trimmed, "dicthas(")) {
-        return false;
-    }
-    // arrayExists(lambda, arr) → false (stub)
-    if (std.ascii.startsWithIgnoreCase(trimmed, "arrayexists(")) {
-        return false;
-    }
+    // isIPv4String / isIPv6String / dictHas / arrayExists:
+    // These are evaluated by evalTextExpr (which returns 0 or 1), then truthy-checked below.
 
     // col op val comparisons
     const ops = [_]struct { text: []const u8, op: generic_sql.CmpOp }{
@@ -1958,10 +3175,11 @@ fn evalTextBoolExpr(expr: []const u8, row: *const RowCtx) bool {
     // Truthy check: non-empty string or non-zero number
     if (evalTextExpr(trimmed, row)) |v| {
         return switch (v) {
-            .i64 => |i| i != 0,
-            .f64 => |f| f != 0,
-            .str => |s| s.len > 0,
-            .null_val => false,
+            .i64       => |i| i != 0,
+            .f64       => |f| f != 0,
+            .str, .str_owned => v.toStr().?.len > 0,
+            .array     => |a| a.len > 0,
+            .null_val  => false,
         };
     }
     return false;
