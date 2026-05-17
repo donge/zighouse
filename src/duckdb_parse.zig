@@ -447,13 +447,14 @@ fn translateWhere(allocator: std.mem.Allocator, val: std.json.Value) !*generic_s
     if (std.mem.eql(u8, class, "OPERATOR")) {
         const op_type = obj.get("type").?.string;
         const children = obj.get("children").?.array.items;
-        if ((std.mem.eql(u8, op_type, "OPERATOR_IN") or std.mem.eql(u8, op_type, "OPERATOR_NOT_IN")) and
+        if ((std.mem.eql(u8, op_type, "OPERATOR_IN") or std.mem.eql(u8, op_type, "OPERATOR_NOT_IN") or
+             std.mem.eql(u8, op_type, "COMPARE_IN") or std.mem.eql(u8, op_type, "COMPARE_NOT_IN")) and
             children.len >= 2)
         {
             const col_name = columnName(children[0]) orelse return error.UnsupportedWhereNode;
             const col = try allocator.dupe(u8, col_name);
             errdefer allocator.free(col);
-            const negate = std.mem.eql(u8, op_type, "OPERATOR_NOT_IN");
+            const negate = std.mem.eql(u8, op_type, "OPERATOR_NOT_IN") or std.mem.eql(u8, op_type, "COMPARE_NOT_IN");
             // Build one cmp_int node per value, combined with OR (or AND for NOT IN)
             const vals = children[1..];
             var kids = try allocator.alloc(*generic_sql.WhereNode, vals.len);
@@ -1080,10 +1081,11 @@ fn exprToText(allocator: std.mem.Allocator, val: std.json.Value) !?[]const u8 {
                 key[1..key.len-1] else key;
             return try std.fmt.allocPrint(allocator, "{s}['{s}']", .{ map_col, key_inner });
         }
-        if (std.mem.eql(u8, op_type, "OPERATOR_IN") or std.mem.eql(u8, op_type, "OPERATOR_NOT_IN")) {
+        if (std.mem.eql(u8, op_type, "OPERATOR_IN") or std.mem.eql(u8, op_type, "OPERATOR_NOT_IN") or
+            std.mem.eql(u8, op_type, "COMPARE_IN") or std.mem.eql(u8, op_type, "COMPARE_NOT_IN")) {
             const col = try exprToText(allocator, children[0]) orelse return null;
             defer allocator.free(col);
-            const in_kw: []const u8 = if (std.mem.eql(u8, op_type, "OPERATOR_IN")) "IN" else "NOT IN";
+            const in_kw: []const u8 = if (std.mem.eql(u8, op_type, "OPERATOR_NOT_IN") or std.mem.eql(u8, op_type, "COMPARE_NOT_IN")) "NOT IN" else "IN";
             var vals: std.ArrayList(u8) = .empty;
             defer vals.deinit(allocator);
             try vals.append(allocator, '(');

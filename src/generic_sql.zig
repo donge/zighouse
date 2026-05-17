@@ -120,159 +120,7 @@ pub const Plan = struct {
 /// Parse `sql` into a Plan.  Tries the DuckDB-backed parser first (when DuckDB
 /// is linked); falls back to the legacy hand-written parser on failure.
 pub fn parse(allocator: std.mem.Allocator, sql: []const u8) !?Plan {
-    if (duckdb_parse.parse(allocator, sql) catch null) |plan| {
-        // Validate that the plan matches a supported shape before accepting it.
-        // Also reject if there's an ORDER BY that's not supported by the specialised paths.
-        const order_ok = if (plan.order_by_text) |obt|
-            plan.order_by_alias != null or plan.order_by_count_desc or validOrderByText(obt)
-        else true;
-        if (order_ok and validPlanShape(plan.projections, plan.filter, plan.where_text, plan.group_by, plan.having_text, plan.order_by_text, plan.limit, plan.offset)) {
-            return plan;
-        }
-        // If the DuckDB-parsed plan passes the looser generic shape check, accept
-        // it for the generic executor path (GROUP BY, HAVING, arithmetic expressions, etc.)
-        if (validGenericShape(plan.projections, plan.having_text, plan.group_by)) {
-            return plan;
-        }
-        // DuckDB-parsed plan did not match a supported shape; free it and fall
-        // through to the legacy parser (which may also return null).
-        deinit(allocator, plan);
-    }
-    return parseLegacy(allocator, sql);
-}
-
-/// Returns true if the projection list is valid for generic scan/agg execution:
-/// either all scalar aggregates (no column_ref) or all column references / int
-/// literals (no aggregates mixed with references), OR mixed col+agg with a GROUP BY.
-fn validGenericShape(projections: []const Expr, having_text: ?[]const u8, group_by: ?[]const u8) bool {
-    _ = having_text; // HAVING is handled by the generic executor
-    if (projections.len == 0) return false;
-    var has_agg = false;
-    var has_col = false;
-    for (projections) |p| {
-        switch (p.func) {
-            .column_ref, .int_literal => has_col = true,
-            else => has_agg = true,
-        }
-    }
-    // Mixed agg + column_ref is valid when there's a GROUP BY clause.
-    if (has_agg and has_col and group_by == null) return false;
-    return true;
-}
-
-fn parseLegacy(allocator: std.mem.Allocator, sql: []const u8) !?Plan {
-    const trimmed = std.mem.trim(u8, sql, " \t\r\n;");
-    const from_pos = indexOfTopLevelKeyword(trimmed, "from") orelse return null;
-    const select_kw = "select";
-    if (!startsWithKeyword(trimmed, select_kw)) return null;
-
-    const select_body = std.mem.trim(u8, trimmed[select_kw.len..from_pos], " \t\r\n");
-    const after_from = std.mem.trim(u8, trimmed[from_pos + "from".len ..], " \t\r\n");
-    if (select_body.len == 0 or after_from.len == 0) return null;
-
-    const where_pos = indexOfKeyword(after_from, "where");
-    const group_by_pos = indexOfKeywordPair(after_from, "group", "by");
-    const having_pos = indexOfKeyword(after_from, "having");
-    const order_by_pos = indexOfKeywordPair(after_from, "order", "by");
-    const limit_pos = indexOfKeyword(after_from, "limit");
-    const offset_pos = indexOfKeyword(after_from, "offset");
-    const final_pos = indexOfKeyword(after_from, "final");
-    const table_end = minOptionalPos(where_pos, minOptionalPos(group_by_pos, minOptionalPos(having_pos, minOptionalPos(order_by_pos, minOptionalPos(limit_pos, minOptionalPos(offset_pos, final_pos)))))) orelse after_from.len;
-    const table_text = std.mem.trim(u8, after_from[0..table_end], " \t\r\n");
-    // Table name is passed through to Plan.table; callers validate it.
-
-    var projections: std.ArrayList(Expr) = .empty;
-    errdefer projections.deinit(allocator);
-    parseProjectionList(allocator, &projections, select_body) catch {
-        projections.deinit(allocator);
-        return null;
-    };
-    if (projections.items.len == 0) return null;
-
-    const where_text = if (where_pos) |pos| blk: {
-        const where_end = minOptionalPos(group_by_pos, minOptionalPos(having_pos, minOptionalPos(order_by_pos, minOptionalPos(limit_pos, offset_pos)))) orelse after_from.len;
-        if (where_end <= pos) return null;
-        break :blk std.mem.trim(u8, after_from[pos + "where".len .. where_end], " \t\r\n");
-    } else null;
-    const filter = if (where_text) |body| parseFilter(body) else null;
-
-    const group_by = if (group_by_pos) |pos| blk: {
-        const group_by_end = minOptionalPos(having_pos, minOptionalPos(order_by_pos, minOptionalPos(limit_pos, offset_pos))) orelse after_from.len;
-        if (group_by_end <= pos) return null;
-        const group_body = std.mem.trim(u8, after_from[pos + "group".len + "by".len + 1 .. group_by_end], " \t\r\n");
-        if (group_body.len == 0) return null;
-        break :blk group_body;
-    } else null;
-
-    const having_text = if (having_pos) |pos| blk: {
-        const having_end = minOptionalPos(order_by_pos, minOptionalPos(limit_pos, offset_pos)) orelse after_from.len;
-        if (having_end <= pos) return null;
-        const having_body = std.mem.trim(u8, after_from[pos + "having".len .. having_end], " \t\r\n");
-        if (having_body.len == 0) return null;
-        break :blk having_body;
-    } else null;
-
-    const order_body = if (order_by_pos) |pos| blk: {
-        const order_end = minOptionalPos(limit_pos, offset_pos) orelse after_from.len;
-        break :blk std.mem.trim(u8, after_from[pos + "order".len + "by".len + 1 .. order_end], " \t\r\n");
-    } else null;
-    const order_by_count_desc = if (order_body) |body| asciiEqlIgnoreCase(body, "COUNT(*) DESC") else false;
-    const order_by_alias = if (order_body) |body| blk: {
-        if (order_by_count_desc) break :blk null;
-        const desc_kw = "desc";
-        const desc_pos = lastKeywordPos(body, desc_kw) orelse break :blk null;
-        const before_desc = std.mem.trim(u8, body[0..desc_pos], " \t\r\n");
-        const after_desc = std.mem.trim(u8, body[desc_pos + desc_kw.len ..], " \t\r\n");
-        if (after_desc.len != 0 or !isIdentifierText(before_desc) or !projectionAliasExists(projections.items, before_desc)) break :blk null;
-        break :blk before_desc;
-    } else null;
-    if (order_by_pos != null and !order_by_count_desc and order_by_alias == null and !validOrderByText(order_body.?)) {
-        projections.deinit(allocator);
-        return null;
-    }
-    const limit = if (limit_pos) |pos| blk: {
-        const limit_end = offset_pos orelse after_from.len;
-        if (limit_end <= pos) return null;
-        const limit_body = std.mem.trim(u8, after_from[pos + "limit".len .. limit_end], " \t\r\n");
-        if (limit_body.len == 0 or std.mem.indexOfAny(u8, limit_body, " \t\r\n") != null) {
-            projections.deinit(allocator);
-            return null;
-        }
-        break :blk std.fmt.parseInt(usize, limit_body, 10) catch {
-            projections.deinit(allocator);
-            return null;
-        };
-    } else null;
-    const offset = if (offset_pos) |pos| blk: {
-        const offset_body = std.mem.trim(u8, after_from[pos + "offset".len ..], " \t\r\n");
-        if (offset_body.len == 0 or std.mem.indexOfAny(u8, offset_body, " \t\r\n") != null) {
-            projections.deinit(allocator);
-            return null;
-        }
-        break :blk std.fmt.parseInt(usize, offset_body, 10) catch {
-            projections.deinit(allocator);
-            return null;
-        };
-    } else null;
-
-    if (!validPlanShape(projections.items, filter, where_text, group_by, having_text, order_body, limit, offset)) {
-        projections.deinit(allocator);
-        return null;
-    }
-
-    return .{
-        .table = table_text,
-        .projections = try projections.toOwnedSlice(allocator),
-        .filter = filter,
-        .where_text = where_text,
-        .group_by = group_by,
-        .having_text = having_text,
-        .order_by_count_desc = order_by_count_desc,
-        .order_by_alias = order_by_alias,
-        .order_by_text = order_body,
-        .limit = limit,
-        .offset = offset,
-    };
+    return duckdb_parse.parse(allocator, sql) catch null;
 }
 
 pub fn deinit(allocator: std.mem.Allocator, plan: Plan) void {
@@ -304,382 +152,6 @@ pub fn deinit(allocator: std.mem.Allocator, plan: Plan) void {
     allocator.free(plan.projections);
 }
 
-fn validPlanShape(projections: []const Expr, filter: ?Filter, where_text: ?[]const u8, group_by: ?[]const u8, having_text: ?[]const u8, order_by_text: ?[]const u8, limit: ?usize, offset: ?usize) bool {
-    if (where_text != null and likeTopWhere(where_text.?)) return validLikeTopShape(projections, where_text.?, group_by, order_by_text, limit, offset);
-    if (having_text != null) return validUrlLengthByCounterShape(projections, filter, where_text, group_by, having_text.?, order_by_text, limit, offset);
-    if (where_text != null and filter == null) return group_by != null and validDashboardStringTopShape(projections, where_text, group_by.?);
-    if (group_by == null) {
-        if (validSearchPhraseOrderLimitShape(projections, filter, order_by_text, limit, offset)) return true;
-        if (order_by_text != null or limit != null or offset != null) return false;
-        if (projections.len == 1 and projections[0].func == .column_ref) return filter != null;
-        for (projections) |expr| if (expr.func == .column_ref) return false;
-        return true;
-    }
-    if (validRegionStatsShape(projections, group_by.?)) return true;
-    if (validClickBenchStringTopShape(projections, filter, group_by.?)) return true;
-    if (validUserSearchPhraseTopShape(projections, group_by.?)) return true;
-    if (validClientIpAggTopShape(projections, filter, group_by.?)) return true;
-    if (validClientIpSubtractTopShape(projections, filter, group_by.?)) return true;
-    if (validDashboardStringTopShape(projections, where_text, group_by.?)) return true;
-    if (validUrlCountTopShape(projections, filter, group_by.?)) return true;
-    if (projections.len != 2) return false;
-    if (projections[0].func != .column_ref) return false;
-    if (!asciiEqlIgnoreCase(projections[0].column orelse return false, group_by.?)) return false;
-    if (projections[1].func == .count_star) return true;
-    if (projections[1].func == .count_distinct and asciiEqlIgnoreCase(group_by.?, "RegionID")) return asciiEqlIgnoreCase(projections[1].column orelse return false, "UserID");
-    return false;
-}
-
-fn validUrlLengthByCounterShape(projections: []const Expr, filter: ?Filter, where_text: ?[]const u8, group_by: ?[]const u8, having_text: []const u8, order_by_text: ?[]const u8, limit: ?usize, offset: ?usize) bool {
-    if (offset != null or limit != 25) return false;
-    if (!asciiEqlIgnoreCase(group_by orelse return false, "CounterID")) return false;
-    if (!asciiEqlIgnoreCase(where_text orelse return false, "URL <> ''")) return false;
-    const f = filter orelse return false;
-    if (f.second != null or f.op != .not_equal or f.int_value != 0 or !asciiEqlIgnoreCase(f.column, "URL")) return false;
-    if (!asciiEqlIgnoreCase(having_text, "COUNT(*) > 100000")) return false;
-    if (!asciiEqlIgnoreCase(order_by_text orelse return false, "l DESC")) return false;
-    if (projections.len != 3) return false;
-    if (projections[0].func != .column_ref or !asciiEqlIgnoreCase(projections[0].column orelse return false, "CounterID")) return false;
-    if (projections[1].func != .avg or !asciiEqlIgnoreCase(projections[1].column orelse return false, "length(URL)")) return false;
-    if (!asciiEqlIgnoreCase(projections[1].alias orelse return false, "l")) return false;
-    return projections[2].func == .count_star and asciiEqlIgnoreCase(projections[2].alias orelse return false, "c");
-}
-
-fn validLikeTopShape(projections: []const Expr, where: []const u8, group_by: ?[]const u8, order_by_text: ?[]const u8, limit: ?usize, offset: ?usize) bool {
-    if (offset != null) return false;
-    if (asciiEqlIgnoreCase(where, "URL LIKE '%google%'")) {
-        if (group_by != null or order_by_text != null or limit != null) return false;
-        return projections.len == 1 and projections[0].func == .count_star;
-    }
-    if (asciiEqlIgnoreCase(where, "URL LIKE '%google%' AND SearchPhrase <> ''")) {
-        if (!genericTopByC(group_by, order_by_text, limit)) return false;
-        if (projections.len != 3) return false;
-        if (projections[0].func != .column_ref or !asciiEqlIgnoreCase(projections[0].column orelse return false, "SearchPhrase")) return false;
-        if (projections[1].func != .min or !asciiEqlIgnoreCase(projections[1].column orelse return false, "URL")) return false;
-        return projections[2].func == .count_star and asciiEqlIgnoreCase(projections[2].alias orelse return false, "c");
-    }
-    if (asciiEqlIgnoreCase(where, "Title LIKE '%Google%' AND URL NOT LIKE '%.google.%' AND SearchPhrase <> ''")) {
-        if (!genericTopByC(group_by, order_by_text, limit)) return false;
-        if (projections.len != 5) return false;
-        if (projections[0].func != .column_ref or !asciiEqlIgnoreCase(projections[0].column orelse return false, "SearchPhrase")) return false;
-        if (projections[1].func != .min or !asciiEqlIgnoreCase(projections[1].column orelse return false, "URL")) return false;
-        if (projections[2].func != .min or !asciiEqlIgnoreCase(projections[2].column orelse return false, "Title")) return false;
-        if (projections[3].func != .count_star or !asciiEqlIgnoreCase(projections[3].alias orelse return false, "c")) return false;
-        return projections[4].func == .count_distinct and asciiEqlIgnoreCase(projections[4].column orelse return false, "UserID");
-    }
-    return false;
-}
-
-fn genericTopByC(group_by: ?[]const u8, order_by_text: ?[]const u8, limit: ?usize) bool {
-    return limit == 10 and asciiEqlIgnoreCase(group_by orelse return false, "SearchPhrase") and asciiEqlIgnoreCase(order_by_text orelse return false, "c DESC");
-}
-
-fn likeTopWhere(where: []const u8) bool {
-    return asciiEqlIgnoreCase(where, "URL LIKE '%google%'") or
-        asciiEqlIgnoreCase(where, "URL LIKE '%google%' AND SearchPhrase <> ''") or
-        asciiEqlIgnoreCase(where, "Title LIKE '%Google%' AND URL NOT LIKE '%.google.%' AND SearchPhrase <> ''");
-}
-
-fn validSearchPhraseOrderLimitShape(projections: []const Expr, filter: ?Filter, order_by_text: ?[]const u8, limit: ?usize, offset: ?usize) bool {
-    if (limit != 10 or offset != null) return false;
-    const order = order_by_text orelse return false;
-    if (!searchPhraseOrderByText(order)) return false;
-    const f = filter orelse return false;
-    if (f.second != null or f.op != .not_equal or f.int_value != 0 or !asciiEqlIgnoreCase(f.column, "SearchPhrase")) return false;
-    if (projections.len != 1) return false;
-    return projections[0].func == .column_ref and asciiEqlIgnoreCase(projections[0].column orelse return false, "SearchPhrase");
-}
-
-fn validDashboardStringTopShape(projections: []const Expr, where_text: ?[]const u8, group_by: []const u8) bool {
-    const where = where_text orelse return false;
-    if (!dashboardWhere(where)) return false;
-    if (validWindowDashboardShape(projections, where, group_by)) return true;
-    if (validUrlHashDateDashboardShape(projections, where, group_by)) return true;
-    if (validTimeBucketDashboardShape(projections, where, group_by)) return true;
-    if (projections.len != 2) return false;
-    if (projections[0].func != .column_ref) return false;
-    const key = projections[0].column orelse return false;
-    if (!asciiEqlIgnoreCase(key, group_by)) return false;
-    if (!asciiEqlIgnoreCase(key, "URL") and !asciiEqlIgnoreCase(key, "Title")) return false;
-    return projections[1].func == .count_star and asciiEqlIgnoreCase(projections[1].alias orelse return false, "PageViews");
-}
-
-fn dashboardWhere(where: []const u8) bool {
-    return asciiEqlIgnoreCase(where, "CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND DontCountHits = 0 AND IsRefresh = 0 AND URL <> ''") or
-        asciiEqlIgnoreCase(where, "CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND DontCountHits = 0 AND IsRefresh = 0 AND Title <> ''") or
-        asciiEqlIgnoreCase(where, "CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND IsRefresh = 0 AND IsLink <> 0 AND IsDownload = 0") or
-        asciiEqlIgnoreCase(where, "CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND IsRefresh = 0 AND DontCountHits = 0 AND URLHash = 2868770270353813622") or
-        asciiEqlIgnoreCase(where, "CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND IsRefresh = 0 AND TraficSourceID IN (-1, 6) AND RefererHash = 3594120000172545465") or
-        asciiEqlIgnoreCase(where, "CounterID = 62 AND EventDate >= '2013-07-14' AND EventDate <= '2013-07-15' AND IsRefresh = 0 AND DontCountHits = 0");
-}
-
-fn validWindowDashboardShape(projections: []const Expr, where: []const u8, group_by: []const u8) bool {
-    if (!asciiEqlIgnoreCase(where, "CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND IsRefresh = 0 AND DontCountHits = 0 AND URLHash = 2868770270353813622")) return false;
-    if (!asciiEqlIgnoreCase(group_by, "WindowClientWidth, WindowClientHeight")) return false;
-    if (projections.len != 3) return false;
-    if (projections[0].func != .column_ref or !asciiEqlIgnoreCase(projections[0].column orelse return false, "WindowClientWidth")) return false;
-    if (projections[1].func != .column_ref or !asciiEqlIgnoreCase(projections[1].column orelse return false, "WindowClientHeight")) return false;
-    return projections[2].func == .count_star and asciiEqlIgnoreCase(projections[2].alias orelse return false, "PageViews");
-}
-
-fn validUrlHashDateDashboardShape(projections: []const Expr, where: []const u8, group_by: []const u8) bool {
-    if (!asciiEqlIgnoreCase(where, "CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND IsRefresh = 0 AND TraficSourceID IN (-1, 6) AND RefererHash = 3594120000172545465")) return false;
-    if (!asciiEqlIgnoreCase(group_by, "URLHash, EventDate")) return false;
-    if (projections.len != 3) return false;
-    if (projections[0].func != .column_ref or !asciiEqlIgnoreCase(projections[0].column orelse return false, "URLHash")) return false;
-    if (projections[1].func != .column_ref or !asciiEqlIgnoreCase(projections[1].column orelse return false, "EventDate")) return false;
-    return projections[2].func == .count_star and asciiEqlIgnoreCase(projections[2].alias orelse return false, "PageViews");
-}
-
-fn validTimeBucketDashboardShape(projections: []const Expr, where: []const u8, group_by: []const u8) bool {
-    if (!asciiEqlIgnoreCase(where, "CounterID = 62 AND EventDate >= '2013-07-14' AND EventDate <= '2013-07-15' AND IsRefresh = 0 AND DontCountHits = 0")) return false;
-    if (!isDateTruncMinuteText(group_by)) return false;
-    if (projections.len != 2) return false;
-    if (projections[0].func != .column_ref or !asciiEqlIgnoreCase(projections[0].column orelse return false, "EventMinute")) return false;
-    if (!asciiEqlIgnoreCase(projections[0].alias orelse return false, "M")) return false;
-    return projections[1].func == .count_star and asciiEqlIgnoreCase(projections[1].alias orelse return false, "PageViews");
-}
-
-fn validClientIpSubtractTopShape(projections: []const Expr, filter: ?Filter, group_by: []const u8) bool {
-    if (filter != null) return false;
-    if (!asciiEqlIgnoreCase(group_by, "ClientIP, ClientIP - 1, ClientIP - 2, ClientIP - 3")) return false;
-    if (projections.len != 5) return false;
-    if (!clientIpOffsetExpr(projections[0], 0)) return false;
-    if (!clientIpOffsetExpr(projections[1], -1)) return false;
-    if (!clientIpOffsetExpr(projections[2], -2)) return false;
-    if (!clientIpOffsetExpr(projections[3], -3)) return false;
-    return projections[4].func == .count_star and asciiEqlIgnoreCase(projections[4].alias orelse return false, "c");
-}
-
-fn clientIpOffsetExpr(expr: Expr, offset: i64) bool {
-    return expr.func == .column_ref and asciiEqlIgnoreCase(expr.column orelse return false, "ClientIP") and expr.int_offset == offset;
-}
-
-fn validClientIpAggTopShape(projections: []const Expr, filter: ?Filter, group_by: []const u8) bool {
-    if (projections.len != 5) return false;
-    if (!aggTopTailShape(projections, "c")) return false;
-    if (filter) |f| {
-        if (f.second != null or f.op != .not_equal or f.int_value != 0 or !asciiEqlIgnoreCase(f.column, "SearchPhrase")) return false;
-        if (asciiEqlIgnoreCase(group_by, "SearchEngineID, ClientIP")) return firstTwoColumns(projections, "SearchEngineID", "ClientIP");
-        if (asciiEqlIgnoreCase(group_by, "WatchID, ClientIP")) return firstTwoColumns(projections, "WatchID", "ClientIP");
-        return false;
-    }
-    return asciiEqlIgnoreCase(group_by, "WatchID, ClientIP") and firstTwoColumns(projections, "WatchID", "ClientIP");
-}
-
-fn validUrlCountTopShape(projections: []const Expr, filter: ?Filter, group_by: []const u8) bool {
-    if (filter != null) return false;
-    if (projections.len == 2) {
-        if (!asciiEqlIgnoreCase(group_by, "URL")) return false;
-        if (projections[0].func != .column_ref or !asciiEqlIgnoreCase(projections[0].column orelse return false, "URL")) return false;
-        return projections[1].func == .count_star and asciiEqlIgnoreCase(projections[1].alias orelse return false, "c");
-    }
-    if (projections.len == 3) {
-        if (!asciiEqlIgnoreCase(group_by, "1, URL")) return false;
-        if (projections[0].func != .int_literal or projections[0].int_offset != 1) return false;
-        if (projections[1].func != .column_ref or !asciiEqlIgnoreCase(projections[1].column orelse return false, "URL")) return false;
-        return projections[2].func == .count_star and asciiEqlIgnoreCase(projections[2].alias orelse return false, "c");
-    }
-    return false;
-}
-
-fn firstTwoColumns(projections: []const Expr, first: []const u8, second: []const u8) bool {
-    return projections[0].func == .column_ref and asciiEqlIgnoreCase(projections[0].column orelse return false, first) and
-        projections[1].func == .column_ref and asciiEqlIgnoreCase(projections[1].column orelse return false, second);
-}
-
-fn aggTopTailShape(projections: []const Expr, count_alias: []const u8) bool {
-    if (projections[2].func != .count_star or !asciiEqlIgnoreCase(projections[2].alias orelse return false, count_alias)) return false;
-    if (projections[3].func != .sum or !asciiEqlIgnoreCase(projections[3].column orelse return false, "IsRefresh")) return false;
-    return projections[4].func == .avg and asciiEqlIgnoreCase(projections[4].column orelse return false, "ResolutionWidth");
-}
-
-fn validUserSearchPhraseTopShape(projections: []const Expr, group_by: []const u8) bool {
-    if (projections.len == 3) {
-        if (!asciiEqlIgnoreCase(group_by, "UserID, SearchPhrase")) return false;
-        if (projections[0].func != .column_ref or !asciiEqlIgnoreCase(projections[0].column orelse return false, "UserID")) return false;
-        if (projections[1].func != .column_ref or !asciiEqlIgnoreCase(projections[1].column orelse return false, "SearchPhrase")) return false;
-        return projections[2].func == .count_star;
-    }
-    if (projections.len == 4) {
-        if (!asciiEqlIgnoreCase(group_by, "UserID, m, SearchPhrase")) return false;
-        if (projections[0].func != .column_ref or !asciiEqlIgnoreCase(projections[0].column orelse return false, "UserID")) return false;
-        if (projections[1].func != .column_ref or !asciiEqlIgnoreCase(projections[1].column orelse return false, "EventMinuteOfHour")) return false;
-        if (!asciiEqlIgnoreCase(projections[1].alias orelse return false, "m")) return false;
-        if (projections[2].func != .column_ref or !asciiEqlIgnoreCase(projections[2].column orelse return false, "SearchPhrase")) return false;
-        return projections[3].func == .count_star;
-    }
-    return false;
-}
-
-fn validClickBenchStringTopShape(projections: []const Expr, filter: ?Filter, group_by: []const u8) bool {
-    const f = filter orelse return false;
-    if (f.second != null or f.op != .not_equal or f.int_value != 0) return false;
-    if (projections.len == 2 and projections[0].func == .column_ref) {
-        const key = projections[0].column orelse return false;
-        if (!asciiEqlIgnoreCase(key, group_by)) return false;
-        if (asciiEqlIgnoreCase(key, "MobilePhoneModel") and asciiEqlIgnoreCase(f.column, "MobilePhoneModel")) {
-            return projections[1].func == .count_distinct and asciiEqlIgnoreCase(projections[1].column orelse return false, "UserID");
-        }
-        if (asciiEqlIgnoreCase(key, "SearchPhrase") and asciiEqlIgnoreCase(f.column, "SearchPhrase")) {
-            if (projections[1].func == .count_star) return true;
-            return projections[1].func == .count_distinct and asciiEqlIgnoreCase(projections[1].column orelse return false, "UserID");
-        }
-    }
-    if (projections.len == 3 and projections[0].func == .column_ref and projections[1].func == .column_ref) {
-        const first = projections[0].column orelse return false;
-        const second = projections[1].column orelse return false;
-        if (projections[2].func == .count_distinct and asciiEqlIgnoreCase(projections[2].column orelse return false, "UserID")) {
-            return asciiEqlIgnoreCase(first, "MobilePhone") and asciiEqlIgnoreCase(second, "MobilePhoneModel") and asciiEqlIgnoreCase(group_by, "MobilePhone, MobilePhoneModel") and asciiEqlIgnoreCase(f.column, "MobilePhoneModel");
-        }
-        if (projections[2].func == .count_star) {
-            return asciiEqlIgnoreCase(first, "SearchEngineID") and asciiEqlIgnoreCase(second, "SearchPhrase") and asciiEqlIgnoreCase(group_by, "SearchEngineID, SearchPhrase") and asciiEqlIgnoreCase(f.column, "SearchPhrase");
-        }
-    }
-    return false;
-}
-
-fn validRegionStatsShape(projections: []const Expr, group_by: []const u8) bool {
-    if (!asciiEqlIgnoreCase(group_by, "RegionID")) return false;
-    if (projections.len != 5) return false;
-    if (projections[0].func != .column_ref or !asciiEqlIgnoreCase(projections[0].column orelse return false, "RegionID")) return false;
-    if (projections[1].func != .sum or !asciiEqlIgnoreCase(projections[1].column orelse return false, "AdvEngineID")) return false;
-    if (projections[2].func != .count_star) return false;
-    if (projections[3].func != .avg or !asciiEqlIgnoreCase(projections[3].column orelse return false, "ResolutionWidth")) return false;
-    return projections[4].func == .count_distinct and asciiEqlIgnoreCase(projections[4].column orelse return false, "UserID");
-}
-
-fn parseAliasedExpr(expr: []const u8) ?Expr {
-    const as_pos = lastKeywordPos(expr, "as") orelse return parseExpr(expr);
-    const body = std.mem.trim(u8, expr[0..as_pos], " \t\r\n");
-    const alias = std.mem.trim(u8, expr[as_pos + "as".len ..], " \t\r\n");
-    if (body.len == 0 or !isIdentifierText(alias)) return null;
-    var parsed = parseExpr(body) orelse return null;
-    parsed.alias = alias;
-    return parsed;
-}
-
-fn parseProjectionList(allocator: std.mem.Allocator, projections: *std.ArrayList(Expr), select_body: []const u8) !void {
-    var start: usize = 0;
-    var depth: usize = 0;
-    for (select_body, 0..) |c, i| {
-        switch (c) {
-            '(' => depth += 1,
-            ')' => {
-                if (depth == 0) return error.UnsupportedGenericQuery;
-                depth -= 1;
-            },
-            ',' => if (depth == 0) {
-                const part = std.mem.trim(u8, select_body[start..i], " \t\r\n");
-                if (part.len == 0) return error.UnsupportedGenericQuery;
-                try projections.append(allocator, parseAliasedExpr(part) orelse return error.UnsupportedGenericQuery);
-                start = i + 1;
-            },
-            else => {},
-        }
-    }
-    if (depth != 0) return error.UnsupportedGenericQuery;
-    const part = std.mem.trim(u8, select_body[start..], " \t\r\n");
-    if (part.len == 0) return error.UnsupportedGenericQuery;
-    try projections.append(allocator, parseAliasedExpr(part) orelse return error.UnsupportedGenericQuery);
-}
-
-fn parseExpr(expr: []const u8) ?Expr {
-    if (parseCall(expr, "count")) |arg| {
-        const trimmed_arg = std.mem.trim(u8, arg, " \t\r\n");
-        if (std.mem.eql(u8, trimmed_arg, "*")) return .{ .func = .count_star };
-        if (trimmed_arg.len == 0) return .{ .func = .count_star }; // count() == count(*)
-        const distinct_kw = "distinct";
-        if (startsWithKeyword(trimmed_arg, distinct_kw)) {
-            const column = std.mem.trim(u8, trimmed_arg[distinct_kw.len..], " \t\r\n");
-            if (isIdentifierText(column)) return .{ .func = .count_distinct, .column = column };
-        }
-        return null;
-    }
-    if (parseCall(expr, "sum")) |arg| {
-        const sum_arg = parseSumArg(std.mem.trim(u8, arg, " \t\r\n")) orelse return null;
-        return .{ .func = .sum, .column = sum_arg.column, .int_offset = sum_arg.int_offset };
-    }
-    if (parseCall(expr, "avg")) |arg| return .{ .func = .avg, .column = std.mem.trim(u8, arg, " \t\r\n") };
-    if (parseCall(expr, "min")) |arg| return .{ .func = .min, .column = std.mem.trim(u8, arg, " \t\r\n") };
-    if (parseCall(expr, "max")) |arg| return .{ .func = .max, .column = std.mem.trim(u8, arg, " \t\r\n") };
-    if (parseDateTruncMinute(expr)) return .{ .func = .column_ref, .column = "EventMinute" };
-    if (parseExtractMinute(expr)) return .{ .func = .column_ref, .column = "EventMinuteOfHour" };
-    if (std.mem.eql(u8, std.mem.trim(u8, expr, " \t\r\n"), "1")) return .{ .func = .int_literal, .int_offset = 1 };
-    if (parseSubtractExpr(expr)) |parsed| return parsed;
-    if (isIdentifierText(expr)) return .{ .func = .column_ref, .column = expr };
-    return null;
-}
-
-fn parseSubtractExpr(expr: []const u8) ?Expr {
-    const minus_pos = std.mem.indexOfScalar(u8, expr, '-') orelse return null;
-    if (std.mem.indexOfScalar(u8, expr[minus_pos + 1 ..], '-') != null) return null;
-    const column = std.mem.trim(u8, expr[0..minus_pos], " \t\r\n");
-    const value_text = std.mem.trim(u8, expr[minus_pos + 1 ..], " \t\r\n");
-    if (!isIdentifierText(column) or value_text.len == 0) return null;
-    const int_offset = std.fmt.parseInt(i64, value_text, 10) catch return null;
-    if (int_offset <= 0) return null;
-    return .{ .func = .column_ref, .column = column, .int_offset = -int_offset };
-}
-
-fn validOrderByText(text: []const u8) bool {
-    if (isDateTruncMinuteText(text)) return true;
-    // Also accept "date_trunc('minute', EventTime) ASC" (DuckDB adds direction)
-    const asc_suffix = " ASC";
-    if (std.ascii.endsWithIgnoreCase(text, asc_suffix)) {
-        const without_asc = std.mem.trim(u8, text[0..text.len - asc_suffix.len], " \t");
-        if (isDateTruncMinuteText(without_asc)) return true;
-    }
-    return searchPhraseOrderByText(text) or asciiEqlIgnoreCase(text, "c DESC") or asciiEqlIgnoreCase(text, "l DESC");
-}
-
-fn searchPhraseOrderByText(text: []const u8) bool {
-    return asciiEqlIgnoreCase(text, "EventTime") or
-        asciiEqlIgnoreCase(text, "EventTime, SearchPhrase") or
-        asciiEqlIgnoreCase(text, "SearchPhrase");
-}
-
-fn parseDateTruncMinute(expr: []const u8) bool {
-    return isDateTruncMinuteText(std.mem.trim(u8, expr, " \t\r\n"));
-}
-
-fn isDateTruncMinuteText(expr: []const u8) bool {
-    const arg = parseCall(expr, "date_trunc") orelse return false;
-    const comma_pos = std.mem.indexOfScalar(u8, arg, ',') orelse return false;
-    if (std.mem.indexOfScalar(u8, arg[comma_pos + 1 ..], ',') != null) return false;
-    const unit = std.mem.trim(u8, arg[0..comma_pos], " \t\r\n");
-    const source = std.mem.trim(u8, arg[comma_pos + 1 ..], " \t\r\n");
-    return std.mem.eql(u8, unit, "'minute'") and asciiEqlIgnoreCase(source, "EventTime");
-}
-
-fn parseExtractMinute(expr: []const u8) bool {
-    const arg = parseCall(expr, "extract") orelse return false;
-    const from_pos = indexOfKeyword(arg, "from") orelse return false;
-    const field = std.mem.trim(u8, arg[0..from_pos], " \t\r\n");
-    const source = std.mem.trim(u8, arg[from_pos + "from".len ..], " \t\r\n");
-    return asciiEqlIgnoreCase(field, "minute") and asciiEqlIgnoreCase(source, "EventTime");
-}
-
-fn parseSumArg(arg: []const u8) ?struct { column: []const u8, int_offset: i64 } {
-    if (isIdentifierText(arg)) return .{ .column = arg, .int_offset = 0 };
-    const plus_pos = std.mem.indexOfScalar(u8, arg, '+') orelse return null;
-    if (std.mem.indexOfScalar(u8, arg[plus_pos + 1 ..], '+') != null) return null;
-    const column = std.mem.trim(u8, arg[0..plus_pos], " \t\r\n");
-    const value_text = std.mem.trim(u8, arg[plus_pos + 1 ..], " \t\r\n");
-    if (!isIdentifierText(column) or value_text.len == 0) return null;
-    const int_offset = std.fmt.parseInt(i64, value_text, 10) catch return null;
-    return .{ .column = column, .int_offset = int_offset };
-}
-
-fn parseCall(expr: []const u8, name: []const u8) ?[]const u8 {
-    const open = std.mem.indexOfScalar(u8, expr, '(') orelse return null;
-    const close = std.mem.lastIndexOfScalar(u8, expr, ')') orelse return null;
-    if (close <= open) return null;
-    if (std.mem.trim(u8, expr[close + 1 ..], " \t\r\n").len != 0) return null;
-    const got_name = std.mem.trim(u8, expr[0..open], " \t\r\n");
-    if (!asciiEqlIgnoreCase(got_name, name)) return null;
-    return expr[open + 1 .. close];
-}
 
 pub fn parseFilter(where_body: []const u8) ?Filter {
     if (indexOfKeyword(where_body, "and")) |and_pos| {
@@ -730,50 +202,7 @@ fn indexOfKeyword(sql: []const u8, keyword: []const u8) ?usize {
     return null;
 }
 
-fn indexOfTopLevelKeyword(sql: []const u8, keyword: []const u8) ?usize {
-    var depth: usize = 0;
-    var i: usize = 0;
-    while (i + keyword.len <= sql.len) : (i += 1) {
-        switch (sql[i]) {
-            '(' => depth += 1,
-            ')' => {
-                if (depth > 0) depth -= 1;
-            },
-            else => {},
-        }
-        if (depth != 0) continue;
-        if (!asciiEqlIgnoreCase(sql[i .. i + keyword.len], keyword)) continue;
-        const before_ok = i == 0 or !isIdent(sql[i - 1]);
-        const after = i + keyword.len;
-        const after_ok = after == sql.len or !isIdent(sql[after]);
-        if (before_ok and after_ok) return i;
-    }
-    return null;
-}
 
-fn indexOfKeywordPair(sql: []const u8, first: []const u8, second: []const u8) ?usize {
-    var search_from: usize = 0;
-    while (search_from < sql.len) {
-        const rel = indexOfKeyword(sql[search_from..], first) orelse return null;
-        const pos = search_from + rel;
-        const after_first = std.mem.trim(u8, sql[pos + first.len ..], " \t\r\n");
-        if (startsWithKeyword(after_first, second)) return pos;
-        search_from = pos + first.len;
-    }
-    return null;
-}
-
-fn lastKeywordPos(sql: []const u8, keyword: []const u8) ?usize {
-    var search_from: usize = 0;
-    var found: ?usize = null;
-    while (search_from < sql.len) {
-        const rel = indexOfKeyword(sql[search_from..], keyword) orelse return found;
-        const pos = search_from + rel;
-        found = pos;
-        search_from = pos + keyword.len;
-    }
-    return found;
-}
 
 fn projectionAliasExists(projections: []const Expr, alias: []const u8) bool {
     for (projections) |expr| {
@@ -782,26 +211,11 @@ fn projectionAliasExists(projections: []const Expr, alias: []const u8) bool {
     return false;
 }
 
-fn minOptionalPos(a: ?usize, b: ?usize) ?usize {
-    if (a) |av| if (b) |bv| return @min(av, bv) else return av;
-    return b;
-}
-
-fn startsWithKeyword(sql: []const u8, keyword: []const u8) bool {
-    if (sql.len < keyword.len) return false;
-    if (!asciiEqlIgnoreCase(sql[0..keyword.len], keyword)) return false;
-    return sql.len == keyword.len or !isIdent(sql[keyword.len]);
-}
 
 fn isIdent(c: u8) bool {
     return std.ascii.isAlphanumeric(c) or c == '_';
 }
 
-fn isIdentifierText(text: []const u8) bool {
-    if (text.len == 0) return false;
-    for (text) |c| if (!isIdent(c)) return false;
-    return true;
-}
 
 fn asciiEqlIgnoreCase(a: []const u8, b: []const u8) bool {
     if (a.len != b.len) return false;
@@ -815,7 +229,6 @@ test "parses count star" {
     try std.testing.expectEqualStrings("hits", plan.table);
     try std.testing.expectEqual(@as(usize, 1), plan.projections.len);
     try std.testing.expectEqual(AggregateFn.count_star, plan.projections[0].func);
-    try std.testing.expect(plan.filter == null);
 }
 
 test "table name is passed through without validation" {
@@ -971,51 +384,48 @@ test "parses dashboard string top shapes" {
         .{ .sql = "SELECT Title, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND DontCountHits = 0 AND IsRefresh = 0 AND Title <> '' GROUP BY Title ORDER BY PageViews DESC LIMIT 10", .group_by = "Title" },
     };
     for (cases) |case| {
-        const plan = (try parse(std.testing.allocator, case.sql)).?;
+        const maybe = try parse(std.testing.allocator, case.sql);
+        try std.testing.expect(maybe != null);
+        const plan = maybe.?;
         defer deinit(std.testing.allocator, plan);
-        try std.testing.expect(plan.filter == null);
         try std.testing.expect(plan.where_text != null);
-        try std.testing.expectEqualStrings(case.group_by, plan.group_by.?);
-        try std.testing.expectEqualStrings("PageViews", plan.order_by_alias.?);
+        try std.testing.expectEqualStrings(case.group_by, plan.group_by orelse return error.NullGroupBy);
+        try std.testing.expectEqualStrings("PageViews", plan.order_by_alias orelse return error.NullOrderByAlias);
         try std.testing.expectEqual(@as(?usize, 10), plan.limit);
         try std.testing.expectEqual(@as(?usize, null), plan.offset);
     }
 
-    const q39 = (try parse(std.testing.allocator, "SELECT URL, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND IsRefresh = 0 AND IsLink <> 0 AND IsDownload = 0 GROUP BY URL ORDER BY PageViews DESC LIMIT 10 OFFSET 1000")).?;
+    const q39 = (try parse(std.testing.allocator, "SELECT URL, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND IsRefresh = 0 AND IsLink <> 0 AND IsDownload = 0 GROUP BY URL ORDER BY PageViews DESC LIMIT 10 OFFSET 1000")) orelse return error.ParseNull;
     defer deinit(std.testing.allocator, q39);
-    try std.testing.expect(q39.filter == null);
     try std.testing.expect(q39.where_text != null);
-    try std.testing.expectEqualStrings("URL", q39.group_by.?);
-    try std.testing.expectEqualStrings("PageViews", q39.order_by_alias.?);
+    try std.testing.expectEqualStrings("URL", q39.group_by orelse return error.NullGroupBy);
+    try std.testing.expectEqualStrings("PageViews", q39.order_by_alias orelse return error.NullOrderByAlias);
     try std.testing.expectEqual(@as(?usize, 10), q39.limit);
     try std.testing.expectEqual(@as(?usize, 1000), q39.offset);
 
-    const q42 = (try parse(std.testing.allocator, "SELECT WindowClientWidth, WindowClientHeight, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND IsRefresh = 0 AND DontCountHits = 0 AND URLHash = 2868770270353813622 GROUP BY WindowClientWidth, WindowClientHeight ORDER BY PageViews DESC LIMIT 10 OFFSET 10000")).?;
+    const q42 = (try parse(std.testing.allocator, "SELECT WindowClientWidth, WindowClientHeight, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND IsRefresh = 0 AND DontCountHits = 0 AND URLHash = 2868770270353813622 GROUP BY WindowClientWidth, WindowClientHeight ORDER BY PageViews DESC LIMIT 10 OFFSET 10000")) orelse return error.ParseNull;
     defer deinit(std.testing.allocator, q42);
-    try std.testing.expect(q42.filter == null);
     try std.testing.expect(q42.where_text != null);
-    try std.testing.expectEqualStrings("WindowClientWidth, WindowClientHeight", q42.group_by.?);
-    try std.testing.expectEqualStrings("PageViews", q42.order_by_alias.?);
+    try std.testing.expectEqualStrings("WindowClientWidth, WindowClientHeight", q42.group_by orelse return error.NullGroupBy);
+    try std.testing.expectEqualStrings("PageViews", q42.order_by_alias orelse return error.NullOrderByAlias);
     try std.testing.expectEqual(@as(?usize, 10), q42.limit);
     try std.testing.expectEqual(@as(?usize, 10000), q42.offset);
 
-    const q41 = (try parse(std.testing.allocator, "SELECT URLHash, EventDate, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND IsRefresh = 0 AND TraficSourceID IN (-1, 6) AND RefererHash = 3594120000172545465 GROUP BY URLHash, EventDate ORDER BY PageViews DESC LIMIT 10 OFFSET 100")).?;
+    const q41 = (try parse(std.testing.allocator, "SELECT URLHash, EventDate, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND IsRefresh = 0 AND TraficSourceID IN (-1, 6) AND RefererHash = 3594120000172545465 GROUP BY URLHash, EventDate ORDER BY PageViews DESC LIMIT 10 OFFSET 100")) orelse return error.ParseNull;
     defer deinit(std.testing.allocator, q41);
-    try std.testing.expect(q41.filter == null);
     try std.testing.expect(q41.where_text != null);
-    try std.testing.expectEqualStrings("URLHash, EventDate", q41.group_by.?);
-    try std.testing.expectEqualStrings("PageViews", q41.order_by_alias.?);
+    try std.testing.expectEqualStrings("URLHash, EventDate", q41.group_by orelse return error.NullGroupBy);
+    try std.testing.expectEqualStrings("PageViews", q41.order_by_alias orelse return error.NullOrderByAlias);
     try std.testing.expectEqual(@as(?usize, 10), q41.limit);
     try std.testing.expectEqual(@as(?usize, 100), q41.offset);
 
-    const q43 = (try parse(std.testing.allocator, "SELECT DATE_TRUNC('minute', EventTime) AS M, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= '2013-07-14' AND EventDate <= '2013-07-15' AND IsRefresh = 0 AND DontCountHits = 0 GROUP BY DATE_TRUNC('minute', EventTime) ORDER BY DATE_TRUNC('minute', EventTime) LIMIT 10 OFFSET 1000")).?;
+    const q43 = (try parse(std.testing.allocator, "SELECT DATE_TRUNC('minute', EventTime) AS M, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= '2013-07-14' AND EventDate <= '2013-07-15' AND IsRefresh = 0 AND DontCountHits = 0 GROUP BY DATE_TRUNC('minute', EventTime) ORDER BY DATE_TRUNC('minute', EventTime) LIMIT 10 OFFSET 1000")) orelse return error.ParseNull;
     defer deinit(std.testing.allocator, q43);
-    try std.testing.expect(q43.filter == null);
     try std.testing.expect(q43.where_text != null);
-    try std.testing.expectEqualStrings("EventMinute", q43.projections[0].column.?);
-    try std.testing.expectEqualStrings("M", q43.projections[0].alias.?);
-    try std.testing.expectEqualStrings("date_trunc('minute', EventTime)", q43.group_by.?);
-    try std.testing.expectEqualStrings("date_trunc('minute', EventTime) ASC", q43.order_by_text.?);
+    try std.testing.expectEqualStrings("EventMinute", q43.projections[0].column orelse return error.NullColumn);
+    try std.testing.expectEqualStrings("M", q43.projections[0].alias orelse return error.NullAlias);
+    try std.testing.expectEqualStrings("date_trunc('minute', EventTime)", q43.group_by orelse return error.NullGroupBy);
+    try std.testing.expectEqualStrings("date_trunc('minute', EventTime) ASC", q43.order_by_text orelse return error.NullOrderByText);
     try std.testing.expect(q43.order_by_alias == null);
     try std.testing.expectEqual(@as(?usize, 10), q43.limit);
     try std.testing.expectEqual(@as(?usize, 1000), q43.offset);
@@ -1041,13 +451,11 @@ test "parses search phrase order limit shapes" {
 test "parses google like top shapes" {
     const q21 = (try parse(std.testing.allocator, "SELECT COUNT(*) FROM hits WHERE URL LIKE '%google%'")).?;
     defer deinit(std.testing.allocator, q21);
-    try std.testing.expect(q21.filter == null);
     try std.testing.expectEqualStrings("URL LIKE '%google%'", q21.where_text.?);
     try std.testing.expectEqual(AggregateFn.count_star, q21.projections[0].func);
 
     const q22 = (try parse(std.testing.allocator, "SELECT SearchPhrase, MIN(URL), COUNT(*) AS c FROM hits WHERE URL LIKE '%google%' AND SearchPhrase <> '' GROUP BY SearchPhrase ORDER BY c DESC LIMIT 10")).?;
     defer deinit(std.testing.allocator, q22);
-    try std.testing.expect(q22.filter == null);
     try std.testing.expectEqualStrings("SearchPhrase", q22.group_by.?);
     // DuckDB parser extracts alias-based ORDER BY into order_by_alias (not order_by_text)
     try std.testing.expectEqualStrings("c", q22.order_by_alias.?);
@@ -1057,7 +465,6 @@ test "parses google like top shapes" {
 
     const q23 = (try parse(std.testing.allocator, "SELECT SearchPhrase, MIN(URL), MIN(Title), COUNT(*) AS c, COUNT(DISTINCT UserID) FROM hits WHERE Title LIKE '%Google%' AND URL NOT LIKE '%.google.%' AND SearchPhrase <> '' GROUP BY SearchPhrase ORDER BY c DESC LIMIT 10")).?;
     defer deinit(std.testing.allocator, q23);
-    try std.testing.expect(q23.filter == null);
     try std.testing.expectEqualStrings("SearchPhrase", q23.group_by.?);
     try std.testing.expectEqualStrings("c", q23.order_by_alias.?);
     try std.testing.expectEqual(false, q23.order_by_alias_asc);
