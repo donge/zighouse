@@ -158,11 +158,8 @@ pub const Server = struct {
             // Substitute $N parameters from URL query string params.
             const after_params = try substituteParams(self.allocator, target, trimmed_raw);
             defer self.allocator.free(after_params);
-            // Rewrite CH time functions to DuckDB equivalents.
-            const after_time = try rewriteTimeFunctions(self.allocator, after_params);
-            defer self.allocator.free(after_time);
             // Remove FINAL keyword (no-op in ZigHouse).
-            const trimmed_sql = try removeFinal(self.allocator, after_time);
+            const trimmed_sql = try removeFinal(self.allocator, after_params);
             defer self.allocator.free(trimmed_sql);
             try self.dispatchSql(request, out, trimmed_sql);
         } else {
@@ -203,11 +200,8 @@ pub const Server = struct {
             // Substitute $N parameters from URL query string params.
             const after_params = try substituteParams(self.allocator, target, trimmed_raw);
             defer self.allocator.free(after_params);
-            // Rewrite CH time functions to DuckDB equivalents.
-            const after_time = try rewriteTimeFunctions(self.allocator, after_params);
-            defer self.allocator.free(after_time);
             // Remove FINAL keyword (no-op in ZigHouse).
-            const trimmed = try removeFinal(self.allocator, after_time);
+            const trimmed = try removeFinal(self.allocator, after_params);
             defer self.allocator.free(trimmed);
             try self.dispatchSqlWithData(request, out, trimmed, data_part);
         }
@@ -1266,63 +1260,6 @@ fn removeFinal(allocator: std.mem.Allocator, sql: []const u8) ![]u8 {
         i += 1;
     }
     return result.toOwnedSlice(allocator);
-}
-
-/// Rewrite CH time functions to DuckDB equivalents:
-///   toStartOfMinute(col) → date_trunc('minute', col)
-///   toStartOfHour(col)   → date_trunc('hour', col)
-///   toStartOfDay(col)    → date_trunc('day', col)
-fn rewriteTimeFunctions(allocator: std.mem.Allocator, sql: []const u8) ![]u8 {
-    const replacements = [_]struct { from: []const u8, to_prefix: []const u8, unit: []const u8 }{
-        .{ .from = "toStartOfMinute", .to_prefix = "date_trunc", .unit = "'minute'" },
-        .{ .from = "toStartOfHour", .to_prefix = "date_trunc", .unit = "'hour'" },
-        .{ .from = "toStartOfDay", .to_prefix = "date_trunc", .unit = "'day'" },
-    };
-    var current = try allocator.dupe(u8, sql);
-    for (replacements) |rep| {
-        var result: std.ArrayList(u8) = .empty;
-        errdefer result.deinit(allocator);
-        var i: usize = 0;
-        while (i < current.len) {
-            if (i + rep.from.len <= current.len and
-                std.ascii.eqlIgnoreCase(current[i .. i + rep.from.len], rep.from))
-            {
-                // Check word boundary before
-                const before_ok = i == 0 or (!std.ascii.isAlphanumeric(current[i - 1]) and current[i - 1] != '_');
-                // Find opening paren
-                const after_fn = i + rep.from.len;
-                var j = after_fn;
-                while (j < current.len and current[j] == ' ') j += 1;
-                if (before_ok and j < current.len and current[j] == '(') {
-                    // Find matching closing paren
-                    var depth: usize = 0;
-                    var k = j;
-                    while (k < current.len) : (k += 1) {
-                        if (current[k] == '(') depth += 1 else if (current[k] == ')') {
-                            depth -= 1;
-                            if (depth == 0) break;
-                        }
-                    }
-                    if (k < current.len) {
-                        const inner = current[j + 1 .. k];
-                        try result.appendSlice(allocator, rep.to_prefix);
-                        try result.append(allocator, '(');
-                        try result.appendSlice(allocator, rep.unit);
-                        try result.appendSlice(allocator, ", ");
-                        try result.appendSlice(allocator, inner);
-                        try result.append(allocator, ')');
-                        i = k + 1;
-                        continue;
-                    }
-                }
-            }
-            try result.append(allocator, current[i]);
-            i += 1;
-        }
-        allocator.free(current);
-        current = try result.toOwnedSlice(allocator);
-    }
-    return current;
 }
 
 /// Extract a URL query parameter value from a path like `/?query=...&foo=bar`.

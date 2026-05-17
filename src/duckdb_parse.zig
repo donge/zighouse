@@ -7,6 +7,7 @@
 const std = @import("std");
 const build_options = @import("build_options");
 const generic_sql = @import("generic_sql.zig");
+const ch_compat = @import("ch_compat.zig");
 
 // ── C imports (DuckDB) ───────────────────────────────────────────────────────
 
@@ -70,9 +71,9 @@ fn serializeSql(allocator: std.mem.Allocator, sql: []const u8) !?[]u8 {
     const con = getConn();
     if (con == null) return error.DuckDbConnectFailed;
 
-    // Pre-process: replace ClickHouse-specific functions with DuckDB equivalents.
-    // any(x) → any_value(x)  (word-boundary match only)
-    const processed = try replaceClickHouseFuncs(allocator, sql);
+    // Pre-process: rewrite CH-specific grammar that DuckDB cannot parse.
+    // Returns null for constructs we cannot handle (e.g. ARRAY JOIN).
+    const processed = try ch_compat.rewrite(allocator, sql) orelse return null;
     defer allocator.free(processed);
 
     // Build: SELECT json_serialize_sql($$<sql>$$)
@@ -101,33 +102,6 @@ fn serializeSql(allocator: std.mem.Allocator, sql: []const u8) !?[]u8 {
 
     const json_slice = std.mem.span(raw);
     return try allocator.dupe(u8, json_slice);
-}
-
-/// Replace ClickHouse-specific aggregate functions with DuckDB equivalents.
-/// Replacements: any( → any_value(
-fn replaceClickHouseFuncs(allocator: std.mem.Allocator, sql: []const u8) ![]u8 {
-    var out: std.ArrayList(u8) = .empty;
-    defer out.deinit(allocator);
-    var i: usize = 0;
-    while (i < sql.len) {
-        // Check for "any(" with word boundary before
-        if (i + 4 <= sql.len and
-            std.mem.eql(u8, sql[i .. i + 4], "any(") and
-            (i == 0 or !isIdentChar(sql[i - 1])))
-        {
-            try out.appendSlice(allocator, "any_value(");
-            i += 4;
-            continue;
-        }
-        try out.append(allocator, sql[i]);
-        i += 1;
-    }
-    return try out.toOwnedSlice(allocator);
-}
-
-fn isIdentChar(c2: u8) bool {
-    return (c2 >= 'a' and c2 <= 'z') or (c2 >= 'A' and c2 <= 'Z') or
-           (c2 >= '0' and c2 <= '9') or c2 == '_';
 }
 
 // ── JSON AST → Plan translator ───────────────────────────────────────────────
