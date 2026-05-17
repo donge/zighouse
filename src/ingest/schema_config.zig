@@ -218,6 +218,26 @@ fn parseColumnType(s: []const u8) ?schema.ColumnType {
     if (asciiEql(s, "String")) return .text;
     if (asciiEql(s, "Float32")) return .float32;
     if (asciiEql(s, "Float64")) return .float64;
+    // Extended CH types: map to closest base type (ch_type preserved for wire encoding).
+    if (std.mem.startsWith(u8, s, "LowCardinality(")) return .text;
+    if (std.mem.startsWith(u8, s, "DateTime64(")) return .timestamp;
+    if (asciiEql(s, "IPv4")) return .text;
+    if (asciiEql(s, "IPv6")) return .text;
+    if (std.mem.startsWith(u8, s, "Array(")) return .text;
+    if (std.mem.startsWith(u8, s, "Map(")) return .text;
+    if (std.mem.startsWith(u8, s, "Nullable(")) return .text;
+    if (std.mem.startsWith(u8, s, "FixedString(")) return .text;
+    if (asciiEql(s, "UUID")) return .text;
+    if (asciiEql(s, "Bool")) return .int8;
+    if (std.mem.startsWith(u8, s, "Enum8(")) return .text;
+    if (std.mem.startsWith(u8, s, "Enum16(")) return .text;
+    if (std.mem.startsWith(u8, s, "Decimal(")) return .float64;
+    if (std.mem.startsWith(u8, s, "Decimal32(")) return .float64;
+    if (std.mem.startsWith(u8, s, "Decimal64(")) return .float64;
+    if (std.mem.startsWith(u8, s, "Decimal128(")) return .float64;
+    if (std.mem.startsWith(u8, s, "Tuple(")) return .text;
+    if (std.mem.startsWith(u8, s, "SimpleAggregateFunction(")) return .text;
+    if (std.mem.startsWith(u8, s, "AggregateFunction(")) return .text;
     return null;
 }
 

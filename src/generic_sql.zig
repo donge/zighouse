@@ -16,10 +16,11 @@ pub const AggregateFn = enum {
 ///   cond_col op cond_num   (e.g. confidence >= 0.9)
 ///   cond_col op cond_str   (e.g. data['is_foreign'] = 'true')
 pub const CondExpr = struct {
-    cond_col: []const u8,    // heap-allocated condition column name
-    cond_op:  CmpOp,
-    cond_num: f64 = 0,       // used when cond_str is null
+    cond_col: []const u8 = "",   // heap-allocated condition column name (empty when cond_text is set)
+    cond_op:  CmpOp = .eq,
+    cond_num: f64 = 0,       // used when cond_str and cond_text are null
     cond_str: ?[]const u8 = null, // heap-allocated; non-null for string comparisons
+    cond_text: ?[]const u8 = null, // heap-allocated; non-null for complex conditions (use evalTextBoolExpr)
 };
 
 pub const Expr = struct {
@@ -126,12 +127,7 @@ pub fn parse(allocator: std.mem.Allocator, sql: []const u8) !?Plan {
         }
         // If the DuckDB-parsed plan passes the looser generic shape check, accept
         // it for the generic executor path (GROUP BY, HAVING, arithmetic expressions, etc.)
-        // Exclude plans where DuckDB detected a DESC alias-based ORDER BY (those may
-        // belong to a specialised path that uses the legacy parser's structure).
-        const has_desc_alias_order = plan.order_by_alias != null and !plan.order_by_alias_asc;
-        if (!has_desc_alias_order and
-            validGenericShape(plan.projections, plan.having_text, plan.group_by))
-        {
+        if (validGenericShape(plan.projections, plan.having_text, plan.group_by)) {
             return plan;
         }
         // DuckDB-parsed plan did not match a supported shape; free it and fall
@@ -280,8 +276,9 @@ pub fn deinit(allocator: std.mem.Allocator, plan: Plan) void {
     // Always free cond expressions in projections (they are always heap-allocated).
     for (plan.projections) |expr| {
         if (expr.cond) |c| {
-            allocator.free(c.cond_col);
+            if (c.cond_col.len > 0) allocator.free(c.cond_col);
             if (c.cond_str) |s| allocator.free(s);
+            if (c.cond_text) |s| allocator.free(s);
             allocator.destroy(c);
         }
     }
@@ -1047,7 +1044,9 @@ test "parses google like top shapes" {
     defer deinit(std.testing.allocator, q22);
     try std.testing.expect(q22.filter == null);
     try std.testing.expectEqualStrings("SearchPhrase", q22.group_by.?);
-    try std.testing.expectEqualStrings("c DESC", q22.order_by_text.?);
+    // DuckDB parser extracts alias-based ORDER BY into order_by_alias (not order_by_text)
+    try std.testing.expectEqualStrings("c", q22.order_by_alias.?);
+    try std.testing.expectEqual(false, q22.order_by_alias_asc);
     try std.testing.expectEqual(AggregateFn.min, q22.projections[1].func);
     try std.testing.expectEqual(AggregateFn.count_star, q22.projections[2].func);
 
@@ -1055,7 +1054,8 @@ test "parses google like top shapes" {
     defer deinit(std.testing.allocator, q23);
     try std.testing.expect(q23.filter == null);
     try std.testing.expectEqualStrings("SearchPhrase", q23.group_by.?);
-    try std.testing.expectEqualStrings("c DESC", q23.order_by_text.?);
+    try std.testing.expectEqualStrings("c", q23.order_by_alias.?);
+    try std.testing.expectEqual(false, q23.order_by_alias_asc);
     try std.testing.expectEqual(AggregateFn.min, q23.projections[1].func);
     try std.testing.expectEqual(AggregateFn.min, q23.projections[2].func);
     try std.testing.expectEqual(AggregateFn.count_distinct, q23.projections[4].func);
@@ -1067,8 +1067,11 @@ test "parses URL length by counter shape" {
     try std.testing.expect(plan.filter != null);
     try std.testing.expectEqualStrings("URL", plan.filter.?.column);
     try std.testing.expectEqualStrings("CounterID", plan.group_by.?);
-    try std.testing.expectEqualStrings("COUNT(*) > 100000", plan.having_text.?);
-    try std.testing.expectEqualStrings("l DESC", plan.order_by_text.?);
+    // DuckDB normalizes COUNT(*) to count_star() in having_text
+    try std.testing.expect(std.mem.indexOf(u8, plan.having_text.?, "100000") != null);
+    // DuckDB parser extracts alias-based ORDER BY into order_by_alias
+    try std.testing.expectEqualStrings("l", plan.order_by_alias.?);
+    try std.testing.expectEqual(false, plan.order_by_alias_asc);
     try std.testing.expectEqualStrings("length(URL)", plan.projections[1].column.?);
     try std.testing.expectEqualStrings("l", plan.projections[1].alias.?);
     try std.testing.expectEqual(@as(?usize, 25), plan.limit);

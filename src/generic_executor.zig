@@ -951,6 +951,8 @@ const AggState = struct {
 /// Evaluate an optional inline condition (CondExpr) against the current row.
 fn evalCondExpr(cond: ?*const generic_sql.CondExpr, row: *const RowCtx) bool {
     const c = cond orelse return true; // no condition → always pass
+    // Complex text condition (CONJUNCTION, BETWEEN, etc.)
+    if (c.cond_text) |ct| return evalTextBoolExpr(ct, row);
     // Support data['key'] in cond_col via RowCtx.get
     const v = row.get(c.cond_col) orelse return false;
     if (c.cond_str) |sv| {
@@ -1505,9 +1507,12 @@ fn collectNeededColumns(
         }
         // Also collect columns from cond expressions (countIf/uniqExactIf)
         if (proj.cond) |cond| {
-            if (parseMapSubscript(cond.cond_col)) |sub| {
+            if (cond.cond_text != null) {
+                // For text conditions we load all columns (can't easily parse column refs)
+                // so just skip targeted collection; the row will have all columns anyway.
+            } else if (parseMapSubscript(cond.cond_col)) |sub| {
                 try add(allocator, &seen, needed, sub.col, table);
-            } else {
+            } else if (cond.cond_col.len > 0) {
                 try add(allocator, &seen, needed, cond.cond_col, table);
             }
         }

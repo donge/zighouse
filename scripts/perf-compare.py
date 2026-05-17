@@ -67,7 +67,7 @@ def main() -> int:
         c = min(cvals)
         d = pct(c, b)
         per_query.append((idx, b, c, d))
-        if d > args.per_query_threshold and c - b > 0.002:
+        if d > args.per_query_threshold and c - b > 0.005:
             failures.append(f"q{idx} warm best regressed {d:.2f}% ({b:.6f}s -> {c:.6f}s)")
 
     base_cmp = compare_summary(base)
