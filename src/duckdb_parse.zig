@@ -167,10 +167,18 @@ fn translateJsonInner(allocator: std.mem.Allocator, json: []const u8) !generic_s
 /// Translate a SELECT_NODE JSON object into a Plan (recursive for subqueries).
 fn translateSelectNode(allocator: std.mem.Allocator, node_obj: std.json.ObjectMap) anyerror!generic_sql.Plan {
     // ── table name ──────────────────────────────────────────────────────────
-    const from_table = node_obj.get("from_table") orelse return error.Unsupported;
+    // If there is no FROM clause (e.g. SELECT 1, SELECT now()), treat as
+    // FROM system.one — matches ClickHouse behaviour.
     var subquery_source: ?*generic_sql.Plan = null;
     errdefer if (subquery_source) |sq| { generic_sql.deinit(allocator, sq.*); allocator.destroy(sq); };
-    const table_name = try extractTableNameOrSubquery(allocator, from_table, &subquery_source) orelse return error.Unsupported;
+    const table_name = blk: {
+        const from_table = node_obj.get("from_table") orelse {
+            break :blk try allocator.dupe(u8, "system.one");
+        };
+        const name = try extractTableNameOrSubquery(allocator, from_table, &subquery_source) orelse
+            break :blk try allocator.dupe(u8, "system.one");
+        break :blk name;
+    };
     errdefer allocator.free(table_name);
 
     // ── WITH / CTE support: if from_table is a CTE name, inline it as subquery ─
