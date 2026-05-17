@@ -94,35 +94,49 @@ def enc_dt64_col(vals): return b"".join(u64le(v) for v in vals)  # ms since epoc
 def enc_ipv6_col(vals): return b"".join(ipv6_bytes(v) for v in vals)
 
 def enc_array_str_col(rows):
-    """Array(String): each row is a list of strings.
-    Wire: for each row: varuint(len) then len × ch_str
+    """Array(String): ClickHouse Native offset format.
+    Wire: uint64[num_rows] cumulative end-offsets, then all element strings concatenated.
     """
-    out = b""
+    # Compute cumulative offsets
+    offsets = b""
+    elements = b""
+    cumulative = 0
     for arr in rows:
-        out += varint(len(arr))
+        cumulative += len(arr)
+        offsets += u64le(cumulative)
         for s in arr:
-            out += ch_str(s)
-    return out
+            elements += ch_str(s)
+    return offsets + elements
 
 def enc_map_str_f64_col(rows):
-    """Map(String, Float64): each row is dict {str: float}.
-    Wire: varuint(size) then size × (ch_str key + f64le value)
+    """Map(String, Float64): ClickHouse Native offset format.
+    Wire: uint64[num_rows] cumulative pair-offsets, then all keys concatenated, then all values concatenated.
     """
-    out = b""
+    offsets = b""
+    keys = b""
+    vals = b""
+    cumulative = 0
     for d in rows:
-        out += varint(len(d))
+        cumulative += len(d)
+        offsets += u64le(cumulative)
         for k, v in d.items():
-            out += ch_str(k) + f64le(v)
-    return out
+            keys += ch_str(k)
+            vals += f64le(v)
+    return offsets + keys + vals
 
 def enc_map_str_str_col(rows):
-    """Map(String, String)"""
-    out = b""
+    """Map(String, String): ClickHouse Native offset format."""
+    offsets = b""
+    keys = b""
+    vals = b""
+    cumulative = 0
     for d in rows:
-        out += varint(len(d))
+        cumulative += len(d)
+        offsets += u64le(cumulative)
         for k, v in d.items():
-            out += ch_str(k) + ch_str(v)
-    return out
+            keys += ch_str(k)
+            vals += ch_str(v)
+    return offsets + keys + vals
 
 def block_header(num_cols, num_rows):
     return varint(num_cols) + varint(num_rows)

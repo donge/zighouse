@@ -6108,6 +6108,8 @@ fn executeGenericFilteredProjection(native: *Native, expr: generic_sql.Expr, hot
         .int_literal => unreachable,
         .count_distinct => error.UnsupportedGenericQuery,
         .count_star => unreachable,
+        .count_if, .uniq_exact, .uniq_exact_if,
+        .group_uniq_array, .any_val => error.UnsupportedGenericQuery,
         .sum => aggregateSum(column, predicate, expr.int_offset),
         .avg => aggregateAvg(column, predicate),
         .min => aggregateMin(column, predicate),
@@ -6179,6 +6181,11 @@ fn writeGenericHeader(out: *std.ArrayList(u8), allocator: std.mem.Allocator, pla
             .avg => try out.print(allocator, "avg({s})", .{expr.column.?}),
             .min => try out.print(allocator, "min({s})", .{expr.column.?}),
             .max => try out.print(allocator, "max({s})", .{expr.column.?}),
+            .count_if => try out.appendSlice(allocator, "countIf(...)"),
+            .uniq_exact => try out.print(allocator, "uniqExact({s})", .{expr.column orelse ""}),
+            .uniq_exact_if => try out.print(allocator, "uniqExactIf({s},...)", .{expr.column orelse ""}),
+            .group_uniq_array => try out.print(allocator, "groupUniqArray({s})", .{expr.column orelse ""}),
+            .any_val => try out.print(allocator, "any({s})", .{expr.column orelse ""}),
         }
     }
     try out.append(allocator, '\n');

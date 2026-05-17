@@ -1,13 +1,36 @@
 const std = @import("std");
 const duckdb_parse = @import("duckdb_parse.zig");
 
-pub const AggregateFn = enum { column_ref, int_literal, count_star, count_distinct, sum, avg, min, max };
+pub const AggregateFn = enum {
+    column_ref, int_literal,
+    count_star, count_distinct,
+    count_if,         // countIf(expr) — condition stored in cond_col/cond_op/cond_val
+    sum, avg, min, max,
+    uniq_exact,       // uniqExact(col) — exact distinct count using string set
+    uniq_exact_if,    // uniqExactIf(col, cond) — conditional exact distinct
+    group_uniq_array, // groupUniqArray(col) — array of distinct values (joined as string)
+    any_val,          // any(col) — first non-null value
+};
+
+/// Optional inline condition for countIf / uniqExactIf:
+///   cond_col op cond_num   (e.g. confidence >= 0.9)
+///   cond_col op cond_str   (e.g. data['is_foreign'] = 'true')
+pub const CondExpr = struct {
+    cond_col: []const u8,    // heap-allocated condition column name
+    cond_op:  CmpOp,
+    cond_num: f64 = 0,       // used when cond_str is null
+    cond_str: ?[]const u8 = null, // heap-allocated; non-null for string comparisons
+};
 
 pub const Expr = struct {
     func: AggregateFn,
     column: ?[]const u8 = null,
     int_offset: i64 = 0,
     alias: ?[]const u8 = null,
+    /// Inline condition for countIf / uniqExactIf (owned, free in deinit).
+    cond: ?*CondExpr = null,
+    /// Separator for group_uniq_array result (default ", "). Owned when plan.owned=true.
+    sep: ?[]const u8 = null,
 };
 
 // ── WhereNode: generic predicate tree ─────────────────────────────────────────
@@ -254,6 +277,14 @@ fn parseLegacy(allocator: std.mem.Allocator, sql: []const u8) !?Plan {
 
 pub fn deinit(allocator: std.mem.Allocator, plan: Plan) void {
     if (plan.where_expr) |we| freeWhereNode(allocator, we);
+    // Always free cond expressions in projections (they are always heap-allocated).
+    for (plan.projections) |expr| {
+        if (expr.cond) |c| {
+            allocator.free(c.cond_col);
+            if (c.cond_str) |s| allocator.free(s);
+            allocator.destroy(c);
+        }
+    }
     if (plan.owned) {
         allocator.free(plan.table);
         if (plan.where_text) |s| allocator.free(s);
@@ -265,6 +296,7 @@ pub fn deinit(allocator: std.mem.Allocator, plan: Plan) void {
         for (plan.projections) |expr| {
             if (expr.alias) |a| allocator.free(a);
             if (expr.column) |col| allocator.free(col);
+            if (expr.sep) |s| allocator.free(s);
         }
     }
     allocator.free(plan.projections);

@@ -149,15 +149,40 @@ pub const RowBinaryDecoder = struct {
                         pos += 8;
                     },
                     .text, .char => {
-                        const len, const var_bytes = readVarUInt(data[pos..]) orelse
-                            return error.UnexpectedEndOfData;
-                        pos += var_bytes;
-                        if (len > MAX_STRING_LEN) return error.StringTooLong;
-                        if (pos + len > data.len) return error.UnexpectedEndOfData;
-                        const start = buf.str_bytes.items.len;
-                        try buf.str_bytes.appendSlice(self.allocator, data[pos..][0..len]);
-                        try buf.str_vals.append(self.allocator, buf.str_bytes.items[start..]);
-                        pos += len;
+                        // Dispatch based on ch_type for special encodings.
+                        const ch_ty = col.ch_type orelse "";
+                        if (chTypeEql(ch_ty, "IPv6")) {
+                            // IPv6: fixed 16 bytes raw
+                            if (pos + 16 > data.len) return error.UnexpectedEndOfData;
+                            const start = buf.str_bytes.items.len;
+                            try buf.str_bytes.appendSlice(self.allocator, data[pos..][0..16]);
+                            try buf.str_vals.append(self.allocator, buf.str_bytes.items[start..]);
+                            pos += 16;
+                        } else if (chTypeEql(ch_ty, "IPv4")) {
+                            // IPv4: fixed 4 bytes raw
+                            if (pos + 4 > data.len) return error.UnexpectedEndOfData;
+                            const start = buf.str_bytes.items.len;
+                            try buf.str_bytes.appendSlice(self.allocator, data[pos..][0..4]);
+                            try buf.str_vals.append(self.allocator, buf.str_bytes.items[start..]);
+                            pos += 4;
+                        } else if (chTypeStartsWith(ch_ty, "Array(")) {
+                            // Array(T) RowBinary: varint count + count * T values
+                            pos = try decodeRowBinaryArrayOrMap(self.allocator, ch_ty, data, pos, buf);
+                        } else if (chTypeStartsWith(ch_ty, "Map(")) {
+                            // Map(K,V) RowBinary: varint count + count * (K, V) pairs
+                            pos = try decodeRowBinaryArrayOrMap(self.allocator, ch_ty, data, pos, buf);
+                        } else {
+                            // Plain String / LowCardinality(String) / etc.
+                            const len, const var_bytes = readVarUInt(data[pos..]) orelse
+                                return error.UnexpectedEndOfData;
+                            pos += var_bytes;
+                            if (len > MAX_STRING_LEN) return error.StringTooLong;
+                            if (pos + len > data.len) return error.UnexpectedEndOfData;
+                            const start = buf.str_bytes.items.len;
+                            try buf.str_bytes.appendSlice(self.allocator, data[pos..][0..len]);
+                            try buf.str_vals.append(self.allocator, buf.str_bytes.items[start..]);
+                            pos += len;
+                        }
                     },
                 }
             }
@@ -227,26 +252,35 @@ pub fn decodeWithHeader(allocator: std.mem.Allocator, data: []const u8) !WithHea
         pos += len;
     }
 
-    // Read column types → schema.ColumnType
+    // Read column types → schema.ColumnType + raw type strings
     const col_types = try allocator.alloc(schema.ColumnType, num_cols);
     defer allocator.free(col_types);
+    const col_type_strs = try allocator.alloc([]u8, num_cols);
+    var type_strs_read: usize = 0;
+    errdefer {
+        for (col_type_strs[0..type_strs_read]) |ts| allocator.free(ts);
+        allocator.free(col_type_strs);
+    }
 
-    for (col_types) |*ty| {
+    for (col_types, col_type_strs) |*ty, *ts| {
         const len, const lb = readVarUInt(data[pos..]) orelse return error.UnexpectedEndOfData;
         pos += lb;
         if (pos + len > data.len) return error.UnexpectedEndOfData;
         const type_str = data[pos .. pos + len];
         pos += len;
         ty.* = parseChType(type_str) orelse return error.UnsupportedColumnType;
+        ts.* = try allocator.dupe(u8, type_str);
+        type_strs_read += 1;
     }
 
     // Build schema.Table columns
     const columns = try allocator.alloc(schema.Column, num_cols);
     errdefer allocator.free(columns);
-    for (columns, col_names, col_types) |*col, name, ty| {
-        col.* = .{ .name = name, .ty = ty };
+    for (columns, col_names, col_types, col_type_strs) |*col, name, ty, ts| {
+        col.* = .{ .name = name, .ty = ty, .ch_type = ts };
     }
     allocator.free(col_names); // slice itself (names owned by columns now)
+    allocator.free(col_type_strs); // slice itself (type strs owned by columns now)
 
     const table = schema.Table{ .name = "", .columns = columns };
 
@@ -348,10 +382,12 @@ pub fn decodeNativeBlock(allocator: std.mem.Allocator, data: []const u8) !WithHe
 
         // Dupe the original CH type string so we can persist it in the schema.
         const ch_type_owned = try allocator.dupe(u8, type_str);
-        errdefer allocator.free(ch_type_owned);
+        var ch_type_transferred = false;
+        errdefer if (!ch_type_transferred) allocator.free(ch_type_owned);
 
         columns[ci] = .{ .name = name_owned, .ty = col_ty, .ch_type = ch_type_owned };
         name_transferred = true;
+        ch_type_transferred = true;
         cols_inited += 1;
 
         col_bufs[ci] = ColumnBuffer.init(columns[ci]);
@@ -626,6 +662,82 @@ fn measureNativeValue(type_str: []const u8, data: []const u8, pos: usize) !usize
     }
     // Tuple / other: unsupported, return error
     return error.UnsupportedColumnType;
+}
+
+/// Decode one Array(T) or Map(K,V) value from RowBinary (row-by-row format).
+/// RowBinary Array: varint(count) + count * element  → store raw bytes as-is
+/// RowBinary Map:   varint(count) + count*(key,val)  → re-encode as keys_section+values_section
+/// (the re-encoded Map format matches what lookupMapBlob in generic_executor expects)
+fn decodeRowBinaryArrayOrMap(
+    allocator: std.mem.Allocator,
+    type_str: []const u8,
+    data: []const u8,
+    pos: usize,
+    col_buf: *ColumnBuffer,
+) !usize {
+    if (chTypeStartsWith(type_str, "Map(")) {
+        // Parse Map(K, V) interleaved RowBinary format, re-encode as keys||values blob.
+        const count, const cb = readVarUInt(data[pos..]) orelse return error.UnexpectedEndOfData;
+        const p = pos + cb;
+
+        const inner = extractInner(type_str);
+        var ktype: []const u8 = inner;
+        var vtype: []const u8 = "";
+        {
+            var depth: usize = 0;
+            for (inner, 0..) |c, ii| {
+                if (c == '(') depth += 1
+                else if (c == ')') depth -= 1
+                else if (c == ',' and depth == 0) {
+                    ktype = std.mem.trim(u8, inner[0..ii], " ");
+                    vtype = std.mem.trim(u8, inner[ii+1..], " ");
+                    break;
+                }
+            }
+        }
+
+        // Collect key sizes and value sizes first pass.
+        var key_sizes = try allocator.alloc(usize, count);
+        defer allocator.free(key_sizes);
+        var val_sizes = try allocator.alloc(usize, count);
+        defer allocator.free(val_sizes);
+
+        var scan = p;
+        for (0..count) |i| {
+            const ksz = try measureNativeValue(ktype, data, scan);
+            key_sizes[i] = ksz;
+            scan += ksz;
+            const vsz = try measureNativeValue(vtype, data, scan);
+            val_sizes[i] = vsz;
+            scan += vsz;
+        }
+        const end_pos = scan;
+
+        // Build keys section then values section.
+        const start = col_buf.str_bytes.items.len;
+        // Keys pass: data[p] = k0,v0,k1,v1,...
+        var kp = p;
+        for (0..count) |i| {
+            try col_buf.str_bytes.appendSlice(allocator, data[kp..][0..key_sizes[i]]);
+            kp += key_sizes[i] + val_sizes[i];
+        }
+        // Values pass: skip over keys to reach values
+        var vp2 = p;
+        for (0..count) |i| {
+            vp2 += key_sizes[i]; // skip key
+            try col_buf.str_bytes.appendSlice(allocator, data[vp2..][0..val_sizes[i]]);
+            vp2 += val_sizes[i]; // skip val
+        }
+        try col_buf.str_vals.append(allocator, col_buf.str_bytes.items[start..]);
+        return end_pos;
+    }
+
+    // Array or other: store raw bytes as-is (varint count + elements).
+    const sz = try measureNativeValue(type_str, data, pos);
+    const start = col_buf.str_bytes.items.len;
+    try col_buf.str_bytes.appendSlice(allocator, data[pos..][0..sz]);
+    try col_buf.str_vals.append(allocator, col_buf.str_bytes.items[start..]);
+    return pos + sz;
 }
 
 /// Decode `num_rows` values from a Native Block for a .text-mapped column.

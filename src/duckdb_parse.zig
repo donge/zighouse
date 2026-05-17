@@ -420,6 +420,92 @@ fn parseCmpOp(type_str: []const u8) ?generic_sql.CmpOp {
     return null;
 }
 
+/// Parse a simple comparison node like `confidence >= 0.9` or `col = 'str'`
+/// into a CondExpr (heap-allocated; caller owns it via deinit).
+fn parseCondExpr(allocator: std.mem.Allocator, val: std.json.Value) !?*generic_sql.CondExpr {
+    if (val == .null) return null;
+    const obj = val.object;
+    const class = (obj.get("class") orelse return null).string;
+    if (!std.mem.eql(u8, class, "COMPARISON")) return null;
+
+    const type_str = (obj.get("type") orelse return null).string;
+    const op = parseCmpOp(type_str) orelse return null;
+
+    // DuckDB COMPARISON nodes use "left"/"right" keys (not "children").
+    const left_node = obj.get("left") orelse return null;
+    const right_node = obj.get("right") orelse return null;
+
+    // Left side: column reference or expression (encode as text)
+    const col_name = blk: {
+        if (columnName(left_node)) |cn| {
+            break :blk try allocator.dupe(u8, cn);
+        }
+        // fallback: expression as text
+        break :blk try exprToText(allocator, left_node) orelse return null;
+    };
+    errdefer allocator.free(col_name);
+
+    // Right side: numeric or string constant
+    if (floatLiteralValue(right_node)) |fv| {
+        const cond = try allocator.create(generic_sql.CondExpr);
+        cond.* = .{ .cond_col = col_name, .cond_op = op, .cond_num = fv };
+        return cond;
+    }
+    if (strLiteralValue(right_node)) |sv| {
+        const sv_dup = try allocator.dupe(u8, sv);
+        const cond = try allocator.create(generic_sql.CondExpr);
+        cond.* = .{ .cond_col = col_name, .cond_op = op, .cond_str = sv_dup };
+        return cond;
+    }
+    if (intLiteralValue(right_node)) |iv| {
+        const cond = try allocator.create(generic_sql.CondExpr);
+        cond.* = .{ .cond_col = col_name, .cond_op = op, .cond_num = @floatFromInt(iv) };
+        return cond;
+    }
+
+    allocator.free(col_name);
+    return null;
+}
+
+/// Extract a float literal value from a CONSTANT node (also handles int and DECIMAL).
+fn floatLiteralValue(val: std.json.Value) ?f64 {
+    if (val == .null) return null;
+    const obj = val.object;
+    const class = (obj.get("class") orelse return null).string;
+    if (!std.mem.eql(u8, class, "CONSTANT")) return null;
+    const v = obj.get("value").?.object;
+    const raw = v.get("value") orelse return null;
+    const base: f64 = switch (raw) {
+        .float => |f| f,
+        .integer => |i| @floatFromInt(i),
+        else => return null,
+    };
+    // DECIMAL type: value is stored as an integer scaled by 10^scale.
+    if (v.get("type")) |type_node| {
+        if (type_node == .object) {
+            const type_id = (type_node.object.get("id") orelse return base).string;
+            if (std.mem.eql(u8, type_id, "DECIMAL")) {
+                if (type_node.object.get("type_info")) |ti| {
+                    if (ti == .object) {
+                        if (ti.object.get("scale")) |scale_node| {
+                            const scale: i64 = switch (scale_node) {
+                                .integer => |i| i,
+                                else => 0,
+                            };
+                            if (scale > 0) {
+                                var divisor: f64 = 1.0;
+                                for (0..@intCast(scale)) |_| divisor *= 10.0;
+                                return base / divisor;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return base;
+}
+
 /// Extract a string/date/timestamp literal value from a CONSTANT node.
 fn strLiteralValue(val: std.json.Value) ?[]const u8 {
     if (val == .null) return null;
@@ -578,11 +664,90 @@ fn translateExpr(allocator: std.mem.Allocator, val: std.json.Value) !?generic_sq
             const col = try allocator.dupe(u8, child_col);
             return .{ .func = .column_ref, .column = col, .alias = alias };
         }
-        // date_trunc('minute', EventTime) → column_ref "EventMinute" (matches group key)
+        // countIf(expr) — condition is the argument expression
+        if (std.mem.eql(u8, fn_name, "countif") and children.len == 1) {
+            const cond = try parseCondExpr(allocator, children[0]) orelse return null;
+            return .{ .func = .count_if, .column = null, .alias = alias, .cond = cond };
+        }
+        // uniqExact(col)
+        if ((std.mem.eql(u8, fn_name, "uniqexact") or std.mem.eql(u8, fn_name, "approx_count_distinct")) and children.len == 1) {
+            const child_col = columnName(children[0]) orelse {
+                // Could be an expression like if(...)
+                const col = try exprToText(allocator, children[0]) orelse return null;
+                return .{ .func = .uniq_exact, .column = col, .alias = alias };
+            };
+            const col = try allocator.dupe(u8, child_col);
+            return .{ .func = .uniq_exact, .column = col, .alias = alias };
+        }
+        // uniqExactIf(col, cond)
+        if (std.mem.eql(u8, fn_name, "uniqexactif") and children.len == 2) {
+            const child_col = columnName(children[0]) orelse {
+                const col = try exprToText(allocator, children[0]) orelse return null;
+                const cond = try parseCondExpr(allocator, children[1]) orelse {
+                    allocator.free(col);
+                    return null;
+                };
+                return .{ .func = .uniq_exact_if, .column = col, .alias = alias, .cond = cond };
+            };
+            const col = try allocator.dupe(u8, child_col);
+            const cond = try parseCondExpr(allocator, children[1]) orelse {
+                allocator.free(col);
+                return null;
+            };
+            return .{ .func = .uniq_exact_if, .column = col, .alias = alias, .cond = cond };
+        }
+        // groupUniqArray(col) — array agg of distinct values
+        if (std.mem.eql(u8, fn_name, "groupuniqarray") and children.len == 1) {
+            const child_col = columnName(children[0]) orelse return null;
+            const col = try allocator.dupe(u8, child_col);
+            return .{ .func = .group_uniq_array, .column = col, .alias = alias };
+        }
+        // arrayStringConcat(groupUniqArray(col), sep) → group_uniq_array with sep
+        if (std.mem.eql(u8, fn_name, "arraystringconcat") and children.len >= 1) {
+            const inner = children[0];
+            const inner_obj = inner.object;
+            const inner_class = (inner_obj.get("class") orelse return null).string;
+            if (std.mem.eql(u8, inner_class, "FUNCTION")) {
+                const inner_fn = inner_obj.get("function_name").?.string;
+                if (std.mem.eql(u8, inner_fn, "groupuniqarray")) {
+                    const inner_children = inner_obj.get("children").?.array.items;
+                    if (inner_children.len == 1) {
+                        const child_col = columnName(inner_children[0]) orelse return null;
+                        const col = try allocator.dupe(u8, child_col);
+                        const sep: ?[]const u8 = if (children.len >= 2)
+                            if (strLiteralValue(children[1])) |sv| try allocator.dupe(u8, sv) else null
+                        else null;
+                        return .{ .func = .group_uniq_array, .column = col, .alias = alias, .sep = sep };
+                    }
+                }
+            }
+            // arrayStringConcat(some_array_expr, sep) — generic: treat inner as col reference
+            if (columnName(inner)) |cn| {
+                const col = try allocator.dupe(u8, cn);
+                const sep: ?[]const u8 = if (children.len >= 2)
+                    if (strLiteralValue(children[1])) |sv| try allocator.dupe(u8, sv) else null
+                else null;
+                return .{ .func = .group_uniq_array, .column = col, .alias = alias, .sep = sep };
+            }
+            return null;
+        }
+        // any(col) / any_value(col)
+        if ((std.mem.eql(u8, fn_name, "any") or std.mem.eql(u8, fn_name, "any_value") or std.mem.eql(u8, fn_name, "first")) and children.len == 1) {
+            const child_col = columnName(children[0]) orelse return null;
+            const col = try allocator.dupe(u8, child_col);
+            return .{ .func = .any_val, .column = col, .alias = alias };
+        }
+        // date_trunc('minute'/'hour'/'day', EventTime) → column_ref "EventMinute"/"EventHour"/"EventDay"
         if (std.mem.eql(u8, fn_name, "date_trunc") and children.len == 2) {
-            if (isConstantString(children[0], "minute")) {
-                if (columnName(children[1])) |_| {
+            if (columnName(children[1])) |_| {
+                if (isConstantString(children[0], "minute")) {
                     const col = try allocator.dupe(u8, "EventMinute");
+                    return .{ .func = .column_ref, .column = col, .alias = alias };
+                } else if (isConstantString(children[0], "hour")) {
+                    const col = try allocator.dupe(u8, "EventHour");
+                    return .{ .func = .column_ref, .column = col, .alias = alias };
+                } else if (isConstantString(children[0], "day")) {
+                    const col = try allocator.dupe(u8, "EventDay");
                     return .{ .func = .column_ref, .column = col, .alias = alias };
                 }
             }

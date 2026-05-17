@@ -154,8 +154,17 @@ pub const Server = struct {
                 try sendResponse(request, out, .bad_request, "Failed to decode query parameter\n");
                 return;
             };
-            const trimmed = std.mem.trim(u8, decoded, " \t\r\n");
-            try self.dispatchSql(request, out, trimmed);
+            const trimmed_raw = std.mem.trim(u8, decoded, " \t\r\n");
+            // Substitute $N parameters from URL query string params.
+            const after_params = try substituteParams(self.allocator, target, trimmed_raw);
+            defer self.allocator.free(after_params);
+            // Rewrite CH time functions to DuckDB equivalents.
+            const after_time = try rewriteTimeFunctions(self.allocator, after_params);
+            defer self.allocator.free(after_time);
+            // Remove FINAL keyword (no-op in ZigHouse).
+            const trimmed_sql = try removeFinal(self.allocator, after_time);
+            defer self.allocator.free(trimmed_sql);
+            try self.dispatchSql(request, out, trimmed_sql);
         } else {
             // clickhouse-go sends SQL in POST body.
             // The body may contain: just the SQL (DDL/SELECT), or SQL\ndata (INSERT).
@@ -186,11 +195,20 @@ pub const Server = struct {
             const sql_part = if (nl) |n| body[0..n] else body;
             const data_part = if (nl) |n| body[n + 1 ..] else body[body.len..];
 
-            const trimmed = std.mem.trim(u8, sql_part, " \t\r\n");
-            if (trimmed.len == 0) {
+            const trimmed_raw = std.mem.trim(u8, sql_part, " \t\r\n");
+            if (trimmed_raw.len == 0) {
                 try sendResponse(request, out, .bad_request, "Empty query\n");
                 return;
             }
+            // Substitute $N parameters from URL query string params.
+            const after_params = try substituteParams(self.allocator, target, trimmed_raw);
+            defer self.allocator.free(after_params);
+            // Rewrite CH time functions to DuckDB equivalents.
+            const after_time = try rewriteTimeFunctions(self.allocator, after_params);
+            defer self.allocator.free(after_time);
+            // Remove FINAL keyword (no-op in ZigHouse).
+            const trimmed = try removeFinal(self.allocator, after_time);
+            defer self.allocator.free(trimmed);
             try self.dispatchSqlWithData(request, out, trimmed, data_part);
         }
     }
@@ -204,6 +222,13 @@ pub const Server = struct {
             try self.handleCreate(request, out, trimmed);
         } else if (asciiStartsWith(trimmed, "TRUNCATE")) {
             // TRUNCATE TABLE <name> — no-op
+            try sendResponse(request, out, .ok, "");
+        } else if (asciiStartsWith(trimmed, "DROP") or
+                   asciiStartsWith(trimmed, "SYSTEM") or
+                   asciiStartsWith(trimmed, "ALTER") or
+                   asciiStartsWith(trimmed, "SET"))
+        {
+            // DDL/admin commands we don't need to implement — no-op
             try sendResponse(request, out, .ok, "");
         } else {
             try sendResponse(request, out, .bad_request, "Only CREATE TABLE, INSERT and SELECT are supported\n");
@@ -226,6 +251,7 @@ pub const Server = struct {
             defer self.allocator.free(empty);
             try sendNativeBlock(self.allocator, request, out, empty);
         } else {
+            // Other DDL/admin commands (SYSTEM, DROP, ALTER, SET, etc.) — no-op
             const empty = try native_block.encodeEmpty(self.allocator);
             defer self.allocator.free(empty);
             try sendNativeBlock(self.allocator, request, out, empty);
@@ -246,6 +272,16 @@ pub const Server = struct {
 
         // CREATE DATABASE — no-op.
         if (asciiEql(second2, "DATABASE")) {
+            try sendResponse(request, out, .ok, "");
+            return;
+        }
+        // CREATE DICTIONARY — no-op (dictionary support is not implemented yet).
+        if (asciiEql(second2, "DICTIONARY")) {
+            try sendResponse(request, out, .ok, "");
+            return;
+        }
+        // CREATE VIEW — no-op.
+        if (asciiEql(second2, "VIEW")) {
             try sendResponse(request, out, .ok, "");
             return;
         }
@@ -285,7 +321,7 @@ pub const Server = struct {
 
     // ── INSERT handler ─────────────────────────────────────────────────────────
 
-    fn handleInsert(self: *Server, request: *std.http.Server.Request, out: *std.Io.Writer, sql: []const u8) !void {
+     fn handleInsert(self: *Server, request: *std.http.Server.Request, out: *std.Io.Writer, sql: []const u8) !void {
         // Detect format: RowBinary vs RowBinaryWithNamesAndTypes
         const insert_info = parseInsertTarget(sql) orelse {
             try sendResponse(request, out, .bad_request,
@@ -707,6 +743,14 @@ pub const Server = struct {
             return;
         }
 
+        // CREATE DICTIONARY / VIEW — no-op.
+        if (asciiEql(second, "DICTIONARY") or asciiEql(second, "VIEW")) {
+            const empty = try native_block.encodeEmpty(self.allocator);
+            defer self.allocator.free(empty);
+            try sendNativeBlock(self.allocator, request, out, empty);
+            return;
+        }
+
         // CREATE OR REPLACE FUNCTION / CREATE FUNCTION — no-op.
         if (asciiEql(second, "FUNCTION") or
             (asciiEql(second, "OR") and asciiEql(third, "REPLACE")))
@@ -1082,6 +1126,203 @@ fn sendNativeBlock(allocator: std.mem.Allocator, request: *std.http.Server.Reque
     });
     _ = allocator;
     try out.flush();
+}
+
+/// Substitute positional parameters ($1, $2, …) in `sql` using `param_N=value`
+/// entries from the URL `target`.  Returns the substituted SQL (heap-allocated;
+/// caller owns it) or the original slice if there are no parameters to replace.
+/// Parameter values are URL-decoded and SQL-quoted:
+///   - Looks like a number (int or float)  → inserted verbatim
+///   - Otherwise                            → wrapped in single quotes (') with
+///     internal single-quotes escaped as ''
+fn substituteParams(allocator: std.mem.Allocator, target: []const u8, sql: []const u8) ![]u8 {
+    // Quick check: does the SQL even contain a '$'?
+    if (std.mem.indexOfScalar(u8, sql, '$') == null) return allocator.dupe(u8, sql);
+
+    // Collect param_N=value entries.  Support up to 16 params.
+    const max_params = 16;
+    var param_vals: [max_params]?[]u8 = [_]?[]u8{null} ** max_params;
+    defer {
+        for (param_vals) |pv| if (pv) |v| allocator.free(v);
+    }
+
+    const q_start = std.mem.indexOfScalar(u8, target, '?') orelse target.len;
+    var rest = target[q_start..];
+    // strip leading '?'
+    if (rest.len > 0 and rest[0] == '?') rest = rest[1..];
+    while (rest.len > 0) {
+        const amp = std.mem.indexOfScalar(u8, rest, '&') orelse rest.len;
+        const kv = rest[0..amp];
+        rest = if (amp < rest.len) rest[amp + 1 ..] else "";
+        const eq = std.mem.indexOfScalar(u8, kv, '=') orelse continue;
+        const key = kv[0..eq];
+        const raw_val = kv[eq + 1 ..];
+        // Check prefix "param_" (case-sensitive per ClickHouse spec)
+        if (!std.mem.startsWith(u8, key, "param_")) continue;
+        const num_str = key["param_".len..];
+        const idx = std.fmt.parseInt(usize, num_str, 10) catch continue;
+        if (idx < 1 or idx > max_params) continue;
+        // URL-decode value
+        const decode_buf = try allocator.alloc(u8, raw_val.len);
+        defer allocator.free(decode_buf);
+        const decoded = urlDecode(raw_val, decode_buf) catch raw_val;
+        // Store SQL-quoted value
+        const quoted = try sqlQuoteParam(allocator, decoded);
+        param_vals[idx - 1] = quoted;
+    }
+
+    // Replace each $N in sql with the corresponding value.
+    var result: std.ArrayList(u8) = .empty;
+    errdefer result.deinit(allocator);
+    var i: usize = 0;
+    while (i < sql.len) {
+        if (sql[i] == '$') {
+            // Parse digits after '$'
+            var j = i + 1;
+            while (j < sql.len and std.ascii.isDigit(sql[j])) : (j += 1) {}
+            if (j > i + 1) {
+                const n = std.fmt.parseInt(usize, sql[i + 1 .. j], 10) catch {
+                    try result.append(allocator, sql[i]);
+                    i += 1;
+                    continue;
+                };
+                if (n >= 1 and n <= max_params) {
+                    if (param_vals[n - 1]) |val| {
+                        try result.appendSlice(allocator, val);
+                        i = j;
+                        continue;
+                    }
+                }
+            }
+        }
+        try result.append(allocator, sql[i]);
+        i += 1;
+    }
+    return result.toOwnedSlice(allocator);
+}
+
+/// SQL-quote a parameter value: numbers pass through verbatim; strings get
+/// wrapped in single quotes with internal single-quotes escaped as ''.
+fn sqlQuoteParam(allocator: std.mem.Allocator, val: []const u8) ![]u8 {
+    // If it looks like an integer or float, pass verbatim.
+    if (isNumericLiteral(val)) return allocator.dupe(u8, val);
+    // Otherwise quote as string.
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    try buf.append(allocator, '\'');
+    for (val) |c| {
+        if (c == '\'') try buf.append(allocator, '\''); // escape ''
+        try buf.append(allocator, c);
+    }
+    try buf.append(allocator, '\'');
+    return buf.toOwnedSlice(allocator);
+}
+
+fn isNumericLiteral(s: []const u8) bool {
+    if (s.len == 0) return false;
+    var i: usize = 0;
+    if (s[0] == '-') i = 1;
+    if (i >= s.len) return false;
+    var has_dot = false;
+    while (i < s.len) : (i += 1) {
+        if (s[i] == '.') {
+            if (has_dot) return false;
+            has_dot = true;
+        } else if (!std.ascii.isDigit(s[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// Remove FINAL keyword from SQL (used by ReplacingMergeTree; no-op in ZigHouse).
+/// Returns a heap-allocated copy with FINAL removed (caller owns it), or a dupe
+/// of the original if FINAL was not present.
+fn removeFinal(allocator: std.mem.Allocator, sql: []const u8) ![]u8 {
+    // Case-insensitive search for word-boundary FINAL
+    var result: std.ArrayList(u8) = .empty;
+    errdefer result.deinit(allocator);
+    var i: usize = 0;
+    while (i < sql.len) {
+        // Check for FINAL at word boundary
+        const final_kw = "FINAL";
+        if (i + final_kw.len <= sql.len and
+            std.ascii.eqlIgnoreCase(sql[i .. i + final_kw.len], final_kw))
+        {
+            const before_ok = i == 0 or !std.ascii.isAlphanumeric(sql[i - 1]) and sql[i - 1] != '_';
+            const after_pos = i + final_kw.len;
+            const after_ok = after_pos >= sql.len or (!std.ascii.isAlphanumeric(sql[after_pos]) and sql[after_pos] != '_');
+            if (before_ok and after_ok) {
+                // Skip FINAL + any trailing space
+                i = after_pos;
+                // Remove one preceding space if present
+                if (result.items.len > 0 and result.items[result.items.len - 1] == ' ') {
+                    result.items.len -= 1;
+                }
+                continue;
+            }
+        }
+        try result.append(allocator, sql[i]);
+        i += 1;
+    }
+    return result.toOwnedSlice(allocator);
+}
+
+/// Rewrite CH time functions to DuckDB equivalents:
+///   toStartOfMinute(col) → date_trunc('minute', col)
+///   toStartOfHour(col)   → date_trunc('hour', col)
+///   toStartOfDay(col)    → date_trunc('day', col)
+fn rewriteTimeFunctions(allocator: std.mem.Allocator, sql: []const u8) ![]u8 {
+    const replacements = [_]struct { from: []const u8, to_prefix: []const u8, unit: []const u8 }{
+        .{ .from = "toStartOfMinute", .to_prefix = "date_trunc", .unit = "'minute'" },
+        .{ .from = "toStartOfHour", .to_prefix = "date_trunc", .unit = "'hour'" },
+        .{ .from = "toStartOfDay", .to_prefix = "date_trunc", .unit = "'day'" },
+    };
+    var current = try allocator.dupe(u8, sql);
+    for (replacements) |rep| {
+        var result: std.ArrayList(u8) = .empty;
+        errdefer result.deinit(allocator);
+        var i: usize = 0;
+        while (i < current.len) {
+            if (i + rep.from.len <= current.len and
+                std.ascii.eqlIgnoreCase(current[i .. i + rep.from.len], rep.from))
+            {
+                // Check word boundary before
+                const before_ok = i == 0 or (!std.ascii.isAlphanumeric(current[i - 1]) and current[i - 1] != '_');
+                // Find opening paren
+                const after_fn = i + rep.from.len;
+                var j = after_fn;
+                while (j < current.len and current[j] == ' ') j += 1;
+                if (before_ok and j < current.len and current[j] == '(') {
+                    // Find matching closing paren
+                    var depth: usize = 0;
+                    var k = j;
+                    while (k < current.len) : (k += 1) {
+                        if (current[k] == '(') depth += 1 else if (current[k] == ')') {
+                            depth -= 1;
+                            if (depth == 0) break;
+                        }
+                    }
+                    if (k < current.len) {
+                        const inner = current[j + 1 .. k];
+                        try result.appendSlice(allocator, rep.to_prefix);
+                        try result.append(allocator, '(');
+                        try result.appendSlice(allocator, rep.unit);
+                        try result.appendSlice(allocator, ", ");
+                        try result.appendSlice(allocator, inner);
+                        try result.append(allocator, ')');
+                        i = k + 1;
+                        continue;
+                    }
+                }
+            }
+            try result.append(allocator, current[i]);
+            i += 1;
+        }
+        allocator.free(current);
+        current = try result.toOwnedSlice(allocator);
+    }
+    return current;
 }
 
 /// Extract a URL query parameter value from a path like `/?query=...&foo=bar`.

@@ -361,6 +361,8 @@ fn evalFilter(filter: generic_sql.Filter, row: *const RowCtx) bool {
 fn evalPlanFilter(plan: generic_sql.Plan, row: *const RowCtx) bool {
     if (plan.where_expr) |we| return evalWhereNode(we, row);
     if (plan.filter) |f| return evalFilter(f, row);
+    // Fall back to text-based WHERE evaluation for complex predicates
+    if (plan.where_text) |wt| return evalTextBoolExpr(wt, row);
     return true; // no filter: row passes
 }
 
@@ -371,12 +373,108 @@ const RowCtx = struct {
     values: []const Value,
 
     fn get(self: *const RowCtx, name: []const u8) ?Value {
+        // Fast path: direct column name match
         for (self.names, self.values) |n, v| {
             if (std.ascii.eqlIgnoreCase(n, name)) return v;
+        }
+        // Slow path: Map subscript access like data['key'] or features['key']
+        if (parseMapSubscript(name)) |sub| {
+            for (self.names, self.values) |n, v| {
+                if (std.ascii.eqlIgnoreCase(n, sub.col)) {
+                    // v is a .str containing raw Map binary blob (key+value pairs)
+                    const blob = v.toStr() orelse return Value{ .str = "" };
+                    const found = lookupMapBlob(blob, sub.key) orelse return Value{ .str = "" };
+                    return Value{ .str = found };
+                }
+            }
         }
         return null;
     }
 };
+
+/// Parsed result of `col['key']` subscript expression.
+const MapSubscript = struct { col: []const u8, key: []const u8 };
+
+/// Parse `expr` as `col['key']` or `col["key"]`.
+/// Returns null if not a subscript expression.
+fn parseMapSubscript(expr: []const u8) ?MapSubscript {
+    const open = std.mem.indexOfScalar(u8, expr, '[') orelse return null;
+    const close = std.mem.lastIndexOfScalar(u8, expr, ']') orelse return null;
+    if (close <= open + 2) return null;
+    const col = std.mem.trim(u8, expr[0..open], " \t");
+    if (col.len == 0) return null;
+    var inner = std.mem.trim(u8, expr[open + 1 .. close], " \t");
+    // Strip surrounding quotes
+    if (inner.len >= 2 and ((inner[0] == '\'' and inner[inner.len - 1] == '\'') or
+                             (inner[0] == '"' and inner[inner.len - 1] == '"'))) {
+        inner = inner[1 .. inner.len - 1];
+    }
+    return .{ .col = col, .key = inner };
+}
+
+/// Look up `key` in a raw ClickHouse Map(String,String) binary blob.
+/// The blob format (as stored by consumeNativeTextRows for a single row) is:
+///   N * (varUInt(klen) + kbytes) followed by N * (varUInt(vlen) + vbytes)
+/// But since we don't have count N stored in the blob, we store it as:
+///   key_data_bytes + value_data_bytes concatenated back-to-back.
+/// We find the boundary by scanning keys first and counting, then scanning values.
+///
+/// Actually, ZigHouse stores the raw key bytes + raw value bytes for the row's
+/// pairs concatenated.  The format stored by consumeNativeTextRows (line 747-749) is:
+///   data[k_row_start..kp]  (all keys varUInt-prefixed)
+///   data[v_row_start..vp]  (all values varUInt-prefixed)
+/// We scan keys counting N, then scan values to find the Nth one.
+fn lookupMapBlob(blob: []const u8, key: []const u8) ?[]const u8 {
+    // First pass: collect key positions and count N.
+    var kp: usize = 0;
+    var count: usize = 0;
+    var match_idx: ?usize = null;
+
+    while (kp < blob.len) {
+        const len, const lb = readVarUIntSlice(blob[kp..]) orelse break;
+        if (kp + lb + len > blob.len) break;
+        const k = blob[kp + lb .. kp + lb + len];
+        if (match_idx == null and std.mem.eql(u8, k, key)) {
+            match_idx = count;
+        }
+        count += 1;
+        kp += lb + len;
+    }
+    // kp is now the boundary between keys and values (since all key data is consumed)
+    if (match_idx == null) return null;
+    // kp now points to start of values section
+    const values_start = kp;
+    var vp: usize = values_start;
+    var vi: usize = 0;
+    while (vp < blob.len) {
+        const vlen, const vlb = readVarUIntSlice(blob[vp..]) orelse break;
+        if (vp + vlb + vlen > blob.len) break;
+        if (vi == match_idx.?) {
+            return blob[vp + vlb .. vp + vlb + vlen];
+        }
+        vi += 1;
+        vp += vlb + vlen;
+    }
+    return null;
+}
+
+/// Read a varint-prefixed length from a byte slice.
+/// Returns (length_value, bytes_consumed) or null if slice is empty/invalid.
+fn readVarUIntSlice(data: []const u8) ?struct { usize, usize } {
+    if (data.len == 0) return null;
+    var val: usize = 0;
+    var shift: u6 = 0;
+    var i: usize = 0;
+    while (i < data.len) {
+        const b = data[i];
+        val |= @as(usize, b & 0x7F) << shift;
+        i += 1;
+        if (b & 0x80 == 0) return .{ val, i };
+        shift += 7;
+        if (shift >= 63) return null;
+    }
+    return null;
+}
 
 // ── Executor ──────────────────────────────────────────────────────────────────
 
@@ -719,8 +817,15 @@ const AggState = struct {
     min: ?Value = null,
     max: ?Value = null,
     distinct: ?*std.HashMap(i64, void, std.hash_map.AutoContext(i64), 80) = null,
+    /// For uniq_exact / uniq_exact_if: string-keyed set (heap-allocated strings).
+    distinct_str: ?*std.StringHashMap(void) = null,
+    /// For group_uniq_array: list of distinct string values (heap-allocated copies).
+    array_vals: ?*std.ArrayList([]const u8) = null,
+    /// For any_val: first observed value.
+    first: ?Value = null,
 
-    fn update(self: *AggState, v: Value, func: generic_sql.AggregateFn, alloc: std.mem.Allocator) !void {
+    fn update(self: *AggState, v: Value, proj: generic_sql.Expr, row: *const RowCtx, alloc: std.mem.Allocator) !void {
+        const func = proj.func;
         switch (func) {
             .count_star => self.count += 1,
             .count_distinct => {
@@ -730,6 +835,52 @@ const AggState = struct {
                     self.distinct = map;
                 }
                 if (v.toI64()) |iv| try self.distinct.?.put(iv, {});
+            },
+            .count_if => {
+                // Evaluate condition from proj.cond against the row.
+                if (evalCondExpr(proj.cond, row)) self.count += 1;
+            },
+            .uniq_exact => {
+                // Use string hash set for both string and numeric values.
+                if (self.distinct_str == null) {
+                    const map = try alloc.create(std.StringHashMap(void));
+                    map.* = std.StringHashMap(void).init(alloc);
+                    self.distinct_str = map;
+                }
+                // Convert value to a string key and store it.
+                const key = try valueToKey(alloc, v);
+                const r = try self.distinct_str.?.getOrPut(key);
+                if (r.found_existing) alloc.free(key); // free duplicate key
+            },
+            .uniq_exact_if => {
+                if (!evalCondExpr(proj.cond, row)) return;
+                if (self.distinct_str == null) {
+                    const map = try alloc.create(std.StringHashMap(void));
+                    map.* = std.StringHashMap(void).init(alloc);
+                    self.distinct_str = map;
+                }
+                const key = try valueToKey(alloc, v);
+                const r = try self.distinct_str.?.getOrPut(key);
+                if (r.found_existing) alloc.free(key);
+            },
+            .group_uniq_array => {
+                if (self.array_vals == null) {
+                    const lst = try alloc.create(std.ArrayList([]const u8));
+                    lst.* = .empty;
+                    self.array_vals = lst;
+                }
+                // Only add distinct values (use a small linear search for now).
+                const sv = try valueToKey(alloc, v);
+                for (self.array_vals.?.items) |existing| {
+                    if (std.mem.eql(u8, existing, sv)) { alloc.free(sv); return; }
+                }
+                try self.array_vals.?.append(alloc, sv);
+            },
+            .any_val => {
+                if (self.first == null) {
+                    // Deep-copy string values.
+                    self.first = if (v == .str) Value{ .str = try alloc.dupe(u8, v.str) } else v;
+                }
             },
             .sum => { if (v.toF64()) |fv| self.sum += fv; },
             .avg => {
@@ -746,14 +897,27 @@ const AggState = struct {
         }
     }
 
-    fn result(self: *const AggState, func: generic_sql.AggregateFn) Value {
-        return switch (func) {
-            .count_star => Value{ .i64 = self.count },
+    fn result(self: *const AggState, proj: generic_sql.Expr, alloc: std.mem.Allocator) Value {
+        return switch (proj.func) {
+            .count_star, .count_if => Value{ .i64 = self.count },
             .count_distinct => Value{ .i64 = if (self.distinct) |d| @intCast(d.count()) else 0 },
+            .uniq_exact, .uniq_exact_if => Value{ .i64 = if (self.distinct_str) |d| @intCast(d.count()) else 0 },
             .sum => Value{ .f64 = self.sum },
             .avg => if (self.count == 0) Value{ .f64 = 0 } else Value{ .f64 = self.sum / @as(f64, @floatFromInt(self.count)) },
             .min => self.min orelse Value{ .null_val = {} },
             .max => self.max orelse Value{ .null_val = {} },
+            .group_uniq_array => blk: {
+                // Return as a separator-joined string (default ", ").
+                if (self.array_vals == null or self.array_vals.?.items.len == 0) break :blk Value{ .str = "" };
+                const sep: []const u8 = proj.sep orelse ", ";
+                var buf: std.ArrayList(u8) = .empty;
+                for (self.array_vals.?.items, 0..) |s, i| {
+                    if (i != 0) buf.appendSlice(alloc, sep) catch {};
+                    buf.appendSlice(alloc, s) catch {};
+                }
+                break :blk Value{ .str = buf.toOwnedSlice(alloc) catch "" };
+            },
+            .any_val => self.first orelse Value{ .str = "" },
             .column_ref, .int_literal => Value{ .null_val = {} },
         };
     }
@@ -764,8 +928,63 @@ const AggState = struct {
             alloc.destroy(d);
             self.distinct = null;
         }
+        if (self.distinct_str) |d| {
+            var it = d.keyIterator();
+            while (it.next()) |k| alloc.free(k.*);
+            d.deinit();
+            alloc.destroy(d);
+            self.distinct_str = null;
+        }
+        if (self.array_vals) |lst| {
+            for (lst.items) |s| alloc.free(s);
+            lst.deinit(alloc);
+            alloc.destroy(lst);
+            self.array_vals = null;
+        }
+        if (self.first) |fv| {
+            if (fv == .str) alloc.free(fv.str);
+            self.first = null;
+        }
     }
 };
+
+/// Evaluate an optional inline condition (CondExpr) against the current row.
+fn evalCondExpr(cond: ?*const generic_sql.CondExpr, row: *const RowCtx) bool {
+    const c = cond orelse return true; // no condition → always pass
+    // Support data['key'] in cond_col via RowCtx.get
+    const v = row.get(c.cond_col) orelse return false;
+    if (c.cond_str) |sv| {
+        const got = v.toStr() orelse return false;
+        return switch (c.cond_op) {
+            .eq => std.mem.eql(u8, got, sv),
+            .ne => !std.mem.eql(u8, got, sv),
+            .lt => std.mem.order(u8, got, sv) == .lt,
+            .le => std.mem.order(u8, got, sv) != .gt,
+            .gt => std.mem.order(u8, got, sv) == .gt,
+            .ge => std.mem.order(u8, got, sv) != .lt,
+        };
+    } else {
+        const fv = v.toF64() orelse return false;
+        return switch (c.cond_op) {
+            .eq => fv == c.cond_num,
+            .ne => fv != c.cond_num,
+            .lt => fv <  c.cond_num,
+            .le => fv <= c.cond_num,
+            .gt => fv >  c.cond_num,
+            .ge => fv >= c.cond_num,
+        };
+    }
+}
+
+/// Convert a Value to an owned string key (for string hash sets).
+fn valueToKey(alloc: std.mem.Allocator, v: Value) ![]u8 {
+    return switch (v) {
+        .str => |s| try alloc.dupe(u8, s),
+        .i64 => |i| try std.fmt.allocPrint(alloc, "{d}", .{i}),
+        .f64 => |f| try std.fmt.allocPrint(alloc, "{d}", .{f}),
+        .null_val => try alloc.dupe(u8, ""),
+    };
+}
 
 const ScalarAggCtx = struct {
     allocator: std.mem.Allocator,
@@ -789,7 +1008,7 @@ const ScalarAggCtx = struct {
         // Update each aggregate
         for (self.plan.projections, self.states) |proj, *state| {
             const v = evalProjectionExpr(proj, row);
-            try state.update(v, proj.func, self.allocator);
+            try state.update(v, proj, row, self.allocator);
         }
     }
 
@@ -805,7 +1024,7 @@ const ScalarAggCtx = struct {
         // Values
         for (plan.projections, self.states, 0..) |proj, *state, i| {
             if (i != 0) try out.append(allocator, ',');
-            try state.result(proj.func).writeCsv(&out, allocator);
+            try state.result(proj, self.allocator).writeCsv(&out, allocator);
         }
         try out.append(allocator, '\n');
         return out.toOwnedSlice(allocator);
@@ -881,14 +1100,28 @@ const GroupByCtx = struct {
 
     /// Evaluate a group key expression against a row.
     fn evalGroupKeyExpr(expr: GroupKeyExpr, row: *const RowCtx) Value {
-        // EventMinute is a derived column: truncate EventTime timestamp to minutes
+        // EventMinute: truncate EventTime to minutes
         if (std.ascii.eqlIgnoreCase(expr.base_col, "EventMinute")) {
-            // EventTime is stored as microseconds since epoch (DuckDB TIMESTAMP)
-            // Truncate to minutes: floor(ts / 60_000_000) * 60_000_000
             const ts_v = row.get("EventTime") orelse return Value{ .null_val = {} };
             const ts = ts_v.toI64() orelse return Value{ .null_val = {} };
-            const minute_us: i64 = 60 * 1_000_000;
-            const truncated = @divFloor(ts, minute_us) * minute_us;
+            const unit_us: i64 = 60 * 1_000_000;
+            const truncated = @divFloor(ts, unit_us) * unit_us;
+            return Value{ .i64 = truncated + expr.offset };
+        }
+        // EventHour: truncate EventTime to hours
+        if (std.ascii.eqlIgnoreCase(expr.base_col, "EventHour")) {
+            const ts_v = row.get("EventTime") orelse return Value{ .null_val = {} };
+            const ts = ts_v.toI64() orelse return Value{ .null_val = {} };
+            const unit_us: i64 = 3600 * 1_000_000;
+            const truncated = @divFloor(ts, unit_us) * unit_us;
+            return Value{ .i64 = truncated + expr.offset };
+        }
+        // EventDay: truncate EventTime to days
+        if (std.ascii.eqlIgnoreCase(expr.base_col, "EventDay")) {
+            const ts_v = row.get("EventTime") orelse return Value{ .null_val = {} };
+            const ts = ts_v.toI64() orelse return Value{ .null_val = {} };
+            const unit_us: i64 = 86400 * 1_000_000;
+            const truncated = @divFloor(ts, unit_us) * unit_us;
             return Value{ .i64 = truncated + expr.offset };
         }
         const v = row.get(expr.base_col) orelse return Value{ .null_val = {} };
@@ -941,7 +1174,7 @@ const GroupByCtx = struct {
         // Update aggregates
         for (self.plan.projections, entry.states) |proj, *state| {
             const v = evalProjectionExpr(proj, row);
-            try state.update(v, proj.func, self.allocator);
+            try state.update(v, proj, row, self.allocator);
         }
     }
 
@@ -992,8 +1225,8 @@ const GroupByCtx = struct {
                 const eb = ctx.entries[b];
                 if (ctx.sort_idx) |si| {
                     if (si < ea.states.len) {
-                        const va = ea.states[si].result(ctx.plan.projections[si].func);
-                        const vb = eb.states[si].result(ctx.plan.projections[si].func);
+                        const va = ea.states[si].result(ctx.plan.projections[si], std.heap.page_allocator);
+                        const vb = eb.states[si].result(ctx.plan.projections[si], std.heap.page_allocator);
                         const ord = Value.order(va, vb);
                         if (ctx.desc) return ord == .gt;
                         return ord == .lt;
@@ -1034,7 +1267,7 @@ const GroupByCtx = struct {
             // HAVING filter
             if (having) |hv| {
                 if (hv.proj_idx < entry.states.len) {
-                    const v = entry.states[hv.proj_idx].result(plan.projections[hv.proj_idx].func);
+                    const v = entry.states[hv.proj_idx].result(plan.projections[hv.proj_idx], allocator);
                     const iv = v.toI64() orelse 0;
                     const passes = switch (hv.op) {
                         .eq => iv == hv.threshold,
@@ -1079,13 +1312,13 @@ const GroupByCtx = struct {
                     }
                     if (!is_key) {
                         // Non-key column_ref in projection: output first value seen
-                        const v = state.result(proj.func);
+                        const v = state.result(proj, self.allocator);
                         try v.writeCsv(&out, allocator);
                     }
                 } else if (proj.func == .int_literal) {
                     try out.print(allocator, "{d}", .{proj.int_offset});
                 } else {
-                    const v = state.result(proj.func);
+                    const v = state.result(proj, self.allocator);
                     try v.writeCsv(&out, allocator);
                 }
                 col_written += 1;
@@ -1219,10 +1452,22 @@ fn collectWhereNodeColumns(
         }
     }.f;
     switch (node.*) {
-        .cmp_int  => |c| try add(allocator, seen, needed, c.col, table),
-        .cmp_str  => |c| try add(allocator, seen, needed, c.col, table),
-        .like     => |l| try add(allocator, seen, needed, l.col, table),
-        .is_null, .is_not_null => |col| try add(allocator, seen, needed, col, table),
+        .cmp_int  => |c| {
+            if (parseMapSubscript(c.col)) |sub| try add(allocator, seen, needed, sub.col, table)
+            else try add(allocator, seen, needed, c.col, table);
+        },
+        .cmp_str  => |c| {
+            if (parseMapSubscript(c.col)) |sub| try add(allocator, seen, needed, sub.col, table)
+            else try add(allocator, seen, needed, c.col, table);
+        },
+        .like     => |l| {
+            if (parseMapSubscript(l.col)) |sub| try add(allocator, seen, needed, sub.col, table)
+            else try add(allocator, seen, needed, l.col, table);
+        },
+        .is_null, .is_not_null => |col| {
+            if (parseMapSubscript(col)) |sub| try add(allocator, seen, needed, sub.col, table)
+            else try add(allocator, seen, needed, col, table);
+        },
         .and_ => |children| for (children) |ch| try collectWhereNodeColumns(allocator, seen, needed, ch, table),
         .or_  => |children| for (children) |ch| try collectWhereNodeColumns(allocator, seen, needed, ch, table),
     }
@@ -1251,8 +1496,19 @@ fn collectNeededColumns(
             // Handle "length(<actual_col>)" — collect the inner column
             if (parseLengthCall(col)) |inner| {
                 try add(allocator, &seen, needed, inner, table);
+            } else if (parseMapSubscript(col)) |sub| {
+                // data['key'] → need the Map column (e.g. "data")
+                try add(allocator, &seen, needed, sub.col, table);
             } else {
                 try add(allocator, &seen, needed, col, table);
+            }
+        }
+        // Also collect columns from cond expressions (countIf/uniqExactIf)
+        if (proj.cond) |cond| {
+            if (parseMapSubscript(cond.cond_col)) |sub| {
+                try add(allocator, &seen, needed, sub.col, table);
+            } else {
+                try add(allocator, &seen, needed, cond.cond_col, table);
             }
         }
     }
@@ -1268,8 +1524,10 @@ fn collectNeededColumns(
             allocator.free(exprs);
         }
         for (exprs) |e| {
-            // "EventMinute" maps to the EventTime column in Parquet
-            const real_col = if (std.ascii.eqlIgnoreCase(e.base_col, "EventMinute")) "EventTime" else e.base_col;
+            // EventMinute/EventHour/EventDay are derived from EventTime
+            const real_col = if (std.ascii.eqlIgnoreCase(e.base_col, "EventMinute") or
+                std.ascii.eqlIgnoreCase(e.base_col, "EventHour") or
+                std.ascii.eqlIgnoreCase(e.base_col, "EventDay")) "EventTime" else e.base_col;
             try add(allocator, &seen, needed, real_col, table);
         }
     }
@@ -1341,9 +1599,9 @@ fn parseGroupCols(allocator: std.mem.Allocator, group_by: []const u8) ![][]const
                 if (part.len == 0) continue;
                 // Skip numeric position references like "1", "2"
                 if (std.fmt.parseInt(usize, part, 10) catch null) |_| continue;
-                // Map date_trunc('minute', EventTime) → EventMinute
-                if (isDateTruncMinutePart(part)) {
-                    try result.append(allocator, try allocator.dupe(u8, "EventMinute"));
+                // Map date_trunc(unit, EventTime) → EventMinute/EventHour/EventDay
+                if (dateTruncDerivedCol(part)) |derived| {
+                    try result.append(allocator, try allocator.dupe(u8, derived));
                     continue;
                 }
                 // Handle arithmetic expressions like "ClientIP - 1": use the base column name
@@ -1356,19 +1614,28 @@ fn parseGroupCols(allocator: std.mem.Allocator, group_by: []const u8) ![][]const
     return result.toOwnedSlice(allocator);
 }
 
-/// Returns true if `part` is a date_trunc('minute', EventTime) expression.
-fn isDateTruncMinutePart(part: []const u8) bool {
-    const lower_len = part.len;
-    if (lower_len < 7) return false;
-    if (!std.ascii.startsWithIgnoreCase(part, "date_trunc")) return false;
-    const open = std.mem.indexOfScalar(u8, part, '(') orelse return false;
-    const close = std.mem.lastIndexOfScalar(u8, part, ')') orelse return false;
-    if (close <= open) return false;
+/// Returns the derived column name if `part` is a date_trunc(unit, EventTime) expression,
+/// otherwise null. Supported units: 'minute' → EventMinute, 'hour' → EventHour, 'day' → EventDay.
+fn dateTruncDerivedCol(part: []const u8) ?[]const u8 {
+    if (part.len < 7) return null;
+    if (!std.ascii.startsWithIgnoreCase(part, "date_trunc")) return null;
+    const open = std.mem.indexOfScalar(u8, part, '(') orelse return null;
+    const close = std.mem.lastIndexOfScalar(u8, part, ')') orelse return null;
+    if (close <= open) return null;
     const inner = std.mem.trim(u8, part[open + 1 .. close], " \t\r\n");
-    const comma = std.mem.indexOfScalar(u8, inner, ',') orelse return false;
+    const comma = std.mem.indexOfScalar(u8, inner, ',') orelse return null;
     const unit = std.mem.trim(u8, inner[0..comma], " \t\r\n");
     const source = std.mem.trim(u8, inner[comma + 1 ..], " \t\r\n");
-    return std.mem.eql(u8, unit, "'minute'") and std.ascii.eqlIgnoreCase(source, "EventTime");
+    if (!std.ascii.eqlIgnoreCase(source, "EventTime")) return null;
+    if (std.mem.eql(u8, unit, "'minute'")) return "EventMinute";
+    if (std.mem.eql(u8, unit, "'hour'")) return "EventHour";
+    if (std.mem.eql(u8, unit, "'day'")) return "EventDay";
+    return null;
+}
+
+/// Returns true if `part` is a date_trunc('minute', EventTime) expression.
+fn isDateTruncMinutePart(part: []const u8) bool {
+    return std.mem.eql(u8, dateTruncDerivedCol(part) orelse return false, "EventMinute");
 }
 
 /// Extract the base column name from an expression like "ClientIP - 1" → "ClientIP".
@@ -1386,9 +1653,9 @@ fn extractBaseColumnName(expr: []const u8) []const u8 {
 
 /// Parse a group-by expression string like "ClientIP - 1" into a GroupKeyExpr.
 fn parseGroupKeyExpr(allocator: std.mem.Allocator, part: []const u8) !GroupKeyExpr {
-    // date_trunc → EventMinute with offset 0
-    if (isDateTruncMinutePart(part)) {
-        return .{ .base_col = try allocator.dupe(u8, "EventMinute"), .offset = 0 };
+    // date_trunc(unit, EventTime) → EventMinute/EventHour/EventDay with offset 0
+    if (dateTruncDerivedCol(part)) |derived| {
+        return .{ .base_col = try allocator.dupe(u8, derived), .offset = 0 };
     }
     // Look for subtraction
     if (std.mem.indexOfScalar(u8, part, '-')) |pos| {
@@ -1448,11 +1715,16 @@ fn evalProjectionExpr(proj: generic_sql.Expr, row: *const RowCtx) Value {
     switch (proj.func) {
         .column_ref => {
             const col = proj.column orelse return Value{ .null_val = {} };
-            return row.get(col) orelse Value{ .null_val = {} };
+            // Try direct column lookup (also handles data['key'] via RowCtx.get)
+            if (row.get(col)) |v| return v;
+            // Fall back to text expression evaluator for complex expressions
+            return evalTextExpr(col, row) orelse Value{ .str = "" };
         },
         .int_literal => return Value{ .i64 = proj.int_offset },
-        .count_star  => return Value{ .i64 = 1 }, // counted by AggState
-        .count_distinct, .sum, .avg, .min, .max => {
+        .count_star, .count_if  => return Value{ .i64 = 1 }, // counted by AggState
+        .count_distinct, .sum, .avg, .min, .max,
+        .uniq_exact, .uniq_exact_if,
+        .group_uniq_array, .any_val => {
             const col = proj.column orelse return Value{ .null_val = {} };
             // Handle "length(<actual_col>)" — compute string length instead of column value
             if (parseLengthCall(col)) |inner_col| {
@@ -1462,9 +1734,265 @@ fn evalProjectionExpr(proj: generic_sql.Expr, row: *const RowCtx) Value {
                     else => Value{ .null_val = {} },
                 };
             }
-            return row.get(col) orelse Value{ .null_val = {} };
+            // Try Map subscript / direct lookup
+            if (row.get(col)) |v| return v;
+            return evalTextExpr(col, row) orelse Value{ .null_val = {} };
         },
     }
+}
+
+/// Evaluate a text-encoded expression against a row.
+/// Handles: if(cond_expr, then_expr, else_expr), column references, string literals.
+/// Returns null if the expression cannot be evaluated.
+fn evalTextExpr(expr: []const u8, row: *const RowCtx) ?Value {
+    const trimmed = std.mem.trim(u8, expr, " \t\r\n");
+    if (trimmed.len == 0) return Value{ .str = "" };
+
+    // String literal: 'value'
+    if (trimmed.len >= 2 and trimmed[0] == '\'' and trimmed[trimmed.len - 1] == '\'') {
+        return Value{ .str = trimmed[1 .. trimmed.len - 1] };
+    }
+
+    // Integer literal
+    if (std.fmt.parseInt(i64, trimmed, 10) catch null) |iv| {
+        return Value{ .i64 = iv };
+    }
+
+    // if(cond, then, else) — split top-level args
+    if (std.ascii.startsWithIgnoreCase(trimmed, "if(") and trimmed[trimmed.len - 1] == ')') {
+        const inner = trimmed[3 .. trimmed.len - 1];
+        var args = splitTopLevelArgs(inner) catch return null;
+        defer args.deinit();
+        if (args.len == 3) {
+            const cond_expr = std.mem.trim(u8, args.items[0], " \t\r\n");
+            const then_expr = std.mem.trim(u8, args.items[1], " \t\r\n");
+            const else_expr = std.mem.trim(u8, args.items[2], " \t\r\n");
+            const cond_val = evalTextBoolExpr(cond_expr, row);
+            if (cond_val) {
+                return evalTextExpr(then_expr, row);
+            } else {
+                return evalTextExpr(else_expr, row);
+            }
+        }
+    }
+
+    // isIPv4String(col) → 0 or 1 (placeholder: always 0 without real IP parsing)
+    if (std.ascii.startsWithIgnoreCase(trimmed, "isipv4string(") and trimmed[trimmed.len - 1] == ')') {
+        const inner_col = std.mem.trim(u8, trimmed[13 .. trimmed.len - 1], " \t\r\n");
+        const v = row.get(inner_col) orelse return Value{ .i64 = 0 };
+        const sv = v.toStr() orelse return Value{ .i64 = 0 };
+        return Value{ .i64 = if (isIPv4String(sv)) 1 else 0 };
+    }
+    if (std.ascii.startsWithIgnoreCase(trimmed, "isipv6string(") and trimmed[trimmed.len - 1] == ')') {
+        const inner_col = std.mem.trim(u8, trimmed[13 .. trimmed.len - 1], " \t\r\n");
+        const v = row.get(inner_col) orelse return Value{ .i64 = 0 };
+        const sv = v.toStr() orelse return Value{ .i64 = 0 };
+        return Value{ .i64 = if (isIPv6String(sv)) 1 else 0 };
+    }
+
+    // dictHas(dict_name, key) → 0 (stub: no dict loaded)
+    if (std.ascii.startsWithIgnoreCase(trimmed, "dicthas(")) {
+        return Value{ .i64 = 0 };
+    }
+    // dictGetOrDefault(dict_name, attr, key, default) → default value
+    if (std.ascii.startsWithIgnoreCase(trimmed, "dictgetordefault(")) {
+        // Extract the default (4th arg) and return it
+        const inner = trimmed[17 .. trimmed.len - 1]; // strip "dictGetOrDefault(" and ")"
+        var args = splitTopLevelArgs(inner) catch return Value{ .str = "" };
+        defer args.deinit();
+        if (args.len >= 4) {
+            const default_expr = std.mem.trim(u8, args.items[3], " \t\r\n");
+            return evalTextExpr(default_expr, row) orelse Value{ .str = "" };
+        }
+        return Value{ .str = "" };
+    }
+    // dictGet(dict_name, attr, key) → empty string (stub)
+    if (std.ascii.startsWithIgnoreCase(trimmed, "dictget(")) {
+        return Value{ .str = "" };
+    }
+    // dictGetOrNull(dict_name, attr, key) → null (stub)
+    if (std.ascii.startsWithIgnoreCase(trimmed, "dictgetornull(")) {
+        return Value{ .null_val = {} };
+    }
+
+    // max(expr) scalar — for single-row contexts
+    if (std.ascii.startsWithIgnoreCase(trimmed, "max(") and trimmed[trimmed.len - 1] == ')') {
+        const inner_expr = std.mem.trim(u8, trimmed[4 .. trimmed.len - 1], " \t\r\n");
+        return evalTextExpr(inner_expr, row) orelse Value{ .null_val = {} };
+    }
+
+    // Direct column lookup (fallback)
+    return row.get(trimmed);
+}
+
+/// Evaluate a text-encoded boolean condition (for if() conditions).
+fn evalTextBoolExpr(expr: []const u8, row: *const RowCtx) bool {
+    const trimmed = std.mem.trim(u8, expr, " \t\r\n");
+
+    // AND: split on top-level AND
+    if (findTopLevelKeyword(trimmed, "AND")) |pos| {
+        const left = evalTextBoolExpr(trimmed[0..pos], row);
+        if (!left) return false;
+        return evalTextBoolExpr(trimmed[pos + 3 ..], row);
+    }
+    // OR: split on top-level OR
+    if (findTopLevelKeyword(trimmed, "OR")) |pos| {
+        const left = evalTextBoolExpr(trimmed[0..pos], row);
+        if (left) return true;
+        return evalTextBoolExpr(trimmed[pos + 2 ..], row);
+    }
+
+    // isIPv4String(col) or isIPv6String(col)
+    if (std.ascii.startsWithIgnoreCase(trimmed, "isipv4string(") and trimmed[trimmed.len - 1] == ')') {
+        const inner_col = std.mem.trim(u8, trimmed[13 .. trimmed.len - 1], " \t\r\n");
+        const v = row.get(inner_col) orelse return false;
+        const sv = v.toStr() orelse return false;
+        return isIPv4String(sv);
+    }
+    if (std.ascii.startsWithIgnoreCase(trimmed, "isipv6string(") and trimmed[trimmed.len - 1] == ')') {
+        const inner_col = std.mem.trim(u8, trimmed[13 .. trimmed.len - 1], " \t\r\n");
+        const v = row.get(inner_col) orelse return false;
+        const sv = v.toStr() orelse return false;
+        return isIPv6String(sv);
+    }
+
+    // dictHas(dict_name, key) → false (stub: no dict loaded)
+    if (std.ascii.startsWithIgnoreCase(trimmed, "dicthas(")) {
+        return false;
+    }
+    // arrayExists(lambda, arr) → false (stub)
+    if (std.ascii.startsWithIgnoreCase(trimmed, "arrayexists(")) {
+        return false;
+    }
+
+    // col op val comparisons
+    const ops = [_]struct { text: []const u8, op: generic_sql.CmpOp }{
+        .{ .text = "<>", .op = .ne },
+        .{ .text = ">=", .op = .ge },
+        .{ .text = "<=", .op = .le },
+        .{ .text = "!=", .op = .ne },
+        .{ .text = "=",  .op = .eq },
+        .{ .text = ">",  .op = .gt },
+        .{ .text = "<",  .op = .lt },
+    };
+    for (ops) |candidate| {
+        const pos = std.mem.indexOf(u8, trimmed, candidate.text) orelse continue;
+        const lhs_raw = std.mem.trim(u8, trimmed[0..pos], " \t\r\n");
+        const rhs_raw = std.mem.trim(u8, trimmed[pos + candidate.text.len ..], " \t\r\n");
+        const lv = evalTextExpr(lhs_raw, row) orelse Value{ .null_val = {} };
+        const rv = evalTextExpr(rhs_raw, row) orelse Value{ .null_val = {} };
+        const ord = Value.order(lv, rv);
+        return switch (candidate.op) {
+            .eq => ord == .eq,
+            .ne => ord != .eq,
+            .lt => ord == .lt,
+            .le => ord != .gt,
+            .gt => ord == .gt,
+            .ge => ord != .lt,
+        };
+    }
+
+    // Truthy check: non-empty string or non-zero number
+    if (evalTextExpr(trimmed, row)) |v| {
+        return switch (v) {
+            .i64 => |i| i != 0,
+            .f64 => |f| f != 0,
+            .str => |s| s.len > 0,
+            .null_val => false,
+        };
+    }
+    return false;
+}
+
+/// Find a top-level (depth=0) keyword in an expression.
+/// Returns the position of the keyword or null.
+fn findTopLevelKeyword(expr: []const u8, kw: []const u8) ?usize {
+    var depth: usize = 0;
+    var i: usize = 0;
+    while (i + kw.len <= expr.len) : (i += 1) {
+        switch (expr[i]) {
+            '(' => { depth += 1; continue; },
+            ')' => { if (depth > 0) depth -= 1; continue; },
+            '\'' => {
+                // Skip string literal
+                i += 1;
+                while (i < expr.len and expr[i] != '\'') i += 1;
+                continue;
+            },
+            else => {},
+        }
+        if (depth != 0) continue;
+        if (!std.ascii.eqlIgnoreCase(expr[i .. i + kw.len], kw)) continue;
+        const before_ok = i == 0 or !std.ascii.isAlphanumeric(expr[i - 1]);
+        const after_pos = i + kw.len;
+        const after_ok = after_pos >= expr.len or !std.ascii.isAlphanumeric(expr[after_pos]);
+        if (before_ok and after_ok) return i;
+    }
+    return null;
+}
+
+/// Split a string by top-level (depth=0) commas.
+/// Returns a fixed-size buffer of slices (max 8 args).
+const SplitResult = struct {
+    items: [8][]const u8 = undefined,
+    len: usize = 0,
+
+    fn deinit(_: *SplitResult) void {}
+};
+
+fn splitTopLevelArgs(expr: []const u8) !SplitResult {
+    var result: SplitResult = .{};
+    var depth: usize = 0;
+    var start: usize = 0;
+    var i: usize = 0;
+    while (i <= expr.len) : (i += 1) {
+        const c = if (i < expr.len) expr[i] else ',';
+        switch (c) {
+            '(' => depth += 1,
+            ')' => { if (depth > 0) depth -= 1; },
+            '\'' => {
+                i += 1;
+                while (i < expr.len and expr[i] != '\'') i += 1;
+            },
+            ',' => if (depth == 0) {
+                if (result.len < result.items.len) {
+                    result.items[result.len] = expr[start..i];
+                    result.len += 1;
+                }
+                start = i + 1;
+            },
+            else => {},
+        }
+    }
+    return result;
+}
+
+/// Check if a string looks like an IPv4 address (e.g. "1.2.3.4").
+fn isIPv4String(s: []const u8) bool {
+    var parts: u8 = 0;
+    var start: usize = 0;
+    for (s, 0..) |c, i| {
+        if (c == '.') {
+            const part = s[start..i];
+            const n = std.fmt.parseInt(u16, part, 10) catch return false;
+            if (n > 255) return false;
+            parts += 1;
+            start = i + 1;
+        }
+    }
+    if (parts != 3) return false;
+    const last = std.fmt.parseInt(u16, s[start..], 10) catch return false;
+    return last <= 255;
+}
+
+/// Check if a string looks like an IPv6 address (contains ':').
+fn isIPv6String(s: []const u8) bool {
+    if (s.len < 2) return false;
+    var colon_count: u8 = 0;
+    for (s) |c| {
+        if (c == ':') colon_count += 1;
+    }
+    return colon_count >= 2;
 }
 
 /// If expr is of the form "length(<col>)" (case-insensitive), returns the inner col name.
@@ -1503,6 +2031,11 @@ fn writeExprHeader(out: *std.ArrayList(u8), allocator: std.mem.Allocator, proj: 
         .avg => try out.print(allocator, "avg({s})", .{proj.column orelse ""}),
         .min => try out.print(allocator, "min({s})", .{proj.column orelse ""}),
         .max => try out.print(allocator, "max({s})", .{proj.column orelse ""}),
+        .count_if => try out.print(allocator, "countIf(...)", .{}),
+        .uniq_exact => try out.print(allocator, "uniqExact({s})", .{proj.column orelse ""}),
+        .uniq_exact_if => try out.print(allocator, "uniqExactIf({s},...)", .{proj.column orelse ""}),
+        .group_uniq_array => try out.print(allocator, "groupUniqArray({s})", .{proj.column orelse ""}),
+        .any_val => try out.print(allocator, "any({s})", .{proj.column orelse ""}),
     }
 }
 
@@ -1527,7 +2060,10 @@ fn writeGroupHeader(
 fn allAggregates(projections: []const generic_sql.Expr) bool {
     for (projections) |p| {
         switch (p.func) {
-            .count_star, .count_distinct, .sum, .avg, .min, .max => {},
+            .count_star, .count_distinct, .count_if,
+            .sum, .avg, .min, .max,
+            .uniq_exact, .uniq_exact_if,
+            .group_uniq_array, .any_val => {},
             .column_ref, .int_literal => return false,
         }
     }

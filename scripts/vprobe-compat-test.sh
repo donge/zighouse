@@ -285,6 +285,158 @@ echo "=== Section 10: SELECT FINAL (ReplacingMergeTree) ==="
 select_eq "SELECT count(*) FROM scoring_rules FINAL" \
   "SELECT count(*) FROM vprobe.scoring_rules FINAL" "1"
 
+# ── Section 11: CREATE DICTIONARY (no-op) ────────────────────────────────────
+echo ""
+echo "=== Section 11: CREATE DICTIONARY (no-op) ==="
+
+ddl "CREATE DICTIONARY dict_intel" \
+  "CREATE DICTIONARY IF NOT EXISTS vprobe.dict_intel (
+    list_name String,
+    entry     String,
+    note      String
+  ) PRIMARY KEY (list_name, entry)
+  SOURCE(CLICKHOUSE(DB 'vprobe' TABLE 'intel_entries' USER 'default' PASSWORD ''))
+  LAYOUT(COMPLEX_KEY_HASHED())
+  LIFETIME(MIN 5 MAX 30)"
+
+ddl "CREATE DICTIONARY dict_intel_exact" \
+  "CREATE DICTIONARY IF NOT EXISTS vprobe.dict_intel_exact (
+    kind    String,
+    key     String,
+    feed_id String,
+    score   Float64
+  ) PRIMARY KEY (kind, key)
+  SOURCE(CLICKHOUSE(DB 'vprobe' TABLE 'intel_entries' USER 'default' PASSWORD ''))
+  LAYOUT(COMPLEX_KEY_HASHED())
+  LIFETIME(MIN 5 MAX 30)"
+
+# ── Section 12: CREATE VIEW (no-op) ──────────────────────────────────────────
+echo ""
+echo "=== Section 12: CREATE VIEW (no-op) ==="
+
+ddl "CREATE VIEW intel_exact_current" \
+  "CREATE VIEW IF NOT EXISTS vprobe.intel_exact_current AS SELECT kind, entry AS key, note FROM vprobe.intel_entries"
+
+# ── Section 13: detect_events INSERT + SELECT with data['key'] ────────────────
+echo ""
+echo "=== Section 13: detect_events INSERT + SELECT with data['key'] ==="
+
+python3 - <<'PYEOF' > /tmp/zh_detect.bin
+import struct, sys, time
+
+names = ['event_type', 'timestamp', 'probe_id', 'flow_id',
+         'src_ip', 'src_port', 'dst_ip', 'dst_port',
+         'protocol', 'confidence', 'evidence', 'features', 'data',
+         'sni', 'up_bytes', 'down_bytes', 'dst_country', 'src_country']
+types = ['LowCardinality(String)', 'DateTime64(3)', 'LowCardinality(String)', 'String',
+         'IPv6', 'UInt16', 'IPv6', 'UInt16',
+         'LowCardinality(String)', 'Float64', 'Array(String)', 'Map(String, Float64)', 'Map(String, String)',
+         'String', 'UInt64', 'UInt64', 'LowCardinality(String)', 'LowCardinality(String)']
+
+buf = bytes([len(names)])
+for n in names:
+    buf += bytes([len(n)]) + n.encode()
+for t in types:
+    buf += bytes([len(t)]) + t.encode()
+
+def write_str(s):
+    b = s.encode()
+    return bytes([len(b)]) + b
+
+def varint(n):
+    r = b''
+    while n > 0x7f:
+        r += bytes([(n & 0x7f) | 0x80])
+        n >>= 7
+    r += bytes([n])
+    return r
+
+def write_array_str(items):
+    # RowBinary Array(String): varint count + each String
+    r = varint(len(items))
+    for item in items:
+        r += write_str(item)
+    return r
+
+def write_map_str_f64(pairs):
+    # RowBinary Map(String,Float64): varint count + each (String,Float64)
+    r = varint(len(pairs))
+    for k, v in pairs:
+        r += write_str(k)
+        r += struct.pack('<d', v)
+    return r
+
+def write_map_str_str(pairs):
+    # RowBinary Map(String,String): varint count + each (String,String)
+    r = varint(len(pairs))
+    for k, v in pairs:
+        r += write_str(k)
+        r += write_str(v)
+    return r
+
+now_ms = int(time.time() * 1000)
+ipv6_zero = b'\x00' * 16
+
+# 2 rows
+for i in range(2):
+    buf += write_str('network_scan')  # event_type
+    buf += struct.pack('<q', now_ms + i * 1000)  # timestamp
+    buf += write_str('probe-1')  # probe_id
+    buf += write_str(f'flow-{i}')  # flow_id
+    buf += ipv6_zero  # src_ip
+    buf += struct.pack('<H', 1234)  # src_port
+    buf += ipv6_zero  # dst_ip
+    buf += struct.pack('<H', 80)  # dst_port
+    buf += write_str('TCP')  # protocol
+    buf += struct.pack('<d', 0.9 if i == 0 else 0.5)  # confidence
+    buf += write_array_str([])  # evidence
+    buf += write_map_str_f64([])  # features
+    domain = f'evil{i}.com'
+    buf += write_map_str_str([('domain', domain), ('is_foreign', 'true' if i == 0 else 'false')])  # data
+    buf += write_str('')  # sni
+    buf += struct.pack('<Q', 1000)  # up_bytes
+    buf += struct.pack('<Q', 2000)  # down_bytes
+    buf += write_str('CN')  # dst_country
+    buf += write_str('US')  # src_country
+
+sys.stdout.buffer.write(buf)
+PYEOF
+
+INSERT_CODE=$(curl --noproxy 127.0.0.1 -s -o /tmp/zh_insert_resp.txt -w "%{http_code}" \
+  --data-binary @/tmp/zh_detect.bin \
+  "http://127.0.0.1:$PORT/?query=INSERT+INTO+vprobe.detect_events+FORMAT+RowBinaryWithNamesAndTypes")
+if [ "$INSERT_CODE" = "200" ]; then
+  pass "INSERT detect_events (2 rows)"
+else
+  fail "INSERT detect_events (HTTP $INSERT_CODE: $(cat /tmp/zh_insert_resp.txt))"
+fi
+
+select_eq "SELECT count(*) detect_events" \
+  "SELECT count(*) FROM vprobe.detect_events" "2"
+
+select_eq "SELECT count(*) high confidence" \
+  "SELECT countIf(confidence >= 0.9) FROM vprobe.detect_events" "1"
+
+select_eq "SELECT count(*) WHERE protocol=TCP" \
+  "SELECT count(*) FROM vprobe.detect_events WHERE protocol = 'TCP'" "2"
+
+# ── Section 14: complex queries (groupUniqArray, arrayStringConcat) ────────────
+echo ""
+echo "=== Section 14: groupUniqArray + arrayStringConcat ==="
+
+select_eq "SELECT arrayStringConcat(groupUniqArray)" \
+  "SELECT arrayStringConcat(groupUniqArray(protocol), ', ') AS protocols FROM vprobe.detect_events" "TCP"
+
+# ── Section 15: SYSTEM RELOAD DICTIONARY (no-op) ──────────────────────────────
+echo ""
+echo "=== Section 15: SYSTEM RELOAD DICTIONARY (no-op) ==="
+
+ddl "SYSTEM RELOAD DICTIONARY" \
+  "SYSTEM RELOAD DICTIONARY vprobe.dict_intel"
+
+ddl "DROP DICTIONARY" \
+  "DROP DICTIONARY IF EXISTS vprobe.dict_intel"
+
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo ""
 echo "=============================="
