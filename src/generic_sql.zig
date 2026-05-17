@@ -107,6 +107,10 @@ pub const Plan = struct {
     order_by_text: ?[]const u8 = null,
     limit: ?usize = null,
     offset: ?usize = null,
+    /// Subquery in FROM clause: `SELECT … FROM (SELECT …) AS t`.
+    /// When set, `table` is the subquery alias (or "__subquery__").
+    /// Free with deinit(allocator, subquery_source.*) then destroy.
+    subquery_source: ?*Plan = null,
     /// When true, all string fields (table, where_text, group_by, having_text,
     /// order_by_alias, order_by_text) were heap-allocated by the DuckDB parser
     /// and must be freed by deinit().  Legacy parser uses SQL slices (no free).
@@ -272,6 +276,7 @@ fn parseLegacy(allocator: std.mem.Allocator, sql: []const u8) !?Plan {
 }
 
 pub fn deinit(allocator: std.mem.Allocator, plan: Plan) void {
+    if (plan.subquery_source) |sq| { deinit(allocator, sq.*); allocator.destroy(sq); }
     if (plan.where_expr) |we| freeWhereNode(allocator, we);
     // Always free cond expressions in projections (they are always heap-allocated).
     for (plan.projections) |expr| {

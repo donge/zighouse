@@ -530,6 +530,12 @@ pub const Server = struct {
         };
         defer generic_sql.deinit(self.allocator, plan);
 
+        // Subquery in FROM clause: run inner plan first, then outer plan over result rows.
+        if (plan.subquery_source) |inner_plan| {
+            try self.handleSubquerySelect(request, out, plan, inner_plan.*);
+            return;
+        }
+
         // Resolve db.table from plan.table (may be "db.table" or bare "table").
         const db_table = splitDbTable(plan.table);
 
@@ -572,6 +578,23 @@ pub const Server = struct {
         );
         defer self.allocator.free(result);
 
+        try sendResponse(request, out, .ok, result);
+    }
+
+    /// Handle SELECT with a subquery in FROM: materialize inner plan, then run outer.
+    fn handleSubquerySelect(self: *Server, request: *std.http.Server.Request, out: *std.Io.Writer, outer: generic_sql.Plan, inner: generic_sql.Plan) !void {
+        const db_table = splitDbTable(inner.table);
+        const entry = self.schemas.find(db_table.db, db_table.table) orelse {
+            try sendResponse(request, out, .bad_request, "Unknown table in subquery\n");
+            return;
+        };
+        var parts = try part_scanner.scan(self.allocator, self.io, self.config.data_dir, db_table.db, db_table.table);
+        defer parts.deinit();
+        const inner_csv = try generic_executor.runWithSource(self.allocator, self.io, inner, .{ .ch_parts = parts.dirs() }, &entry.table);
+        defer self.allocator.free(inner_csv);
+        // Run outer plan over the CSV rows materialized from inner plan.
+        const result = try generic_executor.runOverCsv(self.allocator, outer, inner_csv, &entry.table);
+        defer self.allocator.free(result);
         try sendResponse(request, out, .ok, result);
     }
 

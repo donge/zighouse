@@ -143,9 +143,16 @@ fn translateJsonInner(allocator: std.mem.Allocator, json: []const u8) !generic_s
     const node_type = (node_obj.get("type") orelse return error.Unsupported).string;
     if (!std.mem.eql(u8, node_type, "SELECT_NODE")) return error.Unsupported;
 
+    return translateSelectNode(allocator, node_obj);
+}
+
+/// Translate a SELECT_NODE JSON object into a Plan (recursive for subqueries).
+fn translateSelectNode(allocator: std.mem.Allocator, node_obj: std.json.ObjectMap) anyerror!generic_sql.Plan {
     // ── table name ──────────────────────────────────────────────────────────
     const from_table = node_obj.get("from_table") orelse return error.Unsupported;
-    const table_name = try extractTableName(allocator, from_table) orelse return error.Unsupported;
+    var subquery_source: ?*generic_sql.Plan = null;
+    errdefer if (subquery_source) |sq| { generic_sql.deinit(allocator, sq.*); allocator.destroy(sq); };
+    const table_name = try extractTableNameOrSubquery(allocator, from_table, &subquery_source) orelse return error.Unsupported;
     errdefer allocator.free(table_name);
 
     // ── projections ─────────────────────────────────────────────────────────
@@ -268,6 +275,7 @@ fn translateJsonInner(allocator: std.mem.Allocator, json: []const u8) !generic_s
         .order_by_text = order_by_text,
         .limit = limit,
         .offset = offset,
+        .subquery_source = subquery_source,
         .owned = true,
     };
 }
@@ -606,9 +614,33 @@ fn strLiteralValue(val: std.json.Value) ?[]const u8 {
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 fn extractTableName(allocator: std.mem.Allocator, from: std.json.Value) !?[]u8 {
+    return extractTableNameOrSubquery(allocator, from, null);
+}
+
+/// Like extractTableName, but also handles SUBQUERY type by recursing.
+/// If `subquery_out` is non-null, it will be set to the parsed inner plan (caller owns it).
+fn extractTableNameOrSubquery(allocator: std.mem.Allocator, from: std.json.Value, subquery_out: ?*?*generic_sql.Plan) !?[]u8 {
     if (from == .null) return null;
     const obj = from.object;
     const t = (obj.get("type") orelse return null).string;
+    if (std.mem.eql(u8, t, "SUBQUERY")) {
+        // FROM (SELECT ...) [AS alias]
+        if (subquery_out == null) return null; // caller doesn't want subquery
+        const subquery_val = obj.get("subquery") orelse return null;
+        // subquery_val is {"node": {"type":"SELECT_NODE", ...}, "named_param_map":[]}
+        const inner_node_val = subquery_val.object.get("node") orelse return null;
+        const inner_type = (inner_node_val.object.get("type") orelse return null).string;
+        if (!std.mem.eql(u8, inner_type, "SELECT_NODE")) return null;
+        const inner_plan = try translateSelectNode(allocator, inner_node_val.object);
+        const sq = try allocator.create(generic_sql.Plan);
+        sq.* = inner_plan;
+        subquery_out.?.* = sq;
+        // Use alias if present, else "__subquery__".
+        const alias_raw = obj.get("alias") orelse return try allocator.dupe(u8, "__subquery__");
+        if (alias_raw == .string and alias_raw.string.len > 0)
+            return try allocator.dupe(u8, alias_raw.string);
+        return try allocator.dupe(u8, "__subquery__");
+    }
     if (!std.mem.eql(u8, t, "BASE_TABLE")) return null;
     const name = (obj.get("table_name") orelse return null).string;
     // If schema_name is set and non-empty and not "main", reconstruct "schema.table".

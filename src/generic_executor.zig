@@ -42,6 +42,8 @@ pub const Source = union(enum) {
     /// Read from multiple CH MergeTree part directories (multi-part ZigHouse path).
     /// Rows are streamed sequentially across all parts.
     ch_parts: []const []const u8,
+    /// Materialized CSV from a subquery (header line + data lines).
+    csv_rows: []const u8,
 };
 
 // ── Public entry points ───────────────────────────────────────────────────────
@@ -71,6 +73,16 @@ pub fn runWithSource(
     if (!has_group and all_agg) return exec.runScalarAgg();
     if (has_group) return exec.runGroupBy();
     return exec.runScan();
+}
+
+/// Run `plan` against a materialized CSV (from a subquery) and return CSV result.
+pub fn runOverCsv(
+    allocator: std.mem.Allocator,
+    plan: generic_sql.Plan,
+    csv: []const u8,
+    table: *const schema.Table,
+) anyerror![]u8 {
+    return runWithSource(allocator, undefined, plan, .{ .csv_rows = csv }, table);
 }
 
 /// Backward-compatible entry point: execute `plan` against a Parquet file.
@@ -549,6 +561,7 @@ const Executor = struct {
                     try self.streamRowsChPart(part_dir, needed, context, callback);
                 }
             },
+            .csv_rows => |csv| return streamRowsCsvFn(self.allocator, csv, context, callback),
         }
     }
 
@@ -808,6 +821,51 @@ const Executor = struct {
         }
     }
 };
+
+/// Stream rows from a materialized CSV (header + data lines).
+/// Parses header to get column names, then feeds each data row as a RowCtx.
+fn streamRowsCsvFn(
+    allocator: std.mem.Allocator,
+    csv: []const u8,
+    context: anytype,
+    comptime callback: fn (@TypeOf(context), *const RowCtx) anyerror!void,
+) anyerror!void {
+    var lines = std.mem.splitScalar(u8, csv, '\n');
+    const header_line = lines.next() orelse return;
+    // Parse header columns
+    var col_names: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer col_names.deinit(allocator);
+    var hdr_it = std.mem.splitScalar(u8, header_line, ',');
+    while (hdr_it.next()) |col| try col_names.append(allocator, std.mem.trim(u8, col, " \t\r"));
+
+    var values: std.ArrayListUnmanaged(Value) = .empty;
+    defer values.deinit(allocator);
+
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (trimmed.len == 0) continue;
+        values.clearRetainingCapacity();
+        var it = std.mem.splitScalar(u8, trimmed, ',');
+        var idx: usize = 0;
+        while (it.next()) |cell| : (idx += 1) {
+            const s = std.mem.trim(u8, cell, " \t\r");
+            // Try to parse as integer, then float, else string.
+            if (std.fmt.parseInt(i64, s, 10)) |n| {
+                try values.append(allocator, .{ .i64 = n });
+            } else |_| if (std.fmt.parseFloat(f64, s)) |f| {
+                try values.append(allocator, .{ .f64 = f });
+            } else |_| {
+                try values.append(allocator, .{ .str = s });
+            }
+        }
+        // Pad with empty strings if fewer cells than headers.
+        while (values.items.len < col_names.items.len) {
+            try values.append(allocator, .{ .str = "" });
+        }
+        const row = RowCtx{ .names = col_names.items, .values = values.items };
+        try callback(context, &row);
+    }
+}
 
 // ── Scalar aggregate context ──────────────────────────────────────────────────
 
