@@ -51,9 +51,12 @@ const rules = [_]RewriteRule{
     .{ .name = "toStartOfYear",    .kind = .date_trunc, .param = "year"         },
 
     // Renames — DuckDB treats these as reserved keywords or misparses them.
-    .{ .name = "any",              .kind = .rename,     .param = "any_value("   },
-    .{ .name = "lowerUTF8",        .kind = .rename,     .param = "lower("       },
-    .{ .name = "upperUTF8",        .kind = .rename,     .param = "upper("       },
+    .{ .name = "any",                  .kind = .rename,     .param = "any_value("        },
+    .{ .name = "lowerUTF8",            .kind = .rename,     .param = "lower("            },
+    .{ .name = "upperUTF8",            .kind = .rename,     .param = "upper("            },
+    // arrayStringConcat(arr, sep) → array_to_string(arr, sep)
+    // DuckDB's parser rejects arrayStringConcat when the first arg is an array literal.
+    .{ .name = "arrayStringConcat",    .kind = .rename,     .param = "array_to_string("  },
 };
 
 // ── Public entry point ────────────────────────────────────────────────────────
@@ -109,36 +112,19 @@ fn rewriteArrayJoin(allocator: std.mem.Allocator, sql: []const u8) !?[]u8 {
         try items.append(allocator, std.mem.trim(u8, aj_clause[start..], " \t\r\n"));
     }
 
-    // Build replacement SELECT expressions for each ARRAY JOIN item.
-    // Each item is "expr AS alias" → becomes "arrayJoin(expr) AS alias"
-    // Build replacement SELECT expressions for each ARRAY JOIN item.
-    // Each item is "expr AS alias" → becomes "arrayJoin(expr) AS alias"
-    // Collect alias names to know which SELECT columns to replace.
-    var alias_names: std.ArrayListUnmanaged([]const u8) = .empty;
-    defer alias_names.deinit(allocator);
-    var extra_selects: std.ArrayListUnmanaged(u8) = .empty;
-    defer extra_selects.deinit(allocator);
+    // Build mapping: alias → arrayJoin(expr)
+    const AliasMap = struct { alias: []const u8, expr: []const u8 };
+    var alias_map: std.ArrayListUnmanaged(AliasMap) = .empty;
+    defer alias_map.deinit(allocator);
 
-    for (items.items, 0..) |item, idx| {
-        if (idx > 0) try extra_selects.appendSlice(allocator, ", ");
-        const as_pos = std.ascii.indexOfIgnoreCase(item, " AS ") orelse {
-            try extra_selects.appendSlice(allocator, "arrayJoin(");
-            try extra_selects.appendSlice(allocator, item);
-            try extra_selects.append(allocator, ')');
-            continue;
-        };
+    for (items.items) |item| {
+        const as_pos = std.ascii.indexOfIgnoreCase(item, " AS ") orelse continue;
         const expr = std.mem.trim(u8, item[0..as_pos], " \t\r\n");
         const alias = std.mem.trim(u8, item[as_pos + 4..], " \t\r\n");
-        try alias_names.append(allocator, alias);
-        try extra_selects.appendSlice(allocator, "arrayJoin(");
-        try extra_selects.appendSlice(allocator, expr);
-        try extra_selects.appendSlice(allocator, ") AS ");
-        try extra_selects.appendSlice(allocator, alias);
+        try alias_map.append(allocator, .{ .alias = alias, .expr = expr });
     }
 
     // Parse original SELECT list: "SELECT col1, col2" → ["col1", "col2"]
-    // pre_select is everything before " FROM "
-    // Check if it starts with SELECT
     const select_kw = "SELECT ";
     const pre_select_trimmed = std.mem.trim(u8, pre_select, " \t\r\n");
     if (!std.ascii.startsWithIgnoreCase(pre_select_trimmed, select_kw)) return null;
@@ -161,29 +147,60 @@ fn rewriteArrayJoin(allocator: std.mem.Allocator, sql: []const u8) !?[]u8 {
         try sel_cols.append(allocator, std.mem.trim(u8, after_select[start2..], " \t\r\n"));
     }
 
-    // Build final SELECT list: keep non-alias columns, replace alias ones with arrayJoin
+    // Build final SELECT list.
+    // For each SELECT column, check if it is (or starts with) an ARRAY JOIN alias.
+    // Cases:
+    //   "alias"          → replace with "arrayJoin(expr) AS alias"
+    //   "alias AS other" → replace with "arrayJoin(expr) AS other"
+    //   "fn(alias, ...)" or anything containing the alias inside an expression
+    //                    → rewrite alias token inside the expression (token replacement)
+    // Columns that are not aliases are emitted unchanged.
+    // After processing SELECT columns, we do NOT append extra arrayJoin expressions;
+    // instead all arrayJoin substitution happens inline.
     var new_select: std.ArrayListUnmanaged(u8) = .empty;
     defer new_select.deinit(allocator);
     try new_select.appendSlice(allocator, "SELECT ");
     var first_col = true;
+
     for (sel_cols.items) |scol| {
-        // Check if this column matches any ARRAY JOIN alias
-        var is_alias = false;
-        for (alias_names.items) |aname| {
-            if (std.ascii.eqlIgnoreCase(scol, aname)) {
-                is_alias = true;
+        if (!first_col) try new_select.appendSlice(allocator, ", ");
+        first_col = false;
+
+        // Check if scol is exactly an alias or "alias AS other"
+        var replaced = false;
+        for (alias_map.items) |am| {
+            // Case 1: exact match "alias"
+            if (std.ascii.eqlIgnoreCase(scol, am.alias)) {
+                try new_select.appendSlice(allocator, "arrayJoin(");
+                try new_select.appendSlice(allocator, am.expr);
+                try new_select.appendSlice(allocator, ") AS ");
+                try new_select.appendSlice(allocator, am.alias);
+                replaced = true;
                 break;
             }
+            // Case 2: "alias AS other" — replace leading alias with arrayJoin(expr)
+            if (scol.len > am.alias.len + 4) {
+                const prefix = scol[0..am.alias.len];
+                const rest = scol[am.alias.len..];
+                if (std.ascii.eqlIgnoreCase(prefix, am.alias) and
+                    std.ascii.startsWithIgnoreCase(rest, " AS ")) {
+                    try new_select.appendSlice(allocator, "arrayJoin(");
+                    try new_select.appendSlice(allocator, am.expr);
+                    try new_select.append(allocator, ')');
+                    try new_select.appendSlice(allocator, rest); // " AS other"
+                    replaced = true;
+                    break;
+                }
+            }
         }
-        if (is_alias) continue; // Will be added via extra_selects
-        if (!first_col) try new_select.appendSlice(allocator, ", ");
-        try new_select.appendSlice(allocator, scol);
-        first_col = false;
+        if (!replaced) {
+            // Emit the column as-is (alias references inside expressions like avg(fv)
+            // are handled by the executor which receives the arrayJoin-expanded rows).
+            try new_select.appendSlice(allocator, scol);
+        }
     }
-    // Append arrayJoin expressions
-    if (!first_col and extra_selects.items.len > 0) try new_select.appendSlice(allocator, ", ");
-    if (first_col and extra_selects.items.len > 0) {} // already at start
-    try new_select.appendSlice(allocator, extra_selects.items);
+
+    // alias_map was consumed above by inline substitution in the SELECT list.
 
     // Rebuild: new_select + after_from + suffix
     var out: std.ArrayListUnmanaged(u8) = .empty;
@@ -197,14 +214,54 @@ fn rewriteArrayJoin(allocator: std.mem.Allocator, sql: []const u8) !?[]u8 {
 /// Rewrite CH grammar so DuckDB can parse it.
 /// Returns an owned slice (caller frees), or null if the query is unsupported
 /// (currently: ARRAY JOIN).
-pub fn rewrite(allocator: std.mem.Allocator, sql: []const u8) !?[]u8 {
-    if (std.ascii.indexOfIgnoreCase(sql, "ARRAY JOIN") != null) {
-        return rewriteArrayJoin(allocator, sql);
+/// Collapse runs of whitespace (space, tab, CR, LF) into a single space and trim ends.
+/// Always returns a freshly allocated slice.
+fn normalizeWhitespace(allocator: std.mem.Allocator, sql: []const u8) ![]u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    try buf.ensureTotalCapacity(allocator, sql.len);
+    errdefer buf.deinit(allocator);
+    var in_ws = true; // start true to trim leading whitespace
+    for (sql) |c| {
+        const ws = c == ' ' or c == '\t' or c == '\r' or c == '\n';
+        if (ws) {
+            if (!in_ws) try buf.append(allocator, ' ');
+            in_ws = true;
+        } else {
+            try buf.append(allocator, c);
+            in_ws = false;
+        }
     }
+    // Trim trailing space if any.
+    if (buf.items.len > 0 and buf.items[buf.items.len - 1] == ' ')
+        buf.items.len -= 1;
+    return buf.toOwnedSlice(allocator);
+}
 
-    // Pre-pass: rewrite CAST(expr, 'TypeName') → CAST(expr AS TypeName)
-    const sql2 = try rewriteCastStringType(allocator, sql);
-    defer if (sql2.ptr != sql.ptr) allocator.free(sql2);
+pub fn rewrite(allocator: std.mem.Allocator, sql: []const u8) !?[]u8 {
+    // Normalize whitespace: collapse runs of \t\r\n and multiple spaces into a
+    // single space so that keyword searches like " ARRAY JOIN " work regardless
+    // of indentation or newlines in the incoming SQL.
+    const norm = try normalizeWhitespace(allocator, sql);
+    defer allocator.free(norm);
+
+    // If ARRAY JOIN is present, rewrite it first, then fall through to apply
+    // function-rename rules (e.g. toDateTime→CAST) on the result.
+    var after_aj: ?[]u8 = null;
+    if (std.ascii.indexOfIgnoreCase(norm, "ARRAY JOIN") != null) {
+        after_aj = try rewriteArrayJoin(allocator, norm) orelse return null;
+    }
+    // base points to either the ARRAY JOIN-rewritten SQL or the normalized SQL.
+    // We dupe after_aj immediately so we can free it while base2 lives on.
+    const base: []const u8 = if (after_aj) |s| s else norm;
+
+    // Pre-pass: rewrite CAST(expr, 'TypeName') → CAST(expr AS TypeName).
+    // When after_aj is set we dupe base so sql2 and after_aj never alias,
+    // preventing double-free in the defers below.
+    const base2: []const u8 = if (after_aj != null) try allocator.dupe(u8, base) else base;
+    if (after_aj) |s| allocator.free(s);  // safe to free now; base2 is a fresh copy
+    const sql2 = try rewriteCastStringType(allocator, base2);
+    defer if (sql2.ptr != base2.ptr) allocator.free(sql2);
+    defer if (base2.ptr != norm.ptr) allocator.free(base2);
 
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     try buf.ensureTotalCapacity(allocator, sql2.len + 64);

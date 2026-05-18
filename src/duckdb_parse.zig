@@ -37,6 +37,11 @@ fn getConn() if (build_options.duckdb) c.duckdb_connection else void {
             var con: c.duckdb_connection = null;
             if (c.duckdb_connect(db, &con) == c.DuckDBSuccess) {
                 g_conn = .{ .db = db, .con = con };
+                // Register ClickHouse-compatible scalar macros so DuckDB can parse
+                // queries that use CH-specific function names.  These macros are
+                // semantically approximate; the real evaluation happens in our own
+                // evalTextExpr runtime.  Registrations are best-effort (errors ignored).
+                registerMacros(con);
             } else {
                 c.duckdb_close(&db);
             }
@@ -44,6 +49,25 @@ fn getConn() if (build_options.duckdb) c.duckdb_connection else void {
         g_conn_ready = true;
     }
     return g_conn.con;
+}
+
+fn registerMacros(con: c.duckdb_connection) void {
+    const macros = [_][*:0]const u8{
+        "CREATE MACRO IF NOT EXISTS isIPv4String(x) AS (regexp_matches(CAST(x AS VARCHAR), '^[0-9]+[.][0-9]+[.][0-9]+[.][0-9]+$'))",
+        "CREATE MACRO IF NOT EXISTS isIPv6String(x) AS (regexp_matches(CAST(x AS VARCHAR), '.*:.*'))",
+        "CREATE MACRO IF NOT EXISTS IPv4StringToNumOrDefault(x) AS (0)",
+        "CREATE MACRO IF NOT EXISTS IPv6StringToNumOrDefault(x) AS (0)",
+        "CREATE MACRO IF NOT EXISTS dictGetOrDefault(d, a, k, def) AS (def)",
+        "CREATE MACRO IF NOT EXISTS dictHas(d, k) AS (false)",
+        "CREATE MACRO IF NOT EXISTS toIPv4(x) AS (CAST(x AS VARCHAR))",
+        "CREATE MACRO IF NOT EXISTS toIPv6(x) AS (CAST(x AS VARCHAR))",
+        "CREATE MACRO IF NOT EXISTS risk_score(proto, feats) AS (0.0)",
+    };
+    for (macros) |m| {
+        var r: c.duckdb_result = undefined;
+        _ = c.duckdb_query(con, m, &r);
+        c.duckdb_destroy_result(&r);
+    }
 }
 
 // ── Public API ───────────────────────────────────────────────────────────────
@@ -409,16 +433,14 @@ fn translateWhere(allocator: std.mem.Allocator, val: std.json.Value) !*generic_s
         // lower bound: col >= lower
         {
             const col = try allocator.dupe(u8, col_name);
-            errdefer allocator.free(col);
             if (intLiteralValue(lower_node)) |iv| {
                 const node = try allocator.create(generic_sql.WhereNode);
                 node.* = .{ .cmp_int = .{ .col = col, .op = .ge, .val = iv } };
                 kids[n_built] = node;
                 n_built += 1;
             } else if (strLiteralValue(lower_node)) |sv| {
-                const val_owned = try allocator.dupe(u8, sv);
-                errdefer allocator.free(val_owned);
-                const node = try allocator.create(generic_sql.WhereNode);
+                const val_owned = allocator.dupe(u8, sv) catch { allocator.free(col); return error.UnsupportedWhereNode; };
+                const node = allocator.create(generic_sql.WhereNode) catch { allocator.free(val_owned); allocator.free(col); return error.UnsupportedWhereNode; };
                 node.* = .{ .cmp_str = .{ .col = col, .op = .ge, .val = val_owned } };
                 kids[n_built] = node;
                 n_built += 1;
@@ -431,16 +453,14 @@ fn translateWhere(allocator: std.mem.Allocator, val: std.json.Value) !*generic_s
         // upper bound: col <= upper
         {
             const col = try allocator.dupe(u8, col_name);
-            errdefer allocator.free(col);
             if (intLiteralValue(upper_node)) |iv| {
                 const node = try allocator.create(generic_sql.WhereNode);
                 node.* = .{ .cmp_int = .{ .col = col, .op = .le, .val = iv } };
                 kids[n_built] = node;
                 n_built += 1;
             } else if (strLiteralValue(upper_node)) |sv| {
-                const val_owned = try allocator.dupe(u8, sv);
-                errdefer allocator.free(val_owned);
-                const node = try allocator.create(generic_sql.WhereNode);
+                const val_owned = allocator.dupe(u8, sv) catch { allocator.free(col); return error.UnsupportedWhereNode; };
+                const node = allocator.create(generic_sql.WhereNode) catch { allocator.free(val_owned); allocator.free(col); return error.UnsupportedWhereNode; };
                 node.* = .{ .cmp_str = .{ .col = col, .op = .le, .val = val_owned } };
                 kids[n_built] = node;
                 n_built += 1;
@@ -648,6 +668,11 @@ fn strLiteralValue(val: std.json.Value) ?[]const u8 {
     if (val == .null) return null;
     const obj = val.object;
     const class = (obj.get("class") orelse return null).string;
+    // CAST(str AS TIMESTAMP/DATE/…) → unwrap to the child constant string
+    if (std.mem.eql(u8, class, "CAST")) {
+        const child = obj.get("child") orelse return null;
+        return strLiteralValue(child);
+    }
     if (!std.mem.eql(u8, class, "CONSTANT")) return null;
     const v = obj.get("value").?.object;
     const type_id = v.get("type").?.object.get("id").?.string;
@@ -736,6 +761,48 @@ fn translateExpr(allocator: std.mem.Allocator, val: std.json.Value) !?generic_sq
             };
             return .{ .func = .int_literal, .int_offset = int_val, .alias = alias };
         }
+        // Float/Decimal literals (e.g. 0.0, 0.95)
+        if (std.mem.eql(u8, type_id, "FLOAT") or
+            std.mem.eql(u8, type_id, "DOUBLE"))
+        {
+            const fval: f64 = switch (v.get("value").?) {
+                .integer => |i| @as(f64, @floatFromInt(i)),
+                .float => |f| f,
+                else => return null,
+            };
+            return .{ .func = .float_literal, .float_val = fval, .alias = alias };
+        }
+        if (std.mem.eql(u8, type_id, "DECIMAL")) {
+            const type_info = if (v.get("type").?.object.get("type_info")) |ti| ti else return null;
+            const scale: i64 = if (type_info == .object) blk: {
+                if (type_info.object.get("scale")) |sn|
+                    break :blk switch (sn) { .integer => |i| i, else => 0 };
+                break :blk 0;
+            } else 0;
+            const raw_int: i64 = switch (v.get("value").?) {
+                .integer => |i| i,
+                .float => |f| @as(i64, @intFromFloat(f)),
+                else => return null,
+            };
+            if (scale <= 0) return .{ .func = .int_literal, .int_offset = raw_int, .alias = alias };
+            var divisor: f64 = 1.0;
+            for (0..@intCast(scale)) |_| divisor *= 10.0;
+            const fval: f64 = @as(f64, @floatFromInt(raw_int)) / divisor;
+            return .{ .func = .float_literal, .float_val = fval, .alias = alias };
+        }
+        // VARCHAR string literal
+        if (std.mem.eql(u8, type_id, "VARCHAR") or
+            std.mem.eql(u8, type_id, "DATE") or
+            std.mem.eql(u8, type_id, "TIMESTAMP"))
+        {
+            const s = switch (v.get("value").?) {
+                .string => |sv| sv,
+                else => return null,
+            };
+            const col = try std.fmt.allocPrint(allocator, "'{s}'", .{s});
+            errdefer allocator.free(col);
+            return .{ .func = .column_ref, .column = col, .alias = alias };
+        }
         return null;
     }
 
@@ -789,7 +856,9 @@ fn translateExpr(allocator: std.mem.Allocator, val: std.json.Value) !?generic_sq
                     }
                 }
             }
-            return null;
+            // General expression: render to text
+            const col = try exprToText(allocator, child) orelse return null;
+            return .{ .func = .sum, .column = col, .alias = alias };
         }
         if (std.mem.eql(u8, fn_name, "avg") and children.len == 1) {
             const inner = children[0];
@@ -798,18 +867,24 @@ fn translateExpr(allocator: std.mem.Allocator, val: std.json.Value) !?generic_sq
                 const col = try std.fmt.allocPrint(allocator, "length({s})", .{col_name});
                 return .{ .func = .avg, .column = col, .alias = alias };
             }
-            const child_col = columnName(inner) orelse return null;
-            const col = try allocator.dupe(u8, child_col);
+            const col = if (columnName(inner)) |cn|
+                try allocator.dupe(u8, cn)
+            else
+                try exprToText(allocator, inner) orelse return null;
             return .{ .func = .avg, .column = col, .alias = alias };
         }
         if (std.mem.eql(u8, fn_name, "min") and children.len == 1) {
-            const child_col = columnName(children[0]) orelse return null;
-            const col = try allocator.dupe(u8, child_col);
+            const col = if (columnName(children[0])) |cn|
+                try allocator.dupe(u8, cn)
+            else
+                try exprToText(allocator, children[0]) orelse return null;
             return .{ .func = .min, .column = col, .alias = alias };
         }
         if (std.mem.eql(u8, fn_name, "max") and children.len == 1) {
-            const child_col = columnName(children[0]) orelse return null;
-            const col = try allocator.dupe(u8, child_col);
+            const col = if (columnName(children[0])) |cn|
+                try allocator.dupe(u8, cn)
+            else
+                try exprToText(allocator, children[0]) orelse return null;
             return .{ .func = .max, .column = col, .alias = alias };
         }
         if ((std.mem.eql(u8, fn_name, "count_distinct") or
@@ -885,7 +960,8 @@ fn translateExpr(allocator: std.mem.Allocator, val: std.json.Value) !?generic_sq
             return .{ .func = .group_uniq_array, .column = col, .alias = alias };
         }
         // arrayStringConcat(groupUniqArray(col), sep) → group_uniq_array with sep
-        if (std.mem.eql(u8, fn_name, "arraystringconcat") and children.len >= 1) {
+        // Also handles array_to_string(...) which is the DuckDB rename of arrayStringConcat.
+        if ((std.mem.eql(u8, fn_name, "arraystringconcat") or std.mem.eql(u8, fn_name, "array_to_string")) and children.len >= 1) {
             const inner = children[0];
             const inner_obj = inner.object;
             const inner_class = (inner_obj.get("class") orelse return null).string;
@@ -915,9 +991,16 @@ fn translateExpr(allocator: std.mem.Allocator, val: std.json.Value) !?generic_sq
         }
         // any(col) / any_value(col)
         if ((std.mem.eql(u8, fn_name, "any") or std.mem.eql(u8, fn_name, "any_value") or std.mem.eql(u8, fn_name, "first")) and children.len == 1) {
-            const child_col = columnName(children[0]) orelse return null;
-            const col = try allocator.dupe(u8, child_col);
-            return .{ .func = .any_val, .column = col, .alias = alias };
+            // Try simple column name first.
+            if (columnName(children[0])) |child_col| {
+                const col = try allocator.dupe(u8, child_col);
+                return .{ .func = .any_val, .column = col, .alias = alias };
+            }
+            // Complex expression (e.g. any(if(...))): render as text.
+            if (exprToText(allocator, children[0])) |col| {
+                return .{ .func = .any_val, .column = col, .alias = alias };
+            } else |_| {}
+            return null;
         }
         // date_trunc('minute'/'hour'/'day', EventTime) → column_ref "EventMinute"/"EventHour"/"EventDay"
         // For non-EventTime columns, fall through to text rendering.
@@ -1238,6 +1321,10 @@ fn exprToText(allocator: std.mem.Allocator, val: std.json.Value) !?[]const u8 {
             var divisor: f64 = 1.0;
             for (0..@intCast(scale)) |_| divisor *= 10.0;
             const fval: f64 = @as(f64, @floatFromInt(raw_int)) / divisor;
+            // Always include decimal point so downstream type inference sees a float.
+            if (fval == @trunc(fval) and @abs(fval) < 1e15) {
+                return try std.fmt.allocPrint(allocator, "{d}.0", .{@as(i64, @intFromFloat(fval))});
+            }
             return try std.fmt.allocPrint(allocator, "{d}", .{fval});
         }
         const sv: ?[]const u8 = switch (raw_val) {

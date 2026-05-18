@@ -75,8 +75,12 @@ pub fn runWithSource(
 
     const has_group = plan.group_by != null;
     const all_agg = allAggregates(plan.projections);
+    const any_agg = anyAggregate(plan.projections);
 
-    if (!has_group and all_agg) return exec.runScalarAgg();
+    // Run as scalar aggregation when there is no GROUP BY and at least one
+    // aggregate function.  column_ref projections (e.g. `if(total>0, avg(x), 0)`)
+    // are evaluated post-aggregation against the assembled aggregate RowCtx.
+    if (!has_group and (all_agg or any_agg)) return exec.runScalarAgg();
     if (has_group) return exec.runGroupBy();
     return exec.runScan();
 }
@@ -205,8 +209,10 @@ const Value = union(enum) {
         switch (self) {
             .i64 => |v| try out.print(allocator, "{d}", .{v}),
             .f64 => |v| {
+                // Always output with a decimal point so csvToNativeBlock can detect
+                // this as a Float64 column (not Int64/UInt64).
                 if (v == @trunc(v) and @abs(v) < 1e15) {
-                    try out.print(allocator, "{d}", .{@as(i64, @intFromFloat(v))});
+                    try out.print(allocator, "{d}.0", .{@as(i64, @intFromFloat(v))});
                 } else {
                     try out.print(allocator, "{d}", .{v});
                 }
@@ -214,7 +220,9 @@ const Value = union(enum) {
             .str      => |s| try out.appendSlice(allocator, s),
             .str_owned => |s| try out.appendSlice(allocator, s),
             .array    => |arr| {
-                // Render array as \f-separated list (matches internal array storage)
+                // Render array as \x01 sentinel + \x0c-separated elements
+                // so csvToNativeBlock can detect Array(String) columns.
+                try out.append(allocator, 0x01);
                 for (arr, 0..) |elem, i| {
                     if (i > 0) try out.append(allocator, '\x0c');
                     try elem.writeCsv(out, allocator);
@@ -324,14 +332,27 @@ fn likeMatch(str: []const u8, pattern: []const u8, case_insensitive: bool) bool 
 
 /// Parse a 'YYYY-MM-DD' date string into days-since-epoch (DuckDB DATE epoch).
 /// Returns null if the string is not a recognisable date.
+/// Parse a date/datetime string into a Unix millisecond timestamp (UTC).
+/// Accepts:
+///   'YYYY-MM-DD'           → start of that day, 00:00:00.000 UTC (ms)
+///   'YYYY-MM-DD HH:MM:SS'  → that exact second, .000 UTC (ms)
+/// Returns null if the string does not match either format.
 fn parseDateStr(s: []const u8) ?i64 {
-    // Accept 'YYYY-MM-DD' (10 chars)
-    if (s.len != 10 or s[4] != '-' or s[7] != '-') return null;
+    if (s.len < 10 or s[4] != '-' or s[7] != '-') return null;
     const y = std.fmt.parseInt(i32, s[0..4], 10) catch return null;
-    const m = std.fmt.parseInt(u8,  s[5..7], 10) catch return null;
-    const d = std.fmt.parseInt(u8,  s[8..10], 10) catch return null;
-    // Days since 1970-01-01 using a simple Gregorian calendar formula
-    return dateToDays(y, m, d);
+    const mo = std.fmt.parseInt(u8,  s[5..7], 10) catch return null;
+    const d  = std.fmt.parseInt(u8,  s[8..10], 10) catch return null;
+    const day_epoch = dateToDays(y, mo, d); // days since 1970-01-01
+    var h:  i64 = 0;
+    var mi: i64 = 0;
+    var sec: i64 = 0;
+    if (s.len >= 19 and s[10] == ' ' and s[13] == ':' and s[16] == ':') {
+        h   = std.fmt.parseInt(i64, s[11..13], 10) catch 0;
+        mi  = std.fmt.parseInt(i64, s[14..16], 10) catch 0;
+        sec = std.fmt.parseInt(i64, s[17..19], 10) catch 0;
+    }
+    const total_s = day_epoch * 86400 + h * 3600 + mi * 60 + sec;
+    return total_s * 1000; // milliseconds
 }
 
 fn dateToDays(year: i32, month: u8, day: u8) i64 {
@@ -581,6 +602,137 @@ fn lookupMapBlobTyped(blob: []const u8, key: []const u8, val_ch_type: []const u8
     return Value{ .str = "" };
 }
 
+/// Serialize a raw blob stored by decodeRowBinaryArrayOrMap into ClickHouse
+/// TabSeparated text format:
+///   Array(String)  → ['a','b']
+///   Array(Float64) → [1.5,2.0]
+///   Map(String,Float64) → {'k1':1.5,'k2':2.0}
+fn writeBlobAsChText(blob: []const u8, ch_type: []const u8, out: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
+    if (std.mem.startsWith(u8, ch_type, "Array(")) {
+        const elem_type = ch_type[6 .. ch_type.len - 1]; // strip "Array(" and ")"
+        if (blob.len == 0) {
+            try out.appendSlice(allocator, "[]");
+            return;
+        }
+        try out.append(allocator, '[');
+        const fix_w = mapValueFixedWidth(elem_type);
+        var p: usize = 0;
+        var first = true;
+        while (p < blob.len) {
+            if (!first) try out.append(allocator, ',');
+            first = false;
+            const is_str = fix_w == null;
+            if (is_str) {
+                const slen, const slb = readVarUIntSlice(blob[p..]) orelse break;
+                if (p + slb + slen > blob.len) break;
+                const s = blob[p + slb .. p + slb + slen];
+                try out.append(allocator, '\'');
+                for (s) |c| {
+                    if (c == '\'') try out.append(allocator, '\\');
+                    try out.append(allocator, c);
+                }
+                try out.append(allocator, '\'');
+                p += slb + slen;
+            } else {
+                const w = fix_w.?;
+                if (p + w > blob.len) break;
+                const raw = blob[p..p+w];
+                if (w == 8) {
+                    const bits = std.mem.readInt(u64, raw[0..8], .little);
+                    const f: f64 = @bitCast(bits);
+                    try out.print(allocator, "{d}", .{f});
+                } else if (w == 4) {
+                    const bits = std.mem.readInt(u32, raw[0..4], .little);
+                    const f: f32 = @bitCast(bits);
+                    try out.print(allocator, "{d}", .{f});
+                } else {
+                    var ibuf = [_]u8{0} ** 8;
+                    @memcpy(ibuf[0..w], raw[0..w]);
+                    try out.print(allocator, "{d}", .{std.mem.readInt(i64, &ibuf, .little)});
+                }
+                p += w;
+            }
+        }
+        try out.append(allocator, ']');
+    } else if (std.mem.startsWith(u8, ch_type, "Map(")) {
+        // Map(K, V) blob: varint N | N×key_bytes | N×val_bytes (value format depends on V)
+        if (blob.len == 0) {
+            try out.appendSlice(allocator, "{}");
+            return;
+        }
+        const count, const cb = readVarUIntSlice(blob) orelse { try out.appendSlice(allocator, "{}"); return; };
+        // Extract value type
+        const inner = ch_type[4 .. ch_type.len - 1];
+        var depth: usize = 0;
+        var comma_pos: usize = inner.len;
+        for (inner, 0..) |c, idx| {
+            if (c == '(') depth += 1
+            else if (c == ')') depth -= 1
+            else if (c == ',' and depth == 0) { comma_pos = idx; break; }
+        }
+        const val_type = if (comma_pos < inner.len) std.mem.trim(u8, inner[comma_pos+1..], " ") else "String";
+        const fix_w = mapValueFixedWidth(val_type);
+
+        // Read keys
+        var keys = try allocator.alloc([]const u8, count);
+        defer allocator.free(keys);
+        var kp: usize = cb;
+        for (0..count) |i| {
+            const klen, const klb = readVarUIntSlice(blob[kp..]) orelse break;
+            if (kp + klb + klen > blob.len) break;
+            keys[i] = blob[kp + klb .. kp + klb + klen];
+            kp += klb + klen;
+        }
+
+        try out.append(allocator, '{');
+        var vp: usize = kp;
+        for (0..count) |i| {
+            if (i > 0) try out.append(allocator, ',');
+            // key (always string)
+            try out.append(allocator, '\'');
+            for (keys[i]) |c| {
+                if (c == '\'') try out.append(allocator, '\\');
+                try out.append(allocator, c);
+            }
+            try out.appendSlice(allocator, "':");
+            if (fix_w == null) {
+                const vlen, const vlb = readVarUIntSlice(blob[vp..]) orelse break;
+                if (vp + vlb + vlen > blob.len) break;
+                const s = blob[vp + vlb .. vp + vlb + vlen];
+                try out.append(allocator, '\'');
+                for (s) |c| {
+                    if (c == '\'') try out.append(allocator, '\\');
+                    try out.append(allocator, c);
+                }
+                try out.append(allocator, '\'');
+                vp += vlb + vlen;
+            } else {
+                const w = fix_w.?;
+                if (vp + w > blob.len) break;
+                const raw = blob[vp..vp+w];
+                if (w == 8) {
+                    const bits = std.mem.readInt(u64, raw[0..8], .little);
+                    const f: f64 = @bitCast(bits);
+                    try out.print(allocator, "{d}", .{f});
+                } else if (w == 4) {
+                    const bits = std.mem.readInt(u32, raw[0..4], .little);
+                    const f: f32 = @bitCast(bits);
+                    try out.print(allocator, "{d}", .{f});
+                } else {
+                    var ibuf = [_]u8{0} ** 8;
+                    @memcpy(ibuf[0..w], raw[0..w]);
+                    try out.print(allocator, "{d}", .{std.mem.readInt(i64, &ibuf, .little)});
+                }
+                vp += w;
+            }
+        }
+        try out.append(allocator, '}');
+    } else {
+        // Fallback: raw string
+        try out.appendSlice(allocator, blob);
+    }
+}
+
 /// Read a varint-prefixed length from a byte slice.
 /// Returns (length_value, bytes_consumed) or null if slice is empty/invalid.
 /// Convert 16-byte IPv6 raw bytes to a string. Returns page_allocator-owned string or null.
@@ -671,6 +823,7 @@ const Executor = struct {
         try collectNeededColumns(self.allocator, self.plan, &needed, self.table);
 
         var ctx = ScanCtx.init(self.allocator, self.plan);
+        ctx.table = self.table;
         defer ctx.deinit(self.allocator);
         try self.streamRows(&needed, &ctx, ScanCtx.observe);
         return ctx.format(self.allocator, self.plan);
@@ -1090,7 +1243,7 @@ const AggState = struct {
             .max => {
                 if (self.max == null or Value.order(v, self.max.?) == .gt) self.max = v;
             },
-            .column_ref, .int_literal => {},
+            .column_ref, .int_literal, .float_literal => {},
         }
     }
 
@@ -1099,7 +1252,10 @@ const AggState = struct {
             .count_star, .count_if => Value{ .i64 = self.count },
             .count_distinct => Value{ .i64 = if (self.distinct) |d| @intCast(d.count()) else 0 },
             .uniq_exact, .uniq_exact_if => Value{ .i64 = if (self.distinct_str) |d| @intCast(d.count()) else 0 },
-            .sum => Value{ .f64 = self.sum },
+            .sum => if (self.sum == @trunc(self.sum) and @abs(self.sum) < 9.007199e15)
+                Value{ .i64 = @intFromFloat(self.sum) }
+            else
+                Value{ .f64 = self.sum },
             .avg => if (self.count == 0) Value{ .f64 = 0 } else Value{ .f64 = self.sum / @as(f64, @floatFromInt(self.count)) },
             .min => self.min orelse Value{ .null_val = {} },
             .max => self.max orelse Value{ .null_val = {} },
@@ -1118,7 +1274,7 @@ const AggState = struct {
                 break :blk Value{ .str = buf.toOwnedSlice(alloc) catch "" };
             },
             .any_val => self.first orelse Value{ .str = "" },
-            .column_ref, .int_literal => Value{ .null_val = {} },
+            .column_ref, .int_literal, .float_literal => Value{ .null_val = {} },
         };
     }
 
@@ -1240,11 +1396,76 @@ const ScalarAggCtx = struct {
             try writeExprHeader(&out, allocator, proj);
         }
         try out.append(allocator, '\n');
-        // Values
-        for (plan.projections, self.states, 0..) |proj, *state, i| {
-            if (i != 0) try out.append(allocator, ',');
+
+        // First pass: compute all aggregate results and build a RowCtx so that
+        // column_ref projections (e.g. `if(total > 0, avg(conf), 0)`) can
+        // reference sibling aggregate aliases.
+        const n = plan.projections.len;
+        // Each projection contributes up to 2 names (alias + column text).
+        const row_names  = try allocator.alloc([]const u8, n * 3);
+        defer allocator.free(row_names);
+        const row_values = try allocator.alloc(Value, n * 3);
+        defer allocator.free(row_values);
+        var n_entries: usize = 0;
+
+        for (plan.projections, self.states) |proj, *state| {
             var v = state.result(proj, self.allocator);
             if (proj.post_fn) |pf| v = applyPostFn(pf, v, allocator);
+            // Register by alias (e.g. "avg_conf")
+            if (proj.alias) |a| {
+                row_names[n_entries]  = a;
+                row_values[n_entries] = v;
+                n_entries += 1;
+            }
+            // Register by raw column name (e.g. "confidence" for avg projection)
+            if (proj.column) |col_text| {
+                row_names[n_entries]  = col_text;
+                row_values[n_entries] = v;
+                n_entries += 1;
+            }
+            // Register by header expression text (e.g. "avg(confidence)")
+            // so that sibling column_ref expressions can reference it directly.
+            {
+                var hdr_buf: std.ArrayList(u8) = .empty;
+                if (writeExprHeader(&hdr_buf, allocator, proj)) |_| {
+                    const hdr_text = hdr_buf.toOwnedSlice(allocator) catch "";
+                    if (hdr_text.len > 0) {
+                        row_names[n_entries]  = hdr_text;
+                        row_values[n_entries] = v;
+                        n_entries += 1;
+                    }
+                } else |_| {
+                    hdr_buf.deinit(allocator);
+                }
+            }
+        }
+        const agg_row = RowCtx{ .names = row_names[0..n_entries], .values = row_values[0..n_entries] };
+
+        // Second pass: emit values.
+        // Non-aggregate projections (column_ref) are evaluated against the
+        // assembled RowCtx so they can reference sibling aggregate aliases.
+        for (plan.projections, self.states, 0..) |proj, *state2, pi| {
+            _ = state2;
+            if (pi != 0) try out.append(allocator, ',');
+            var v: Value = if (proj.func == .column_ref or proj.func == .int_literal) blk: {
+                const expr_text = proj.column orelse break :blk Value{ .null_val = {} };
+                break :blk evalTextExpr(expr_text, &agg_row) orelse Value{ .null_val = {} };
+            } else if (proj.func == .float_literal) Value{ .f64 = proj.float_val } else blk: {
+                // Try alias then column then header-expression text as key.
+                if (proj.alias) |a| {
+                    if (agg_row.get(a)) |val| break :blk val;
+                }
+                if (proj.column) |col| {
+                    if (agg_row.get(col)) |val| break :blk val;
+                }
+                // Fall back to the header expression text (e.g. "count_star()")
+                var hdr_buf2: std.ArrayList(u8) = .empty;
+                defer hdr_buf2.deinit(allocator);
+                if (writeExprHeader(&hdr_buf2, allocator, proj)) |_| {
+                    if (agg_row.get(hdr_buf2.items)) |val| break :blk val;
+                } else |_| {}
+                break :blk Value{ .null_val = {} };
+            };
             try v.writeCsv(&out, allocator);
         }
         try out.append(allocator, '\n');
@@ -1320,7 +1541,10 @@ const GroupByCtx = struct {
     }
 
     /// Evaluate a group key expression against a row.
-    fn evalGroupKeyExpr(expr: GroupKeyExpr, row: *const RowCtx) Value {
+    /// When the group-by column name is a SELECT alias (e.g. GROUP BY ip where
+    /// ip = IPv6NumToString(dst_ip)), look up the alias in projections and
+    /// evaluate the underlying expression.
+    fn evalGroupKeyExpr(expr: GroupKeyExpr, plan: generic_sql.Plan, row: *const RowCtx) Value {
         // EventMinute: truncate EventTime to minutes
         if (std.ascii.eqlIgnoreCase(expr.base_col, "EventMinute")) {
             const ts_v = row.get("EventTime") orelse return Value{ .null_val = {} };
@@ -1345,10 +1569,25 @@ const GroupByCtx = struct {
             const truncated = @divFloor(ts, unit_us) * unit_us;
             return Value{ .i64 = truncated + expr.offset };
         }
-        const v = row.get(expr.base_col) orelse return Value{ .null_val = {} };
-        if (expr.offset == 0) return v;
-        const iv = v.toI64() orelse return v;
-        return Value{ .i64 = iv + expr.offset };
+        // Try direct column lookup first.
+        if (row.get(expr.base_col)) |v| {
+            if (expr.offset == 0) return v;
+            const iv = v.toI64() orelse return v;
+            return Value{ .i64 = iv + expr.offset };
+        }
+        // Not a raw column — check if base_col matches a SELECT alias.
+        // If so, evaluate the alias's underlying expression.
+        for (plan.projections) |proj| {
+            const alias = proj.alias orelse proj.column orelse continue;
+            if (std.ascii.eqlIgnoreCase(alias, expr.base_col)) {
+                const col_expr = proj.column orelse expr.base_col;
+                const v = evalTextExpr(col_expr, row) orelse return Value{ .null_val = {} };
+                if (expr.offset == 0) return v;
+                const iv = v.toI64() orelse return v;
+                return Value{ .i64 = iv + expr.offset };
+            }
+        }
+        return Value{ .null_val = {} };
     }
 
     fn observe(self: *GroupByCtx, row: *const RowCtx) anyerror!void {
@@ -1358,7 +1597,7 @@ const GroupByCtx = struct {
         var key_buf: std.ArrayList(u8) = .empty;
         defer key_buf.deinit(self.allocator);
         for (self.group_exprs) |expr| {
-            const v = evalGroupKeyExpr(expr, row);
+            const v = evalGroupKeyExpr(expr, self.plan, row);
             try v.writeCsv(&key_buf, self.allocator);
             try key_buf.append(self.allocator, 0); // separator
         }
@@ -1374,7 +1613,7 @@ const GroupByCtx = struct {
             // Clone key values (evaluated expressions)
             const key_values = try self.allocator.alloc(Value, self.group_exprs.len);
             for (self.group_exprs, key_values) |expr, *kv| {
-                const v = evalGroupKeyExpr(expr, row);
+                const v = evalGroupKeyExpr(expr, self.plan, row);
                 kv.* = switch (v) {
                     .str      => |s| Value{ .str = try self.allocator.dupe(u8, s) },
                     .str_owned => |s| Value{ .str = try self.allocator.dupe(u8, s) },
@@ -1526,20 +1765,49 @@ const GroupByCtx = struct {
                     // Check if it matches a group key expression (by base col + offset)
                     var is_key = false;
                     for (self.group_exprs, entry.key_values) |ge, kv| {
-                        if (std.ascii.eqlIgnoreCase(ge.base_col, col_name) and ge.offset == proj.int_offset) {
+                        // Match by raw column name OR by projection alias (for GROUP BY alias)
+                        const alias = proj.alias orelse col_name;
+                        const match = (std.ascii.eqlIgnoreCase(ge.base_col, col_name) or
+                                       std.ascii.eqlIgnoreCase(ge.base_col, alias)) and
+                                      ge.offset == proj.int_offset;
+                        if (match) {
                             try kv.writeCsv(&out, allocator);
                             is_key = true;
                             break;
                         }
                     }
                     if (!is_key) {
-                        // Non-key column_ref in projection: output first value seen
-                        var v = state.result(proj, self.allocator);
-                        if (proj.post_fn) |pf| v = applyPostFn(pf, v, allocator);
-                        try v.writeCsv(&out, allocator);
+                        // Non-key column_ref in projection: try to evaluate as
+                        // a complex expression over the already-aggregated result row.
+                        const col_name2 = proj.column orelse "";
+                        // Build a RowCtx from the aggregated states + group key values.
+                        var agg_names: std.ArrayList([]const u8) = .empty;
+                        defer agg_names.deinit(self.allocator);
+                        var agg_vals: std.ArrayList(Value) = .empty;
+                        defer agg_vals.deinit(self.allocator);
+                        for (plan.projections, entry.states) |ap, *ast| {
+                            const key = ap.alias orelse ap.column orelse continue;
+                            agg_names.append(self.allocator, key) catch {};
+                            agg_vals.append(self.allocator, ast.result(ap, self.allocator)) catch {};
+                        }
+                        for (self.group_exprs, entry.key_values) |ge, kv| {
+                            agg_names.append(self.allocator, ge.base_col) catch {};
+                            agg_vals.append(self.allocator, kv) catch {};
+                        }
+                        const agg_row2 = RowCtx{ .names = agg_names.items, .values = agg_vals.items };
+                        var v2 = evalTextExpr(col_name2, &agg_row2) orelse state.result(proj, self.allocator);
+                        if (proj.post_fn) |pf| v2 = applyPostFn(pf, v2, allocator);
+                        try v2.writeCsv(&out, allocator);
                     }
                 } else if (proj.func == .int_literal) {
                     try out.print(allocator, "{d}", .{proj.int_offset});
+                } else if (proj.func == .float_literal) {
+                    const fv = proj.float_val;
+                    if (fv == @trunc(fv) and @abs(fv) < 1e15) {
+                        try out.print(allocator, "{d}.0", .{@as(i64, @intFromFloat(fv))});
+                    } else {
+                        try out.print(allocator, "{d}", .{fv});
+                    }
                 } else {
                     var v = state.result(proj, self.allocator);
                     if (proj.post_fn) |pf| v = applyPostFn(pf, v, allocator);
@@ -1561,6 +1829,7 @@ const ScanCtx = struct {
     plan: generic_sql.Plan,
     rows: std.ArrayList([]Value), // each entry owns its Value slice
     arena: std.heap.ArenaAllocator,
+    table: ?*const schema.Table = null,
 
     fn init(allocator: std.mem.Allocator, plan: generic_sql.Plan) ScanCtx {
         return .{
@@ -1568,6 +1837,7 @@ const ScanCtx = struct {
             .plan = plan,
             .rows = .empty,
             .arena = std.heap.ArenaAllocator.init(allocator),
+            .table = null,
         };
     }
 
@@ -1644,16 +1914,17 @@ const ScanCtx = struct {
                 .str      => |s| Value{ .str = try self.arena.allocator().dupe(u8, s) },
                 .str_owned => |s| Value{ .str = try self.arena.allocator().dupe(u8, s) },
                 .array    => |arr| blk: {
-                    // Deep-copy array into arena: serialize as \x0c-separated string
-                    var buf: std.ArrayList(u8) = .empty;
-                    defer buf.deinit(self.allocator);
-                    for (arr, 0..) |elem, i| {
-                        if (i > 0) try buf.append(self.allocator, '\x0c');
-                        try elem.writeCsv(&buf, self.allocator);
-                    }
-                    const owned = try self.arena.allocator().dupe(u8, buf.items);
-                    break :blk Value{ .str = owned };
-                },
+                     // Serialize as \x01+\x0c-joined for csvToNativeBlock array detection.
+                     var buf: std.ArrayList(u8) = .empty;
+                     defer buf.deinit(self.allocator);
+                     try buf.append(self.allocator, 0x01);
+                     for (arr, 0..) |elem, i| {
+                         if (i > 0) try buf.append(self.allocator, '\x0c');
+                         try elem.writeCsv(&buf, self.allocator);
+                     }
+                     const owned = try self.arena.allocator().dupe(u8, buf.items);
+                     break :blk Value{ .str = owned };
+                 },
                 else => raw,
             };
         }
@@ -1731,8 +2002,24 @@ const ScanCtx = struct {
         try out.append(allocator, '\n');
 
         for (out_rows) |row_vals| {
-            for (row_vals, 0..) |v, i| {
+            for (row_vals, plan.projections, 0..) |v, proj, i| {
                 if (i != 0) try out.append(allocator, ',');
+                // If we have schema info, check if the column is Array/Map and
+                // serialize blob to CH TabSeparated text format.
+                const ch_type: ?[]const u8 = blk: {
+                    if (self.table) |tbl| {
+                        const col_name = proj.column orelse proj.alias orelse break :blk null;
+                        if (tbl.findColumn(col_name)) |ci| break :blk tbl.columns[ci].ch_type;
+                    }
+                    break :blk null;
+                };
+                if (ch_type) |ct| {
+                    if (std.mem.startsWith(u8, ct, "Array(") or std.mem.startsWith(u8, ct, "Map(")) {
+                        const blob = v.toStr() orelse "";
+                        try writeBlobAsChText(blob, ct, &out, allocator);
+                        continue;
+                    }
+                }
                 try v.writeCsv(&out, allocator);
             }
             try out.append(allocator, '\n');
@@ -2117,6 +2404,7 @@ fn evalProjectionExpr(proj: generic_sql.Expr, row: *const RowCtx) Value {
             return evalTextExpr(col, row) orelse Value{ .str = "" };
         },
         .int_literal => return Value{ .i64 = proj.int_offset },
+        .float_literal => return Value{ .f64 = proj.float_val },
         .count_star, .count_if  => return Value{ .i64 = 1 }, // counted by AggState
         .count_distinct, .sum, .avg, .min, .max,
         .uniq_exact, .uniq_exact_if,
@@ -2204,6 +2492,8 @@ const EvalKind = enum {
     stub_empty_str,    // dictGet → ""
     stub_null,         // dictGetOrNull → null
     stub_default_arg4, // dictGetOrDefault → 4th arg
+    // IP conversion
+    ipv6_num_to_str,   // IPv6NumToString(bytes) → "x.x.x.x" or "::ffff:..." string
     // Scalar passthrough (max in non-aggregate context)
     scalar_passthru,   // max(expr) → evalTextExpr(inner)
 };
@@ -2264,6 +2554,7 @@ const func_evals = [_]FuncEval{
     .{ .name = "dictget",                     .kind = .stub_empty_str   },
     .{ .name = "dictgetornull",               .kind = .stub_null        },
     .{ .name = "dictgetordefault",            .kind = .stub_default_arg4},
+    .{ .name = "ipv6numtostring",             .kind = .ipv6_num_to_str  },
     .{ .name = "max",                         .kind = .scalar_passthru  },
 };
 
@@ -2391,6 +2682,36 @@ fn evalTextExpr(expr: []const u8, row: *const RowCtx) ?Value {
             list.append(std.heap.page_allocator, v) catch {};
         }
         return Value{ .array = list.toOwnedSlice(std.heap.page_allocator) catch return null };
+    }
+
+    // ── outer parentheses: strip and re-evaluate ────────────────────
+    if (trimmed.len >= 2 and trimmed[0] == '(' and trimmed[trimmed.len - 1] == ')') {
+        // Only strip if the outer parens truly wrap the whole expression
+        var depth: i32 = 0;
+        var balanced = true;
+        for (trimmed[0..trimmed.len - 1], 0..) |c, ci| {
+            if (c == '(') depth += 1 else if (c == ')') {
+                depth -= 1;
+                if (depth == 0 and ci < trimmed.len - 1) { balanced = false; break; }
+            }
+        }
+        if (balanced) return evalTextExpr(trimmed[1 .. trimmed.len - 1], row);
+    }
+
+    // ── logical OR / AND as value expression (returns 0 or 1 i64) ──
+    if (findTopLevelKeyword(trimmed, "OR")) |pos| {
+        const lv = evalTextExpr(trimmed[0..pos], row) orelse Value{ .i64 = 0 };
+        const rv = evalTextExpr(trimmed[pos + 2 ..], row) orelse Value{ .i64 = 0 };
+        const lb = switch (lv) { .i64 => |v| v != 0, .f64 => |v| v != 0.0, .str => |v| v.len > 0, else => false };
+        const rb = switch (rv) { .i64 => |v| v != 0, .f64 => |v| v != 0.0, .str => |v| v.len > 0, else => false };
+        return Value{ .i64 = if (lb or rb) 1 else 0 };
+    }
+    if (findTopLevelKeyword(trimmed, "AND")) |pos| {
+        const lv = evalTextExpr(trimmed[0..pos], row) orelse Value{ .i64 = 0 };
+        const rv = evalTextExpr(trimmed[pos + 3 ..], row) orelse Value{ .i64 = 0 };
+        const lb = switch (lv) { .i64 => |v| v != 0, .f64 => |v| v != 0.0, .str => |v| v.len > 0, else => false };
+        const rb = switch (rv) { .i64 => |v| v != 0, .f64 => |v| v != 0.0, .str => |v| v.len > 0, else => false };
+        return Value{ .i64 = if (lb and rb) 1 else 0 };
     }
 
     // ── CASE WHEN … END (keyword-prefix, not a function call) ──────
@@ -2531,8 +2852,24 @@ fn evalFunc(kind: EvalKind, name: []const u8, inner: []const u8, row: *const Row
             const cond = std.mem.trim(u8, args.items[0], " \t\r\n");
             const then = std.mem.trim(u8, args.items[1], " \t\r\n");
             const els  = std.mem.trim(u8, args.items[2], " \t\r\n");
-            return if (evalTextBoolExpr(cond, row)) evalTextExpr(then, row)
-                   else                             evalTextExpr(els,  row);
+            const then_val = evalTextExpr(then, row);
+            const else_val = evalTextExpr(els,  row);
+            const chosen = if (evalTextBoolExpr(cond, row)) then_val else else_val;
+            // Coerce: if either branch is f64, return f64 to keep type consistent.
+            if (then_val != null and else_val != null) {
+                const tv = then_val.?;
+                const ev = else_val.?;
+                const either_float = (tv == .f64) or (ev == .f64);
+                if (either_float) {
+                    if (chosen) |cv| {
+                        return switch (cv) {
+                            .i64 => |v| Value{ .f64 = @floatFromInt(v) },
+                            else => cv,
+                        };
+                    }
+                }
+            }
+            return chosen;
         },
         // ── string functions ───────────────────────────────────────
         .str_lower => {
@@ -2753,9 +3090,22 @@ fn evalFunc(kind: EvalKind, name: []const u8, inner: []const u8, row: *const Row
             }
         },
         .cast_expr => {
-            const as_pos = std.ascii.indexOfIgnoreCase(inner, " AS ") orelse return null;
-            const expr_part = std.mem.trim(u8, inner[0..as_pos], " \t\r\n");
-            const type_part = std.mem.trim(u8, inner[as_pos + 4 ..], " \t\r\n");
+            // Support both CAST(expr AS type) and CAST(expr, 'type') / CAST(expr, type)
+            // Determine expr_part and type_part depending on syntax used
+            var cast_buf = [2][]const u8{ inner, "" };
+            if (std.ascii.indexOfIgnoreCase(inner, " AS ")) |as_pos| {
+                cast_buf[0] = std.mem.trim(u8, inner[0..as_pos], " \t\r\n");
+                cast_buf[1] = std.mem.trim(u8, inner[as_pos + 4 ..], " \t\r\n");
+            } else {
+                const cast_args = splitTopLevelArgs(inner) catch return null;
+                if (cast_args.len < 2) return null;
+                cast_buf[0] = std.mem.trim(u8, cast_args.items[0], " \t\r\n");
+                var tp = std.mem.trim(u8, cast_args.items[1], " \t\r\n");
+                if (tp.len >= 2 and tp[0] == '\'' and tp[tp.len - 1] == '\'') tp = tp[1 .. tp.len - 1];
+                cast_buf[1] = tp;
+            }
+            const expr_part = cast_buf[0];
+            const type_part = cast_buf[1];
             const v = evalTextExpr(expr_part, row) orelse return null;
             if (std.ascii.eqlIgnoreCase(type_part, "VARCHAR") or
                 std.ascii.eqlIgnoreCase(type_part, "STRING"))
@@ -2785,22 +3135,13 @@ fn evalFunc(kind: EvalKind, name: []const u8, inner: []const u8, row: *const Row
                     else => return Value{ .str = v.toStr() orelse return null },
                 }
             }
-            // For array/list types, serialize as a bracket-enclosed comma-separated string
+            // For array/list types, preserve as Value.array so writeCsv emits the \x01 sentinel
             if (std.ascii.startsWithIgnoreCase(type_part, "VARCHAR[]") or
-                std.ascii.eqlIgnoreCase(type_part, "LIST"))
+                std.ascii.eqlIgnoreCase(type_part, "LIST") or
+                std.ascii.startsWithIgnoreCase(type_part, "Array("))
             {
                 switch (v) {
-                    .array => |arr| {
-                        var sb: std.ArrayList(u8) = .empty;
-                        sb.append(std.heap.page_allocator, '[') catch return Value{ .str = "[]" };
-                        for (arr, 0..) |elem, ei| {
-                            if (ei > 0) sb.append(std.heap.page_allocator, ',') catch {};
-                            const s = elem.toStr() orelse "";
-                            sb.appendSlice(std.heap.page_allocator, s) catch {};
-                        }
-                        sb.append(std.heap.page_allocator, ']') catch {};
-                        return Value{ .str_owned = sb.toOwnedSlice(std.heap.page_allocator) catch return Value{ .str = "[]" } };
-                    },
+                    .array => return v,
                     else => {},
                 }
             }
@@ -3062,6 +3403,16 @@ fn evalFunc(kind: EvalKind, name: []const u8, inner: []const u8, row: *const Row
                 return evalTextExpr(std.mem.trim(u8, args.items[3], " \t\r\n"), row) orelse Value{ .str = "" };
             return Value{ .str = "" };
         },
+        // ── IPv6NumToString(bytes) → IP string ─────────────────────
+        .ipv6_num_to_str => {
+            const v = evalTextExpr(inner, row) orelse return Value{ .str = "" };
+            const s = v.toStr() orelse return Value{ .str = "" };
+            if (s.len == 16) {
+                if (ipv6BytesToStr(s)) |ip_str| return Value{ .str_owned = ip_str };
+            }
+            // Already a string IP (e.g. from CSV round-trip) — pass through.
+            return Value{ .str = s };
+        },
         // ── Scalar passthrough ─────────────────────────────────────
         .scalar_passthru => return evalTextExpr(inner, row) orelse Value{ .null_val = {} },
     }
@@ -3110,12 +3461,33 @@ fn evalCaseWhen(trimmed: []const u8, row: *const RowCtx) ?Value {
             const then_expr = std.mem.trim(u8, trimmed[then_start..pos], " \t");
             if (evalTextBoolExpr(when_expr, row))
                 return evalTextExpr(then_expr, row);
+            // Save first THEN expr text for type coercion of the ELSE branch.
+            const first_then_expr = if (pos == trimmed.len) then_expr else then_expr;
+            _ = first_then_expr;
             // else continue to next WHEN/ELSE
         } else if (std.ascii.startsWithIgnoreCase(trimmed[pos..], "ELSE ")) {
             const else_expr = std.mem.trim(u8, trimmed[pos + 5 ..], " \t");
             // strip trailing END
             const end_pos = std.ascii.indexOfIgnoreCase(else_expr, " END") orelse else_expr.len;
-            return evalTextExpr(else_expr[0..end_pos], row);
+            const else_val = evalTextExpr(else_expr[0..end_pos], row);
+            // If ELSE is an integer literal but any THEN branch looks like a float aggregate
+            // (e.g. avg(...)), coerce to Float64 so Go driver sees consistent type.
+            if (else_val) |v| switch (v) {
+                .i64 => |iv| {
+                    // Scan back through the CASE expression for "avg(" or "sum(" or similar
+                    // float-producing aggregate to determine the expected return type.
+                    if (std.mem.indexOf(u8, trimmed, "avg(") != null or
+                        std.mem.indexOf(u8, trimmed, "sum(") != null or
+                        std.mem.indexOf(u8, trimmed, "AVG(") != null or
+                        std.mem.indexOf(u8, trimmed, "SUM(") != null)
+                    {
+                        return Value{ .f64 = @floatFromInt(iv) };
+                    }
+                    return v;
+                },
+                else => return v,
+            };
+            return else_val;
         } else if (std.ascii.startsWithIgnoreCase(trimmed[pos..], "END")) {
             break;
         } else {
@@ -3303,6 +3675,7 @@ fn writeExprHeader(out: *std.ArrayList(u8), allocator: std.mem.Allocator, proj: 
             }
         },
         .int_literal => try out.print(allocator, "{d}", .{proj.int_offset}),
+        .float_literal => try out.print(allocator, "{d}", .{proj.float_val}),
         .count_star => try out.appendSlice(allocator, "count_star()"),
         .count_distinct => try out.print(allocator, "count(DISTINCT {s})", .{proj.column orelse ""}),
         .sum => if (proj.int_offset == 0)
@@ -3345,10 +3718,23 @@ fn allAggregates(projections: []const generic_sql.Expr) bool {
             .sum, .avg, .min, .max,
             .uniq_exact, .uniq_exact_if,
             .group_uniq_array, .any_val => {},
-            .column_ref, .int_literal => return false,
+            .column_ref, .int_literal, .float_literal => return false,
         }
     }
     return projections.len > 0;
+}
+
+fn anyAggregate(projections: []const generic_sql.Expr) bool {
+    for (projections) |p| {
+        switch (p.func) {
+            .count_star, .count_distinct, .count_if,
+            .sum, .avg, .min, .max,
+            .uniq_exact, .uniq_exact_if,
+            .group_uniq_array, .any_val => return true,
+            .column_ref, .int_literal, .float_literal => {},
+        }
+    }
+    return false;
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

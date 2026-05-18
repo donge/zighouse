@@ -6102,10 +6102,12 @@ fn writeFilteredDateValues(out: *std.ArrayList(u8), allocator: std.mem.Allocator
 fn executeGenericFilteredProjection(native: *Native, expr: generic_sql.Expr, hot: *const HotColumns, predicate: []const i16) !GenericValue {
     if (expr.func == .count_star) return .{ .int = @intCast(simd.countNonZero(i16, predicate)) };
     if (expr.func == .int_literal) return .{ .int = expr.int_offset };
+    if (expr.func == .float_literal) return .{ .float = expr.float_val };
     const column = bindGenericColumn(native, hot, expr.column orelse return error.UnsupportedGenericQuery) catch return error.UnsupportedGenericQuery;
     return switch (expr.func) {
         .column_ref => error.UnsupportedGenericQuery,
         .int_literal => unreachable,
+        .float_literal => unreachable,
         .count_distinct => error.UnsupportedGenericQuery,
         .count_star => unreachable,
         .count_if, .uniq_exact, .uniq_exact_if,
@@ -6175,6 +6177,7 @@ fn writeGenericHeader(out: *std.ArrayList(u8), allocator: std.mem.Allocator, pla
         switch (expr.func) {
             .column_ref => try out.print(allocator, "{s}", .{expr.column.?}),
             .int_literal => try out.print(allocator, "{d}", .{expr.int_offset}),
+            .float_literal => try out.print(allocator, "{d}", .{expr.float_val}),
             .count_distinct => try out.print(allocator, "count(DISTINCT {s})", .{expr.column.?}),
             .count_star => try out.appendSlice(allocator, "count_star()"),
             .sum => if (expr.int_offset == 0) try out.print(allocator, "sum({s})", .{expr.column.?}) else try out.print(allocator, "sum(({s} + {d}))", .{ expr.column.?, expr.int_offset }),

@@ -182,20 +182,17 @@ pub const Server = struct {
             // The body may contain: just the SQL (DDL/SELECT), or SQL\ndata (INSERT).
             // We read the full body and split at first newline if it's an INSERT.
             var body_buf: [4096]u8 = undefined;
+            request.head.expect = null; // suppress Expect: 100-continue handling
             const body_reader = request.readerExpectNone(&body_buf);
             const max_body = 256 * 1024 * 1024;
-            const body_len: usize = if (request.head.content_length) |cl|
-                @min(@as(usize, cl), max_body)
-            else
-                max_body;
-            const body = try body_reader.readAlloc(self.allocator, body_len);
+            const body = try body_reader.allocRemaining(self.allocator, .limited(max_body));
             defer self.allocator.free(body);
 
-            // Split SQL from optional data payload only for INSERT with FORMAT.
-            // clickhouse-go sends INSERT as: "INSERT INTO ... FORMAT ...\n<binary data>"
-            // INSERT with VALUES uses the entire body as SQL (multi-line allowed).
-            // For SELECT/CREATE the entire body is SQL (may contain newlines).
-            const trimmed_check = std.mem.trim(u8, body, " \t\r\n");
+             // Split SQL from optional data payload only for INSERT with FORMAT.
+             // clickhouse-go sends INSERT as: "INSERT INTO ... FORMAT ...\n<binary data>"
+             // INSERT with VALUES uses the entire body as SQL (multi-line allowed).
+             // For SELECT/CREATE the entire body is SQL (may contain newlines).
+             const trimmed_check = std.mem.trim(u8, body, " \t\r\n");
             const is_insert = asciiStartsWith(trimmed_check, "INSERT");
             // Only split at first newline if there's a FORMAT keyword on the first line.
             const first_nl = std.mem.indexOfScalar(u8, body, '\n');
@@ -216,8 +213,10 @@ pub const Server = struct {
             const after_params = try substituteParams(self.allocator, target, trimmed_raw);
             defer self.allocator.free(after_params);
             // Remove FINAL keyword (no-op in ZigHouse).
-            const trimmed = try removeFinal(self.allocator, after_params);
-            defer self.allocator.free(trimmed);
+            const after_final = try removeFinal(self.allocator, after_params);
+            defer self.allocator.free(after_final);
+            // Strip trailing FORMAT <name> clause (added by clickhouse-go).
+            const trimmed = stripFormatClause(after_final);
             try self.dispatchSqlWithData(request, out, trimmed, data_part);
         }
     }
@@ -633,11 +632,12 @@ pub const Server = struct {
         };
         defer if (final_mode) self.allocator.free(sql_clean);
 
-        // Parse SQL into a Plan.
-        const plan = (try generic_sql.parse(self.allocator, sql_clean)) orelse {
-            try sendResponse(request, out, .bad_request, "Cannot parse SELECT query\n");
-            return;
-        };
+         // Parse SQL into a Plan.
+         const plan = (try generic_sql.parse(self.allocator, sql_clean)) orelse {
+             std.debug.print("Cannot parse SELECT query: {s}\n", .{sql_clean[0..@min(200, sql_clean.len)]});
+             try sendResponse(request, out, .bad_request, "Cannot parse SELECT query\n");
+             return;
+         };
         defer generic_sql.deinit(self.allocator, plan);
         _ = &final_mode;
 
@@ -811,8 +811,10 @@ pub const Server = struct {
 
     /// SELECT handler for body-SQL mode.
     /// Handles clickhouse-go handshake and generic SELECTs.
-    fn handleSelectSimple(self: *Server, request: *std.http.Server.Request, out: *std.Io.Writer, sql: []const u8) !void {
-        // clickhouse-go handshake: SELECT displayName(), version(), revision(), timezone()
+     fn handleSelectSimple(self: *Server, request: *std.http.Server.Request, out: *std.Io.Writer, sql: []const u8) !void {
+         // Debug: log incoming SQL
+         std.debug.print("[SQL] {s}\n", .{sql[0..@min(3000, sql.len)]});
+         // clickhouse-go handshake: SELECT displayName(), version(), revision(), timezone()
         // Must return a Native Block (clickhouse-go uses default_format=Native).
         if (std.mem.indexOf(u8, sql, "displayName()") != null or
             std.mem.indexOf(u8, sql, "version()") != null)
@@ -844,12 +846,36 @@ pub const Server = struct {
 
     /// SELECT that doesn't drain the body (already consumed by handleRequest).
     fn handleSelectNoDrain(self: *Server, request: *std.http.Server.Request, out: *std.Io.Writer, sql: []const u8) !void {
+        // Make user-defined functions available to the executor.
+        generic_executor.udf_registry = &self.functions;
+
         // Parse SQL into a Plan.
         const plan = (try generic_sql.parse(self.allocator, sql)) orelse {
             try sendResponse(request, out, .bad_request, "Cannot parse SELECT query\n");
             return;
         };
         defer generic_sql.deinit(self.allocator, plan);
+
+        // Subquery: materialize inner, run outer, return Native block.
+        if (plan.subquery_source) |inner_plan| {
+            const inner_db_table = splitDbTable(inner_plan.table);
+            const inner_entry = self.schemas.find(inner_db_table.db, inner_db_table.table) orelse {
+                const nb = try native_block.encodeEmpty(self.allocator);
+                defer self.allocator.free(nb);
+                try sendNativeBlock(self.allocator, request, out, nb);
+                return;
+            };
+            var inner_parts = try part_scanner.scan(self.allocator, self.io, self.config.data_dir, inner_db_table.db, inner_db_table.table);
+            defer inner_parts.deinit();
+            const inner_csv = try generic_executor.runWithSource(self.allocator, self.io, inner_plan.*, .{ .ch_parts = inner_parts.dirs() }, &inner_entry.table);
+            defer self.allocator.free(inner_csv);
+            const result = try generic_executor.runOverCsv(self.allocator, plan, inner_csv, &inner_entry.table);
+            defer self.allocator.free(result);
+            const nb = try csvToNativeBlock(self.allocator, result);
+            defer self.allocator.free(nb);
+            try sendNativeBlock(self.allocator, request, out, nb);
+            return;
+        }
 
         const db_table = splitDbTable(plan.table);
 
@@ -1443,6 +1469,33 @@ fn isNumericLiteral(s: []const u8) bool {
     return true;
 }
 
+/// Strip trailing FORMAT <name> clause added by clickhouse-go (e.g. "FORMAT Native").
+/// Returns a slice into the original string (no allocation).
+fn stripFormatClause(sql: []const u8) []const u8 {
+    // Trim trailing whitespace
+    var end: usize = sql.len;
+    while (end > 0 and (sql[end - 1] == ' ' or sql[end - 1] == '\t' or sql[end - 1] == '\r' or sql[end - 1] == '\n')) end -= 1;
+    const trimmed = sql[0..end];
+    // Walk backwards: last word (format name), then "FORMAT"
+    var i = end;
+    while (i > 0 and (std.ascii.isAlphanumeric(sql[i - 1]) or sql[i - 1] == '_')) i -= 1;
+    if (i == end) return sql; // no word
+    // skip spaces
+    var j = i;
+    while (j > 0 and (sql[j - 1] == ' ' or sql[j - 1] == '\t')) j -= 1;
+    // check "FORMAT" keyword
+    const kw = "FORMAT";
+    if (j >= kw.len and std.ascii.eqlIgnoreCase(trimmed[j - kw.len .. j], kw)) {
+        const before = j - kw.len;
+        if (before == 0 or !std.ascii.isAlphanumeric(sql[before - 1])) {
+            var k = before;
+            while (k > 0 and (sql[k - 1] == ' ' or sql[k - 1] == '\t' or sql[k - 1] == '\r' or sql[k - 1] == '\n')) k -= 1;
+            return sql[0..k];
+        }
+    }
+    return sql;
+}
+
 /// Remove FINAL keyword from SQL (used by ReplacingMergeTree; no-op in ZigHouse).
 /// Returns a heap-allocated copy with FINAL removed (caller owns it), or a dupe
 /// of the original if FINAL was not present.
@@ -1724,11 +1777,12 @@ fn csvToNativeBlockWithSchema(allocator: std.mem.Allocator, csv: []const u8, tbl
 
     const num_rows = lines.items.len - 1;
 
-    // For each column, collect string values then determine type (Int64, Float64, or String)
+    // For each column, collect string values then determine type (Int64, Float64, Array(String), or String)
     const ColData = struct {
         vals: [][]const u8,
         is_int: bool,
         is_float: bool,
+        is_array: bool,  // true if any value starts with 0x01 (array sentinel)
         has_negative: bool,
     };
     const col_data = try allocator.alloc(ColData, num_cols);
@@ -1736,7 +1790,7 @@ fn csvToNativeBlockWithSchema(allocator: std.mem.Allocator, csv: []const u8, tbl
 
     for (0..num_cols) |ci| {
         const vals = try allocator.alloc([]const u8, num_rows);
-        col_data[ci] = .{ .vals = vals, .is_int = true, .is_float = true, .has_negative = false };
+        col_data[ci] = .{ .vals = vals, .is_int = true, .is_float = true, .is_array = false, .has_negative = false };
     }
     defer for (col_data) |cd| allocator.free(cd.vals);
 
@@ -1746,10 +1800,21 @@ fn csvToNativeBlockWithSchema(allocator: std.mem.Allocator, csv: []const u8, tbl
         while (val_it.next()) |val| : (ci += 1) {
             if (ci >= num_cols) break;
             col_data[ci].vals[ri] = val;
+            // Check for array sentinel (0x01 prefix from writeCsv)
+            if (val.len > 0 and val[0] == 0x01) {
+                col_data[ci].is_array = true;
+                col_data[ci].is_int = false;
+                col_data[ci].is_float = false;
+                continue;
+            }
             // Try to parse as int
             if (col_data[ci].is_int) {
                 const iv = std.fmt.parseInt(i64, val, 10) catch {
                     col_data[ci].is_int = false;
+                    // Fall through to float check below (don't continue).
+                    _ = std.fmt.parseFloat(f64, val) catch {
+                        col_data[ci].is_float = false;
+                    };
                     continue;
                 };
                 if (iv < 0) col_data[ci].has_negative = true;
@@ -1906,8 +1971,20 @@ fn csvToNativeBlockWithSchema(allocator: std.mem.Allocator, csv: []const u8, tbl
                     }
                 },
             }
-        } else if (col_data[ci].is_int) {
-            if (col_data[ci].has_negative) {
+        } else if (col_data[ci].is_int and num_rows > 0) {
+            // Heuristic: large positive integers >= 1e12 are ms-epoch timestamps → DateTime64(3)
+            const first_val_int = std.fmt.parseInt(i64, col_data[ci].vals[0], 10) catch 0;
+            const is_timestamp_ms = !col_data[ci].has_negative and first_val_int >= 1_000_000_000_000;
+            if (is_timestamp_ms) {
+                try putS(&buf, allocator, "DateTime64(3)");
+                try buf.append(allocator, 0);
+                for (col_data[ci].vals) |val| {
+                    const iv = std.fmt.parseInt(i64, val, 10) catch 0;
+                    var tmp: [8]u8 = undefined;
+                    std.mem.writeInt(i64, &tmp, iv, .little);
+                    try buf.appendSlice(allocator, &tmp);
+                }
+            } else if (col_data[ci].has_negative) {
                 try putS(&buf, allocator, "Int64");
                 try buf.append(allocator, 0);
                 for (col_data[ci].vals) |val| {
@@ -1926,7 +2003,7 @@ fn csvToNativeBlockWithSchema(allocator: std.mem.Allocator, csv: []const u8, tbl
                     try buf.appendSlice(allocator, &tmp);
                 }
             }
-        } else if (col_data[ci].is_float) {
+        } else if (col_data[ci].is_float and num_rows > 0) {
             try putS(&buf, allocator, "Float64");
             try buf.append(allocator, 0); // custom_serialization=false
             for (col_data[ci].vals) |val| {
@@ -1936,6 +2013,38 @@ fn csvToNativeBlockWithSchema(allocator: std.mem.Allocator, csv: []const u8, tbl
                 std.mem.writeInt(u64, &tmp, bits, .little);
                 try buf.appendSlice(allocator, &tmp);
             }
+        } else if (col_data[ci].is_array) {
+            // Array(String): each value is \x01 + elements joined by \x0c
+            try putS(&buf, allocator, "Array(String)");
+            try buf.append(allocator, 0); // custom_serialization=false
+            // ClickHouse Native Array format:
+            // 1) Cumulative offsets: one uint64 per row (how many total elements through this row)
+            // 2) All element strings concatenated (each as varint_len + bytes)
+            var all_elems: std.ArrayListUnmanaged([]const u8) = .empty;
+            defer all_elems.deinit(allocator);
+            var cumulative: u64 = 0;
+            // First pass: write offsets and collect elements
+            var offsets_buf: std.ArrayListUnmanaged(u8) = .empty;
+            defer offsets_buf.deinit(allocator);
+            for (col_data[ci].vals) |val| {
+                const content = if (val.len > 0 and val[0] == 0x01) val[1..] else "";
+                if (content.len == 0) {
+                    // empty array — offset unchanged
+                } else {
+                    var elem_it = std.mem.splitScalar(u8, content, '\x0c');
+                    while (elem_it.next()) |elem| {
+                        cumulative += 1;
+                        try all_elems.append(allocator, elem);
+                    }
+                }
+                // Write offset as little-endian uint64
+                var tmp: [8]u8 = undefined;
+                std.mem.writeInt(u64, &tmp, cumulative, .little);
+                try offsets_buf.appendSlice(allocator, &tmp);
+            }
+            try buf.appendSlice(allocator, offsets_buf.items);
+            // Second: write all elements
+            for (all_elems.items) |elem| try putS(&buf, allocator, elem);
         } else {
             try putS(&buf, allocator, "String");
             try buf.append(allocator, 0); // custom_serialization=false

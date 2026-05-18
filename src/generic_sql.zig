@@ -2,7 +2,7 @@ const std = @import("std");
 const duckdb_parse = @import("duckdb_parse.zig");
 
 pub const AggregateFn = enum {
-    column_ref, int_literal,
+    column_ref, int_literal, float_literal,
     count_star, count_distinct,
     count_if,         // countIf(expr) — condition stored in cond_col/cond_op/cond_val
     sum, avg, min, max,
@@ -27,6 +27,7 @@ pub const Expr = struct {
     func: AggregateFn,
     column: ?[]const u8 = null,
     int_offset: i64 = 0,
+    float_val: f64 = 0.0,
     alias: ?[]const u8 = null,
     /// Inline condition for countIf / uniqExactIf (owned, free in deinit).
     cond: ?*CondExpr = null,

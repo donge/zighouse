@@ -253,9 +253,12 @@ pub fn decodeWithHeader(allocator: std.mem.Allocator, data: []const u8) !WithHea
     // Read column names
     const col_names = try allocator.alloc([]u8, num_cols);
     var names_read: usize = 0;
+    var col_names_freed = false;
     errdefer {
-        for (col_names[0..names_read]) |n| allocator.free(n);
-        allocator.free(col_names);
+        if (!col_names_freed) {
+            for (col_names[0..names_read]) |n| allocator.free(n);
+            allocator.free(col_names);
+        }
     }
     for (col_names) |*name| {
         const len, const lb = readVarUInt(data[pos..]) orelse return error.UnexpectedEndOfData;
@@ -271,9 +274,12 @@ pub fn decodeWithHeader(allocator: std.mem.Allocator, data: []const u8) !WithHea
     defer allocator.free(col_types);
     const col_type_strs = try allocator.alloc([]u8, num_cols);
     var type_strs_read: usize = 0;
+    var col_type_strs_freed = false;
     errdefer {
-        for (col_type_strs[0..type_strs_read]) |ts| allocator.free(ts);
-        allocator.free(col_type_strs);
+        if (!col_type_strs_freed) {
+            for (col_type_strs[0..type_strs_read]) |ts| allocator.free(ts);
+            allocator.free(col_type_strs);
+        }
     }
 
     for (col_types, col_type_strs) |*ty, *ts| {
@@ -294,7 +300,9 @@ pub fn decodeWithHeader(allocator: std.mem.Allocator, data: []const u8) !WithHea
         col.* = .{ .name = name, .ty = ty, .ch_type = ts };
     }
     allocator.free(col_names); // slice itself (names owned by columns now)
+    col_names_freed = true;
     allocator.free(col_type_strs); // slice itself (type strs owned by columns now)
+    col_type_strs_freed = true;
 
     const table = schema.Table{ .name = "", .columns = columns };
 
