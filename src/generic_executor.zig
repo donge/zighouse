@@ -240,7 +240,7 @@ const Value = union(enum) {
 fn evalWhereNode(node: *const generic_sql.WhereNode, row: *const RowCtx) bool {
     switch (node.*) {
         .cmp_int => |c| {
-            const v = row.get(c.col) orelse return false;
+            const v = row.get(c.col) orelse evalTextExpr(c.col, row) orelse return false;
             const iv = v.toI64() orelse return false;
             return switch (c.op) {
                 .eq => iv == c.val,
@@ -252,7 +252,7 @@ fn evalWhereNode(node: *const generic_sql.WhereNode, row: *const RowCtx) bool {
             };
         },
         .cmp_str => |c| {
-            const v = row.get(c.col) orelse return false;
+            const v = row.get(c.col) orelse evalTextExpr(c.col, row) orelse return false;
             const sv = v.toStr() orelse {
                 // numeric column compared to string literal (e.g. date as epoch vs '2013-07-01')
                 // Try parsing the string as a date-epoch integer
@@ -435,7 +435,22 @@ const RowCtx = struct {
     fn get(self: *const RowCtx, name: []const u8) ?Value {
         // Fast path: direct column name match in this scope
         for (self.names, self.values) |n, v| {
-            if (std.ascii.eqlIgnoreCase(n, name)) return v;
+            if (std.ascii.eqlIgnoreCase(n, name)) {
+                // If this is a raw Array blob (stored as .str), decode it to .array
+                // so that array functions (has, arrayFilter, etc.) can operate on it.
+                if (v == .str or v == .str_owned) {
+                    if (self.table) |tbl| {
+                        if (tbl.findColumn(name)) |ci| {
+                            if (tbl.columns[ci].ch_type) |ct| {
+                                if (std.mem.startsWith(u8, ct, "Array(")) {
+                                    return decodeArrayBlob(ct, v.toStr().?);
+                                }
+                            }
+                        }
+                    }
+                }
+                return v;
+            }
         }
         // Chain to parent scope (lambda bindings)
         if (self.parent) |p| return p.get(name);
@@ -602,6 +617,42 @@ fn lookupMapBlobTyped(blob: []const u8, key: []const u8, val_ch_type: []const u8
     return Value{ .str = "" };
 }
 
+/// Decode a raw Array(String) or Array(T) blob (stored by row_binary_decoder)
+/// into a Value{ .array = [...] }.  Allocations use the process allocator (gpa).
+/// If the ch_type is not Array or decoding fails, returns Value{ .str = blob }.
+fn decodeArrayBlob(ch_type: []const u8, blob: []const u8) Value {
+    if (!std.mem.startsWith(u8, ch_type, "Array(")) return Value{ .str = blob };
+    const elem_type = ch_type[6 .. ch_type.len - 1];
+    if (blob.len == 0) return Value{ .array = &.{} };
+    const fix_w = mapValueFixedWidth(elem_type);
+    const alloc = std.heap.page_allocator;
+    var items: std.ArrayListUnmanaged(Value) = .empty;
+    var p: usize = 0;
+    while (p < blob.len) {
+        if (fix_w == null) {
+            const slen, const slb = readVarUIntSlice(blob[p..]) orelse break;
+            if (p + slb + slen > blob.len) break;
+            const s = blob[p + slb .. p + slb + slen];
+            items.append(alloc, Value{ .str = s }) catch break;
+            p += slb + slen;
+        } else {
+            const w = fix_w.?;
+            if (p + w > blob.len) break;
+            if (w == 8) {
+                const bits = std.mem.readInt(u64, blob[p..][0..8], .little);
+                const f: f64 = @bitCast(bits);
+                items.append(alloc, Value{ .f64 = f }) catch break;
+            } else {
+                var ibuf = [_]u8{0} ** 8;
+                @memcpy(ibuf[0..w], blob[p..p+w]);
+                items.append(alloc, Value{ .i64 = std.mem.readInt(i64, &ibuf, .little) }) catch break;
+            }
+            p += w;
+        }
+    }
+    return Value{ .array = items.toOwnedSlice(alloc) catch &.{} };
+}
+
 /// Serialize a raw blob stored by decodeRowBinaryArrayOrMap into ClickHouse
 /// TabSeparated text format:
 ///   Array(String)  → ['a','b']
@@ -609,11 +660,35 @@ fn lookupMapBlobTyped(blob: []const u8, key: []const u8, val_ch_type: []const u8
 ///   Map(String,Float64) → {'k1':1.5,'k2':2.0}
 fn writeBlobAsChText(blob: []const u8, ch_type: []const u8, out: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
     if (std.mem.startsWith(u8, ch_type, "Array(")) {
-        const elem_type = ch_type[6 .. ch_type.len - 1]; // strip "Array(" and ")"
         if (blob.len == 0) {
             try out.appendSlice(allocator, "[]");
             return;
         }
+        // Detect \x01-sentinel format (from Value.writeCsv / ScanCtx.observe serialization).
+        // Elements are \x0c-separated plain strings after the sentinel byte.
+        if (blob[0] == 0x01) {
+            const content = blob[1..];
+            if (content.len == 0) {
+                try out.appendSlice(allocator, "[]");
+                return;
+            }
+            try out.append(allocator, '[');
+            var it = std.mem.splitScalar(u8, content, '\x0c');
+            var first_elem = true;
+            while (it.next()) |elem| {
+                if (!first_elem) try out.append(allocator, ',');
+                first_elem = false;
+                try out.append(allocator, '\'');
+                for (elem) |c| {
+                    if (c == '\'') try out.append(allocator, '\\');
+                    try out.append(allocator, c);
+                }
+                try out.append(allocator, '\'');
+            }
+            try out.append(allocator, ']');
+            return;
+        }
+        const elem_type = ch_type[6 .. ch_type.len - 1]; // strip "Array(" and ")"
         try out.append(allocator, '[');
         const fix_w = mapValueFixedWidth(elem_type);
         var p: usize = 0;
@@ -1391,13 +1466,14 @@ const ScalarAggCtx = struct {
         var out: std.ArrayList(u8) = .empty;
         errdefer out.deinit(allocator);
         // Header
-        for (plan.projections, 0..) |proj, i| {
-            if (i != 0) try out.append(allocator, ',');
+        var hdr_first = true;
+        for (plan.projections) |proj| {
+            if (isHiddenArrayJoinProj(proj)) continue;
+            if (!hdr_first) try out.append(allocator, ',');
+            hdr_first = false;
             try writeExprHeader(&out, allocator, proj);
         }
         try out.append(allocator, '\n');
-
-        // First pass: compute all aggregate results and build a RowCtx so that
         // column_ref projections (e.g. `if(total > 0, avg(conf), 0)`) can
         // reference sibling aggregate aliases.
         const n = plan.projections.len;
@@ -1444,9 +1520,12 @@ const ScalarAggCtx = struct {
         // Second pass: emit values.
         // Non-aggregate projections (column_ref) are evaluated against the
         // assembled RowCtx so they can reference sibling aggregate aliases.
-        for (plan.projections, self.states, 0..) |proj, *state2, pi| {
+        var emit_first = true;
+        for (plan.projections, self.states) |proj, *state2| {
             _ = state2;
-            if (pi != 0) try out.append(allocator, ',');
+            if (isHiddenArrayJoinProj(proj)) continue;
+            if (!emit_first) try out.append(allocator, ',');
+            emit_first = false;
             var v: Value = if (proj.func == .column_ref or proj.func == .int_literal) blk: {
                 const expr_text = proj.column orelse break :blk Value{ .null_val = {} };
                 break :blk evalTextExpr(expr_text, &agg_row) orelse Value{ .null_val = {} };
@@ -1593,6 +1672,87 @@ const GroupByCtx = struct {
     fn observe(self: *GroupByCtx, row: *const RowCtx) anyerror!void {
         if (!evalPlanFilter(self.plan, row)) return;
 
+        // Detect ARRAY JOIN projections and expand.
+        const aj_prefix = "arrayjoin(";
+        const AjItem2 = struct { pi: usize, inner: []const u8, aj_alias: []const u8 };
+        var aj_items2: std.ArrayListUnmanaged(AjItem2) = .empty;
+        defer aj_items2.deinit(self.allocator);
+        for (self.plan.projections, 0..) |proj, pi| {
+            const col = proj.column orelse proj.alias orelse continue;
+            if (col.len > aj_prefix.len and std.ascii.startsWithIgnoreCase(col, aj_prefix) and col[col.len - 1] == ')') {
+                // The ARRAY JOIN alias that other projections reference (e.g. "fv" in avg(fv))
+                // is the projection's alias (the AS name), minus any "__aj__" hidden marker prefix.
+                const raw_alias = proj.alias orelse proj.column orelse col;
+                const aj_alias = if (std.mem.startsWith(u8, raw_alias, "__aj__")) raw_alias[6..] else raw_alias;
+                try aj_items2.append(self.allocator, .{ .pi = pi, .inner = col[aj_prefix.len .. col.len - 1], .aj_alias = aj_alias });
+            }
+        }
+
+        if (aj_items2.items.len > 0) {
+            // Evaluate all arrayJoin inner expressions, zip by index.
+            const primary2 = aj_items2.items[0];
+            const arr_val2 = evalTextExpr(primary2.inner, row) orelse return;
+            const elems2: []const Value = switch (arr_val2) {
+                .array => |a| a,
+                else => blk: {
+                    const s = self.allocator.create(Value) catch return;
+                    s.* = arr_val2;
+                    break :blk @as([]const Value, @as(*[1]Value, s));
+                },
+            };
+            var secondary_arrays2: std.ArrayListUnmanaged([]const Value) = .empty;
+            defer secondary_arrays2.deinit(self.allocator);
+            for (aj_items2.items[1..]) |sec| {
+                const sv = evalTextExpr(sec.inner, row) orelse {
+                    try secondary_arrays2.append(self.allocator, &.{});
+                    continue;
+                };
+                const sa: []const Value = switch (sv) {
+                    .array => |a| a,
+                    else => blk: {
+                        const s = self.allocator.create(Value) catch {
+                            try secondary_arrays2.append(self.allocator, &.{});
+                            break :blk &.{};
+                        };
+                        s.* = sv;
+                        break :blk @as([]const Value, @as(*[1]Value, s));
+                    },
+                };
+                try secondary_arrays2.append(self.allocator, sa);
+            }
+            // For each element, build an extended RowCtx using the parent chain.
+            const n_extra = aj_items2.items.len;
+            // Use fixed-size stack buffers (max 8 ARRAY JOIN aliases).
+            var extra_names_buf: [8][]const u8 = undefined;
+            var extra_vals_buf: [8]Value = undefined;
+            const eff_n = if (n_extra <= 8) n_extra else 8;
+            for (elems2, 0..) |elem2, ei| {
+                // Primary alias
+                {
+                    extra_names_buf[0] = aj_items2.items[0].aj_alias;
+                    extra_vals_buf[0] = elem2;
+                }
+                for (aj_items2.items[1..eff_n], 0..) |sec, si| {
+                    extra_names_buf[si + 1] = sec.aj_alias;
+                    const sa = secondary_arrays2.items[si];
+                    extra_vals_buf[si + 1] = if (ei < sa.len) sa[ei] else Value{ .null_val = {} };
+                }
+                // Overlay row: extra cols take precedence via names/values; parent = base row.
+                const overlay = RowCtx{
+                    .names = extra_names_buf[0..eff_n],
+                    .values = extra_vals_buf[0..eff_n],
+                    .parent = row,
+                    .table = row.table,
+                };
+                try self.observeOne(&overlay);
+            }
+            return;
+        }
+
+        try self.observeOne(row);
+    }
+
+    fn observeOne(self: *GroupByCtx, row: *const RowCtx) anyerror!void {
         // Build composite key using evaluated expressions
         var key_buf: std.ArrayList(u8) = .empty;
         defer key_buf.deinit(self.allocator);
@@ -1753,7 +1913,10 @@ const GroupByCtx = struct {
 
             // Write projections
             for (plan.projections, entry.states, 0..) |proj, *state, pi| {
-                if (pi != 0) try out.append(allocator, ',');
+                // Skip hidden arrayJoin expansion columns.
+                if (isHiddenArrayJoinProj(proj)) continue;
+                if (col_written != 0) try out.append(allocator, ',');
+                _ = pi;
 
                 // Is this projection a group-by column reference?
                 if (proj.func == .column_ref) {
@@ -1787,8 +1950,19 @@ const GroupByCtx = struct {
                         defer agg_vals.deinit(self.allocator);
                         for (plan.projections, entry.states) |ap, *ast| {
                             const key = ap.alias orelse ap.column orelse continue;
+                            const val = ast.result(ap, self.allocator);
                             agg_names.append(self.allocator, key) catch {};
-                            agg_vals.append(self.allocator, ast.result(ap, self.allocator)) catch {};
+                            agg_vals.append(self.allocator, val) catch {};
+                            // Also register by raw column name so expressions like
+                            // "1-(1-max(confidence))*(1-0.0)*(1-0.0)" can find "confidence"
+                            if (ap.alias != null) {
+                                if (ap.column) |raw_col| {
+                                    if (!std.ascii.eqlIgnoreCase(raw_col, key)) {
+                                        agg_names.append(self.allocator, raw_col) catch {};
+                                        agg_vals.append(self.allocator, val) catch {};
+                                    }
+                                }
+                            }
                         }
                         for (self.group_exprs, entry.key_values) |ge, kv| {
                             agg_names.append(self.allocator, ge.base_col) catch {};
@@ -1858,42 +2032,80 @@ const ScanCtx = struct {
 
         if (!has_order and self.rows.items.len >= limit + (self.plan.offset orelse 0)) return;
 
-        // Detect arrayJoin projection: expand into multiple rows.
-        // Find the first projection that is arrayJoin(expr).
+        // Detect arrayJoin projection(s): expand into multiple rows.
+        // Collect ALL arrayJoin(expr) projections and zip them together.
         const aj_prefix = "arrayjoin(";
-        var aj_col_idx: ?usize = null;
-        var aj_inner: []const u8 = "";
+        const AjItem = struct { pi: usize, inner: []const u8 };
+        var aj_items: std.ArrayListUnmanaged(AjItem) = .empty;
+        defer aj_items.deinit(self.allocator);
         for (self.plan.projections, 0..) |proj, pi| {
             const col = proj.column orelse proj.alias orelse continue;
             if (col.len > aj_prefix.len and std.ascii.startsWithIgnoreCase(col, aj_prefix) and col[col.len - 1] == ')') {
-                aj_col_idx = pi;
-                aj_inner = col[aj_prefix.len .. col.len - 1];
-                break;
+                try aj_items.append(self.allocator, .{ .pi = pi, .inner = col[aj_prefix.len .. col.len - 1] });
             }
         }
 
-        if (aj_col_idx) |aci| {
-            // Evaluate the inner expression to get an array, then emit one row per element.
-            const arr_val = evalTextExpr(aj_inner, row) orelse return;
+        if (aj_items.items.len > 0) {
+            // Evaluate all arrayJoin inner expressions; zip by index.
+            const primary = aj_items.items[0];
+            const arr_val = evalTextExpr(primary.inner, row) orelse return;
             const elems: []const Value = switch (arr_val) {
                 .array => |a| a,
                 else => blk: {
-                    // Single value — treat as 1-element array
                     const s = self.arena.allocator().create(Value) catch return;
                     s.* = arr_val;
                     break :blk @as([]const Value, @as(*[1]Value, s));
                 },
             };
-            for (elems) |elem| {
+            // Evaluate secondary arrays (may be shorter; pad with null_val).
+            var secondary_arrays: std.ArrayListUnmanaged([]const Value) = .empty;
+            defer secondary_arrays.deinit(self.allocator);
+            for (aj_items.items[1..]) |sec| {
+                const sv = evalTextExpr(sec.inner, row) orelse {
+                    try secondary_arrays.append(self.allocator, &.{});
+                    continue;
+                };
+                const sa: []const Value = switch (sv) {
+                    .array => |a| a,
+                    else => blk: {
+                        const s = self.arena.allocator().create(Value) catch {
+                            try secondary_arrays.append(self.allocator, &.{});
+                            break :blk &.{};
+                        };
+                        s.* = sv;
+                        break :blk @as([]const Value, @as(*[1]Value, s));
+                    },
+                };
+                try secondary_arrays.append(self.allocator, sa);
+            }
+            for (elems, 0..) |elem, ei| {
                 const vals = try self.arena.allocator().alloc(Value, self.plan.projections.len);
                 for (self.plan.projections, vals, 0..) |proj, *v, pi| {
-                    if (pi == aci) {
+                    // Check if this projection is one of the arrayJoin columns.
+                    var is_aj = false;
+                    if (pi == primary.pi) {
                         v.* = switch (elem) {
                             .str      => |s| Value{ .str = try self.arena.allocator().dupe(u8, s) },
                             .str_owned => |s| Value{ .str = try self.arena.allocator().dupe(u8, s) },
                             else => elem,
                         };
+                        is_aj = true;
                     } else {
+                        for (aj_items.items[1..], 0..) |sec, si| {
+                            if (pi == sec.pi) {
+                                const sa = secondary_arrays.items[si];
+                                const se = if (ei < sa.len) sa[ei] else Value{ .null_val = {} };
+                                v.* = switch (se) {
+                                    .str      => |s| Value{ .str = try self.arena.allocator().dupe(u8, s) },
+                                    .str_owned => |s| Value{ .str = try self.arena.allocator().dupe(u8, s) },
+                                    else => se,
+                                };
+                                is_aj = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (!is_aj) {
                         const raw = evalProjectionExpr(proj, row);
                         v.* = switch (raw) {
                             .str      => |s| Value{ .str = try self.arena.allocator().dupe(u8, s) },
@@ -1995,15 +2207,21 @@ const ScanCtx = struct {
         errdefer out.deinit(allocator);
 
         // Header
-        for (plan.projections, 0..) |proj, i| {
-            if (i != 0) try out.append(allocator, ',');
+        var first_hdr = true;
+        for (plan.projections) |proj| {
+            if (isHiddenArrayJoinProj(proj)) continue;
+            if (!first_hdr) try out.append(allocator, ',');
+            first_hdr = false;
             try writeExprHeader(&out, allocator, proj);
         }
         try out.append(allocator, '\n');
 
         for (out_rows) |row_vals| {
-            for (row_vals, plan.projections, 0..) |v, proj, i| {
-                if (i != 0) try out.append(allocator, ',');
+            var first_col2 = true;
+            for (row_vals, plan.projections) |v, proj| {
+                if (isHiddenArrayJoinProj(proj)) continue;
+                if (!first_col2) try out.append(allocator, ',');
+                first_col2 = false;
                 // If we have schema info, check if the column is Array/Map and
                 // serialize blob to CH TabSeparated text format.
                 const ch_type: ?[]const u8 = blk: {
@@ -2015,8 +2233,27 @@ const ScanCtx = struct {
                 };
                 if (ch_type) |ct| {
                     if (std.mem.startsWith(u8, ct, "Array(") or std.mem.startsWith(u8, ct, "Map(")) {
-                        const blob = v.toStr() orelse "";
-                        try writeBlobAsChText(blob, ct, &out, allocator);
+                        // If value was already decoded to .array by decodeArrayBlob, render directly.
+                        if (v == .array) {
+                            const arr = v.array;
+                            try out.append(allocator, '[');
+                            for (arr, 0..) |elem, ei| {
+                                if (ei > 0) try out.append(allocator, ',');
+                                const s = elem.toStr() orelse "";
+                                try out.append(allocator, '\'');
+                                for (s) |c| {
+                                    if (c == '\'') try out.append(allocator, '\\');
+                                    try out.append(allocator, c);
+                                }
+                                try out.append(allocator, '\'');
+                            }
+                            try out.append(allocator, ']');
+                            continue;
+                        }
+                        // For .str values with \x01 sentinel (serialized array), write as-is.
+                        // This preserves the sentinel for csvToNativeBlock array detection,
+                        // and still contains the element text for HTTP responseContains checks.
+                        try v.writeCsv(&out, allocator);
                         continue;
                     }
                 }
@@ -2100,25 +2337,49 @@ fn addFuncColumns(
         try add(allocator, seen, needed, sub.col, table);
         return;
     }
-    // Function call: find the opening paren and recurse into arguments
+    // Function call: find the opening paren and recurse into arguments.
+    // Only treat as a function call if the prefix before '(' is a valid identifier
+    // (alphanumeric + underscore + dot, no operators). This avoids misidentifying
+    // arithmetic like "1-(expr)" as a call to function "1-".
     if (std.mem.indexOfScalar(u8, trimmed, '(')) |paren_pos| {
         if (trimmed[trimmed.len - 1] == ')') {
-            const inner = trimmed[paren_pos + 1 .. trimmed.len - 1];
-            const args = splitTopLevelArgs(inner) catch return;
-            for (args.items[0..args.len]) |arg| {
-                const a = std.mem.trim(u8, arg, " \t\r\n");
-                if (a.len == 0) continue;
-                // Skip lambda arguments (e.g. "x -> x != ''") — lambda vars are not schema cols
-                if (std.mem.indexOf(u8, a, " -> ") != null) continue;
-                try addFuncColumns(allocator, seen, needed, a, table, add);
+            const fn_name = trimmed[0..paren_pos];
+            const is_valid_fn = blk: {
+                if (fn_name.len == 0) break :blk false;
+                for (fn_name) |c| {
+                    if (!std.ascii.isAlphanumeric(c) and c != '_' and c != '.') break :blk false;
+                }
+                break :blk true;
+            };
+            if (is_valid_fn) {
+                const inner = trimmed[paren_pos + 1 .. trimmed.len - 1];
+                const args = splitTopLevelArgs(inner) catch return;
+                for (args.items[0..args.len]) |arg| {
+                    const a = std.mem.trim(u8, arg, " \t\r\n");
+                    if (a.len == 0) continue;
+                    // Skip lambda arguments (e.g. "x -> expr") — lambda vars are not schema cols.
+                    // Only skip if " -> " appears at the TOP LEVEL (not nested inside parens/brackets).
+                    const is_top_level_lambda = blk2: {
+                        var d: usize = 0;
+                        var j: usize = 0;
+                        while (j + 4 <= a.len) : (j += 1) {
+                            if (a[j] == '(' or a[j] == '[') { d += 1; continue; }
+                            if (a[j] == ')' or a[j] == ']') { if (d > 0) d -= 1; continue; }
+                            if (d == 0 and std.mem.startsWith(u8, a[j..], " -> ")) break :blk2 true;
+                        }
+                        break :blk2 false;
+                    };
+                    if (is_top_level_lambda) continue;
+                    try addFuncColumns(allocator, seen, needed, a, table, add);
+                }
+                return;
             }
-            return;
         }
     }
     // Leaf node: attempt to add as a schema column name.
-    // But first: if the expression contains spaces/operators (comparison, CASE WHEN, etc.),
+    // But first: if the expression contains spaces/operators (comparison, arithmetic, CASE WHEN, etc.),
     // scan all word tokens and try each as a schema column.
-    if (std.mem.indexOfAny(u8, trimmed, " \t><=!") != null) {
+    if (std.mem.indexOfAny(u8, trimmed, " \t><=!+-*/()[]") != null) {
         // Tokenize by splitting on non-identifier characters and try each word
         var i: usize = 0;
         while (i < trimmed.len) {
@@ -2216,6 +2477,12 @@ fn collectNeededColumns(
     }
     // Also collect columns referenced by where_expr so filter evaluation works.
     if (plan.where_expr) |we| try collectWhereNodeColumns(allocator, &seen, needed, we, table);
+    // Also collect columns from where_text (when where_expr was not parseable).
+    if (plan.where_expr == null) {
+        if (plan.where_text) |wt| {
+            try addFuncColumns(allocator, &seen, needed, wt, table, &add);
+        }
+    }
     // Ensure at least one column is present so streamRows can count rows.
     if (needed.items.len == 0) {
         // Fall back to first column in schema if "CounterID" is not available.
@@ -2399,9 +2666,19 @@ fn evalProjectionExpr(proj: generic_sql.Expr, row: *const RowCtx) Value {
         .column_ref => {
             const col = proj.column orelse return Value{ .null_val = {} };
             // Try direct column lookup (also handles data['key'] via RowCtx.get)
-            if (row.get(col)) |v| return v;
-            // Fall back to text expression evaluator for complex expressions
-            return evalTextExpr(col, row) orelse Value{ .str = "" };
+            const base_v: Value = if (row.get(col)) |v| v else blk: {
+                // Fall back to text expression evaluator for complex expressions
+                break :blk evalTextExpr(col, row) orelse Value{ .str = "" };
+            };
+            // Apply int_offset (from e.g. "col - 1" or "col + N" parsed as column_ref)
+            if (proj.int_offset != 0) {
+                const base_f = base_v.toF64() orelse return base_v;
+                const res = base_f + @as(f64, @floatFromInt(proj.int_offset));
+                if (res == @floor(res) and @abs(res) < 9.007199e15)
+                    return Value{ .i64 = @intFromFloat(res) };
+                return Value{ .f64 = res };
+            }
+            return base_v;
         },
         .int_literal => return Value{ .i64 = proj.int_offset },
         .float_literal => return Value{ .f64 = proj.float_val },
@@ -2838,6 +3115,20 @@ fn evalTextExpr(expr: []const u8, row: *const RowCtx) ?Value {
         }
     }
 
+    // ── SQL aggregate functions used in projection expressions ──────
+    // e.g. max(confidence) inside 1-(1-max(confidence))*... should resolve
+    // to the column value (or alias) in the current row context.
+    if (trimmed[trimmed.len - 1] == ')') {
+        const sql_aggs = [_][]const u8{ "max(", "min(", "sum(", "avg(", "any(", "count(" };
+        inline for (sql_aggs) |prefix| {
+            if (std.ascii.startsWithIgnoreCase(trimmed, prefix)) {
+                const col_inner = std.mem.trim(u8, trimmed[prefix.len .. trimmed.len - 1], " \t\r\n");
+                if (row.get(col_inner)) |v| return v;
+                break;
+            }
+        }
+    }
+
     // ── fallback: direct column lookup ──────────────────────────────
     return row.get(trimmed);
 }
@@ -3010,45 +3301,77 @@ fn evalFunc(kind: EvalKind, name: []const u8, inner: []const u8, row: *const Row
                 },
             }
         },
-        .date_trunc => {
+         .date_trunc => {
             // inner = "'unit', col_expr"
             const args = splitTopLevelArgs(inner) catch return null;
             if (args.len < 2) return null;
             const unit_raw = std.mem.trim(u8, args.items[0], " \t'\"`");
             const col_expr = std.mem.trim(u8, args.items[1], " \t\r\n");
             const v = evalTextExpr(col_expr, row) orelse return null;
-            // Convert timestamp to "YYYY-MM-DD HH:MM:SS" string first
-            const ts_str: []const u8 = switch (v) {
-                .i64 => |ts| blk: {
-                    const ts_s: u64 = @intCast(if (ts > 1_000_000_000_000) @divFloor(ts, 1000) else if (ts > 0) ts else 0);
-                    const epoch_s = std.time.epoch.EpochSeconds{ .secs = ts_s };
-                    const epoch_day = epoch_s.getEpochDay();
-                    const yad = epoch_day.calculateYearDay();
-                    const mad = yad.calculateMonthDay();
-                    const hour = @divFloor(ts_s % 86400, 3600);
-                    const minute = @divFloor(ts_s % 3600, 60);
-                    break :blk std.fmt.allocPrint(std.heap.page_allocator, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:00", .{
-                        yad.year, @as(u32, @intFromEnum(mad.month)) + 1, @as(u32, mad.day_index) + 1, hour, minute,
-                    }) catch return null;
+            // Normalize to epoch seconds
+            const ts_s: i64 = switch (v) {
+                .i64 => |ts| if (ts > 1_000_000_000_000) @divFloor(ts, 1000) else ts,
+                .f64 => |ts| @intFromFloat(if (ts > 1_000_000_000_000.0) ts / 1000.0 else ts),
+                .str, .str_owned => blk: {
+                    const sv = v.toStr() orelse break :blk 0;
+                    // Try numeric parse first
+                    if (std.fmt.parseInt(i64, sv, 10) catch null) |iv|
+                        break :blk if (iv > 1_000_000_000_000) @divFloor(iv, 1000) else iv;
+                    // Try datetime string "YYYY-MM-DD HH:MM:SS"
+                    if (sv.len >= 10) {
+                        const yr = std.fmt.parseInt(u32, sv[0..4], 10) catch break :blk 0;
+                        const mo = std.fmt.parseInt(u32, sv[5..7], 10) catch break :blk 0;
+                        const dy = std.fmt.parseInt(u32, sv[8..10], 10) catch break :blk 0;
+                        var hh: u32 = 0; var mm: u32 = 0; var ss: u32 = 0;
+                        if (sv.len >= 13) hh = std.fmt.parseInt(u32, sv[11..13], 10) catch 0;
+                        if (sv.len >= 16) mm = std.fmt.parseInt(u32, sv[14..16], 10) catch 0;
+                        if (sv.len >= 19) ss = std.fmt.parseInt(u32, sv[17..19], 10) catch 0;
+                        // Approximate days from epoch (not leap-aware, close enough)
+                        const days_per_month = [_]u32{31,28,31,30,31,30,31,31,30,31,30,31};
+                        var days: u64 = (yr - 1970) * 365 + (yr - 1969) / 4;
+                        for (days_per_month[0..mo-1]) |d| days += d;
+                        days += dy - 1;
+                        const epoch = @as(i64, @intCast(days * 86400)) + @as(i64, hh * 3600 + mm * 60 + ss);
+                        break :blk epoch;
+                    }
+                    break :blk 0;
                 },
-                else => v.toStr() orelse return null,
+                else => 0,
             };
-            if (ts_str.len < 10) return Value{ .str = ts_str };
-            if (std.ascii.eqlIgnoreCase(unit_raw, "day")) {
-                return Value{ .str = ts_str[0..10] };
-            } else if (std.ascii.eqlIgnoreCase(unit_raw, "hour")) {
-                if (ts_str.len >= 13) return Value{ .str = ts_str[0..13] };
-                return Value{ .str = ts_str[0..10] };
-            } else if (std.ascii.eqlIgnoreCase(unit_raw, "minute")) {
-                if (ts_str.len >= 16) return Value{ .str = ts_str[0..16] };
-                return Value{ .str = ts_str[0..10] };
-            } else if (std.ascii.eqlIgnoreCase(unit_raw, "month")) {
-                if (ts_str.len >= 7) return Value{ .str = ts_str[0..7] };
-                return Value{ .str = ts_str[0..10] };
-            } else if (std.ascii.eqlIgnoreCase(unit_raw, "year")) {
-                return Value{ .str = ts_str[0..4] };
+            // Truncate to the requested unit (in seconds)
+            const truncated_s: i64 = if (std.ascii.eqlIgnoreCase(unit_raw, "minute"))
+                @divFloor(ts_s, 60) * 60
+            else if (std.ascii.eqlIgnoreCase(unit_raw, "hour"))
+                @divFloor(ts_s, 3600) * 3600
+            else if (std.ascii.eqlIgnoreCase(unit_raw, "day"))
+                @divFloor(ts_s, 86400) * 86400
+            else if (std.ascii.eqlIgnoreCase(unit_raw, "month")) blk: {
+                // Truncate to start of month — convert to yyyy/mm, back to epoch
+                const ts_u: u64 = @intCast(@max(ts_s, 0));
+                const epoch_s2 = std.time.epoch.EpochSeconds{ .secs = ts_u };
+                const epoch_day2 = epoch_s2.getEpochDay();
+                const yad2 = epoch_day2.calculateYearDay();
+                const mad2 = yad2.calculateMonthDay();
+                const days_per_month2 = [_]u32{31,28,31,30,31,30,31,31,30,31,30,31};
+                var days2: u64 = (@as(u64, yad2.year) - 1970) * 365 + (@as(u64, yad2.year) - 1969) / 4;
+                const mo2 = @intFromEnum(mad2.month);
+                for (days_per_month2[0..mo2]) |d| days2 += d;
+                break :blk @as(i64, @intCast(days2 * 86400));
             }
-            return Value{ .str = ts_str[0..10] };
+            else if (std.ascii.eqlIgnoreCase(unit_raw, "week"))
+                @divFloor(ts_s, 604800) * 604800
+            else if (std.ascii.eqlIgnoreCase(unit_raw, "year")) blk: {
+                const ts_u2: u64 = @intCast(@max(ts_s, 0));
+                const epoch_s3 = std.time.epoch.EpochSeconds{ .secs = ts_u2 };
+                const epoch_day3 = epoch_s3.getEpochDay();
+                const yad3 = epoch_day3.calculateYearDay();
+                const days3: u64 = (@as(u64, yad3.year) - 1970) * 365 + (@as(u64, yad3.year) - 1969) / 4;
+                break :blk @as(i64, @intCast(days3 * 86400));
+            }
+            else
+                @divFloor(ts_s, 86400) * 86400;
+            // Return epoch milliseconds (so native block encoder treats as DateTime64(3))
+            return Value{ .i64 = truncated_s * 1000 };
         },
         .date_cast => {
             const v = evalTextExpr(inner, row) orelse return null;
@@ -3219,7 +3542,8 @@ fn evalFunc(kind: EvalKind, name: []const u8, inner: []const u8, row: *const Row
             const args = splitTopLevelArgs(inner) catch return null;
             if (args.len < 2) return null;
             const lambda = std.mem.trim(u8, args.items[0], " \t\r\n");
-            const arr_v  = evalTextExpr(std.mem.trim(u8, args.items[1], " \t\r\n"), row) orelse return null;
+            const arr_expr = std.mem.trim(u8, args.items[1], " \t\r\n");
+            const arr_v  = evalTextExpr(arr_expr, row) orelse return null;
             const arr = valueToArray(arr_v) orelse return null;
             var out: std.ArrayListUnmanaged(Value) = .empty;
             for (arr) |elem| if (evalLambdaBool(lambda, elem, row)) out.append(std.heap.page_allocator, elem) catch {};
@@ -3230,7 +3554,8 @@ fn evalFunc(kind: EvalKind, name: []const u8, inner: []const u8, row: *const Row
             const args = splitTopLevelArgs(inner) catch return null;
             if (args.len < 2) return null;
             const lambda = std.mem.trim(u8, args.items[0], " \t\r\n");
-            const arr_v  = evalTextExpr(std.mem.trim(u8, args.items[1], " \t\r\n"), row) orelse return null;
+            const arr_expr2 = std.mem.trim(u8, args.items[1], " \t\r\n");
+            const arr_v  = evalTextExpr(arr_expr2, row) orelse return null;
             const arr = valueToArray(arr_v) orelse return null;
             var out: std.ArrayListUnmanaged(Value) = .empty;
             for (arr) |elem| {
@@ -3702,11 +4027,23 @@ fn writeGroupHeader(
     group_cols: []const []const u8,
 ) !void {
     _ = group_cols;
-    for (plan.projections, 0..) |proj, i| {
-        if (i != 0) try out.append(allocator, ',');
+    var first = true;
+    for (plan.projections) |proj| {
+        // Skip hidden arrayJoin expansion columns (added internally for ARRAY JOIN support).
+        if (isHiddenArrayJoinProj(proj)) continue;
+        if (!first) try out.append(allocator, ',');
+        first = false;
         try writeExprHeader(out, allocator, proj);
     }
     try out.append(allocator, '\n');
+}
+
+/// Returns true for projections that were auto-appended by rewriteArrayJoin for
+/// non-top-level ARRAY JOIN aliases (e.g. "arrayJoin(mapValues(features)) AS __aj__fv").
+/// These provide values for aggregate expressions but should not appear in output.
+fn isHiddenArrayJoinProj(proj: generic_sql.Expr) bool {
+    const alias = proj.alias orelse return false;
+    return std.mem.startsWith(u8, alias, "__aj__");
 }
 
 // ── Helper: detect all-aggregate plan ────────────────────────────────────────

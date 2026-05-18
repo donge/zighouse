@@ -157,6 +157,11 @@ fn rewriteArrayJoin(allocator: std.mem.Allocator, sql: []const u8) !?[]u8 {
     // Columns that are not aliases are emitted unchanged.
     // After processing SELECT columns, we do NOT append extra arrayJoin expressions;
     // instead all arrayJoin substitution happens inline.
+    // Track which aliases were used as top-level SELECT columns.
+    var alias_used = try allocator.alloc(bool, alias_map.items.len);
+    defer allocator.free(alias_used);
+    @memset(alias_used, false);
+
     var new_select: std.ArrayListUnmanaged(u8) = .empty;
     defer new_select.deinit(allocator);
     try new_select.appendSlice(allocator, "SELECT ");
@@ -168,13 +173,14 @@ fn rewriteArrayJoin(allocator: std.mem.Allocator, sql: []const u8) !?[]u8 {
 
         // Check if scol is exactly an alias or "alias AS other"
         var replaced = false;
-        for (alias_map.items) |am| {
+        for (alias_map.items, 0..) |am, ai| {
             // Case 1: exact match "alias"
             if (std.ascii.eqlIgnoreCase(scol, am.alias)) {
                 try new_select.appendSlice(allocator, "arrayJoin(");
                 try new_select.appendSlice(allocator, am.expr);
                 try new_select.appendSlice(allocator, ") AS ");
                 try new_select.appendSlice(allocator, am.alias);
+                alias_used[ai] = true;
                 replaced = true;
                 break;
             }
@@ -188,15 +194,29 @@ fn rewriteArrayJoin(allocator: std.mem.Allocator, sql: []const u8) !?[]u8 {
                     try new_select.appendSlice(allocator, am.expr);
                     try new_select.append(allocator, ')');
                     try new_select.appendSlice(allocator, rest); // " AS other"
+                    alias_used[ai] = true;
                     replaced = true;
                     break;
                 }
             }
         }
         if (!replaced) {
-            // Emit the column as-is (alias references inside expressions like avg(fv)
-            // are handled by the executor which receives the arrayJoin-expanded rows).
+            // Emit the column as-is; aliases inside expressions (e.g. avg(fv))
+            // will be resolved via extra arrayJoin columns appended below.
             try new_select.appendSlice(allocator, scol);
+        }
+    }
+
+    // Append arrayJoin(expr) AS alias for any ARRAY JOIN alias that did NOT appear
+    // as a top-level SELECT column. This makes the alias available to aggregate
+    // expressions like avg(fv) that reference it inside a function argument.
+    // Prefix with "__aj__" to mark as hidden (not emitted in output).
+    for (alias_map.items, 0..) |am, ai| {
+        if (!alias_used[ai]) {
+            try new_select.appendSlice(allocator, ", arrayJoin(");
+            try new_select.appendSlice(allocator, am.expr);
+            try new_select.appendSlice(allocator, ") AS __aj__");
+            try new_select.appendSlice(allocator, am.alias);
         }
     }
 

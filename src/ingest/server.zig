@@ -1752,6 +1752,21 @@ fn asciiStartsWith(s: []const u8, prefix: []const u8) bool {
 /// Convert a CSV result (header\nvalues\n) from generic_executor into a Native Block.
 /// All columns are treated as either Int64 (parseable integer) or String.
 /// Supports multi-column results (scalar agg) and multi-row results (group-by, scan).
+/// Returns true if a column name looks like an aggregate (count, sum, min, max, avg, total, etc.)
+/// such columns should never be encoded as UInt8 even if their values are 0/1.
+fn isAggColName(name: []const u8) bool {
+    const lower = blk: {
+        var buf: [64]u8 = undefined;
+        if (name.len > buf.len) break :blk name;
+        break :blk std.ascii.lowerString(&buf, name);
+    };
+    const agg_prefixes = [_][]const u8{ "count", "sum(", "avg(", "min(", "max(", "total", "any(", "groupuniq" };
+    for (agg_prefixes) |pfx| {
+        if (std.mem.startsWith(u8, lower, pfx)) return true;
+    }
+    return false;
+}
+
 fn csvToNativeBlock(allocator: std.mem.Allocator, csv: []const u8) ![]u8 {
     return csvToNativeBlockWithSchema(allocator, csv, null);
 }
@@ -1784,13 +1799,15 @@ fn csvToNativeBlockWithSchema(allocator: std.mem.Allocator, csv: []const u8, tbl
         is_float: bool,
         is_array: bool,  // true if any value starts with 0x01 (array sentinel)
         has_negative: bool,
+        max_int: i64,    // maximum integer value seen (for UInt8 detection)
+        is_bool: bool,   // true if all values are "0" or "1" (encode as UInt8)
     };
     const col_data = try allocator.alloc(ColData, num_cols);
     defer allocator.free(col_data);
 
     for (0..num_cols) |ci| {
         const vals = try allocator.alloc([]const u8, num_rows);
-        col_data[ci] = .{ .vals = vals, .is_int = true, .is_float = true, .is_array = false, .has_negative = false };
+        col_data[ci] = .{ .vals = vals, .is_int = true, .is_float = true, .is_array = false, .has_negative = false, .max_int = 0, .is_bool = true };
     }
     defer for (col_data) |cd| allocator.free(cd.vals);
 
@@ -1811,6 +1828,7 @@ fn csvToNativeBlockWithSchema(allocator: std.mem.Allocator, csv: []const u8, tbl
             if (col_data[ci].is_int) {
                 const iv = std.fmt.parseInt(i64, val, 10) catch {
                     col_data[ci].is_int = false;
+                    col_data[ci].is_bool = false;
                     // Fall through to float check below (don't continue).
                     _ = std.fmt.parseFloat(f64, val) catch {
                         col_data[ci].is_float = false;
@@ -1818,6 +1836,9 @@ fn csvToNativeBlockWithSchema(allocator: std.mem.Allocator, csv: []const u8, tbl
                     continue;
                 };
                 if (iv < 0) col_data[ci].has_negative = true;
+                if (iv > col_data[ci].max_int) col_data[ci].max_int = iv;
+                // Track if all values are 0 or 1 (boolean/UInt8)
+                if (iv != 0 and iv != 1) { col_data[ci].is_bool = false; }
             }
             // Try to parse as float (only if not int)
             if (!col_data[ci].is_int and col_data[ci].is_float) {
@@ -1880,9 +1901,22 @@ fn csvToNativeBlockWithSchema(allocator: std.mem.Allocator, csv: []const u8, tbl
             break :blk t.columns[idx].ty;
         } else null;
 
-        if (schema_ty) |sty| {
+        // Check if column has ch_type Array(...) or Map(...) — these take priority
+        // over schema_ty (which maps them to .text) when is_array is detected.
+        const ch_type_override: ?[]const u8 = if (tbl) |t| blk: {
+            const idx = t.findColumn(col_names.items[ci]) orelse break :blk null;
+            const ct = t.columns[idx].ch_type orelse break :blk null;
+            if (std.mem.startsWith(u8, ct, "Array(") or std.mem.startsWith(u8, ct, "Map(")) break :blk ct;
+            break :blk null;
+        } else null;
+
+        // If this column is an Array column (detected via sentinel or ch_type), encode as Array(String).
+        // This must come BEFORE schema_ty check since Array(String) maps to .text in schema.
+        const force_array = (ch_type_override != null and std.mem.startsWith(u8, ch_type_override.?, "Array(")) or col_data[ci].is_array;
+
+        if (schema_ty != null and !force_array) {
             // Use schema type for precise encoding
-            switch (sty) {
+            switch (schema_ty.?) {
                 .int8 => {
                     try putS(&buf, allocator, "UInt8");
                     try buf.append(allocator, 0);
@@ -1972,14 +2006,27 @@ fn csvToNativeBlockWithSchema(allocator: std.mem.Allocator, csv: []const u8, tbl
                 },
             }
         } else if (col_data[ci].is_int and num_rows > 0) {
-            // Heuristic: large positive integers >= 1e12 are ms-epoch timestamps → DateTime64(3)
+            // Heuristic: large positive integers are epoch timestamps → DateTime64(3)
             const first_val_int = std.fmt.parseInt(i64, col_data[ci].vals[0], 10) catch 0;
+            // >= 1e12: millisecond-precision epoch (2001+), already in ms
+            // >= 1e9 and < 1e12: second-precision epoch (2001-2286), multiply by 1000
             const is_timestamp_ms = !col_data[ci].has_negative and first_val_int >= 1_000_000_000_000;
+            const is_timestamp_s  = !col_data[ci].has_negative and first_val_int >= 1_000_000_000 and first_val_int < 1_000_000_000_000;
             if (is_timestamp_ms) {
                 try putS(&buf, allocator, "DateTime64(3)");
                 try buf.append(allocator, 0);
                 for (col_data[ci].vals) |val| {
                     const iv = std.fmt.parseInt(i64, val, 10) catch 0;
+                    var tmp: [8]u8 = undefined;
+                    std.mem.writeInt(i64, &tmp, iv, .little);
+                    try buf.appendSlice(allocator, &tmp);
+                }
+            } else if (is_timestamp_s) {
+                // Second-precision epoch: convert to milliseconds for DateTime64(3)
+                try putS(&buf, allocator, "DateTime64(3)");
+                try buf.append(allocator, 0);
+                for (col_data[ci].vals) |val| {
+                    const iv = (std.fmt.parseInt(i64, val, 10) catch 0) * 1000;
                     var tmp: [8]u8 = undefined;
                     std.mem.writeInt(i64, &tmp, iv, .little);
                     try buf.appendSlice(allocator, &tmp);
@@ -1992,6 +2039,15 @@ fn csvToNativeBlockWithSchema(allocator: std.mem.Allocator, csv: []const u8, tbl
                     var tmp: [8]u8 = undefined;
                     std.mem.writeInt(i64, &tmp, iv, .little);
                     try buf.appendSlice(allocator, &tmp);
+                }
+            } else if (col_data[ci].is_bool and !isAggColName(col_names.items[ci])) {
+                // Boolean-range non-negative integers (0 or 1) → UInt8
+                // (e.g. has(), isIPv4String(), countIf results 0/1)
+                try putS(&buf, allocator, "UInt8");
+                try buf.append(allocator, 0);
+                for (col_data[ci].vals) |val| {
+                    const iv = std.fmt.parseInt(u8, val, 10) catch 0;
+                    try buf.append(allocator, iv);
                 }
             } else {
                 try putS(&buf, allocator, "UInt64");

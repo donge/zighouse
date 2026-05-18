@@ -1445,7 +1445,16 @@ fn exprToText(allocator: std.mem.Allocator, val: std.json.Value) !?[]const u8 {
                 defer allocator.free(l);
                 const r = try exprToText(allocator, children[1]) orelse return null;
                 defer allocator.free(r);
-                return try std.fmt.allocPrint(allocator, "{s} {s} {s}", .{ l, sym, r });
+                // Wrap sub-expressions that contain arithmetic operators to preserve evaluation
+                // order. DuckDB strips parens in the AST, so we must re-add them for our
+                // text-based evaluator which parses right-to-left.
+                const l_needs = std.mem.indexOfAny(u8, l, "+-*/") != null;
+                const r_needs = std.mem.indexOfAny(u8, r, "+-*/") != null;
+                const lp: []const u8 = if (l_needs) "(" else "";
+                const lq: []const u8 = if (l_needs) ")" else "";
+                const rp: []const u8 = if (r_needs) "(" else "";
+                const rq: []const u8 = if (r_needs) ")" else "";
+                return try std.fmt.allocPrint(allocator, "{s}{s}{s} {s} {s}{s}{s}", .{ lp, l, lq, sym, rp, r, rq });
             }
         }
         // Generic function: fn_name(arg1, arg2, ...)
