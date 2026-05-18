@@ -821,6 +821,16 @@ fn consumeNativeTextRows(
         pos.* += num_rows * 8;
         // Measure element positions using offsets
         var ep = pos.*; // start of element data
+        {
+            const total_elems: u64 = if (num_rows > 0)
+                std.mem.readInt(u64, data[offsets_start + (num_rows - 1) * 8..][0..8], .little)
+            else 0;
+            var scan = ep;
+            for (0..total_elems) |_| scan += try measureNativeValue(inner, data, scan);
+            // Pre-reserve to prevent reallocation (which would invalidate stored slices).
+            try col_buf.str_bytes.ensureTotalCapacity(allocator,
+                col_buf.str_bytes.items.len + (scan - ep));
+        }
         var prev_off: u64 = 0;
         for (0..num_rows) |i| {
             const off = std.mem.readInt(u64, data[offsets_start + i * 8..][0..8], .little);
@@ -868,6 +878,11 @@ fn consumeNativeTextRows(
         const vals_start = pos.*;
         for (0..total_pairs) |_| pos.* += try measureNativeValue(vtype, data, pos.*);
         const vals_end = pos.*;
+        // Pre-reserve capacity to prevent reallocation (which would invalidate stored slices).
+        // Total: all key+value bytes + up to 10 bytes per row for the varint N prefix.
+        const map_data_bytes = vals_end - keys_start;
+        try col_buf.str_bytes.ensureTotalCapacity(allocator,
+            col_buf.str_bytes.items.len + map_data_bytes + num_rows * 10);
         // Re-traverse per row to build per-row blobs
         var kp = keys_start;
         var vp = vals_start;
