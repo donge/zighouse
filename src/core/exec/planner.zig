@@ -67,15 +67,15 @@ pub fn plan_query(
 
     // ── WHERE filter ──────────────────────────────────────────────────────────
     if (gplan.where_expr) |we| {
-        if (whereNodeToExpr(ctx, we)) |pred| {
-            const fn_ptr = try ctx.alloc.create(PhysicalNode);
-            fn_ptr.* = .{ .filter = .{ .input = source, .predicate = pred } };
-            source = fn_ptr;
-        }
-        // If whereNodeToExpr returns null, we leave source unfiltered (conservative).
+        const pred = whereNodeToExpr(ctx, we) orelse {
+            // whereNodeToExpr failed (e.g. unsupported column type) — must fall back.
+            return null;
+        };
+        const fn_ptr = try ctx.alloc.create(PhysicalNode);
+        fn_ptr.* = .{ .filter = .{ .input = source, .predicate = pred } };
+        source = fn_ptr;
     } else if (gplan.where_text != null) {
-        // where_text is a raw SQL string that requires evalTextExpr.
-        // Not supported in IR path — caller falls back to generic_executor.
+        // No structured WhereNode (translateWhere failed) — fall back.
         return null;
     }
 
@@ -405,8 +405,14 @@ fn scalarExprToProjectItem(ctx: *PlannerCtx, p: generic_sql.Expr) !?ProjectItem 
         .column_ref => blk: {
             const col_expr = resolveColExpr(ctx, col_name) orelse break :blk null;
             const out_type = schemaColType(ctx, col_name);
+            // Handle col + N / col - N (int_offset)
+            const final_expr: Expr = if (p.int_offset != 0) expr: {
+                const binop = ctx.alloc.create(plan.BinOp) catch break :blk null;
+                binop.* = .{ .left = col_expr, .right = .{ .lit_i64 = p.int_offset } };
+                break :expr if (p.int_offset > 0) Expr{ .add = binop } else Expr{ .sub = binop };
+            } else col_expr;
             break :blk ProjectItem{
-                .expr     = col_expr,
+                .expr     = final_expr,
                 .alias    = alias,
                 .out_type = out_type,
             };
@@ -448,7 +454,13 @@ fn aggExprToProjectItem(ctx: *PlannerCtx, p: generic_sql.Expr) !?ProjectItem {
         },
         .sum => {
             const col_type = schemaColType(ctx, col_name);
-            const arg_expr = resolveColExpr(ctx, col_name) orelse return null;
+            var arg_expr = resolveColExpr(ctx, col_name) orelse return null;
+            // Handle SUM(col + N) / SUM(col - N) via int_offset
+            if (p.int_offset != 0) {
+                const binop = try ctx.alloc.create(plan.BinOp);
+                binop.* = .{ .left = arg_expr, .right = .{ .lit_i64 = p.int_offset } };
+                arg_expr = if (p.int_offset > 0) Expr{ .add = binop } else Expr{ .sub = binop };
+            }
             agg_call.* = .{ .kind = .sum, .arg = arg_expr, .distinct = false };
             const out_type: ColumnType = switch (col_type) {
                 .float64 => .float64,

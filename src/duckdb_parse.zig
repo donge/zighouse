@@ -362,6 +362,7 @@ fn translateSelectNode(allocator: std.mem.Allocator, node_obj: std.json.ObjectMa
     // ── ORDER BY ─────────────────────────────────────────────────────────────
     var order_by_count_desc = false;
     var order_by_alias: ?[]const u8 = null;
+    var order_by_alias_asc: bool = false;
     var order_by_text: ?[]const u8 = null;
 
     for (node_obj.get("modifiers").?.array.items) |mod| {
@@ -380,8 +381,9 @@ fn translateSelectNode(allocator: std.mem.Allocator, node_obj: std.json.ObjectMa
                         order_by_count_desc = true;
                         allocator.free(order_by_text.?);
                         order_by_text = null;
-                    } else if (std.mem.eql(u8, dir, "ORDER_DESCENDING") or std.mem.eql(u8, dir, "DESCENDING")) {
-                        // Check if expr is a COLUMN_REF whose name matches a projection alias
+                    } else {
+                        // DESC or ASC: check if expr is a COLUMN_REF matching a projection alias
+                        const is_asc = std.mem.eql(u8, dir, "ORDER_ASCENDING") or std.mem.eql(u8, dir, "ASCENDING");
                         const alias_candidate: ?[]const u8 = if (exprAlias(expr0)) |a| a
                             else if (columnName(expr0)) |col| col
                             else null;
@@ -389,6 +391,7 @@ fn translateSelectNode(allocator: std.mem.Allocator, node_obj: std.json.ObjectMa
                             const found = projectionAliasExists(projections.items, alias);
                             if (found) {
                                 order_by_alias = try allocator.dupe(u8, alias);
+                                order_by_alias_asc = is_asc;
                                 allocator.free(order_by_text.?);
                                 order_by_text = null;
                             }
@@ -427,6 +430,7 @@ fn translateSelectNode(allocator: std.mem.Allocator, node_obj: std.json.ObjectMa
         .having_text = having_text,
         .order_by_count_desc = order_by_count_desc,
         .order_by_alias = order_by_alias,
+        .order_by_alias_asc = order_by_alias_asc,
         .order_by_text = order_by_text,
         .limit = limit,
         .offset = offset,
