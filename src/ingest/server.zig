@@ -44,6 +44,11 @@ const generic_executor = @import("generic_executor");
 const generic_sql = @import("generic_sql");
 const ddl_parser = @import("ddl_parser");
 const native_block = @import("native_block");
+const csv_mod = @import("csv");
+const serializer = @import("serializer");
+const core = @import("core");
+const ir_planner = @import("ir_planner");
+const part_scan_bridge = @import("part_scan_bridge");
 
 /// Server configuration.
 pub const Config = struct {
@@ -710,7 +715,7 @@ pub const Server = struct {
             return;
         }
 
-        // Run query across all parts.
+        // Run query across all parts (CSV output for ?query= HTTP path).
         const result = try generic_executor.runWithSource(
             self.allocator, self.io,
             plan,
@@ -718,8 +723,61 @@ pub const Server = struct {
             &entry.table,
         );
         defer self.allocator.free(result);
-
         try sendResponse(request, out, .ok, result);
+    }
+
+    /// Try to execute `gplan` via the IR planner + pipeline.
+    /// Returns an owned native-block []u8 on success, or null if the plan
+    /// shape is not yet supported (caller should fall back to generic_executor).
+    fn tryIrExecute(
+        self: *Server,
+        gplan: generic_sql.Plan,
+        table: *const schema.Table,
+        part_dirs: []const []const u8,
+    ) !?[]u8 {
+        // ── 1. Build PlannerCtx & translate ──────────────────────────────────
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        errdefer arena.deinit();
+        const alloc = arena.allocator();
+
+        var pctx = ir_planner.PlannerCtx.init(alloc, table.*);
+        const node = ir_planner.plan_query(&pctx, gplan) catch |err| {
+            // Unexpected planner error — log and fall back.
+            std.log.warn("ir_planner error: {}", .{err});
+            arena.deinit();
+            return null;
+        };
+        if (node == null) {
+            // plan_query returned null → unsupported shape, use fallback.
+            arena.deinit();
+            return null;
+        }
+
+        // ── 2. Build SourceIface via PartScanBridge ───────────────────────────
+        var bridge = part_scan_bridge.PartScanBridge.init(
+            self.allocator, self.io, table.*, part_dirs,
+        ) catch |err| {
+            std.log.warn("part_scan_bridge init error: {}", .{err});
+            arena.deinit();
+            return null;
+        };
+        defer bridge.deinit();
+
+        // ── 3. Execute plan through pipeline ─────────────────────────────────
+        var qctx = core.exec.pipeline.QueryContext.init(self.allocator, bridge.source());
+        defer qctx.deinit();
+
+        var rs = core.exec.pipeline.executePlan(node.?, &qctx) catch |err| {
+            std.log.warn("pipeline executePlan error: {}", .{err});
+            arena.deinit();
+            return null;
+        };
+        defer rs.deinit();
+        arena.deinit(); // free planner IR allocations
+
+        // ── 4. Serialize ResultSet → native block ─────────────────────────────
+        const nb = try serializer.toNativeBlock(self.allocator, rs);
+        return nb;
     }
 
     /// Handle SELECT with a subquery in FROM: materialize inner plan, then run outer.
@@ -871,7 +929,9 @@ pub const Server = struct {
             defer self.allocator.free(inner_csv);
             const result = try generic_executor.runOverCsv(self.allocator, plan, inner_csv, &inner_entry.table);
             defer self.allocator.free(result);
-            const nb = try csvToNativeBlock(self.allocator, result);
+            var rs = try serializer.csvToResultSet(self.allocator, result, &inner_entry.table);
+            defer rs.deinit();
+            const nb = try serializer.toNativeBlock(self.allocator, rs);
             defer self.allocator.free(nb);
             try sendNativeBlock(self.allocator, request, out, nb);
             return;
@@ -881,8 +941,6 @@ pub const Server = struct {
 
         const entry = self.schemas.find(db_table.db, db_table.table) orelse {
             // Unknown table: synthesise a zero-row result.
-            // For scalar aggregate queries (e.g. SELECT count() FROM unknown)
-            // we must return a properly-shaped block; otherwise return empty block.
             const fake_table = schema.Table{ .name = "", .columns = &.{} };
             if (generic_executor.runWithSource(
                 self.allocator, self.io,
@@ -891,7 +949,9 @@ pub const Server = struct {
                 &fake_table,
             )) |fake_result| {
                 defer self.allocator.free(fake_result);
-                const nb = try csvToNativeBlock(self.allocator, fake_result);
+                var rs = try serializer.csvToResultSet(self.allocator, fake_result, null);
+                defer rs.deinit();
+                const nb = try serializer.toNativeBlock(self.allocator, rs);
                 defer self.allocator.free(nb);
                 try sendNativeBlock(self.allocator, request, out, nb);
             } else |_| {
@@ -909,8 +969,6 @@ pub const Server = struct {
         defer parts.deinit();
 
         if (parts.dirs().len == 0) {
-            // No data yet — run the plan against an empty source so scalar aggregates
-            // (e.g. SELECT count() → 0) return a properly-shaped block.
             if (generic_executor.runWithSource(
                 self.allocator, self.io,
                 plan,
@@ -918,7 +976,9 @@ pub const Server = struct {
                 &entry.table,
             )) |empty_result| {
                 defer self.allocator.free(empty_result);
-                const nb = try csvToNativeBlockWithSchema(self.allocator, empty_result, &entry.table);
+                var rs = try serializer.csvToResultSet(self.allocator, empty_result, &entry.table);
+                defer rs.deinit();
+                const nb = try serializer.toNativeBlock(self.allocator, rs);
                 defer self.allocator.free(nb);
                 try sendNativeBlock(self.allocator, request, out, nb);
             } else |_| {
@@ -929,6 +989,14 @@ pub const Server = struct {
             return;
         }
 
+        // ── IR execution path (native binary, no CSV intermediate) ────────────
+        if (try self.tryIrExecute(plan, &entry.table, parts.dirs())) |nb| {
+            defer self.allocator.free(nb);
+            try sendNativeBlock(self.allocator, request, out, nb);
+            return;
+        }
+
+        // ── Fallback: generic_executor → CSV → native block ────────────────
         const result = try generic_executor.runWithSource(
             self.allocator, self.io,
             plan,
@@ -937,13 +1005,13 @@ pub const Server = struct {
         );
         defer self.allocator.free(result);
 
-        // Wrap CSV result in Native Block so clickhouse-go can parse it.
-        const nb = try csvToNativeBlockWithSchema(self.allocator, result, &entry.table);
+        var rs = try serializer.csvToResultSet(self.allocator, result, &entry.table);
+        defer rs.deinit();
+        const nb = try serializer.toNativeBlock(self.allocator, rs);
         defer self.allocator.free(nb);
         try sendNativeBlock(self.allocator, request, out, nb);
     }
 
-    /// CREATE handler for body-SQL mode.
     fn handleCreateSimple(self: *Server, request: *std.http.Server.Request, out: *std.Io.Writer, sql: []const u8) !void {
         // Classify by second (and possibly third) token.
         var it = std.mem.tokenizeAny(u8, sql, " \t\r\n");
@@ -1747,379 +1815,6 @@ fn isValuesWs(c: u8) bool {
 fn asciiStartsWith(s: []const u8, prefix: []const u8) bool {
     if (s.len < prefix.len) return false;
     return asciiEql(s[0..prefix.len], prefix);
-}
-
-/// Convert a CSV result (header\nvalues\n) from generic_executor into a Native Block.
-/// All columns are treated as either Int64 (parseable integer) or String.
-/// Supports multi-column results (scalar agg) and multi-row results (group-by, scan).
-/// Returns true if a column name looks like an aggregate (count, sum, min, max, avg, total, etc.)
-/// such columns should never be encoded as UInt8 even if their values are 0/1.
-fn isAggColName(name: []const u8) bool {
-    const lower = blk: {
-        var buf: [64]u8 = undefined;
-        if (name.len > buf.len) break :blk name;
-        break :blk std.ascii.lowerString(&buf, name);
-    };
-    const agg_prefixes = [_][]const u8{ "count", "sum(", "avg(", "min(", "max(", "total", "any(", "groupuniq" };
-    for (agg_prefixes) |pfx| {
-        if (std.mem.startsWith(u8, lower, pfx)) return true;
-    }
-    return false;
-}
-
-fn csvToNativeBlock(allocator: std.mem.Allocator, csv: []const u8) ![]u8 {
-    return csvToNativeBlockWithSchema(allocator, csv, null);
-}
-
-fn csvToNativeBlockWithSchema(allocator: std.mem.Allocator, csv: []const u8, tbl: ?*const schema.Table) ![]u8 {
-    // Split into lines, skip trailing empty
-    var lines: std.ArrayListUnmanaged([]const u8) = .empty;
-    defer lines.deinit(allocator);
-    var it = std.mem.splitScalar(u8, csv, '\n');
-    while (it.next()) |line| {
-        if (line.len > 0) try lines.append(allocator, line);
-    }
-    if (lines.items.len == 0) return native_block.encodeEmpty(allocator);
-
-    // Parse header (first line): comma-separated column names
-    var col_names: std.ArrayListUnmanaged([]const u8) = .empty;
-    defer col_names.deinit(allocator);
-    var hdr_it = std.mem.splitScalar(u8, lines.items[0], ',');
-    while (hdr_it.next()) |name| try col_names.append(allocator, name);
-
-    const num_cols = col_names.items.len;
-    if (num_cols == 0) return native_block.encodeEmpty(allocator);
-
-    const num_rows = lines.items.len - 1;
-
-    // For each column, collect string values then determine type (Int64, Float64, Array(String), or String)
-    const ColData = struct {
-        vals: [][]const u8,
-        is_int: bool,
-        is_float: bool,
-        is_array: bool,  // true if any value starts with 0x01 (array sentinel)
-        has_negative: bool,
-        max_int: i64,    // maximum integer value seen (for UInt8 detection)
-        is_bool: bool,   // true if all values are "0" or "1" (encode as UInt8)
-    };
-    const col_data = try allocator.alloc(ColData, num_cols);
-    defer allocator.free(col_data);
-
-    for (0..num_cols) |ci| {
-        const vals = try allocator.alloc([]const u8, num_rows);
-        col_data[ci] = .{ .vals = vals, .is_int = true, .is_float = true, .is_array = false, .has_negative = false, .max_int = 0, .is_bool = true };
-    }
-    defer for (col_data) |cd| allocator.free(cd.vals);
-
-    for (lines.items[1..], 0..) |line, ri| {
-        var val_it = std.mem.splitScalar(u8, line, ',');
-        var ci: usize = 0;
-        while (val_it.next()) |val| : (ci += 1) {
-            if (ci >= num_cols) break;
-            col_data[ci].vals[ri] = val;
-            // Check for array sentinel (0x01 prefix from writeCsv)
-            if (val.len > 0 and val[0] == 0x01) {
-                col_data[ci].is_array = true;
-                col_data[ci].is_int = false;
-                col_data[ci].is_float = false;
-                continue;
-            }
-            // Try to parse as int
-            if (col_data[ci].is_int) {
-                const iv = std.fmt.parseInt(i64, val, 10) catch {
-                    col_data[ci].is_int = false;
-                    col_data[ci].is_bool = false;
-                    // Fall through to float check below (don't continue).
-                    _ = std.fmt.parseFloat(f64, val) catch {
-                        col_data[ci].is_float = false;
-                    };
-                    continue;
-                };
-                if (iv < 0) col_data[ci].has_negative = true;
-                if (iv > col_data[ci].max_int) col_data[ci].max_int = iv;
-                // Track if all values are 0 or 1 (boolean/UInt8)
-                if (iv != 0 and iv != 1) { col_data[ci].is_bool = false; }
-            }
-            // Try to parse as float (only if not int)
-            if (!col_data[ci].is_int and col_data[ci].is_float) {
-                _ = std.fmt.parseFloat(f64, val) catch {
-                    col_data[ci].is_float = false;
-                };
-            }
-        }
-        // Fill missing columns with empty string
-        while (ci < num_cols) : (ci += 1) {
-            col_data[ci].vals[ri] = "";
-            col_data[ci].is_int = false;
-            col_data[ci].is_float = false;
-        }
-    }
-
-    // Encode Native Block
-    var buf: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer buf.deinit(allocator);
-
-    // Inline putUVarInt / putString helpers
-    const putV = struct {
-        fn f(b: *std.ArrayListUnmanaged(u8), a: std.mem.Allocator, v: u64) !void {
-            var x = v;
-            while (x >= 0x80) {
-                try b.append(a, @as(u8, @intCast((x & 0x7F) | 0x80)));
-                x >>= 7;
-            }
-            try b.append(a, @as(u8, @intCast(x)));
-        }
-    }.f;
-    const putS = struct {
-        fn f(b: *std.ArrayListUnmanaged(u8), a: std.mem.Allocator, s: []const u8) !void {
-            var x = s.len;
-            while (x >= 0x80) {
-                try b.append(a, @as(u8, @intCast((x & 0x7F) | 0x80)));
-                x >>= 7;
-            }
-            try b.append(a, @as(u8, @intCast(x)));
-            try b.appendSlice(a, s);
-        }
-    }.f;
-
-    // Block info
-    try putV(&buf, allocator, 1);
-    try buf.append(allocator, 0);
-    try putV(&buf, allocator, 2);
-    try buf.appendSlice(allocator, &[4]u8{ 0xFF, 0xFF, 0xFF, 0xFF });
-    try putV(&buf, allocator, 0);
-
-    try putV(&buf, allocator, num_cols);
-    try putV(&buf, allocator, num_rows);
-
-    for (0..num_cols) |ci| {
-        try putS(&buf, allocator, col_names.items[ci]);
-
-        // Determine actual type from schema if available
-        const schema_ty: ?schema.ColumnType = if (tbl) |t| blk: {
-            const idx = t.findColumn(col_names.items[ci]) orelse break :blk null;
-            break :blk t.columns[idx].ty;
-        } else null;
-
-        // Check if column has ch_type Array(...) or Map(...) — these take priority
-        // over schema_ty (which maps them to .text) when is_array is detected.
-        const ch_type_override: ?[]const u8 = if (tbl) |t| blk: {
-            const idx = t.findColumn(col_names.items[ci]) orelse break :blk null;
-            const ct = t.columns[idx].ch_type orelse break :blk null;
-            if (std.mem.startsWith(u8, ct, "Array(") or std.mem.startsWith(u8, ct, "Map(")) break :blk ct;
-            break :blk null;
-        } else null;
-
-        // If this column is an Array column (detected via sentinel or ch_type), encode as Array(String).
-        // This must come BEFORE schema_ty check since Array(String) maps to .text in schema.
-        const force_array = (ch_type_override != null and std.mem.startsWith(u8, ch_type_override.?, "Array(")) or col_data[ci].is_array;
-
-        if (schema_ty != null and !force_array) {
-            // Use schema type for precise encoding
-            switch (schema_ty.?) {
-                .int8 => {
-                    try putS(&buf, allocator, "UInt8");
-                    try buf.append(allocator, 0);
-                    for (col_data[ci].vals) |val| {
-                        const iv = std.fmt.parseInt(u8, val, 10) catch 0;
-                        try buf.append(allocator, iv);
-                    }
-                },
-                .int16 => {
-                    try putS(&buf, allocator, "Int16");
-                    try buf.append(allocator, 0);
-                    for (col_data[ci].vals) |val| {
-                        const iv = std.fmt.parseInt(i16, val, 10) catch 0;
-                        var tmp: [2]u8 = undefined;
-                        std.mem.writeInt(i16, &tmp, iv, .little);
-                        try buf.appendSlice(allocator, &tmp);
-                    }
-                },
-                .int32 => {
-                    try putS(&buf, allocator, "Int32");
-                    try buf.append(allocator, 0);
-                    for (col_data[ci].vals) |val| {
-                        const iv = std.fmt.parseInt(i32, val, 10) catch 0;
-                        var tmp: [4]u8 = undefined;
-                        std.mem.writeInt(i32, &tmp, iv, .little);
-                        try buf.appendSlice(allocator, &tmp);
-                    }
-                },
-                .int64 => {
-                    try putS(&buf, allocator, "Int64");
-                    try buf.append(allocator, 0);
-                    for (col_data[ci].vals) |val| {
-                        const iv = std.fmt.parseInt(i64, val, 10) catch 0;
-                        var tmp: [8]u8 = undefined;
-                        std.mem.writeInt(i64, &tmp, iv, .little);
-                        try buf.appendSlice(allocator, &tmp);
-                    }
-                },
-                .date => {
-                    try putS(&buf, allocator, "Date");
-                    try buf.append(allocator, 0);
-                    for (col_data[ci].vals) |val| {
-                        const iv = std.fmt.parseInt(u16, val, 10) catch 0;
-                        var tmp: [2]u8 = undefined;
-                        std.mem.writeInt(u16, &tmp, iv, .little);
-                        try buf.appendSlice(allocator, &tmp);
-                    }
-                },
-                .timestamp => {
-                    try putS(&buf, allocator, "DateTime64(3)");
-                    try buf.append(allocator, 0);
-                    for (col_data[ci].vals) |val| {
-                        const iv = std.fmt.parseInt(i64, val, 10) catch 0;
-                        var tmp: [8]u8 = undefined;
-                        std.mem.writeInt(i64, &tmp, iv, .little);
-                        try buf.appendSlice(allocator, &tmp);
-                    }
-                },
-                .float32 => {
-                    try putS(&buf, allocator, "Float32");
-                    try buf.append(allocator, 0);
-                    for (col_data[ci].vals) |val| {
-                        const fv = std.fmt.parseFloat(f32, val) catch 0.0;
-                        const bits: u32 = @bitCast(fv);
-                        var tmp: [4]u8 = undefined;
-                        std.mem.writeInt(u32, &tmp, bits, .little);
-                        try buf.appendSlice(allocator, &tmp);
-                    }
-                },
-                .float64 => {
-                    try putS(&buf, allocator, "Float64");
-                    try buf.append(allocator, 0);
-                    for (col_data[ci].vals) |val| {
-                        const fv = std.fmt.parseFloat(f64, val) catch 0.0;
-                        const bits: u64 = @bitCast(fv);
-                        var tmp: [8]u8 = undefined;
-                        std.mem.writeInt(u64, &tmp, bits, .little);
-                        try buf.appendSlice(allocator, &tmp);
-                    }
-                },
-                .text, .char => {
-                    try putS(&buf, allocator, "String");
-                    try buf.append(allocator, 0);
-                    for (col_data[ci].vals) |val| {
-                        try putS(&buf, allocator, val);
-                    }
-                },
-            }
-        } else if (col_data[ci].is_int and num_rows > 0) {
-            // Heuristic: large positive integers are epoch timestamps → DateTime64(3)
-            const first_val_int = std.fmt.parseInt(i64, col_data[ci].vals[0], 10) catch 0;
-            // >= 1e12: millisecond-precision epoch (2001+), already in ms
-            // >= 1e9 and < 1e12: second-precision epoch (2001-2286), multiply by 1000
-            const is_timestamp_ms = !col_data[ci].has_negative and first_val_int >= 1_000_000_000_000;
-            const is_timestamp_s  = !col_data[ci].has_negative and first_val_int >= 1_000_000_000 and first_val_int < 1_000_000_000_000;
-            if (is_timestamp_ms) {
-                try putS(&buf, allocator, "DateTime64(3)");
-                try buf.append(allocator, 0);
-                for (col_data[ci].vals) |val| {
-                    const iv = std.fmt.parseInt(i64, val, 10) catch 0;
-                    var tmp: [8]u8 = undefined;
-                    std.mem.writeInt(i64, &tmp, iv, .little);
-                    try buf.appendSlice(allocator, &tmp);
-                }
-            } else if (is_timestamp_s) {
-                // Second-precision epoch: convert to milliseconds for DateTime64(3)
-                try putS(&buf, allocator, "DateTime64(3)");
-                try buf.append(allocator, 0);
-                for (col_data[ci].vals) |val| {
-                    const iv = (std.fmt.parseInt(i64, val, 10) catch 0) * 1000;
-                    var tmp: [8]u8 = undefined;
-                    std.mem.writeInt(i64, &tmp, iv, .little);
-                    try buf.appendSlice(allocator, &tmp);
-                }
-            } else if (col_data[ci].has_negative) {
-                try putS(&buf, allocator, "Int64");
-                try buf.append(allocator, 0);
-                for (col_data[ci].vals) |val| {
-                    const iv = std.fmt.parseInt(i64, val, 10) catch 0;
-                    var tmp: [8]u8 = undefined;
-                    std.mem.writeInt(i64, &tmp, iv, .little);
-                    try buf.appendSlice(allocator, &tmp);
-                }
-            } else if (col_data[ci].is_bool and !isAggColName(col_names.items[ci])) {
-                // Boolean-range non-negative integers (0 or 1) → UInt8
-                // (e.g. has(), isIPv4String(), countIf results 0/1)
-                try putS(&buf, allocator, "UInt8");
-                try buf.append(allocator, 0);
-                for (col_data[ci].vals) |val| {
-                    const iv = std.fmt.parseInt(u8, val, 10) catch 0;
-                    try buf.append(allocator, iv);
-                }
-            } else {
-                try putS(&buf, allocator, "UInt64");
-                try buf.append(allocator, 0);
-                for (col_data[ci].vals) |val| {
-                    const iv = std.fmt.parseInt(u64, val, 10) catch 0;
-                    var tmp: [8]u8 = undefined;
-                    std.mem.writeInt(u64, &tmp, iv, .little);
-                    try buf.appendSlice(allocator, &tmp);
-                }
-            }
-        } else if (col_data[ci].is_float and num_rows > 0) {
-            try putS(&buf, allocator, "Float64");
-            try buf.append(allocator, 0); // custom_serialization=false
-            for (col_data[ci].vals) |val| {
-                const fv = std.fmt.parseFloat(f64, val) catch 0.0;
-                const bits: u64 = @bitCast(fv);
-                var tmp: [8]u8 = undefined;
-                std.mem.writeInt(u64, &tmp, bits, .little);
-                try buf.appendSlice(allocator, &tmp);
-            }
-        } else if (col_data[ci].is_array) {
-            // Array(String): each value is \x01 + elements joined by \x0c
-            try putS(&buf, allocator, "Array(String)");
-            try buf.append(allocator, 0); // custom_serialization=false
-            // ClickHouse Native Array format:
-            // 1) Cumulative offsets: one uint64 per row (how many total elements through this row)
-            // 2) All element strings concatenated (each as varint_len + bytes)
-            var all_elems: std.ArrayListUnmanaged([]const u8) = .empty;
-            defer all_elems.deinit(allocator);
-            var cumulative: u64 = 0;
-            // First pass: write offsets and collect elements
-            var offsets_buf: std.ArrayListUnmanaged(u8) = .empty;
-            defer offsets_buf.deinit(allocator);
-            for (col_data[ci].vals) |val| {
-                const content = if (val.len > 0 and val[0] == 0x01) val[1..] else "";
-                if (content.len == 0) {
-                    // empty array — offset unchanged
-                } else {
-                    var elem_it = std.mem.splitScalar(u8, content, '\x0c');
-                    while (elem_it.next()) |elem| {
-                        cumulative += 1;
-                        try all_elems.append(allocator, elem);
-                    }
-                }
-                // Write offset as little-endian uint64
-                var tmp: [8]u8 = undefined;
-                std.mem.writeInt(u64, &tmp, cumulative, .little);
-                try offsets_buf.appendSlice(allocator, &tmp);
-            }
-            try buf.appendSlice(allocator, offsets_buf.items);
-            // Second: write all elements
-            for (all_elems.items) |elem| try putS(&buf, allocator, elem);
-        } else {
-            try putS(&buf, allocator, "String");
-            try buf.append(allocator, 0); // custom_serialization=false
-            for (col_data[ci].vals) |val| {
-                try putS(&buf, allocator, val);
-            }
-        }
-    }
-
-    // Empty terminator block
-    try putV(&buf, allocator, 1);
-    try buf.append(allocator, 0);
-    try putV(&buf, allocator, 2);
-    try buf.appendSlice(allocator, &[4]u8{ 0xFF, 0xFF, 0xFF, 0xFF });
-    try putV(&buf, allocator, 0);
-    try putV(&buf, allocator, 0);
-    try putV(&buf, allocator, 0);
-
-    return buf.toOwnedSlice(allocator);
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

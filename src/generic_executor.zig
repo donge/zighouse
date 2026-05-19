@@ -29,6 +29,7 @@ const clickbench_schema = schema.clickbench;
 const schema = @import("schema");
 const build_options = @import("build_options");
 const ch_part = @import("ch_part");
+const csv_mod = @import("csv");
 
 // ── User-defined functions (set by server before calling executor) ────────────
 
@@ -140,6 +141,10 @@ fn lookupColumn(tbl: *const schema.Table, name: []const u8) ?ColDesc {
 const Value = union(enum) {
     i64: i64,
     f64: f64,
+    /// Days since 1970-01-01 (ClickHouse Date / UInt16).
+    date: u16,
+    /// UInt8 boolean result from dictHas/has/etc — must encode as UInt8, not UInt64.
+    uint8: u8,
     /// Slice into arena; valid for the lifetime of the Executor.run call.
     str: []const u8,
     /// Heap-allocated string owned by this Value; caller must free with page_allocator.
@@ -154,17 +159,21 @@ const Value = union(enum) {
 
     fn toI64(self: Value) ?i64 {
         return switch (self) {
-            .i64 => |v| v,
-            .f64 => |v| @intFromFloat(v),
-            else => null,
+            .i64   => |v| v,
+            .f64   => |v| @intFromFloat(v),
+            .date  => |v| @as(i64, v),
+            .uint8 => |v| @as(i64, v),
+            else   => null,
         };
     }
 
     fn toF64(self: Value) ?f64 {
         return switch (self) {
-            .i64 => |v| @floatFromInt(v),
-            .f64 => |v| v,
-            else => null,
+            .i64   => |v| @floatFromInt(v),
+            .f64   => |v| v,
+            .date  => |v| @as(f64, @floatFromInt(v)),
+            .uint8 => |v| @as(f64, @floatFromInt(v)),
+            else   => null,
         };
     }
 
@@ -179,14 +188,32 @@ const Value = union(enum) {
     fn order(a: Value, b: Value) std.math.Order {
         switch (a) {
             .i64 => |av| switch (b) {
-                .i64 => |bv| return std.math.order(av, bv),
-                .f64 => |bv| return std.math.order(@as(f64, @floatFromInt(av)), bv),
-                else => return .lt,
+                .i64   => |bv| return std.math.order(av, bv),
+                .f64   => |bv| return std.math.order(@as(f64, @floatFromInt(av)), bv),
+                .date  => |bv| return std.math.order(av, @as(i64, bv)),
+                .uint8 => |bv| return std.math.order(av, @as(i64, bv)),
+                else   => return .lt,
             },
             .f64 => |av| switch (b) {
-                .i64 => |bv| return std.math.order(av, @as(f64, @floatFromInt(bv))),
-                .f64 => |bv| return std.math.order(av, bv),
-                else => return .lt,
+                .i64   => |bv| return std.math.order(av, @as(f64, @floatFromInt(bv))),
+                .f64   => |bv| return std.math.order(av, bv),
+                .date  => |bv| return std.math.order(av, @as(f64, @floatFromInt(bv))),
+                .uint8 => |bv| return std.math.order(av, @as(f64, @floatFromInt(bv))),
+                else   => return .lt,
+            },
+            .date => |av| switch (b) {
+                .date  => |bv| return std.math.order(av, bv),
+                .i64   => |bv| return std.math.order(@as(i64, av), bv),
+                .f64   => |bv| return std.math.order(@as(f64, @floatFromInt(av)), bv),
+                .uint8 => |bv| return std.math.order(@as(i64, av), @as(i64, bv)),
+                else   => return .lt,
+            },
+            .uint8 => |av| switch (b) {
+                .uint8 => |bv| return std.math.order(av, bv),
+                .i64   => |bv| return std.math.order(@as(i64, av), bv),
+                .f64   => |bv| return std.math.order(@as(f64, @floatFromInt(av)), bv),
+                .date  => |bv| return std.math.order(@as(i64, av), @as(i64, bv)),
+                else   => return .lt,
             },
             .str, .str_owned => {
                 const av = a.toStr().?;
@@ -195,7 +222,7 @@ const Value = union(enum) {
                     else => return .gt,
                 }
             },
-            .array => return .lt,
+            .array    => return .lt,
             .null_val => return if (b == .null_val) .eq else .lt,
         }
     }
@@ -217,18 +244,55 @@ const Value = union(enum) {
                     try out.print(allocator, "{d}", .{v});
                 }
             },
-            .str      => |s| try out.appendSlice(allocator, s),
-            .str_owned => |s| try out.appendSlice(allocator, s),
+            .str      => |s| {
+                // CSV-quote strings that contain commas, quotes, or newlines
+                const needs_quote = std.mem.indexOfAny(u8, s, ",\"\n\r") != null;
+                if (needs_quote) {
+                    try out.append(allocator, '"');
+                    for (s) |ch| {
+                        if (ch == '"') try out.append(allocator, '"'); // escape double-quote
+                        try out.append(allocator, ch);
+                    }
+                    try out.append(allocator, '"');
+                } else {
+                    try out.appendSlice(allocator, s);
+                }
+            },
+            .str_owned => |s| {
+                const needs_quote = std.mem.indexOfAny(u8, s, ",\"\n\r") != null;
+                if (needs_quote) {
+                    try out.append(allocator, '"');
+                    for (s) |ch| {
+                        if (ch == '"') try out.append(allocator, '"');
+                        try out.append(allocator, ch);
+                    }
+                    try out.append(allocator, '"');
+                } else {
+                    try out.appendSlice(allocator, s);
+                }
+            },
             .array    => |arr| {
-                // Render array as \x01 sentinel + \x0c-separated elements
-                // so csvToNativeBlock can detect Array(String) columns.
+                // Render array as \x01 sentinel + \x0c-separated elements.
+                // Use raw (unquoted) string values inside the blob — the \x0c separator
+                // avoids commas so no CSV quoting is needed here.
                 try out.append(allocator, 0x01);
                 for (arr, 0..) |elem, i| {
                     if (i > 0) try out.append(allocator, '\x0c');
-                    try elem.writeCsv(out, allocator);
+                    // Write element as raw string (no CSV quoting inside the blob)
+                    switch (elem) {
+                        .str      => |s| try out.appendSlice(allocator, s),
+                        .str_owned=> |s| try out.appendSlice(allocator, s),
+                        .i64      => |v| try out.print(allocator, "{d}", .{v}),
+                        .f64      => |v| try out.print(allocator, "{d}", .{v}),
+                        else      => try elem.writeCsv(out, allocator),
+                    }
                 }
             },
             .null_val => {},
+            // Date: emit days as integer — header sentinel \x02D: tells native-block to encode as Date
+            .date => |d| try out.print(allocator, "{d}", .{d}),
+            // UInt8 bool: emit as plain integer — header sentinel \x03U8: tells native-block to encode as UInt8
+            .uint8 => |v| try out.print(allocator, "{d}", .{v}),
         }
     }
 };
@@ -1199,31 +1263,84 @@ fn streamRowsCsvFn(
 ) anyerror!void {
     var lines = std.mem.splitScalar(u8, csv, '\n');
     const header_line = lines.next() orelse return;
-    // Parse header columns
+
+    // Parse header using RFC 4180 parser (handles quoted column names with commas).
     var col_names: std.ArrayListUnmanaged([]const u8) = .empty;
     defer col_names.deinit(allocator);
-    var hdr_it = std.mem.splitScalar(u8, header_line, ',');
-    while (hdr_it.next()) |col| try col_names.append(allocator, std.mem.trim(u8, col, " \t\r"));
+    // Storage for heap-duplicated quoted header names.
+    var quoted_headers: std.ArrayListUnmanaged([]u8) = .empty;
+    defer {
+        for (quoted_headers.items) |qh| allocator.free(qh);
+        quoted_headers.deinit(allocator);
+    }
+    {
+        var hdr_pos: usize = 0;
+        var hdr_buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer hdr_buf.deinit(allocator);
+        while (hdr_pos <= header_line.len) {
+            const was = hdr_pos;
+            const name_raw = csv_mod.parseCsvField(header_line, &hdr_pos, &hdr_buf, allocator);
+            if (hdr_pos == was and hdr_pos >= header_line.len) break;
+            // Strip sentinel type prefixes (\x03U8: / \x02D:) that writeExprHeader may emit.
+            const name_stripped: []const u8 = blk: {
+                if (name_raw.len > 4 and name_raw[0] == 0x03 and name_raw[1] == 'U' and name_raw[2] == '8' and name_raw[3] == ':')
+                    break :blk name_raw[4..];
+                if (name_raw.len > 3 and name_raw[0] == 0x02 and name_raw[1] == 'D' and name_raw[2] == ':')
+                    break :blk name_raw[3..];
+                break :blk name_raw;
+            };
+            // If the field was quoted (name_raw lives in hdr_buf), duplicate it.
+            const name: []const u8 = if (was < header_line.len and header_line[was] == '"') blk: {
+                const dup = try allocator.dupe(u8, name_stripped);
+                try quoted_headers.append(allocator, dup);
+                break :blk @as([]const u8, dup);
+            } else name_stripped;
+            try col_names.append(allocator, name);
+            if (hdr_pos == was) break; // no progress guard
+        }
+    }
 
     var values: std.ArrayListUnmanaged(Value) = .empty;
     defer values.deinit(allocator);
+    // Storage for heap-duplicated quoted cell values (freed after each row callback).
+    var quoted_vals: std.ArrayListUnmanaged([]u8) = .empty;
+    defer quoted_vals.deinit(allocator);
 
     while (lines.next()) |line| {
-        const trimmed = std.mem.trim(u8, line, " \t\r");
+        // Trim trailing \r but preserve leading content.
+        const trimmed = std.mem.trim(u8, line, "\r");
         if (trimmed.len == 0) continue;
+
         values.clearRetainingCapacity();
-        var it = std.mem.splitScalar(u8, trimmed, ',');
-        var idx: usize = 0;
-        while (it.next()) |cell| : (idx += 1) {
-            const s = std.mem.trim(u8, cell, " \t\r");
-            // Try to parse as integer, then float, else string.
-            if (std.fmt.parseInt(i64, s, 10)) |n| {
+        // Free quoted cell duplicates from the previous row.
+        for (quoted_vals.items) |qv| allocator.free(qv);
+        quoted_vals.clearRetainingCapacity();
+
+        var pos: usize = 0;
+        var field_buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer field_buf.deinit(allocator);
+
+        while (pos <= trimmed.len and values.items.len < col_names.items.len) {
+            const was = pos;
+            const cell_raw = csv_mod.parseCsvField(trimmed, &pos, &field_buf, allocator);
+            // If quoted, duplicate the cell (field_buf is reused next iteration).
+            const cell: []const u8 = if (was < trimmed.len and trimmed[was] == '"') blk: {
+                const dup = try allocator.dupe(u8, cell_raw);
+                try quoted_vals.append(allocator, dup);
+                break :blk @as([]const u8, dup);
+            } else cell_raw;
+
+            // Array sentinel \x01: store as str so evalProjectionExpr can handle it.
+            if (cell.len > 0 and cell[0] == 0x01) {
+                try values.append(allocator, .{ .str = cell });
+            } else if (std.fmt.parseInt(i64, cell, 10)) |n| {
                 try values.append(allocator, .{ .i64 = n });
-            } else |_| if (std.fmt.parseFloat(f64, s)) |f| {
+            } else |_| if (std.fmt.parseFloat(f64, cell)) |f| {
                 try values.append(allocator, .{ .f64 = f });
             } else |_| {
-                try values.append(allocator, .{ .str = s });
+                try values.append(allocator, .{ .str = cell });
             }
+            if (pos == was) break; // no progress guard
         }
         // Pad with empty strings if fewer cells than headers.
         while (values.items.len < col_names.items.len) {
@@ -1232,6 +1349,10 @@ fn streamRowsCsvFn(
         const row = RowCtx{ .names = col_names.items, .values = values.items };
         try callback(context, &row);
     }
+
+    // Free any remaining quoted cell values from the last row.
+    for (quoted_vals.items) |qv| allocator.free(qv);
+    quoted_vals.clearRetainingCapacity();
 }
 
 // ── Scalar aggregate context ──────────────────────────────────────────────────
@@ -1430,8 +1551,10 @@ fn evalCondExpr(cond: ?*const generic_sql.CondExpr, row: *const RowCtx) bool {
 fn valueToKey(alloc: std.mem.Allocator, v: Value) ![]u8 {
     return switch (v) {
         .str, .str_owned => try alloc.dupe(u8, v.toStr().?),
-        .i64 => |i| try std.fmt.allocPrint(alloc, "{d}", .{i}),
-        .f64 => |f| try std.fmt.allocPrint(alloc, "{d}", .{f}),
+        .i64   => |i| try std.fmt.allocPrint(alloc, "{d}", .{i}),
+        .f64   => |f| try std.fmt.allocPrint(alloc, "{d}", .{f}),
+        .date  => |d| try std.fmt.allocPrint(alloc, "{d}", .{d}),
+        .uint8 => |u| try std.fmt.allocPrint(alloc, "{d}", .{u}),
         .array, .null_val => try alloc.dupe(u8, ""),
     };
 }
@@ -2765,8 +2888,10 @@ const EvalKind = enum {
     map_keys,          // mapKeys(m) → array of keys
     map_values,        // mapValues(m) → array of values
     // Dict stubs
-    stub_zero,         // dictHas, IPv6StringToNumOrDefault → 0
-    stub_empty_str,    // dictGet → ""
+     stub_zero,         // integer functions that stub to 0 (e.g. IPv6StringToNumOrDefault)
+     stub_bool_zero,    // bool functions that stub to UInt8 0 (e.g. dictHas)
+     stub_float_zero,   // float functions that stub to 0.0 (e.g. risk_score)
+     stub_empty_str,    // dictGet → ""
     stub_null,         // dictGetOrNull → null
     stub_default_arg4, // dictGetOrDefault → 4th arg
     // IP conversion
@@ -2800,7 +2925,8 @@ const func_evals = [_]FuncEval{
     .{ .name = "isipv4string",                .kind = .ip_bool          },
     .{ .name = "isipv6string",                .kind = .ip_bool          },
     .{ .name = "ipv4stringtonumordefault",     .kind = .ip_to_num        },
-    .{ .name = "ipv6stringtonumordefault",     .kind = .stub_zero        },
+     .{ .name = "ipv6stringtonumordefault",     .kind = .stub_zero        },
+     .{ .name = "risk_score",                  .kind = .stub_float_zero  },
     .{ .name = "cast",                        .kind = .cast_expr        },
     .{ .name = "tostring",                    .kind = .str_tostring     },
     .{ .name = "now",                         .kind = .fn_now           },
@@ -2822,12 +2948,13 @@ const func_evals = [_]FuncEval{
     .{ .name = "arraymax",                    .kind = .arr_max          },
     .{ .name = "arraymin",                    .kind = .arr_min          },
     .{ .name = "arrayslice",                  .kind = .arr_slice        },
-    .{ .name = "arraystringconcat",           .kind = .arr_str_join     },
+     .{ .name = "arraystringconcat",           .kind = .arr_str_join     },
+     .{ .name = "array_to_string",            .kind = .arr_str_join     },
     .{ .name = "mapkeys",                     .kind = .map_keys         },
     .{ .name = "map_keys",                    .kind = .map_keys         },
     .{ .name = "mapvalues",                   .kind = .map_values       },
     .{ .name = "map_values",                  .kind = .map_values       },
-    .{ .name = "dicthas",                     .kind = .stub_zero        },
+    .{ .name = "dicthas",                     .kind = .stub_bool_zero   },
     .{ .name = "dictget",                     .kind = .stub_empty_str   },
     .{ .name = "dictgetornull",               .kind = .stub_null        },
     .{ .name = "dictgetordefault",            .kind = .stub_default_arg4},
@@ -2899,8 +3026,10 @@ fn evalLambdaBool(lambda_text: []const u8, elem: Value, row: *const RowCtx) bool
     if (has_cmp) return evalTextBoolExpr(body, &inner_row);
     const v = evalTextExpr(body, &inner_row) orelse return false;
     return switch (v) {
-        .i64 => |i| i != 0,
-        .f64 => |f| f != 0,
+        .i64   => |i| i != 0,
+        .f64   => |f| f != 0,
+        .date  => |d| d != 0,
+        .uint8 => |u| u != 0,
         .str, .str_owned => v.toStr().?.len > 0,
         .array => |a| a.len > 0,
         .null_val => false,
@@ -2975,20 +3104,27 @@ fn evalTextExpr(expr: []const u8, row: *const RowCtx) ?Value {
         if (balanced) return evalTextExpr(trimmed[1 .. trimmed.len - 1], row);
     }
 
-    // ── logical OR / AND as value expression (returns 0 or 1 i64) ──
+    // ── logical OR / AND as value expression ───────────────────────────
     if (findTopLevelKeyword(trimmed, "OR")) |pos| {
         const lv = evalTextExpr(trimmed[0..pos], row) orelse Value{ .i64 = 0 };
         const rv = evalTextExpr(trimmed[pos + 2 ..], row) orelse Value{ .i64 = 0 };
-        const lb = switch (lv) { .i64 => |v| v != 0, .f64 => |v| v != 0.0, .str => |v| v.len > 0, else => false };
-        const rb = switch (rv) { .i64 => |v| v != 0, .f64 => |v| v != 0.0, .str => |v| v.len > 0, else => false };
-        return Value{ .i64 = if (lb or rb) 1 else 0 };
+        const lb = switch (lv) { .i64 => |v| v != 0, .f64 => |v| v != 0.0, .uint8 => |v| v != 0, .str, .str_owned => |v| v.len > 0, else => false };
+        const rb = switch (rv) { .i64 => |v| v != 0, .f64 => |v| v != 0.0, .uint8 => |v| v != 0, .str, .str_owned => |v| v.len > 0, else => false };
+        const bit: u8 = if (lb or rb) 1 else 0;
+        // Preserve UInt8 type only if both sides are UInt8 (pure bool OR)
+        const both_u8 = (std.meta.activeTag(lv) == .uint8) and (std.meta.activeTag(rv) == .uint8);
+        if (both_u8) return Value{ .uint8 = bit };
+        return Value{ .i64 = bit };
     }
     if (findTopLevelKeyword(trimmed, "AND")) |pos| {
         const lv = evalTextExpr(trimmed[0..pos], row) orelse Value{ .i64 = 0 };
         const rv = evalTextExpr(trimmed[pos + 3 ..], row) orelse Value{ .i64 = 0 };
-        const lb = switch (lv) { .i64 => |v| v != 0, .f64 => |v| v != 0.0, .str => |v| v.len > 0, else => false };
-        const rb = switch (rv) { .i64 => |v| v != 0, .f64 => |v| v != 0.0, .str => |v| v.len > 0, else => false };
-        return Value{ .i64 = if (lb and rb) 1 else 0 };
+        const lb = switch (lv) { .i64 => |v| v != 0, .f64 => |v| v != 0.0, .uint8 => |v| v != 0, .str, .str_owned => |v| v.len > 0, else => false };
+        const rb = switch (rv) { .i64 => |v| v != 0, .f64 => |v| v != 0.0, .uint8 => |v| v != 0, .str, .str_owned => |v| v.len > 0, else => false };
+        const bit: u8 = if (lb and rb) 1 else 0;
+        const both_u8 = (std.meta.activeTag(lv) == .uint8) and (std.meta.activeTag(rv) == .uint8);
+        if (both_u8) return Value{ .uint8 = bit };
+        return Value{ .i64 = bit };
     }
 
     // ── CASE WHEN … END (keyword-prefix, not a function call) ──────
@@ -3124,6 +3260,8 @@ fn evalTextExpr(expr: []const u8, row: *const RowCtx) ?Value {
             if (std.ascii.startsWithIgnoreCase(trimmed, prefix)) {
                 const col_inner = std.mem.trim(u8, trimmed[prefix.len .. trimmed.len - 1], " \t\r\n");
                 if (row.get(col_inner)) |v| return v;
+                // Also try the full expression as key (e.g. "avg(confidence)" registered by header)
+                if (row.get(trimmed)) |v| return v;
                 break;
             }
         }
@@ -3375,9 +3513,24 @@ fn evalFunc(kind: EvalKind, name: []const u8, inner: []const u8, row: *const Row
         },
         .date_cast => {
             const v = evalTextExpr(inner, row) orelse return null;
+            // Try to convert to days-since-epoch (Value.date)
+            if (v.toI64()) |iv| {
+                // Already an integer; treat as seconds epoch → days
+                const days = @as(u16, @intCast(@max(0, @min(65535, @divFloor(iv, 86400)))));
+                return Value{ .date = days };
+            }
             const sv = v.toStr() orelse return null;
-            if (sv.len >= 10) return Value{ .str = sv[0..10] };
-            return Value{ .str = sv };
+            // Parse "YYYY-MM-DD" → days since 1970-01-01
+            if (sv.len >= 10 and sv[4] == '-' and sv[7] == '-') {
+                const y  = std.fmt.parseInt(i32, sv[0..4], 10) catch null;
+                const mo = std.fmt.parseInt(u8,  sv[5..7], 10) catch null;
+                const dy = std.fmt.parseInt(u8,  sv[8..10], 10) catch null;
+                if (y != null and mo != null and dy != null) {
+                    const d = dateToDays(y.?, mo.?, dy.?);
+                    return Value{ .date = @intCast(@max(0, @min(65535, d))) };
+                }
+            }
+            return Value{ .str = if (sv.len >= 10) sv[0..10] else sv };
         },
         // ── IP functions ───────────────────────────────────────────
         .ip_bool => {
@@ -3442,20 +3595,28 @@ fn evalFunc(kind: EvalKind, name: []const u8, inner: []const u8, row: *const Row
             }
             if (std.ascii.eqlIgnoreCase(type_part, "DATE")) {
                 // Handle both string timestamps and integer Unix timestamps
+                // Return Value.date (days since 1970) so native block encodes as Date (UInt16).
                 switch (v) {
+                    .date => return v, // already a date
                     .i64 => |ts| {
-                        // Convert Unix ms/us to date string
                         const ts_s: u64 = @intCast(if (ts > 1_000_000_000_000) @divFloor(ts, 1000) else if (ts > 0) ts else 0);
-                        const epoch_s = std.time.epoch.EpochSeconds{ .secs = ts_s };
-                        const epoch_day = epoch_s.getEpochDay();
-                        const yad = epoch_day.calculateYearDay();
-                        const mad = yad.calculateMonthDay();
-                        const s = std.fmt.allocPrint(std.heap.page_allocator, "{d:0>4}-{d:0>2}-{d:0>2}", .{
-                            yad.year, @as(u32, @intFromEnum(mad.month)) + 1, @as(u32, mad.day_index) + 1,
-                        }) catch return null;
-                        return Value{ .str_owned = s };
+                        const days: u16 = @intCast(@min(65535, ts_s / 86400));
+                        return Value{ .date = days };
                     },
-                    else => return Value{ .str = v.toStr() orelse return null },
+                    else => {
+                        // Try string "YYYY-MM-DD"
+                        const s = v.toStr() orelse return null;
+                        if (s.len >= 10 and s[4] == '-' and s[7] == '-') {
+                            const y  = std.fmt.parseInt(i32, s[0..4], 10) catch null;
+                            const mo = std.fmt.parseInt(u8,  s[5..7], 10) catch null;
+                            const dy = std.fmt.parseInt(u8,  s[8..10], 10) catch null;
+                            if (y != null and mo != null and dy != null) {
+                                const d = dateToDays(y.?, mo.?, dy.?);
+                                return Value{ .date = @intCast(@max(0, @min(65535, d))) };
+                            }
+                        }
+                        return Value{ .str = s };
+                    },
                 }
             }
             // For array/list types, preserve as Value.array so writeCsv emits the \x01 sentinel
@@ -3495,23 +3656,23 @@ fn evalFunc(kind: EvalKind, name: []const u8, inner: []const u8, row: *const Row
         },
         // ── Array predicates ───────────────────────────────────────
         .arr_has => {
-            const args = splitTopLevelArgs(inner) catch return Value{ .i64 = 0 };
-            if (args.len < 2) return Value{ .i64 = 0 };
-            const arr_v = evalTextExpr(std.mem.trim(u8, args.items[0], " \t\r\n"), row) orelse return Value{ .i64 = 0 };
-            const val_v = evalTextExpr(std.mem.trim(u8, args.items[1], " \t\r\n"), row) orelse return Value{ .i64 = 0 };
-            const arr = valueToArray(arr_v) orelse return Value{ .i64 = 0 };
-            for (arr) |elem| if (Value.eql(elem, val_v)) return Value{ .i64 = 1 };
-            return Value{ .i64 = 0 };
+            const args = splitTopLevelArgs(inner) catch return Value{ .uint8 = 0 };
+            if (args.len < 2) return Value{ .uint8 = 0 };
+            const arr_v = evalTextExpr(std.mem.trim(u8, args.items[0], " \t\r\n"), row) orelse return Value{ .uint8 = 0 };
+            const val_v = evalTextExpr(std.mem.trim(u8, args.items[1], " \t\r\n"), row) orelse return Value{ .uint8 = 0 };
+            const arr = valueToArray(arr_v) orelse return Value{ .uint8 = 0 };
+            for (arr) |elem| if (Value.eql(elem, val_v)) return Value{ .uint8 = 1 };
+            return Value{ .uint8 = 0 };
         },
         .arr_has_any => {
-            const args = splitTopLevelArgs(inner) catch return Value{ .i64 = 0 };
-            if (args.len < 2) return Value{ .i64 = 0 };
-            const arr_v  = evalTextExpr(std.mem.trim(u8, args.items[0], " \t\r\n"), row) orelse return Value{ .i64 = 0 };
-            const vals_v = evalTextExpr(std.mem.trim(u8, args.items[1], " \t\r\n"), row) orelse return Value{ .i64 = 0 };
-            const arr  = valueToArray(arr_v)  orelse return Value{ .i64 = 0 };
-            const vals = valueToArray(vals_v) orelse return Value{ .i64 = 0 };
-            for (vals) |needle| for (arr) |elem| if (Value.eql(elem, needle)) return Value{ .i64 = 1 };
-            return Value{ .i64 = 0 };
+            const args = splitTopLevelArgs(inner) catch return Value{ .uint8 = 0 };
+            if (args.len < 2) return Value{ .uint8 = 0 };
+            const arr_v  = evalTextExpr(std.mem.trim(u8, args.items[0], " \t\r\n"), row) orelse return Value{ .uint8 = 0 };
+            const vals_v = evalTextExpr(std.mem.trim(u8, args.items[1], " \t\r\n"), row) orelse return Value{ .uint8 = 0 };
+            const arr  = valueToArray(arr_v)  orelse return Value{ .uint8 = 0 };
+            const vals = valueToArray(vals_v) orelse return Value{ .uint8 = 0 };
+            for (vals) |needle| for (arr) |elem| if (Value.eql(elem, needle)) return Value{ .uint8 = 1 };
+            return Value{ .uint8 = 0 };
         },
         .arr_has_all => {
             const args = splitTopLevelArgs(inner) catch return Value{ .i64 = 0 };
@@ -3720,6 +3881,8 @@ fn evalFunc(kind: EvalKind, name: []const u8, inner: []const u8, row: *const Row
         },
         // ── Dict stubs ─────────────────────────────────────────────
         .stub_zero       => return Value{ .i64 = 0 },
+        .stub_float_zero => return Value{ .f64 = 0.0 },
+        .stub_bool_zero  => return Value{ .uint8 = 0 },
         .stub_empty_str  => return Value{ .str = "" },
         .stub_null       => return Value{ .null_val = {} },
         .stub_default_arg4 => {
@@ -3874,6 +4037,8 @@ fn evalTextBoolExpr(expr: []const u8, row: *const RowCtx) bool {
         return switch (v) {
             .i64       => |i| i != 0,
             .f64       => |f| f != 0,
+            .date      => |d| d != 0,
+            .uint8     => |u| u != 0,
             .str, .str_owned => v.toStr().?.len > 0,
             .array     => |a| a.len > 0,
             .null_val  => false,
@@ -3984,15 +4149,65 @@ fn parseLengthCall(expr: []const u8) ?[]const u8 {
 // ── Helper: write expression header label ────────────────────────────────────
 
 fn writeExprHeader(out: *std.ArrayList(u8), allocator: std.mem.Allocator, proj: generic_sql.Expr) !void {
+    // Helper to write a column name, quoting it if it contains commas or quotes.
+    const writeColName = struct {
+        fn write(o: *std.ArrayList(u8), a: std.mem.Allocator, name: []const u8) !void {
+            if (std.mem.indexOfAny(u8, name, ",\"\n\r") != null) {
+                try o.append(a, '"');
+                for (name) |c| {
+                    if (c == '"') try o.append(a, '"');
+                    try o.append(a, c);
+                }
+                try o.append(a, '"');
+            } else {
+                try o.appendSlice(a, name);
+            }
+        }
+    }.write;
+    // Determine type prefix for native-block encoding hint, based on the raw expression.
+    // \x03U8: → UInt8 (bool function),  \x02D: → Date.
+    // These prefixes are stripped by csvToNativeBlock before writing column names.
+    const col_expr = proj.column orelse "";
+    const col_lower = blk: {
+        var buf: [256]u8 = undefined;
+        if (col_expr.len > buf.len) break :blk col_expr;
+        break :blk std.ascii.lowerString(&buf, col_expr);
+    };
+    const is_bool_expr = blk: {
+        // Aggregate functions (max/min/sum/avg/count) always return numeric types
+        // that the driver scans as uint64/float64 — never UInt8.
+        switch (proj.func) {
+            .max, .min, .sum, .avg, .count_star, .count_distinct, .count_if,
+            .uniq_exact, .uniq_exact_if, .group_uniq_array, .any_val => break :blk false,
+            else => {},
+        }
+        // Only mark as bool if the top-level expression IS a pure bool function call —
+        // i.e. no top-level OR/AND operators (which would produce a mixed-type result
+        // that must be UInt64, not UInt8).
+        if (findTopLevelKeyword(col_expr, "OR") != null) break :blk false;
+        if (findTopLevelKeyword(col_expr, "AND") != null) break :blk false;
+        break :blk std.mem.startsWith(u8, col_lower, "has(") or
+            std.mem.startsWith(u8, col_lower, "hasany(") or
+            std.mem.startsWith(u8, col_lower, "hasall(") or
+            std.mem.startsWith(u8, col_lower, "dictha") or
+            std.mem.startsWith(u8, col_lower, "nothas(");
+    };
+    const is_date_expr = std.mem.startsWith(u8, col_lower, "cast(") and
+        (std.ascii.indexOfIgnoreCase(col_expr, " AS DATE") != null or
+         std.ascii.indexOfIgnoreCase(col_expr, " AS date") != null) or
+        std.mem.startsWith(u8, col_lower, "todate(");
+    const type_prefix: []const u8 = if (is_bool_expr) "\x03U8:" else if (is_date_expr) "\x02D:" else "";
     if (proj.alias) |a| {
-        try out.appendSlice(allocator, a);
+        if (type_prefix.len > 0) try out.appendSlice(allocator, type_prefix);
+        try writeColName(out, allocator, a);
         return;
     }
     switch (proj.func) {
         .column_ref => {
             const col = proj.column orelse "*";
             if (proj.int_offset == 0) {
-                try out.appendSlice(allocator, col);
+                if (type_prefix.len > 0) try out.appendSlice(allocator, type_prefix);
+                try writeColName(out, allocator, col);
             } else if (proj.int_offset > 0) {
                 try out.print(allocator, "{s} + {d}", .{ col, proj.int_offset });
             } else {
@@ -4043,7 +4258,7 @@ fn writeGroupHeader(
 /// These provide values for aggregate expressions but should not appear in output.
 fn isHiddenArrayJoinProj(proj: generic_sql.Expr) bool {
     const alias = proj.alias orelse return false;
-    return std.mem.startsWith(u8, alias, "__aj__");
+    return std.mem.startsWith(u8, alias, "__aj__") or std.mem.startsWith(u8, alias, "__ha__");
 }
 
 // ── Helper: detect all-aggregate plan ────────────────────────────────────────

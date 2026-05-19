@@ -245,6 +245,86 @@ fn translateSelectNode(allocator: std.mem.Allocator, node_obj: std.json.ObjectMa
     }
     if (projections.items.len == 0) return error.Unsupported;
 
+    // ── Lift nested aggregates out of column_ref projections ─────────────────
+    // e.g. `if(total > 0, avg(confidence), 0) AS avg_conf` becomes a column_ref whose
+    // text is `CASE WHEN total > 0 THEN avg(confidence) ELSE 0 END`. The nested
+    // `avg(confidence)` won't have a corresponding AggState unless we lift it here.
+    {
+        const agg_fns = [_][]const u8{ "avg(", "max(", "min(", "sum(", "any(" };
+        var extra: std.ArrayList(generic_sql.Expr) = .empty;
+        defer extra.deinit(allocator);
+        for (projections.items) |*proj| {
+            if (proj.func != .column_ref) continue;
+            if (proj.column == null) continue;
+            // Scan for agg function calls inside the text
+            for (agg_fns) |pfx| {
+                var search_pos: usize = 0;
+                while (std.mem.indexOfPos(u8, proj.column.?, search_pos, pfx)) |pos| {
+                    // Use current proj.column for all lookups (may have been updated by prior replacement)
+                    const cur_text = proj.column.?;
+                    // Verify this is a standalone function call (not inside an identifier like "hasAny")
+                    if (pos > 0 and (std.ascii.isAlphanumeric(cur_text[pos - 1]) or cur_text[pos - 1] == '_')) {
+                        search_pos = pos + 1;
+                        continue;
+                    }
+                    // Find matching closing paren
+                    var depth: usize = 1;
+                    var end: usize = pos + pfx.len;
+                    while (end < cur_text.len and depth > 0) : (end += 1) {
+                        if (cur_text[end] == '(') depth += 1
+                        else if (cur_text[end] == ')') depth -= 1;
+                    }
+                    const inner_col = std.mem.trim(u8, cur_text[pos + pfx.len .. end - 1], " \t");
+                    // Build a hidden alias like "__ha__avg_confidence"
+                    const fn_name = pfx[0 .. pfx.len - 1]; // strip "("
+                    const safe_inner = blk: {
+                        var sb: std.ArrayList(u8) = .empty;
+                        for (inner_col) |ch| {
+                            if (std.ascii.isAlphanumeric(ch) or ch == '_') sb.append(allocator, ch) catch {};
+                        }
+                        break :blk sb.toOwnedSlice(allocator) catch inner_col;
+                    };
+                    defer allocator.free(safe_inner);
+                    const hidden_alias = try std.fmt.allocPrint(allocator, "__ha__{s}_{s}", .{ fn_name, safe_inner });
+                    // Dupe inner_col BEFORE freeing the old text (inner_col is a slice of cur_text)
+                    const inner_col_dup = try allocator.dupe(u8, inner_col);
+                    // Replace the agg call in the text with the hidden alias
+                    const old_call = cur_text[pos .. end];
+                    const new_text = try std.mem.replaceOwned(u8, allocator, proj.column.?, old_call, hidden_alias);
+                    allocator.free(proj.column.?);
+                    proj.column = new_text;
+                    // Check that this hidden projection doesn't already exist
+                    var already = false;
+                    for (projections.items) |ep| {
+                        if (ep.alias) |a| {
+                            if (std.mem.eql(u8, a, hidden_alias)) { already = true; break; }
+                        }
+                    }
+                    for (extra.items) |ep| {
+                        if (ep.alias) |a| {
+                            if (std.mem.eql(u8, a, hidden_alias)) { already = true; break; }
+                        }
+                    }
+                    if (!already) {
+                        const fn_func: generic_sql.AggregateFn = if (std.mem.eql(u8, fn_name, "avg")) .avg
+                            else if (std.mem.eql(u8, fn_name, "max")) .max
+                            else if (std.mem.eql(u8, fn_name, "min")) .min
+                            else if (std.mem.eql(u8, fn_name, "sum")) .sum
+                            else .any_val;
+                        try extra.append(allocator, .{ .func = fn_func, .column = inner_col_dup, .alias = hidden_alias });
+                    } else {
+                        allocator.free(inner_col_dup);
+                        allocator.free(hidden_alias);
+                    }
+                    search_pos = pos + hidden_alias.len;
+                    const new_col_len = if (proj.column) |nc| nc.len else 0;
+                    if (search_pos >= new_col_len) break;
+                }
+            }
+        }
+        for (extra.items) |ep| try projections.append(allocator, ep);
+    }
+
     // ── WHERE ────────────────────────────────────────────────────────────────
     const where_val = node_obj.get("where_clause");
     var filter: ?generic_sql.Filter = null;
@@ -979,15 +1059,10 @@ fn translateExpr(allocator: std.mem.Allocator, val: std.json.Value) !?generic_sq
                     }
                 }
             }
-            // arrayStringConcat(some_array_expr, sep) — generic: treat inner as col reference
-            if (columnName(inner)) |cn| {
-                const col = try allocator.dupe(u8, cn);
-                const sep: ?[]const u8 = if (children.len >= 2)
-                    if (strLiteralValue(children[1])) |sv| try allocator.dupe(u8, sv) else null
-                else null;
-                return .{ .func = .group_uniq_array, .column = col, .alias = alias, .sep = sep };
-            }
-            return null;
+            // arrayStringConcat(some_array_expr, sep) — generic: render full expression as column_ref
+            // (handles arrayFilter, arrayDistinct, literal arrays, etc.)
+            const fn_text2 = try exprToText(allocator, val) orelse return null;
+            return .{ .func = .column_ref, .column = fn_text2, .alias = alias };
         }
         // any(col) / any_value(col)
         if ((std.mem.eql(u8, fn_name, "any") or std.mem.eql(u8, fn_name, "any_value") or std.mem.eql(u8, fn_name, "first")) and children.len == 1) {

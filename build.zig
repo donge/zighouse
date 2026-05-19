@@ -33,6 +33,13 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // Shared CSV parser module (RFC 4180).
+    const csv_mod = b.createModule(.{
+        .root_source_file = b.path("src/csv.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const exe = b.addExecutable(.{
         .name = "zighouse",
         .root_module = b.createModule(.{
@@ -391,6 +398,7 @@ pub fn build(b: *std.Build) void {
     generic_executor_tests.root_module.addImport("ch_part", ch_part_mod);
     generic_executor_tests.root_module.addImport("generic_sql", generic_sql_mod);
     generic_executor_tests.root_module.addImport("parquet", parquet_mod);
+    generic_executor_tests.root_module.addImport("csv", csv_mod);
     generic_executor_tests.root_module.addIncludePath(.{ .cwd_relative = lz4_include });
     generic_executor_tests.root_module.addLibraryPath(.{ .cwd_relative = lz4_lib });
     generic_executor_tests.root_module.addRPath(.{ .cwd_relative = lz4_lib });
@@ -459,6 +467,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     generic_executor_mod.addImport("build_options", options_mod);
+    generic_executor_mod.addImport("csv", csv_mod);
     generic_executor_mod.link_libc = true;
     generic_executor_mod.addImport("schema", schema_mod);
     generic_executor_mod.addImport("ch_part", ch_part_mod);
@@ -510,6 +519,7 @@ pub fn build(b: *std.Build) void {
     ingest_server_mod.addImport("generic_sql", generic_sql_mod);
     ingest_server_mod.addImport("ddl_parser", ddl_parser_mod);
     ingest_server_mod.addImport("native_block", native_block_mod);
+    ingest_server_mod.addImport("csv", csv_mod);
     ingest_server_mod.link_libc = true;
     ingest_server_mod.addIncludePath(.{ .cwd_relative = lz4_include });
     ingest_server_mod.addLibraryPath(.{ .cwd_relative = lz4_lib });
@@ -538,7 +548,66 @@ pub fn build(b: *std.Build) void {
     unit_tests.root_module.addImport("generic_sql", generic_sql_mod);
     unit_tests.root_module.addImport("parquet", parquet_mod);
 
+    // ── core module (shared engine, no external deps) ───────────────────────
+    // All of src/core/ is a single named module so that internal relative
+    // @import paths resolve correctly when run as a test target.
+    const core_mod = b.createModule(.{
+        .root_source_file = b.path("src/core/core.zig"),
+        .target   = target,
+        .optimize = optimize,
+    });
+    const core_tests = b.addTest(.{ .root_module = core_mod });
+    const core_test_cmd = b.addRunArtifact(core_tests);
+
+    // ── ir_planner module (generic_sql.Plan → PhysicalNode IR) ───────────────
+    const ir_planner_mod = b.createModule(.{
+        .root_source_file = b.path("src/core/exec/planner.zig"),
+        .target   = target,
+        .optimize = optimize,
+    });
+    ir_planner_mod.addImport("generic_sql", generic_sql_mod);
+    ir_planner_mod.addImport("schema",      schema_mod);
+    ir_planner_mod.addImport("core",        core_mod);
+    const ir_planner_tests   = b.addTest(.{ .root_module = ir_planner_mod });
+    const ir_planner_test_cmd = b.addRunArtifact(ir_planner_tests);
+
+    // ── part_scan_bridge module (part.zig → SourceIface bridge) ─────────────
+    const part_scan_bridge_mod = b.createModule(.{
+        .root_source_file = b.path("src/core/source/part_scan_bridge.zig"),
+        .target   = target,
+        .optimize = optimize,
+    });
+    part_scan_bridge_mod.addImport("schema", schema_mod);
+    part_scan_bridge_mod.addImport("core",   core_mod);
+    part_scan_bridge_mod.addImport("part",   ch_part_mod);
+    part_scan_bridge_mod.link_libc = true;
+    part_scan_bridge_mod.addIncludePath(.{ .cwd_relative = lz4_include });
+    part_scan_bridge_mod.addLibraryPath(.{ .cwd_relative = lz4_lib });
+    part_scan_bridge_mod.addRPath(.{ .cwd_relative = lz4_lib });
+    part_scan_bridge_mod.linkSystemLibrary("lz4", .{});
+
+    // ── serializer module (ResultSet → Native block) ─────────────────────────
+    const serializer_mod = b.createModule(.{
+        .root_source_file = b.path("src/ingest/serializer.zig"),
+        .target   = target,
+        .optimize = optimize,
+    });
+    serializer_mod.addImport("core", core_mod);
+    serializer_mod.addImport("schema", schema_mod);
+    serializer_mod.addImport("csv", csv_mod);
+    const serializer_tests = b.addTest(.{ .root_module = serializer_mod });
+    const serializer_test_cmd = b.addRunArtifact(serializer_tests);
+
+    // Wire serializer into ingest_server
+    ingest_server_mod.addImport("core", core_mod);
+    ingest_server_mod.addImport("serializer", serializer_mod);
+    ingest_server_mod.addImport("ir_planner", ir_planner_mod);
+    ingest_server_mod.addImport("part_scan_bridge", part_scan_bridge_mod);
+
     const test_step = b.step("test", "Run unit tests");
+    test_step.dependOn(&ir_planner_test_cmd.step);
+    test_step.dependOn(&core_test_cmd.step);
+    test_step.dependOn(&serializer_test_cmd.step);
     test_step.dependOn(&test_cmd.step);
     test_step.dependOn(&simd_test_cmd.step);
     test_step.dependOn(&parallel_test_cmd.step);
