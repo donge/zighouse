@@ -151,9 +151,29 @@ pub const ResultSink = struct {
                 try ra.dupe(ColMeta, self.metas.items)
             else
                 try ra.alloc(ColMeta, 0);
+            // Allocate a column entry per meta so that len(metas) == len(columns).
+            // Each column has an empty data slice (0 rows).
+            const out_cols = try ra.alloc(Column, num_cols);
+            for (out_cols, out_metas) |*c, meta| {
+                c.* = .{
+                    .name      = meta.name,
+                    .null_mask = &.{},
+                    .len       = 0,
+                    .data      = switch (meta.col_type) {
+                        .bool_u8       => .{ .bool_u8       = &.{} },
+                        .int64         => .{ .int64         = &.{} },
+                        .uint64        => .{ .uint64        = &.{} },
+                        .float64       => .{ .float64       = &.{} },
+                        .string        => .{ .string        = &.{} },
+                        .date_u16      => .{ .date_u16      = &.{} },
+                        .datetime64_ms => .{ .datetime64_ms = &.{} },
+                        .array_string  => .{ .array_string  = &.{} },
+                    },
+                };
+            }
             return ResultSet{
                 .metas    = out_metas,
-                .columns  = &.{},
+                .columns  = out_cols,
                 .num_rows = 0,
                 .arena    = self.result_arena,
             };

@@ -517,7 +517,7 @@ fn translateWhere(allocator: std.mem.Allocator, val: std.json.Value) !*generic_s
         // lower bound: col >= lower
         {
             const col = try allocator.dupe(u8, col_name);
-            if (intLiteralValue(lower_node)) |iv| {
+            if (epochMsFromNode(lower_node)) |iv| {
                 const node = try allocator.create(generic_sql.WhereNode);
                 node.* = .{ .cmp_int = .{ .col = col, .op = .ge, .val = iv } };
                 kids[n_built] = node;
@@ -537,7 +537,7 @@ fn translateWhere(allocator: std.mem.Allocator, val: std.json.Value) !*generic_s
         // upper bound: col <= upper
         {
             const col = try allocator.dupe(u8, col_name);
-            if (intLiteralValue(upper_node)) |iv| {
+            if (epochMsFromNode(upper_node)) |iv| {
                 const node = try allocator.create(generic_sql.WhereNode);
                 node.* = .{ .cmp_int = .{ .col = col, .op = .le, .val = iv } };
                 kids[n_built] = node;
@@ -1760,6 +1760,56 @@ fn isFunctionNamed(val: std.json.Value, name: []const u8) bool {
     const class = (obj.get("class") orelse return false).string;
     if (!std.mem.eql(u8, class, "FUNCTION")) return false;
     return std.mem.eql(u8, obj.get("function_name").?.string, name);
+}
+
+/// Try to extract an epoch-millisecond integer from a node that may be:
+///   - an integer literal (already epoch ms)
+///   - a string literal "YYYY-MM-DD[ HH:MM:SS]" (date or datetime)
+///   - toDateTime('YYYY-MM-DD HH:MM:SS') or toDate('YYYY-MM-DD') function call
+/// Returns null if none of the above match.
+fn epochMsFromNode(val: std.json.Value) ?i64 {
+    if (intLiteralValue(val)) |iv| return iv;
+    if (strLiteralValue(val)) |sv| return parseDateTimeStrMs(sv);
+    const obj = val.object;
+    const class = (obj.get("class") orelse return null).string;
+    if (!std.mem.eql(u8, class, "FUNCTION")) return null;
+    const fn_name = obj.get("function_name").?.string;
+    if (!std.ascii.eqlIgnoreCase(fn_name, "todatetime") and
+        !std.ascii.eqlIgnoreCase(fn_name, "todate")) return null;
+    const children = obj.get("children").?.array.items;
+    if (children.len == 0) return null;
+    const sv = strLiteralValue(children[0]) orelse return null;
+    return parseDateTimeStrMs(sv);
+}
+
+/// Parse "YYYY-MM-DD[ HH:MM:SS]" → epoch milliseconds, or null.
+fn parseDateTimeStrMs(s: []const u8) ?i64 {
+    if (s.len < 10 or s[4] != '-' or s[7] != '-') return null;
+    const y  = std.fmt.parseInt(i32, s[0..4], 10) catch return null;
+    const mo = std.fmt.parseInt(u8,  s[5..7],  10) catch return null;
+    const d  = std.fmt.parseInt(u8,  s[8..10], 10) catch return null;
+    const days = dateToDaysLocal(y, mo, d);
+    var h:   i64 = 0;
+    var mi:  i64 = 0;
+    var sec: i64 = 0;
+    if (s.len >= 19 and s[10] == ' ' and s[13] == ':' and s[16] == ':') {
+        h   = std.fmt.parseInt(i64, s[11..13], 10) catch 0;
+        mi  = std.fmt.parseInt(i64, s[14..16], 10) catch 0;
+        sec = std.fmt.parseInt(i64, s[17..19], 10) catch 0;
+    }
+    return (days * 86400 + h * 3600 + mi * 60 + sec) * 1000;
+}
+
+fn dateToDaysLocal(year: i32, month: u8, day: u8) i64 {
+    var y = year;
+    var m: i32 = month;
+    if (m <= 2) { y -= 1; m += 12; }
+    const A = @divFloor(y, 100);
+    const B = 2 - A + @divFloor(A, 4);
+    const jd: i64 = @as(i64, @intFromFloat(@floor(365.25 * @as(f64, @floatFromInt(y + 4716))))) +
+                    @as(i64, @intFromFloat(@floor(30.6001 * @as(f64, @floatFromInt(m + 1))))) +
+                    @as(i64, day) + B - 1524;
+    return jd - 2440588;
 }
 
 fn functionFirstChildColName(val: std.json.Value) ?[]const u8 {
