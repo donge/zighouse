@@ -487,7 +487,13 @@ const scalar_fns = [_]ScalarFn{
     .{ .name = "toyyyymmdd",     .out = .int64         }, // duckdb_parse lowercases it
     .{ .name = "toStartOfHour",  .out = .datetime64_ms },
     .{ .name = "toStartOfDay",   .out = .datetime64_ms },
-    .{ .name = "toStartOfMinute",.out = .datetime64_ms },
+     .{ .name = "toStartOfMinute",.out = .datetime64_ms },
+     .{ .name = "isIPv4String",    .out = .bool_u8       },
+     .{ .name = "isIPv6String",    .out = .bool_u8       },
+     .{ .name = "IPv4StringToNumOrDefault", .out = .uint64 },
+     .{ .name = "IPv4NumToString", .out = .string        },
+     .{ .name = "IPv6StringToNumOrDefault", .out = .uint64 },
+     .{ .name = "IPv6NumToString", .out = .string        },
 };
 
 /// Map date_trunc unit string → kernels function name and output ColumnType.
@@ -529,6 +535,17 @@ const TokKind = enum {
     star,        // *
     slash,       // /
     percent,     // %
+    eq,          // =
+    neq,         // <> or !=
+    lt,          // <
+    lte,         // <=
+    gt,          // >
+    gte,         // >=
+    kw_and,      // AND
+    kw_or,       // OR
+    kw_not,      // NOT
+    kw_cast,     // CAST
+    kw_as,       // AS
     eof,
 };
 
@@ -572,6 +589,29 @@ const Lexer = struct {
             '*' => { self.pos += 1; return .{ .kind = .star,    .text = self.src[start..self.pos] }; },
             '/' => { self.pos += 1; return .{ .kind = .slash,   .text = self.src[start..self.pos] }; },
             '%' => { self.pos += 1; return .{ .kind = .percent, .text = self.src[start..self.pos] }; },
+            '=' => { self.pos += 1; return .{ .kind = .eq,      .text = self.src[start..self.pos] }; },
+            '!' => {
+                self.pos += 1;
+                if (self.pos < self.src.len and self.src[self.pos] == '=') self.pos += 1;
+                return .{ .kind = .neq, .text = self.src[start..self.pos] };
+            },
+            '<' => {
+                self.pos += 1;
+                if (self.pos < self.src.len and self.src[self.pos] == '=') {
+                    self.pos += 1; return .{ .kind = .lte, .text = self.src[start..self.pos] };
+                }
+                if (self.pos < self.src.len and self.src[self.pos] == '>') {
+                    self.pos += 1; return .{ .kind = .neq, .text = self.src[start..self.pos] };
+                }
+                return .{ .kind = .lt, .text = self.src[start..self.pos] };
+            },
+            '>' => {
+                self.pos += 1;
+                if (self.pos < self.src.len and self.src[self.pos] == '=') {
+                    self.pos += 1; return .{ .kind = .gte, .text = self.src[start..self.pos] };
+                }
+                return .{ .kind = .gt, .text = self.src[start..self.pos] };
+            },
             '\'' => {
                 // String literal: consume until closing '
                 self.pos += 1;
@@ -608,7 +648,13 @@ const Lexer = struct {
                    (std.ascii.isAlphanumeric(self.src[self.pos]) or
                     self.src[self.pos] == '_' or self.src[self.pos] == '.'))
                 self.pos += 1;
-            return .{ .kind = .ident, .text = self.src[start..self.pos] };
+            const word = self.src[start..self.pos];
+            if (std.ascii.eqlIgnoreCase(word, "AND"))  return .{ .kind = .kw_and,  .text = word };
+            if (std.ascii.eqlIgnoreCase(word, "OR"))   return .{ .kind = .kw_or,   .text = word };
+            if (std.ascii.eqlIgnoreCase(word, "NOT"))  return .{ .kind = .kw_not,  .text = word };
+            if (std.ascii.eqlIgnoreCase(word, "CAST")) return .{ .kind = .kw_cast, .text = word };
+            if (std.ascii.eqlIgnoreCase(word, "AS"))   return .{ .kind = .kw_as,   .text = word };
+            return .{ .kind = .ident, .text = word };
         }
 
         // Unknown — advance one byte and return eof-equivalent
@@ -617,12 +663,38 @@ const Lexer = struct {
     }
 };
 
+/// Normalize a function name (which may be lowercase from duckdb AST) to the
+/// canonical casing used by kernels.zig. Falls back to the original if unknown.
+fn canonFnName(name: []const u8) []const u8 {
+    const canon_names = [_][]const u8{
+        "lower", "upper", "length", "char_length", "lowerUTF8", "upperUTF8",
+        "toDate", "toDateOrZero", "toYYYYMMDD", "toUnixTimestamp", "toFloat64",
+        "toUInt64", "toInt64", "toString", "toStartOfMinute", "toStartOfHour",
+        "toStartOfDay", "toStartOfWeek", "toStartOfMonth", "toStartOfYear",
+        "toYear", "toMonth", "toDayOfMonth", "toDayOfWeek", "toHour", "toMinute", "toSecond",
+        "abs", "round", "floor", "ceil", "log", "log2", "log10", "sqrt", "exp",
+        "not", "isNull", "isNotNull", "isIPv4String", "isIPv6String",
+        "IPv4StringToNumOrDefault", "IPv4NumToString",
+        "IPv6StringToNumOrDefault", "IPv6NumToString",
+        "greatest", "least", "intDiv", "modulo",
+        "positionCaseInsensitive", "splitByChar", "concat",
+        "if", "multiIf",
+    };
+    for (canon_names) |cn| {
+        if (std.ascii.eqlIgnoreCase(cn, name)) return cn;
+    }
+    return name;
+}
+
 /// Operator precedence for binary infix operators (Pratt binding power).
 /// Higher number = binds tighter.
 fn infixBP(kind: TokKind) ?u8 {
     return switch (kind) {
-        .plus, .minus   => 10,
-        .star, .slash, .percent => 20,
+        .kw_or                           =>  5,
+        .kw_and                          =>  7,
+        .eq, .neq, .lt, .lte, .gt, .gte =>  9,
+        .plus, .minus                    => 10,
+        .star, .slash, .percent          => 20,
         else => null,
     };
 }
@@ -657,6 +729,42 @@ fn prattExpr(pctx: *ParseCtx, min_bp: u8) anyerror!?Expr {
             const bp = try pctx.arena.create(plan.BinOp);
             bp.* = .{ .left = Expr{ .lit_i64 = 0 }, .right = rhs };
             break :blk_unary Expr{ .sub = bp };
+        },
+
+        // Unary NOT
+        .kw_not => blk_not: {
+            const rhs = try prattExpr(pctx, 8) orelse return null;
+            const fc = try pctx.arena.create(plan.FnCall);
+            const fc_args = try pctx.arena.alloc(Expr, 1);
+            fc_args[0] = rhs;
+            fc.* = .{ .name = "not", .args = fc_args };
+            break :blk_not Expr{ .fn_call = fc };
+        },
+
+        // CAST(expr AS type) → map to a known conversion function
+        .kw_cast => blk_cast: {
+            const lp = pctx.lex.next();
+            if (lp.kind != .lparen) return null;
+            const inner = try prattExpr(pctx, 0) orelse return null;
+            const as_tok = pctx.lex.next();
+            if (as_tok.kind != .kw_as) return null;
+            const type_tok = pctx.lex.next();
+            if (type_tok.kind != .ident) return null;
+            const rp = pctx.lex.next();
+            if (rp.kind != .rparen) return null;
+            const type_name = type_tok.text;
+            // Map target type to a kernels function
+            const fn_name: []const u8 = if (std.ascii.eqlIgnoreCase(type_name, "DATE"))
+                "toDate"
+            else if (std.ascii.eqlIgnoreCase(type_name, "VARCHAR"))
+                "toString"
+            else
+                return null; // unsupported cast type
+            const fc = try pctx.arena.create(plan.FnCall);
+            const fc_args = try pctx.arena.alloc(Expr, 1);
+            fc_args[0] = inner;
+            fc.* = .{ .name = fn_name, .args = fc_args };
+            break :blk_cast Expr{ .fn_call = fc };
         },
 
         // Parenthesised sub-expression
@@ -735,20 +843,26 @@ fn prattExpr(pctx: *ParseCtx, min_bp: u8) anyerror!?Expr {
                 // Verify function is in known scalar_fns or 2-arg numerics
                 const is_known = blk2: {
                     for (scalar_fns) |sf| {
-                        if (std.mem.eql(u8, sf.name, name) and args_slice.len == 1) break :blk2 true;
+                        if (std.ascii.eqlIgnoreCase(sf.name, name) and args_slice.len == 1) break :blk2 true;
                     }
                     if (args_slice.len == 2) {
-                        if (std.mem.eql(u8, name, "greatest") or
-                            std.mem.eql(u8, name, "least") or
-                            std.mem.eql(u8, name, "intDiv") or
-                            std.mem.eql(u8, name, "modulo")) break :blk2 true;
+                        if (std.ascii.eqlIgnoreCase(name, "greatest") or
+                            std.ascii.eqlIgnoreCase(name, "least") or
+                            std.ascii.eqlIgnoreCase(name, "intDiv") or
+                            std.ascii.eqlIgnoreCase(name, "modulo") or
+                            std.ascii.eqlIgnoreCase(name, "positionCaseInsensitive") or
+                            std.ascii.eqlIgnoreCase(name, "splitByChar")) break :blk2 true;
                     }
+                    if (args_slice.len == 3 and std.ascii.eqlIgnoreCase(name, "if")) break :blk2 true;
+                    if (args_slice.len >= 2 and std.ascii.eqlIgnoreCase(name, "concat")) break :blk2 true;
+                    if (args_slice.len >= 3 and std.ascii.eqlIgnoreCase(name, "multiIf")) break :blk2 true;
                     break :blk2 false;
                 };
                 if (!is_known) return null;
 
                 const fc = try pctx.arena.create(plan.FnCall);
-                fc.* = .{ .name = name, .args = args_slice };
+                // Normalize the function name to canonical casing that kernels.zig expects.
+                fc.* = .{ .name = canonFnName(name), .args = args_slice };
                 break :blk Expr{ .fn_call = fc };
             }
 
@@ -768,6 +882,17 @@ fn prattExpr(pctx: *ParseCtx, min_bp: u8) anyerror!?Expr {
         _ = pctx.lex.next(); // consume operator
         const rhs = try prattExpr(pctx, bp) orelse return null;
 
+        // AND/OR: use fn_call representation (no BinOp needed)
+        if (op.kind == .kw_and or op.kind == .kw_or) {
+            const fc = try pctx.arena.create(plan.FnCall);
+            const fc_args = try pctx.arena.alloc(Expr, 2);
+            fc_args[0] = lhs;
+            fc_args[1] = rhs;
+            fc.* = .{ .name = if (op.kind == .kw_and) "and" else "or", .args = fc_args };
+            lhs = Expr{ .fn_call = fc };
+            continue;
+        }
+
         const binop = try pctx.arena.create(plan.BinOp);
         binop.* = .{ .left = lhs, .right = rhs };
 
@@ -777,6 +902,12 @@ fn prattExpr(pctx: *ParseCtx, min_bp: u8) anyerror!?Expr {
             .star    => Expr{ .mul = binop },
             .slash   => Expr{ .div = binop },
             .percent => Expr{ .mod = binop },
+            .eq      => Expr{ .eq  = binop },
+            .neq     => Expr{ .neq = binop },
+            .lt      => Expr{ .lt  = binop },
+            .lte     => Expr{ .lte = binop },
+            .gt      => Expr{ .gt  = binop },
+            .gte     => Expr{ .gte = binop },
             else     => unreachable,
         };
     }
@@ -801,12 +932,20 @@ fn inferExprType(ctx: *PlannerCtx, expr: Expr) ColumnType {
         },
         .div => .float64,  // integer division may produce fraction
         .mod => .int64,
+        // Comparison operators yield bool_u8
+        .eq, .neq, .lt, .lte, .gt, .gte => .bool_u8,
         .fn_call => |fc| {
             for (scalar_fns) |sf| {
                 if (std.mem.eql(u8, sf.name, fc.name)) return sf.out;
             }
             if (std.mem.eql(u8, fc.name, "greatest") or std.mem.eql(u8, fc.name, "least")) return .float64;
             if (std.mem.eql(u8, fc.name, "intDiv") or std.mem.eql(u8, fc.name, "modulo")) return .int64;
+            if (std.mem.eql(u8, fc.name, "positionCaseInsensitive")) return .uint64;
+            if (std.mem.eql(u8, fc.name, "concat")) return .string;
+            if (std.mem.eql(u8, fc.name, "splitByChar")) return .array_string;
+            if (std.mem.eql(u8, fc.name, "if") or std.mem.eql(u8, fc.name, "multiIf")) {
+                if (fc.args.len >= 2) return inferExprType(ctx, fc.args[1]);
+            }
             return .float64;
         },
         else => .float64,

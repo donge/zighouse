@@ -716,7 +716,7 @@ pub const Server = struct {
         }
 
         // ── IR execution path (CSV output, no intermediate generic_executor) ──
-        if (try self.tryIrExecuteCsv(plan, &entry.table, parts.dirs())) |csv| {
+        if (try self.tryIrExecuteCsv(plan, &entry.table, parts.dirs(), sql)) |csv| {
             defer self.allocator.free(csv);
             try sendResponse(request, out, .ok, csv);
             return;
@@ -741,6 +741,7 @@ pub const Server = struct {
         gplan: generic_sql.Plan,
         table: *const schema.Table,
         part_dirs: []const []const u8,
+        orig_sql: []const u8,
     ) !?[]u8 {
         // ── 1. Build PlannerCtx & translate ──────────────────────────────────
         var arena = std.heap.ArenaAllocator.init(self.allocator);
@@ -756,6 +757,7 @@ pub const Server = struct {
         };
         if (node == null) {
             // plan_query returned null → unsupported shape, use fallback.
+            std.log.warn("IR fallback: {s}", .{orig_sql});
             arena.deinit();
             return null;
         }
@@ -794,6 +796,7 @@ pub const Server = struct {
         gplan: generic_sql.Plan,
         table: *const schema.Table,
         part_dirs: []const []const u8,
+        orig_sql: []const u8,
     ) !?[]u8 {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         errdefer arena.deinit();
@@ -806,6 +809,7 @@ pub const Server = struct {
             return null;
         };
         if (node == null) {
+            std.log.warn("IR fallback (csv): {s}", .{orig_sql});
             arena.deinit();
             return null;
         }
@@ -1044,7 +1048,7 @@ pub const Server = struct {
         }
 
         // ── IR execution path (native binary, no CSV intermediate) ────────────
-        if (try self.tryIrExecute(plan, &entry.table, parts.dirs())) |nb| {
+        if (try self.tryIrExecute(plan, &entry.table, parts.dirs(), sql)) |nb| {
             defer self.allocator.free(nb);
             try sendNativeBlock(self.allocator, request, out, nb);
             return;
