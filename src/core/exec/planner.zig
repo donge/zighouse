@@ -533,6 +533,33 @@ fn tryParseFnCallItem(ctx: *PlannerCtx, text: []const u8, alias: []const u8) !?P
         return null;
     }
 
+    // ── Two-argument numeric functions: greatest(col, N), least(col, N) ─────────
+    // Pattern: fn_name(col_or_lit, number_literal) — no nested parens in either arg.
+    if (std.mem.eql(u8, fn_name, "greatest") or
+        std.mem.eql(u8, fn_name, "least") or
+        std.mem.eql(u8, fn_name, "intDiv") or
+        std.mem.eql(u8, fn_name, "modulo"))
+    {
+        if (std.mem.indexOfScalar(u8, args_text, '(') == null) {
+            const comma = std.mem.indexOfScalar(u8, args_text, ',') orelse return null;
+            const a0_raw = std.mem.trim(u8, args_text[0..comma], " \t");
+            const a1_raw = std.mem.trim(u8, args_text[comma+1..], " \t");
+            if (std.mem.indexOfScalar(u8, a1_raw, ',') == null) {
+                const a0_expr = resolveColExpr(ctx, a0_raw) orelse return null;
+                const a1_expr = resolveColExpr(ctx, a1_raw) orelse return null;
+                const fc = try ctx.alloc.create(plan.FnCall);
+                const fc_args = try ctx.alloc.alloc(Expr, 2);
+                fc_args[0] = a0_expr;
+                fc_args[1] = a1_expr;
+                fc.* = .{ .name = fn_name, .args = fc_args };
+                const out: ColumnType = if (std.mem.eql(u8, fn_name, "intDiv") or
+                    std.mem.eql(u8, fn_name, "modulo")) .int64 else .float64;
+                return ProjectItem{ .expr = .{ .fn_call = fc }, .alias = alias, .out_type = out };
+            }
+        }
+        return null;
+    }
+
     // ── Single-argument functions ─────────────────────────────────────────────
     // Reject if arg contains nested parens or commas (multi-arg).
     if (std.mem.indexOfScalar(u8, args_text, '(') != null) return null;
