@@ -498,11 +498,333 @@ const date_trunc_units = [_]DateTruncUnit{
     .{ .unit = "minute", .fn_name = "toStartOfMinute", .out = .datetime64_ms },
 };
 
+// ── Pratt expression parser ───────────────────────────────────────────────────
+//
+// Converts a text expression (as emitted by duckdb_parse.exprToText) into a
+// typed plan.Expr tree.  Handles:
+//
+//   - Integer / float / string literals
+//   - Column references (looked up in schema)
+//   - Arithmetic: + - * / %  (standard precedence)
+//   - Unary minus
+//   - Parenthesised sub-expressions: (expr)
+//   - Scalar function calls: fn(expr, expr, …)
+//     ∙ Single-arg: floor(x), abs(x), lower(x), …
+//     ∙ Two-arg numeric: greatest(a,b), least(a,b), intDiv(a,b), …
+//     ∙ date_trunc('unit', col)
+//
+// Returns null (not an error) if the text cannot be fully parsed.
+
+/// Token kinds produced by the lexer.
+const TokKind = enum {
+    num_int,     // integer literal
+    num_float,   // float literal
+    str_lit,     // 'quoted string'
+    ident,       // identifier / column name
+    lparen,      // (
+    rparen,      // )
+    comma,       // ,
+    plus,        // +
+    minus,       // -
+    star,        // *
+    slash,       // /
+    percent,     // %
+    eof,
+};
+
+const Token = struct {
+    kind: TokKind,
+    text: []const u8,  // slice into original input
+};
+
+/// Minimal lexer: produces one token at a time from a []const u8 cursor.
+const Lexer = struct {
+    src:  []const u8,
+    pos:  usize,
+
+    fn init(src: []const u8) Lexer { return .{ .src = src, .pos = 0 }; }
+
+    fn skipWs(self: *Lexer) void {
+        while (self.pos < self.src.len and
+               (self.src[self.pos] == ' ' or self.src[self.pos] == '\t' or
+                self.src[self.pos] == '\r' or self.src[self.pos] == '\n'))
+            self.pos += 1;
+    }
+
+    fn peek(self: *Lexer) Token {
+        var lex = self.*;
+        return lex.next();
+    }
+
+    fn next(self: *Lexer) Token {
+        self.skipWs();
+        if (self.pos >= self.src.len) return .{ .kind = .eof, .text = "" };
+        const start = self.pos;
+        const ch = self.src[self.pos];
+
+        // Single-char tokens
+        switch (ch) {
+            '(' => { self.pos += 1; return .{ .kind = .lparen,  .text = self.src[start..self.pos] }; },
+            ')' => { self.pos += 1; return .{ .kind = .rparen,  .text = self.src[start..self.pos] }; },
+            ',' => { self.pos += 1; return .{ .kind = .comma,   .text = self.src[start..self.pos] }; },
+            '+' => { self.pos += 1; return .{ .kind = .plus,    .text = self.src[start..self.pos] }; },
+            '-' => { self.pos += 1; return .{ .kind = .minus,   .text = self.src[start..self.pos] }; },
+            '*' => { self.pos += 1; return .{ .kind = .star,    .text = self.src[start..self.pos] }; },
+            '/' => { self.pos += 1; return .{ .kind = .slash,   .text = self.src[start..self.pos] }; },
+            '%' => { self.pos += 1; return .{ .kind = .percent, .text = self.src[start..self.pos] }; },
+            '\'' => {
+                // String literal: consume until closing '
+                self.pos += 1;
+                while (self.pos < self.src.len and self.src[self.pos] != '\'') self.pos += 1;
+                if (self.pos < self.src.len) self.pos += 1; // consume closing '
+                return .{ .kind = .str_lit, .text = self.src[start..self.pos] };
+            },
+            else => {},
+        }
+
+        // Number literal (integer or float)
+        if (std.ascii.isDigit(ch) or (ch == '-' and self.pos + 1 < self.src.len and std.ascii.isDigit(self.src[self.pos + 1]))) {
+            if (ch == '-') self.pos += 1;
+            while (self.pos < self.src.len and std.ascii.isDigit(self.src[self.pos])) self.pos += 1;
+            var is_float = false;
+            if (self.pos < self.src.len and self.src[self.pos] == '.') {
+                is_float = true;
+                self.pos += 1;
+                while (self.pos < self.src.len and std.ascii.isDigit(self.src[self.pos])) self.pos += 1;
+            }
+            // Optional exponent: e+N / e-N
+            if (self.pos < self.src.len and (self.src[self.pos] == 'e' or self.src[self.pos] == 'E')) {
+                is_float = true;
+                self.pos += 1;
+                if (self.pos < self.src.len and (self.src[self.pos] == '+' or self.src[self.pos] == '-')) self.pos += 1;
+                while (self.pos < self.src.len and std.ascii.isDigit(self.src[self.pos])) self.pos += 1;
+            }
+            return .{ .kind = if (is_float) .num_float else .num_int, .text = self.src[start..self.pos] };
+        }
+
+        // Identifier: starts with letter or underscore, may contain digits and dots
+        if (std.ascii.isAlphabetic(ch) or ch == '_') {
+            while (self.pos < self.src.len and
+                   (std.ascii.isAlphanumeric(self.src[self.pos]) or
+                    self.src[self.pos] == '_' or self.src[self.pos] == '.'))
+                self.pos += 1;
+            return .{ .kind = .ident, .text = self.src[start..self.pos] };
+        }
+
+        // Unknown — advance one byte and return eof-equivalent
+        self.pos += 1;
+        return .{ .kind = .eof, .text = self.src[start..self.pos] };
+    }
+};
+
+/// Operator precedence for binary infix operators (Pratt binding power).
+/// Higher number = binds tighter.
+fn infixBP(kind: TokKind) ?u8 {
+    return switch (kind) {
+        .plus, .minus   => 10,
+        .star, .slash, .percent => 20,
+        else => null,
+    };
+}
+
+/// Parse state threaded through Pratt calls.
+const ParseCtx = struct {
+    lex: Lexer,
+    arena: std.mem.Allocator,
+    plan_ctx: *PlannerCtx,
+};
+
+/// Entry: try to parse `text` as a complete arithmetic/function expression.
+/// Returns null if parsing fails or doesn't consume the whole string.
+fn parseArithExpr(ctx: *PlannerCtx, text: []const u8) !?Expr {
+    var pctx = ParseCtx{ .lex = Lexer.init(text), .arena = ctx.alloc, .plan_ctx = ctx };
+    const expr = try prattExpr(&pctx, 0) orelse return null;
+    // Must have consumed the entire input (ignoring whitespace).
+    pctx.lex.skipWs();
+    if (pctx.lex.pos != pctx.lex.src.len) return null; // trailing garbage
+    return expr;
+}
+
+/// Pratt parser: parse an expression with minimum binding power `min_bp`.
+fn prattExpr(pctx: *ParseCtx, min_bp: u8) anyerror!?Expr {
+    // ── NUD (prefix) ─────────────────────────────────────────────────────────
+    var tok = pctx.lex.next();
+
+    var lhs: Expr = switch (tok.kind) {
+        // Unary minus: -(expr)
+        .minus => blk_unary: {
+            const rhs = try prattExpr(pctx, 25) orelse return null; // tight BP
+            const bp = try pctx.arena.create(plan.BinOp);
+            bp.* = .{ .left = Expr{ .lit_i64 = 0 }, .right = rhs };
+            break :blk_unary Expr{ .sub = bp };
+        },
+
+        // Parenthesised sub-expression
+        .lparen => blk_paren: {
+            const inner = try prattExpr(pctx, 0) orelse return null;
+            const close = pctx.lex.next();
+            if (close.kind != .rparen) return null;
+            break :blk_paren inner;
+        },
+
+        // Integer literal
+        .num_int => blk: {
+            const v = std.fmt.parseInt(i64, tok.text, 10) catch return null;
+            break :blk Expr{ .lit_i64 = v };
+        },
+
+        // Float literal
+        .num_float => blk: {
+            const v = std.fmt.parseFloat(f64, tok.text) catch return null;
+            break :blk Expr{ .lit_f64 = v };
+        },
+
+        // String literal: 'value'  → lit_str (strip quotes)
+        .str_lit => blk: {
+            const s = if (tok.text.len >= 2) tok.text[1..tok.text.len - 1] else tok.text;
+            break :blk Expr{ .lit_str = s };
+        },
+
+        // Identifier: either a function call fn(…) or a column/literal
+        .ident => blk: {
+            const name = tok.text;
+            // Look ahead: is next token '('?  → function call
+            const next = pctx.lex.peek();
+            if (next.kind == .lparen) {
+                _ = pctx.lex.next(); // consume '('
+                // Parse argument list
+                var args: std.ArrayListUnmanaged(Expr) = .empty;
+                // Check for zero-arg call
+                const first_peek = pctx.lex.peek();
+                if (first_peek.kind != .rparen) {
+                    while (true) {
+                        const arg = try prattExpr(pctx, 0) orelse return null;
+                        try args.append(pctx.arena, arg);
+                        const sep = pctx.lex.peek();
+                        if (sep.kind == .comma) {
+                            _ = pctx.lex.next();
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                const close = pctx.lex.next();
+                if (close.kind != .rparen) return null;
+
+                const args_slice = try args.toOwnedSlice(pctx.arena);
+
+                // date_trunc special-case: first arg is string literal unit
+                if (std.mem.eql(u8, name, "date_trunc") and args_slice.len == 2) {
+                    const unit_expr = args_slice[0];
+                    const unit_str: []const u8 = switch (unit_expr) {
+                        .lit_str => |s| s,
+                        else => return null,
+                    };
+                    for (date_trunc_units) |dtu| {
+                        if (std.mem.eql(u8, dtu.unit, unit_str)) {
+                            const fc = try pctx.arena.create(plan.FnCall);
+                            const fc_args = try pctx.arena.alloc(Expr, 1);
+                            fc_args[0] = args_slice[1];
+                            fc.* = .{ .name = dtu.fn_name, .args = fc_args };
+                            break :blk Expr{ .fn_call = fc };
+                        }
+                    }
+                    return null;
+                }
+
+                // Verify function is in known scalar_fns or 2-arg numerics
+                const is_known = blk2: {
+                    for (scalar_fns) |sf| {
+                        if (std.mem.eql(u8, sf.name, name) and args_slice.len == 1) break :blk2 true;
+                    }
+                    if (args_slice.len == 2) {
+                        if (std.mem.eql(u8, name, "greatest") or
+                            std.mem.eql(u8, name, "least") or
+                            std.mem.eql(u8, name, "intDiv") or
+                            std.mem.eql(u8, name, "modulo")) break :blk2 true;
+                    }
+                    break :blk2 false;
+                };
+                if (!is_known) return null;
+
+                const fc = try pctx.arena.create(plan.FnCall);
+                fc.* = .{ .name = name, .args = args_slice };
+                break :blk Expr{ .fn_call = fc };
+            }
+
+            // Not a function call — resolve as column ref or literal
+            break :blk resolveColExpr(pctx.plan_ctx, name) orelse return null;
+        },
+
+        else => return null,
+    };
+
+    // ── LED (infix) ───────────────────────────────────────────────────────────
+    while (true) {
+        const op = pctx.lex.peek();
+        const bp = infixBP(op.kind) orelse break;
+        if (bp <= min_bp) break;
+
+        _ = pctx.lex.next(); // consume operator
+        const rhs = try prattExpr(pctx, bp) orelse return null;
+
+        const binop = try pctx.arena.create(plan.BinOp);
+        binop.* = .{ .left = lhs, .right = rhs };
+
+        lhs = switch (op.kind) {
+            .plus    => Expr{ .add = binop },
+            .minus   => Expr{ .sub = binop },
+            .star    => Expr{ .mul = binop },
+            .slash   => Expr{ .div = binop },
+            .percent => Expr{ .mod = binop },
+            else     => unreachable,
+        };
+    }
+
+    return lhs;
+}
+
+/// Infer the output ColumnType of an Expr tree (best-effort, conservative).
+fn inferExprType(ctx: *PlannerCtx, expr: Expr) ColumnType {
+    return switch (expr) {
+        .lit_i64, .lit_u64 => .int64,
+        .lit_f64            => .float64,
+        .lit_str            => .string,
+        .lit_bool           => .bool_u8,
+        .lit_null           => .int64,
+        .col_ref => |ref| schemaColType(ctx, ref.name),
+        .add, .sub, .mul => |op| {
+            const lt = inferExprType(ctx, op.left);
+            const rt = inferExprType(ctx, op.right);
+            if (lt == .float64 or rt == .float64) return .float64;
+            return .int64;
+        },
+        .div => .float64,  // integer division may produce fraction
+        .mod => .int64,
+        .fn_call => |fc| {
+            for (scalar_fns) |sf| {
+                if (std.mem.eql(u8, sf.name, fc.name)) return sf.out;
+            }
+            if (std.mem.eql(u8, fc.name, "greatest") or std.mem.eql(u8, fc.name, "least")) return .float64;
+            if (std.mem.eql(u8, fc.name, "intDiv") or std.mem.eql(u8, fc.name, "modulo")) return .int64;
+            return .float64;
+        },
+        else => .float64,
+    };
+}
+
 /// Try to parse `text` as `fn_name(arg)` where fn_name is in scalar_fns and
 /// arg resolves to a column or literal via resolveColExpr.
 /// Also handles date_trunc('unit', col).
 /// Returns a ready ProjectItem on success, null if not parseable.
 fn tryParseFnCallItem(ctx: *PlannerCtx, text: []const u8, alias: []const u8) !?ProjectItem {
+    // Delegate to the full Pratt expression parser first.
+    if (try parseArithExpr(ctx, text)) |expr| {
+        // Infer output type from the expression.
+        const out_type = inferExprType(ctx, expr);
+        return ProjectItem{ .expr = expr, .alias = alias, .out_type = out_type };
+    }
+
     // Find opening paren — must not be the first char.
     const paren_open = std.mem.indexOfScalar(u8, text, '(') orelse return null;
     if (paren_open == 0) return null;
