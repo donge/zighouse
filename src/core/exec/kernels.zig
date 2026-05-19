@@ -301,19 +301,19 @@ fn evalFnCall(fc: *const plan.FnCall, row: []const ?Value, arena: std.mem.Alloca
     if (std.mem.eql(u8, name, "floor") or std.mem.eql(u8, name, "toInt64OrZero")) {
         const v = args[0] orelse return null;
         return switch (v) {
-            .float64 => |f| Value{ .float64 = @floor(f) },
+            .float64 => |f| Value{ .int64 = @intFromFloat(@floor(f)) },
             .int64   => v,
             .uint64  => v,
-            else     => Value{ .float64 = @floor(v.toF64() orelse 0.0) },
+            else     => Value{ .int64 = @intFromFloat(@floor(v.toF64() orelse 0.0)) },
         };
     }
     if (std.mem.eql(u8, name, "ceil") or std.mem.eql(u8, name, "ceiling")) {
         const v = args[0] orelse return null;
         return switch (v) {
-            .float64 => |f| Value{ .float64 = @ceil(f) },
+            .float64 => |f| Value{ .int64 = @intFromFloat(@ceil(f)) },
             .int64   => v,
             .uint64  => v,
-            else     => Value{ .float64 = @ceil(v.toF64() orelse 0.0) },
+            else     => Value{ .int64 = @intFromFloat(@ceil(v.toF64() orelse 0.0)) },
         };
     }
     if (std.mem.eql(u8, name, "round")) {

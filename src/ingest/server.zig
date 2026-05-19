@@ -715,7 +715,14 @@ pub const Server = struct {
             return;
         }
 
-        // Run query across all parts (CSV output for ?query= HTTP path).
+        // ── IR execution path (CSV output, no intermediate generic_executor) ──
+        if (try self.tryIrExecuteCsv(plan, &entry.table, parts.dirs())) |csv| {
+            defer self.allocator.free(csv);
+            try sendResponse(request, out, .ok, csv);
+            return;
+        }
+
+        // ── Fallback: generic_executor → CSV ──────────────────────────────────
         const result = try generic_executor.runWithSource(
             self.allocator, self.io,
             plan,
@@ -778,6 +785,53 @@ pub const Server = struct {
         // ── 4. Serialize ResultSet → native block ─────────────────────────────
         const nb = try serializer.toNativeBlock(self.allocator, rs);
         return nb;
+    }
+
+    /// Same as tryIrExecute but serialises the ResultSet to CSV instead of a
+    /// native block.  Used by the ?query= HTTP GET path (handleSelect).
+    fn tryIrExecuteCsv(
+        self: *Server,
+        gplan: generic_sql.Plan,
+        table: *const schema.Table,
+        part_dirs: []const []const u8,
+    ) !?[]u8 {
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        errdefer arena.deinit();
+        const alloc = arena.allocator();
+
+        var pctx = ir_planner.PlannerCtx.init(alloc, table.*);
+        const node = ir_planner.plan_query(&pctx, gplan) catch |err| {
+            std.log.warn("ir_planner error (csv): {}", .{err});
+            arena.deinit();
+            return null;
+        };
+        if (node == null) {
+            arena.deinit();
+            return null;
+        }
+
+        var bridge = part_scan_bridge.PartScanBridge.init(
+            self.allocator, self.io, table.*, part_dirs,
+        ) catch |err| {
+            std.log.warn("part_scan_bridge init error (csv): {}", .{err});
+            arena.deinit();
+            return null;
+        };
+        defer bridge.deinit();
+
+        var qctx = core.exec.pipeline.QueryContext.init(self.allocator, bridge.source());
+        defer qctx.deinit();
+
+        var rs = core.exec.pipeline.executePlan(node.?, &qctx) catch |err| {
+            std.log.warn("pipeline executePlan error (csv): {}", .{err});
+            arena.deinit();
+            return null;
+        };
+        defer rs.deinit();
+        arena.deinit();
+
+        const csv = try serializer.toCsv(self.allocator, rs);
+        return csv;
     }
 
     /// Handle SELECT with a subquery in FROM: materialize inner plan, then run outer.

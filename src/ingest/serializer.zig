@@ -368,6 +368,111 @@ fn schemaToCore(ty: schema.ColumnType, ch_type: ?[]const u8) core.ColumnType {
     };
 }
 
+// ── ResultSet → CSV ───────────────────────────────────────────────────────────
+
+/// Serialise `rs` into a CSV byte sequence compatible with generic_executor output.
+///
+/// Format:
+///   - Header row: comma-separated column names, with \x03U8: prefix for bool_u8
+///     and \x02D: prefix for date_u16 (consumed by csvToResultSet / streamRowsCsvFn).
+///   - Data rows: comma-separated values, strings are RFC-4180 quoted when needed.
+///
+/// The caller owns the returned slice and must free it with `alloc`.
+pub fn toCsv(alloc: std.mem.Allocator, rs: ResultSet) ![]u8 {
+    const num_rows = rs.num_rows;
+
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(alloc);
+
+    // ── Header ────────────────────────────────────────────────────────────────
+    for (rs.metas, 0..) |meta, ci| {
+        if (ci > 0) try buf.append(alloc, ',');
+        // Type-hint sentinels so streamRowsCsvFn / csvToResultSet knows the type.
+        switch (meta.col_type) {
+            .bool_u8   => try buf.appendSlice(alloc, "\x03U8:"),
+            .date_u16  => try buf.appendSlice(alloc, "\x02D:"),
+            else       => {},
+        }
+        // Quote column name if it contains commas, quotes, or newlines.
+        const needs_quote = std.mem.indexOfAny(u8, meta.name, ",\"\n\r") != null;
+        if (needs_quote) {
+            try buf.append(alloc, '"');
+            for (meta.name) |ch| {
+                if (ch == '"') try buf.append(alloc, '"');
+                try buf.append(alloc, ch);
+            }
+            try buf.append(alloc, '"');
+        } else {
+            try buf.appendSlice(alloc, meta.name);
+        }
+    }
+    try buf.append(alloc, '\n');
+
+    // ── Data rows ─────────────────────────────────────────────────────────────
+    for (0..num_rows) |r| {
+        for (rs.metas, rs.columns, 0..) |meta, col, ci| {
+            if (ci > 0) try buf.append(alloc, ',');
+            const is_null = core.chunk.isNull(col.null_mask, r);
+            if (is_null) {
+                // Null → empty field
+                continue;
+            }
+            switch (meta.col_type) {
+                .bool_u8 => try buf.print(alloc, "{d}", .{col.data.bool_u8[r]}),
+                .int64   => try buf.print(alloc, "{d}", .{col.data.int64[r]}),
+                .uint64  => {
+                    // Check for narrow wire type via ch_type override.
+                    const wire = meta.ch_type orelse "UInt64";
+                    if (std.mem.eql(u8, wire, "UInt16")) {
+                        try buf.print(alloc, "{d}", .{@as(u16, @truncate(col.data.uint64[r]))});
+                    } else if (std.mem.eql(u8, wire, "UInt32")) {
+                        try buf.print(alloc, "{d}", .{@as(u32, @truncate(col.data.uint64[r]))});
+                    } else {
+                        try buf.print(alloc, "{d}", .{col.data.uint64[r]});
+                    }
+                },
+                .float64 => {
+                    const v = col.data.float64[r];
+                    // Emit decimal point so downstream can distinguish Float64 from Int.
+                    if (v == @trunc(v) and @abs(v) < 1e15) {
+                        try buf.print(alloc, "{d}.0", .{@as(i64, @intFromFloat(v))});
+                    } else {
+                        try buf.print(alloc, "{d}", .{v});
+                    }
+                },
+                .date_u16 => try buf.print(alloc, "{d}", .{col.data.date_u16[r]}),
+                .datetime64_ms => try buf.print(alloc, "{d}", .{col.data.datetime64_ms[r]}),
+                .string => {
+                    const s = col.data.string[r];
+                    const needs_quote = std.mem.indexOfAny(u8, s, ",\"\n\r") != null;
+                    if (needs_quote) {
+                        try buf.append(alloc, '"');
+                        for (s) |ch| {
+                            if (ch == '"') try buf.append(alloc, '"');
+                            try buf.append(alloc, ch);
+                        }
+                        try buf.append(alloc, '"');
+                    } else {
+                        try buf.appendSlice(alloc, s);
+                    }
+                },
+                .array_string => {
+                    // Render as \x01 sentinel + \x0c-separated elements (same as generic_executor).
+                    const arr = col.data.array_string[r];
+                    try buf.append(alloc, 0x01);
+                    for (arr, 0..) |s, i| {
+                        if (i > 0) try buf.append(alloc, '\x0c');
+                        try buf.appendSlice(alloc, s);
+                    }
+                },
+            }
+        }
+        try buf.append(alloc, '\n');
+    }
+
+    return buf.toOwnedSlice(alloc);
+}
+
 // ── ResultSet → Native block ──────────────────────────────────────────────────
 
 /// Serialise `rs` into a ClickHouse Native block byte sequence.

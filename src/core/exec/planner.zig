@@ -403,7 +403,12 @@ fn scalarExprToProjectItem(ctx: *PlannerCtx, p: generic_sql.Expr) !?ProjectItem 
     const col_name = p.column orelse "";
     return switch (p.func) {
         .column_ref => blk: {
-            const col_expr = resolveColExpr(ctx, col_name) orelse break :blk null;
+            const col_expr = resolveColExpr(ctx, col_name) orelse {
+                // col_name might be a function call like "lower(protocol)" — try to
+                // parse it as a known scalar fn and build an fn_call Expr.
+                const item = try tryParseFnCallItem(ctx, col_name, alias) orelse break :blk null;
+                break :blk item;
+            };
             const out_type = schemaColType(ctx, col_name);
             // Handle col + N / col - N (int_offset)
             const final_expr: Expr = if (p.int_offset != 0) expr: {
@@ -428,6 +433,101 @@ fn scalarExprToProjectItem(ctx: *PlannerCtx, p: generic_sql.Expr) !?ProjectItem 
             .out_type = .float64,
         },
         else => null, // aggregate in scalar context — caller handles
+    };
+}
+
+// ── Scalar function call text parser ─────────────────────────────────────────
+//
+// duckdb_parse encodes unrecognised function calls like lower(protocol) as:
+//   .func = .column_ref, .column = "lower(protocol)"
+//
+// We detect a small set of single-argument scalar functions by parsing the
+// text, resolve the argument column, and build a plan.FnCall Expr that
+// kernels.evalFnCall already handles.
+//
+// Supported (single-arg, no inner parens in arg):
+//   lower(col)  upper(col)  length(col)  char_length(col)
+//   toDate(col)  toDateOrZero(col)  toYYYYMMDD(col)
+//   toStartOfHour(col)  toStartOfDay(col)  toStartOfMinute(col)
+//   toString(col)  abs(col)  floor(col)  ceil(col)  round(col)
+//   trim(col)  trimLeft(col)  trimRight(col)  ltrim(col)  rtrim(col)
+//   toInt64(col)  toInt32(col)  toFloat64(col)  toFloat32(col)
+
+/// Known single-argument scalar functions → output ColumnType.
+const ScalarFn = struct { name: []const u8, out: ColumnType };
+const scalar_fns = [_]ScalarFn{
+    .{ .name = "lower",          .out = .string        },
+    .{ .name = "upper",          .out = .string        },
+    .{ .name = "lowerUTF8",      .out = .string        },
+    .{ .name = "upperUTF8",      .out = .string        },
+    .{ .name = "length",         .out = .int64         },
+    .{ .name = "char_length",    .out = .int64         },
+    .{ .name = "toString",       .out = .string        },
+    .{ .name = "trim",           .out = .string        },
+    .{ .name = "trimLeft",       .out = .string        },
+    .{ .name = "trimRight",      .out = .string        },
+    .{ .name = "ltrim",          .out = .string        },
+    .{ .name = "rtrim",          .out = .string        },
+    .{ .name = "abs",            .out = .float64       },
+    .{ .name = "floor",          .out = .int64         },
+    .{ .name = "ceil",           .out = .int64         },
+    .{ .name = "ceiling",        .out = .int64         },
+    .{ .name = "round",          .out = .float64       },
+    .{ .name = "toInt64",        .out = .int64         },
+    .{ .name = "toInt32",        .out = .int64         },
+    .{ .name = "toFloat64",      .out = .float64       },
+    .{ .name = "toFloat32",      .out = .float64       },
+    .{ .name = "toInt64OrZero",  .out = .int64         },
+    .{ .name = "toDate",         .out = .date_u16      },
+    .{ .name = "toDateOrZero",   .out = .date_u16      },
+    .{ .name = "toYYYYMMDD",     .out = .int64         },
+    .{ .name = "toStartOfHour",  .out = .datetime64_ms },
+    .{ .name = "toStartOfDay",   .out = .datetime64_ms },
+    .{ .name = "toStartOfMinute",.out = .datetime64_ms },
+};
+
+/// Try to parse `text` as `fn_name(arg)` where fn_name is in scalar_fns and
+/// arg resolves to a column or literal via resolveColExpr.
+/// Returns a ready ProjectItem on success, null if not parseable.
+fn tryParseFnCallItem(ctx: *PlannerCtx, text: []const u8, alias: []const u8) !?ProjectItem {
+    // Find opening paren — must not be the first char.
+    const paren_open = std.mem.indexOfScalar(u8, text, '(') orelse return null;
+    if (paren_open == 0) return null;
+    // Must end with ')'
+    if (text[text.len - 1] != ')') return null;
+    // Arg text is between parens — reject if it contains nested parens.
+    const arg_text_raw = text[paren_open + 1 .. text.len - 1];
+    if (std.mem.indexOfScalar(u8, arg_text_raw, '(') != null) return null;
+    if (std.mem.indexOfScalar(u8, arg_text_raw, ',') != null) return null;
+
+    const fn_name = text[0..paren_open];
+    const arg_text = std.mem.trim(u8, arg_text_raw, " \t");
+
+    // Lookup in known scalar functions table (case-sensitive, matching kernels.zig).
+    var out_type: ColumnType = .string;
+    var found = false;
+    for (scalar_fns) |sf| {
+        if (std.mem.eql(u8, sf.name, fn_name)) {
+            out_type = sf.out;
+            found = true;
+            break;
+        }
+    }
+    if (!found) return null;
+
+    // Resolve the argument.
+    const arg_expr = resolveColExpr(ctx, arg_text) orelse return null;
+
+    // Build FnCall node.
+    const fc = try ctx.alloc.create(plan.FnCall);
+    const args = try ctx.alloc.alloc(Expr, 1);
+    args[0] = arg_expr;
+    fc.* = .{ .name = fn_name, .args = args };
+
+    return ProjectItem{
+        .expr     = .{ .fn_call = fc },
+        .alias    = alias,
+        .out_type = out_type,
     };
 }
 
