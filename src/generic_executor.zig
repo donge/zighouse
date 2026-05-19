@@ -435,52 +435,10 @@ fn dateToDays(year: i32, month: u8, day: u8) i64 {
 
 /// Evaluate `Filter` against a row represented as a name→Value lookup.
 /// Used as fallback when where_expr is not available.
-fn evalFilter(filter: generic_sql.Filter, row: *const RowCtx) bool {
-    const lv = row.get(filter.column) orelse return false;
-    // Only numeric comparisons in Filter (string comparisons use where_text path)
-    const lv_i = lv.toI64() orelse {
-        // String column: only equality with '' supported via filter
-        if (filter.op == .equal and filter.int_value == 0) {
-            const sv = lv.toStr() orelse return false;
-            return sv.len == 0;
-        }
-        if (filter.op == .not_equal and filter.int_value == 0) {
-            const sv = lv.toStr() orelse return false;
-            return sv.len != 0;
-        }
-        return false;
-    };
-    const rv = filter.int_value;
-    const pass1: bool = switch (filter.op) {
-        .equal         => lv_i == rv,
-        .not_equal     => lv_i != rv,
-        .greater       => lv_i > rv,
-        .greater_equal => lv_i >= rv,
-        .less          => lv_i < rv,
-        .less_equal    => lv_i <= rv,
-    };
-    if (!pass1) return false;
-    // Optional second predicate (AND)
-    if (filter.second) |sec| {
-        const sv = row.get(sec.column) orelse return false;
-        const sv_i = sv.toI64() orelse return false;
-        return switch (sec.op) {
-            .equal         => sv_i == sec.int_value,
-            .not_equal     => sv_i != sec.int_value,
-            .greater       => sv_i > sec.int_value,
-            .greater_equal => sv_i >= sec.int_value,
-            .less          => sv_i < sec.int_value,
-            .less_equal    => sv_i <= sec.int_value,
-        };
-    }
-    return true;
-}
-
 /// Evaluate the plan's WHERE predicate against a row.
-/// Prefers where_expr (full Expr tree) over the legacy filter struct.
+/// Prefers where_expr (full Expr tree) over where_text fallback.
 fn evalPlanFilter(plan: generic_sql.Plan, row: *const RowCtx) bool {
     if (plan.where_expr) |we| return evalWhereNode(we, row);
-    if (plan.filter) |f| return evalFilter(f, row);
     // Fall back to text-based WHERE evaluation for complex predicates
     if (plan.where_text) |wt| return evalTextBoolExpr(wt, row);
     return true; // no filter: row passes
@@ -2579,10 +2537,6 @@ fn collectNeededColumns(
             }
         }
     }
-    if (plan.filter) |filter| {
-        try add(allocator, &seen, needed, filter.column, table);
-        if (filter.second) |sec| try add(allocator, &seen, needed, sec.column, table);
-    }
     // Parse group-by columns using parseGroupExprs (handles arithmetic + date_trunc)
     if (plan.group_by) |gb| {
         const exprs = try parseGroupExprs(allocator, gb);
@@ -2856,7 +2810,6 @@ const EvalKind = enum {
     // Date
     date_yyyymmdd,     // toYYYYMMDD(x) → integer
     date_trunc,        // date_trunc('unit', col) → truncated timestamp string
-    date_cast,         // CAST(x AS DATE) / toDate(x) → date string
     // IP
     ip_bool,           // isIPv4String / isIPv6String → 0 or 1
     ip_to_num,         // IPv4StringToNumOrDefault(s) → uint32
@@ -3510,27 +3463,6 @@ fn evalFunc(kind: EvalKind, name: []const u8, inner: []const u8, row: *const Row
                 @divFloor(ts_s, 86400) * 86400;
             // Return epoch milliseconds (so native block encoder treats as DateTime64(3))
             return Value{ .i64 = truncated_s * 1000 };
-        },
-        .date_cast => {
-            const v = evalTextExpr(inner, row) orelse return null;
-            // Try to convert to days-since-epoch (Value.date)
-            if (v.toI64()) |iv| {
-                // Already an integer; treat as seconds epoch → days
-                const days = @as(u16, @intCast(@max(0, @min(65535, @divFloor(iv, 86400)))));
-                return Value{ .date = days };
-            }
-            const sv = v.toStr() orelse return null;
-            // Parse "YYYY-MM-DD" → days since 1970-01-01
-            if (sv.len >= 10 and sv[4] == '-' and sv[7] == '-') {
-                const y  = std.fmt.parseInt(i32, sv[0..4], 10) catch null;
-                const mo = std.fmt.parseInt(u8,  sv[5..7], 10) catch null;
-                const dy = std.fmt.parseInt(u8,  sv[8..10], 10) catch null;
-                if (y != null and mo != null and dy != null) {
-                    const d = dateToDays(y.?, mo.?, dy.?);
-                    return Value{ .date = @intCast(@max(0, @min(65535, d))) };
-                }
-            }
-            return Value{ .str = if (sv.len >= 10) sv[0..10] else sv };
         },
         // ── IP functions ───────────────────────────────────────────
         .ip_bool => {

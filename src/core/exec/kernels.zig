@@ -660,7 +660,7 @@ fn evalFnCall(fc: *const plan.FnCall, row: []const ?Value, arena: std.mem.Alloca
         }
         return Value{ .uint64 = @intCast(y) };
     }
-    if (std.mem.eql(u8, name, "toYYYYMMDD")) {
+    if (std.mem.eql(u8, name, "toYYYYMMDD") or std.mem.eql(u8, name, "toyyyymmdd")) {
         const v = args[0] orelse return null;
         const days: i64 = switch (v) {
             .date_u16      => |d| @intCast(d),

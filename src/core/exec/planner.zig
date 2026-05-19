@@ -447,11 +447,14 @@ fn scalarExprToProjectItem(ctx: *PlannerCtx, p: generic_sql.Expr) !?ProjectItem 
 //
 // Supported (single-arg, no inner parens in arg):
 //   lower(col)  upper(col)  length(col)  char_length(col)
-//   toDate(col)  toDateOrZero(col)  toYYYYMMDD(col)
+//   toDate(col)  toDateOrZero(col)  toYYYYMMDD(col)  toyyyymmdd(col)
 //   toStartOfHour(col)  toStartOfDay(col)  toStartOfMinute(col)
 //   toString(col)  abs(col)  floor(col)  ceil(col)  round(col)
 //   trim(col)  trimLeft(col)  trimRight(col)  ltrim(col)  rtrim(col)
 //   toInt64(col)  toInt32(col)  toFloat64(col)  toFloat32(col)
+//
+// Supported (two-arg where first arg is a string literal):
+//   date_trunc('hour', col)  date_trunc('day', col)  date_trunc('minute', col)
 
 /// Known single-argument scalar functions → output ColumnType.
 const ScalarFn = struct { name: []const u8, out: ColumnType };
@@ -481,13 +484,23 @@ const scalar_fns = [_]ScalarFn{
     .{ .name = "toDate",         .out = .date_u16      },
     .{ .name = "toDateOrZero",   .out = .date_u16      },
     .{ .name = "toYYYYMMDD",     .out = .int64         },
+    .{ .name = "toyyyymmdd",     .out = .int64         }, // duckdb_parse lowercases it
     .{ .name = "toStartOfHour",  .out = .datetime64_ms },
     .{ .name = "toStartOfDay",   .out = .datetime64_ms },
     .{ .name = "toStartOfMinute",.out = .datetime64_ms },
 };
 
+/// Map date_trunc unit string → kernels function name and output ColumnType.
+const DateTruncUnit = struct { unit: []const u8, fn_name: []const u8, out: ColumnType };
+const date_trunc_units = [_]DateTruncUnit{
+    .{ .unit = "hour",   .fn_name = "toStartOfHour",   .out = .datetime64_ms },
+    .{ .unit = "day",    .fn_name = "toStartOfDay",    .out = .datetime64_ms },
+    .{ .unit = "minute", .fn_name = "toStartOfMinute", .out = .datetime64_ms },
+};
+
 /// Try to parse `text` as `fn_name(arg)` where fn_name is in scalar_fns and
 /// arg resolves to a column or literal via resolveColExpr.
+/// Also handles date_trunc('unit', col).
 /// Returns a ready ProjectItem on success, null if not parseable.
 fn tryParseFnCallItem(ctx: *PlannerCtx, text: []const u8, alias: []const u8) !?ProjectItem {
     // Find opening paren — must not be the first char.
@@ -495,13 +508,37 @@ fn tryParseFnCallItem(ctx: *PlannerCtx, text: []const u8, alias: []const u8) !?P
     if (paren_open == 0) return null;
     // Must end with ')'
     if (text[text.len - 1] != ')') return null;
-    // Arg text is between parens — reject if it contains nested parens.
-    const arg_text_raw = text[paren_open + 1 .. text.len - 1];
-    if (std.mem.indexOfScalar(u8, arg_text_raw, '(') != null) return null;
-    if (std.mem.indexOfScalar(u8, arg_text_raw, ',') != null) return null;
 
     const fn_name = text[0..paren_open];
-    const arg_text = std.mem.trim(u8, arg_text_raw, " \t");
+    const args_text = text[paren_open + 1 .. text.len - 1];
+
+    // ── date_trunc('unit', col) ───────────────────────────────────────────────
+    if (std.mem.eql(u8, fn_name, "date_trunc")) {
+        // args_text looks like: 'hour', timestamp
+        const comma = std.mem.indexOfScalar(u8, args_text, ',') orelse return null;
+        const unit_raw = std.mem.trim(u8, args_text[0..comma], " \t'\"");
+        const col_raw  = std.mem.trim(u8, args_text[comma + 1..], " \t");
+        // col_raw must be a simple column (no parens)
+        if (std.mem.indexOfScalar(u8, col_raw, '(') != null) return null;
+        const arg_expr = resolveColExpr(ctx, col_raw) orelse return null;
+        for (date_trunc_units) |dtu| {
+            if (std.mem.eql(u8, dtu.unit, unit_raw)) {
+                const fc = try ctx.alloc.create(plan.FnCall);
+                const fc_args = try ctx.alloc.alloc(Expr, 1);
+                fc_args[0] = arg_expr;
+                fc.* = .{ .name = dtu.fn_name, .args = fc_args };
+                return ProjectItem{ .expr = .{ .fn_call = fc }, .alias = alias, .out_type = dtu.out };
+            }
+        }
+        return null;
+    }
+
+    // ── Single-argument functions ─────────────────────────────────────────────
+    // Reject if arg contains nested parens or commas (multi-arg).
+    if (std.mem.indexOfScalar(u8, args_text, '(') != null) return null;
+    if (std.mem.indexOfScalar(u8, args_text, ',') != null) return null;
+
+    const arg_text = std.mem.trim(u8, args_text, " \t");
 
     // Lookup in known scalar functions table (case-sensitive, matching kernels.zig).
     var out_type: ColumnType = .string;
@@ -520,9 +557,9 @@ fn tryParseFnCallItem(ctx: *PlannerCtx, text: []const u8, alias: []const u8) !?P
 
     // Build FnCall node.
     const fc = try ctx.alloc.create(plan.FnCall);
-    const args = try ctx.alloc.alloc(Expr, 1);
-    args[0] = arg_expr;
-    fc.* = .{ .name = fn_name, .args = args };
+    const fc_args = try ctx.alloc.alloc(Expr, 1);
+    fc_args[0] = arg_expr;
+    fc.* = .{ .name = fn_name, .args = fc_args };
 
     return ProjectItem{
         .expr     = .{ .fn_call = fc },
