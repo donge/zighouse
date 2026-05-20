@@ -518,6 +518,50 @@ fn evalFnCall(fc: *const plan.FnCall, row: []const ?Value, arena: std.mem.Alloca
         for (out) |*c| c.* = std.ascii.toUpper(c.*);
         return Value{ .string = out };
     }
+    if (std.mem.eql(u8, name, "mapGet")) {
+        // mapGet(blob, key) → look up key in ClickHouse Map blob.
+        // Blob format: varint N | N×(varint+key_bytes) | N×(varint+value_bytes)
+        const blob = (args[0] orelse return Value{ .string = "" }).toStr() orelse return Value{ .string = "" };
+        const key  = (args[1] orelse return Value{ .string = "" }).toStr() orelse return Value{ .string = "" };
+        if (blob.len == 0) return Value{ .string = "" };
+        // Read count N
+        const readVarUInt = struct {
+            fn f(data: []const u8) ?struct { val: u64, adv: usize } {
+                var v: u64 = 0; var shift: u6 = 0; var i: usize = 0;
+                while (i < data.len and i < 9) {
+                    const b = data[i]; i += 1;
+                    v |= (@as(u64, b & 0x7F)) << shift;
+                    if (b & 0x80 == 0) return .{ .val = v, .adv = i };
+                    shift += 7;
+                }
+                return null;
+            }
+        }.f;
+        const cnt_r = readVarUInt(blob) orelse return Value{ .string = "" };
+        const count = cnt_r.val;
+        var kp: usize = cnt_r.adv;
+        var match_idx: ?u64 = null;
+        for (0..count) |i| {
+            const kr = readVarUInt(blob[kp..]) orelse return Value{ .string = "" };
+            const klen = @as(usize, @intCast(kr.val));
+            kp += kr.adv;
+            if (kp + klen > blob.len) return Value{ .string = "" };
+            const k = blob[kp .. kp + klen];
+            if (match_idx == null and std.mem.eql(u8, k, key)) match_idx = @intCast(i);
+            kp += klen;
+        }
+        if (match_idx == null) return Value{ .string = "" };
+        var vp: usize = kp;
+        for (0..count) |i| {
+            const vr = readVarUInt(blob[vp..]) orelse return Value{ .string = "" };
+            const vlen = @as(usize, @intCast(vr.val));
+            vp += vr.adv;
+            if (vp + vlen > blob.len) return Value{ .string = "" };
+            if (i == match_idx.?) return Value{ .string = blob[vp .. vp + vlen] };
+            vp += vlen;
+        }
+        return Value{ .string = "" };
+    }
     if (std.mem.eql(u8, name, "splitByChar")) {
         const delim = (args[0] orelse return null).toStr() orelse return null;
         const s     = (args[1] orelse return null).toStr() orelse return null;

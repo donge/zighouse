@@ -707,6 +707,7 @@ fn canonFnName(name: []const u8) []const u8 {
         "positionCaseInsensitive", "splitByChar", "concat",
         "if", "multiIf",
         "substring", "substr", "startsWith", "endsWith",
+        "mapGet",
     };
     for (canon_names) |cn| {
         if (std.ascii.eqlIgnoreCase(cn, name)) return cn;
@@ -918,7 +919,8 @@ fn prattExpr(pctx: *ParseCtx, min_bp: u8) anyerror!?Expr {
                             std.ascii.eqlIgnoreCase(name, "positionCaseInsensitive") or
                             std.ascii.eqlIgnoreCase(name, "splitByChar") or
                             std.ascii.eqlIgnoreCase(name, "startsWith") or
-                            std.ascii.eqlIgnoreCase(name, "endsWith")) break :blk2 true;
+                            std.ascii.eqlIgnoreCase(name, "endsWith") or
+                            std.ascii.eqlIgnoreCase(name, "mapGet")) break :blk2 true;
                     }
                     if (args_slice.len == 3) {
                         if (std.ascii.eqlIgnoreCase(name, "if") or
@@ -982,6 +984,23 @@ fn prattExpr(pctx: *ParseCtx, min_bp: u8) anyerror!?Expr {
             fc_args[0] = Expr{ .gte = bp_gte };
             fc_args[1] = Expr{ .lte = bp_lte };
             fc.* = .{ .name = "and", .args = fc_args };
+            lhs = Expr{ .fn_call = fc };
+            continue;
+        }
+
+        // MAP SUBSCRIPT: lhs['key']  →  mapGet(lhs, key)
+        if (op.kind == .lbracket) {
+            _ = pctx.lex.next(); // consume '['
+            const key_tok = pctx.lex.next();
+            if (key_tok.kind != .str_lit) return null;
+            const rb = pctx.lex.next();
+            if (rb.kind != .rbracket) return null;
+            const key_str = if (key_tok.text.len >= 2) key_tok.text[1..key_tok.text.len - 1] else key_tok.text;
+            const fc = try pctx.arena.create(plan.FnCall);
+            const fc_args = try pctx.arena.alloc(Expr, 2);
+            fc_args[0] = lhs;
+            fc_args[1] = Expr{ .lit_str = key_str };
+            fc.* = .{ .name = "mapGet", .args = fc_args };
             lhs = Expr{ .fn_call = fc };
             continue;
         }
@@ -1055,6 +1074,7 @@ fn inferExprType(ctx: *PlannerCtx, expr: Expr) ColumnType {
             if (std.mem.eql(u8, fc.name, "splitByChar")) return .array_string;
             if (std.mem.eql(u8, fc.name, "substring") or std.mem.eql(u8, fc.name, "substr")) return .string;
             if (std.mem.eql(u8, fc.name, "startsWith") or std.mem.eql(u8, fc.name, "endsWith")) return .bool_u8;
+            if (std.mem.eql(u8, fc.name, "mapGet")) return .string;
             if (std.mem.eql(u8, fc.name, "if") or std.mem.eql(u8, fc.name, "multiIf")) {
                 if (fc.args.len >= 2) return inferExprType(ctx, fc.args[1]);
             }
