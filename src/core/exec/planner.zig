@@ -150,19 +150,23 @@ pub fn plan_query(
         }
     } else if (gplan.order_by_alias) |alias| {
         // ORDER BY alias [ASC|DESC]
-        const col_idx = findOutputColIdx(source, alias) orelse return null;
-        const sort_keys = try ctx.alloc.alloc(SortKey, 1);
-        sort_keys[0] = .{ .col_idx = col_idx, .desc = !gplan.order_by_alias_asc, .nulls_first = false };
-        if (has_limit) {
-            const k: u64 = @intCast(gplan.limit.?);
-            const topk = try ctx.alloc.create(PhysicalNode);
-            topk.* = .{ .top_k = .{ .input = source, .keys = sort_keys, .k = k } };
-            source = topk;
-        } else {
-            const ob = try ctx.alloc.create(PhysicalNode);
-            ob.* = .{ .order_by = .{ .input = source, .keys = sort_keys } };
-            source = ob;
+        // If the alias is not in the output (e.g. FINAL-appended ORDER BY version),
+        // silently skip rather than aborting the IR plan.
+        if (findOutputColIdx(source, alias)) |col_idx| {
+            const sort_keys = try ctx.alloc.alloc(SortKey, 1);
+            sort_keys[0] = .{ .col_idx = col_idx, .desc = !gplan.order_by_alias_asc, .nulls_first = false };
+            if (has_limit) {
+                const k: u64 = @intCast(gplan.limit.?);
+                const topk = try ctx.alloc.create(PhysicalNode);
+                topk.* = .{ .top_k = .{ .input = source, .keys = sort_keys, .k = k } };
+                source = topk;
+            } else {
+                const ob = try ctx.alloc.create(PhysicalNode);
+                ob.* = .{ .order_by = .{ .input = source, .keys = sort_keys } };
+                source = ob;
+            }
         }
+        // else: ORDER BY references a column not in SELECT — skip silently.
     } else if (gplan.order_by_text != null) {
         // Complex ORDER BY expression — not supported in IR path.
         return null;
@@ -336,7 +340,8 @@ fn resolveColExpr(ctx: *PlannerCtx, col: []const u8) ?Expr {
     // Column reference
     if (ctx.tbl) |tbl| {
         if (tbl.findColumn(col)) |idx| {
-            // Array/Map columns are not yet supported in the IR path.
+            // Array/Map columns are not supported in the IR path — the part scan
+            // bridge returns empty slices for them; they must go through generic_executor.
             const ct = schemaColType(ctx, col);
             if (ct == .array_string) return null;
             return Expr{ .col_ref = .{ .index = idx, .name = col } };
@@ -546,6 +551,17 @@ const TokKind = enum {
     kw_not,      // NOT
     kw_cast,     // CAST
     kw_as,       // AS
+    kw_case,     // CASE
+    kw_when,     // WHEN
+    kw_then,     // THEN
+    kw_else,     // ELSE
+    kw_end,      // END
+    kw_is,       // IS
+    kw_null,     // NULL
+    kw_between,  // BETWEEN
+    kw_in,       // IN
+    lbracket,    // [
+    rbracket,    // ]
     eof,
 };
 
@@ -587,9 +603,11 @@ const Lexer = struct {
             '+' => { self.pos += 1; return .{ .kind = .plus,    .text = self.src[start..self.pos] }; },
             '-' => { self.pos += 1; return .{ .kind = .minus,   .text = self.src[start..self.pos] }; },
             '*' => { self.pos += 1; return .{ .kind = .star,    .text = self.src[start..self.pos] }; },
-            '/' => { self.pos += 1; return .{ .kind = .slash,   .text = self.src[start..self.pos] }; },
-            '%' => { self.pos += 1; return .{ .kind = .percent, .text = self.src[start..self.pos] }; },
-            '=' => { self.pos += 1; return .{ .kind = .eq,      .text = self.src[start..self.pos] }; },
+            '/' => { self.pos += 1; return .{ .kind = .slash,    .text = self.src[start..self.pos] }; },
+            '%' => { self.pos += 1; return .{ .kind = .percent,  .text = self.src[start..self.pos] }; },
+            '=' => { self.pos += 1; return .{ .kind = .eq,       .text = self.src[start..self.pos] }; },
+            '[' => { self.pos += 1; return .{ .kind = .lbracket, .text = self.src[start..self.pos] }; },
+            ']' => { self.pos += 1; return .{ .kind = .rbracket, .text = self.src[start..self.pos] }; },
             '!' => {
                 self.pos += 1;
                 if (self.pos < self.src.len and self.src[self.pos] == '=') self.pos += 1;
@@ -649,11 +667,20 @@ const Lexer = struct {
                     self.src[self.pos] == '_' or self.src[self.pos] == '.'))
                 self.pos += 1;
             const word = self.src[start..self.pos];
-            if (std.ascii.eqlIgnoreCase(word, "AND"))  return .{ .kind = .kw_and,  .text = word };
-            if (std.ascii.eqlIgnoreCase(word, "OR"))   return .{ .kind = .kw_or,   .text = word };
-            if (std.ascii.eqlIgnoreCase(word, "NOT"))  return .{ .kind = .kw_not,  .text = word };
-            if (std.ascii.eqlIgnoreCase(word, "CAST")) return .{ .kind = .kw_cast, .text = word };
-            if (std.ascii.eqlIgnoreCase(word, "AS"))   return .{ .kind = .kw_as,   .text = word };
+            if (std.ascii.eqlIgnoreCase(word, "AND"))     return .{ .kind = .kw_and,     .text = word };
+            if (std.ascii.eqlIgnoreCase(word, "OR"))      return .{ .kind = .kw_or,      .text = word };
+            if (std.ascii.eqlIgnoreCase(word, "NOT"))     return .{ .kind = .kw_not,     .text = word };
+            if (std.ascii.eqlIgnoreCase(word, "CAST"))    return .{ .kind = .kw_cast,    .text = word };
+            if (std.ascii.eqlIgnoreCase(word, "AS"))      return .{ .kind = .kw_as,      .text = word };
+            if (std.ascii.eqlIgnoreCase(word, "CASE"))    return .{ .kind = .kw_case,    .text = word };
+            if (std.ascii.eqlIgnoreCase(word, "WHEN"))    return .{ .kind = .kw_when,    .text = word };
+            if (std.ascii.eqlIgnoreCase(word, "THEN"))    return .{ .kind = .kw_then,    .text = word };
+            if (std.ascii.eqlIgnoreCase(word, "ELSE"))    return .{ .kind = .kw_else,    .text = word };
+            if (std.ascii.eqlIgnoreCase(word, "END"))     return .{ .kind = .kw_end,     .text = word };
+            if (std.ascii.eqlIgnoreCase(word, "IS"))      return .{ .kind = .kw_is,      .text = word };
+            if (std.ascii.eqlIgnoreCase(word, "NULL"))    return .{ .kind = .kw_null,    .text = word };
+            if (std.ascii.eqlIgnoreCase(word, "BETWEEN")) return .{ .kind = .kw_between, .text = word };
+            if (std.ascii.eqlIgnoreCase(word, "IN"))      return .{ .kind = .kw_in,      .text = word };
             return .{ .kind = .ident, .text = word };
         }
 
@@ -679,6 +706,7 @@ fn canonFnName(name: []const u8) []const u8 {
         "greatest", "least", "intDiv", "modulo",
         "positionCaseInsensitive", "splitByChar", "concat",
         "if", "multiIf",
+        "substring", "substr", "startsWith", "endsWith",
     };
     for (canon_names) |cn| {
         if (std.ascii.eqlIgnoreCase(cn, name)) return cn;
@@ -775,6 +803,43 @@ fn prattExpr(pctx: *ParseCtx, min_bp: u8) anyerror!?Expr {
             break :blk_paren inner;
         },
 
+        // NULL literal → lit_i64 0 (treated as null/zero in kernels)
+        .kw_null => Expr{ .lit_null = {} },
+
+        // CASE [WHEN cond THEN val]… [ELSE val] END → multiIf(cond1,val1,…,else)
+        .kw_case => blk_case: {
+            var arms: std.ArrayListUnmanaged(Expr) = .empty;
+            while (true) {
+                const w = pctx.lex.peek();
+                if (w.kind == .kw_when) {
+                    _ = pctx.lex.next(); // consume WHEN
+                    const cond = try prattExpr(pctx, 0) orelse return null;
+                    const th = pctx.lex.next();
+                    if (th.kind != .kw_then) return null;
+                    const val = try prattExpr(pctx, 0) orelse return null;
+                    try arms.append(pctx.arena, cond);
+                    try arms.append(pctx.arena, val);
+                } else if (w.kind == .kw_else) {
+                    _ = pctx.lex.next(); // consume ELSE
+                    const val = try prattExpr(pctx, 0) orelse return null;
+                    try arms.append(pctx.arena, val);
+                    break;
+                } else if (w.kind == .kw_end) {
+                    break;
+                } else {
+                    return null;
+                }
+            }
+            const end = pctx.lex.next();
+            if (end.kind != .kw_end) return null;
+            if (arms.items.len == 0) return null;
+            const args_slice = try arms.toOwnedSlice(pctx.arena);
+            const fn_name: []const u8 = if (args_slice.len == 3) "if" else "multiIf";
+            const fc = try pctx.arena.create(plan.FnCall);
+            fc.* = .{ .name = fn_name, .args = args_slice };
+            break :blk_case Expr{ .fn_call = fc };
+        },
+
         // Integer literal
         .num_int => blk: {
             const v = std.fmt.parseInt(i64, tok.text, 10) catch return null;
@@ -851,9 +916,15 @@ fn prattExpr(pctx: *ParseCtx, min_bp: u8) anyerror!?Expr {
                             std.ascii.eqlIgnoreCase(name, "intDiv") or
                             std.ascii.eqlIgnoreCase(name, "modulo") or
                             std.ascii.eqlIgnoreCase(name, "positionCaseInsensitive") or
-                            std.ascii.eqlIgnoreCase(name, "splitByChar")) break :blk2 true;
+                            std.ascii.eqlIgnoreCase(name, "splitByChar") or
+                            std.ascii.eqlIgnoreCase(name, "startsWith") or
+                            std.ascii.eqlIgnoreCase(name, "endsWith")) break :blk2 true;
                     }
-                    if (args_slice.len == 3 and std.ascii.eqlIgnoreCase(name, "if")) break :blk2 true;
+                    if (args_slice.len == 3) {
+                        if (std.ascii.eqlIgnoreCase(name, "if") or
+                            std.ascii.eqlIgnoreCase(name, "substring") or
+                            std.ascii.eqlIgnoreCase(name, "substr")) break :blk2 true;
+                    }
                     if (args_slice.len >= 2 and std.ascii.eqlIgnoreCase(name, "concat")) break :blk2 true;
                     if (args_slice.len >= 3 and std.ascii.eqlIgnoreCase(name, "multiIf")) break :blk2 true;
                     break :blk2 false;
@@ -876,6 +947,45 @@ fn prattExpr(pctx: *ParseCtx, min_bp: u8) anyerror!?Expr {
     // ── LED (infix) ───────────────────────────────────────────────────────────
     while (true) {
         const op = pctx.lex.peek();
+
+        // IS [NOT] NULL  →  isNull(lhs) or isNotNull(lhs)
+        if (op.kind == .kw_is) {
+            _ = pctx.lex.next(); // consume IS
+            const nx = pctx.lex.peek();
+            const is_not = nx.kind == .kw_not;
+            if (is_not) _ = pctx.lex.next();
+            const nl = pctx.lex.next();
+            if (nl.kind != .kw_null) return null;
+            const fc = try pctx.arena.create(plan.FnCall);
+            const fc_args = try pctx.arena.alloc(Expr, 1);
+            fc_args[0] = lhs;
+            fc.* = .{ .name = if (is_not) "isNotNull" else "isNull", .args = fc_args };
+            lhs = Expr{ .fn_call = fc };
+            continue;
+        }
+
+        // BETWEEN lo AND hi  →  (lhs >= lo AND lhs <= hi)
+        if (op.kind == .kw_between) {
+            _ = pctx.lex.next(); // consume BETWEEN
+            const lo = try prattExpr(pctx, 8) orelse return null; // above AND BP
+            const kw = pctx.lex.next();
+            if (kw.kind != .kw_and) return null;
+            const hi = try prattExpr(pctx, 8) orelse return null;
+            // lhs >= lo
+            const bp_gte = try pctx.arena.create(plan.BinOp);
+            bp_gte.* = .{ .left = lhs, .right = lo };
+            // lhs <= hi  (duplicate lhs — share the value)
+            const bp_lte = try pctx.arena.create(plan.BinOp);
+            bp_lte.* = .{ .left = lhs, .right = hi };
+            const fc = try pctx.arena.create(plan.FnCall);
+            const fc_args = try pctx.arena.alloc(Expr, 2);
+            fc_args[0] = Expr{ .gte = bp_gte };
+            fc_args[1] = Expr{ .lte = bp_lte };
+            fc.* = .{ .name = "and", .args = fc_args };
+            lhs = Expr{ .fn_call = fc };
+            continue;
+        }
+
         const bp = infixBP(op.kind) orelse break;
         if (bp <= min_bp) break;
 
@@ -943,6 +1053,8 @@ fn inferExprType(ctx: *PlannerCtx, expr: Expr) ColumnType {
             if (std.mem.eql(u8, fc.name, "positionCaseInsensitive")) return .uint64;
             if (std.mem.eql(u8, fc.name, "concat")) return .string;
             if (std.mem.eql(u8, fc.name, "splitByChar")) return .array_string;
+            if (std.mem.eql(u8, fc.name, "substring") or std.mem.eql(u8, fc.name, "substr")) return .string;
+            if (std.mem.eql(u8, fc.name, "startsWith") or std.mem.eql(u8, fc.name, "endsWith")) return .bool_u8;
             if (std.mem.eql(u8, fc.name, "if") or std.mem.eql(u8, fc.name, "multiIf")) {
                 if (fc.args.len >= 2) return inferExprType(ctx, fc.args[1]);
             }
