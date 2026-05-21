@@ -492,43 +492,66 @@ fn projectRowList(inner: RowList, items: []const plan.ProjectItem, alloc: std.me
     }
     var rl = RowList.init(new_metas);
 
-    // Detect whether any item is an arrayJoin(expr) call.
-    // If so, we expand each row: arrayJoin col emits one row per element,
-    // other columns repeat their value for each element.
-    var aj_idx: ?usize = null;
+    // Detect arrayJoin(expr) calls among the projection items.
+    // Collect all indices; they will be expanded in lockstep (element i for all).
+    // Other columns repeat their value for each element.
+    var aj_indices: std.ArrayListUnmanaged(usize) = .empty;
+    defer aj_indices.deinit(alloc);
     for (items, 0..) |item, ci| {
         switch (item.expr) {
             .fn_call => |fc| if (std.mem.eql(u8, fc.name, "arrayJoin")) {
-                aj_idx = ci;
-                break;
+                try aj_indices.append(alloc, ci);
             },
             else => {},
         }
     }
 
     for (inner.rows.items) |row| {
-        if (aj_idx) |ai| {
-            // Evaluate the arrayJoin argument → array of strings
-            const aj_expr = switch (items[ai].expr) {
+        if (aj_indices.items.len > 0) {
+            // Evaluate the first arrayJoin argument to determine the expansion count.
+            const first_ai = aj_indices.items[0];
+            const first_aj_expr = switch (items[first_ai].expr) {
                 .fn_call => |fc| fc.args[0],
                 else => unreachable,
             };
-            const arr_val = try kernels.evalExpr(aj_expr, row, null, alloc);
-            const elements: []const []const u8 = switch (arr_val orelse Value{ .array_string = &.{} }) {
+            const first_arr_val = try kernels.evalExpr(first_aj_expr, row, null, alloc);
+            const first_elements: []const []const u8 = switch (first_arr_val orelse Value{ .array_string = &.{} }) {
                 .array_string => |a| a,
                 else => &.{},
             };
+            // Evaluate all arrayJoin arrays upfront (for lockstep expansion).
+            const aj_arrays = try alloc.alloc([]const []const u8, aj_indices.items.len);
+            aj_arrays[0] = first_elements;
+            for (aj_indices.items[1..], 1..) |ai, k| {
+                const aj_expr = switch (items[ai].expr) {
+                    .fn_call => |fc| fc.args[0],
+                    else => unreachable,
+                };
+                const arr_val = try kernels.evalExpr(aj_expr, row, null, alloc);
+                aj_arrays[k] = switch (arr_val orelse Value{ .array_string = &.{} }) {
+                    .array_string => |a| a,
+                    else => &.{},
+                };
+            }
             // Emit one output row per element (or one null row if empty)
-            const n = if (elements.len > 0) elements.len else @as(usize, 1);
+            const n = if (first_elements.len > 0) first_elements.len else @as(usize, 1);
             for (0..n) |ei| {
                 const new_row = try alloc.alloc(?Value, items.len);
+                // Find which aj_index slot this column corresponds to (if any).
                 for (items, 0..) |item, ci| {
-                    if (ci == ai) {
-                        new_row[ci] = if (elements.len > 0)
-                            Value{ .string = elements[ei] }
-                        else
-                            null;
-                    } else {
+                    var is_aj = false;
+                    for (aj_indices.items, 0..) |ai, k| {
+                        if (ci == ai) {
+                            const elems = aj_arrays[k];
+                            new_row[ci] = if (elems.len > ei)
+                                Value{ .string = elems[ei] }
+                            else
+                                null;
+                            is_aj = true;
+                            break;
+                        }
+                    }
+                    if (!is_aj) {
                         new_row[ci] = try kernels.evalExpr(item.expr, row, null, alloc);
                     }
                 }

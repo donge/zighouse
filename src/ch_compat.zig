@@ -201,9 +201,40 @@ fn rewriteArrayJoin(allocator: std.mem.Allocator, sql: []const u8) !?[]u8 {
             }
         }
         if (!replaced) {
-            // Emit the column as-is; aliases inside expressions (e.g. avg(fv))
-            // will be resolved via extra arrayJoin columns appended below.
-            try new_select.appendSlice(allocator, scol);
+            // The column may contain ARRAY JOIN aliases inside expressions
+            // (e.g. "avg(fv) AS avg_val" where "fv" is an alias).
+            // Rewrite each such alias token to "__aj__<alias>" so the planner
+            // can find the hidden arrayJoin expansion column.
+            var rewritten: std.ArrayListUnmanaged(u8) = .empty;
+            defer rewritten.deinit(allocator);
+            var ri: usize = 0;
+            while (ri < scol.len) {
+                var matched_alias = false;
+                for (alias_map.items, 0..) |am, ai| {
+                    if (alias_used[ai]) continue; // top-level aliases already handled
+                    const al = am.alias;
+                    if (ri + al.len > scol.len) continue;
+                    if (!std.ascii.eqlIgnoreCase(scol[ri .. ri + al.len], al)) continue;
+                    // Check word boundaries
+                    const before_ok = ri == 0 or !isIdent(scol[ri - 1]);
+                    const after_ok = ri + al.len >= scol.len or !isIdent(scol[ri + al.len]);
+                    if (!before_ok or !after_ok) continue;
+                    try rewritten.appendSlice(allocator, "__aj__");
+                    try rewritten.appendSlice(allocator, al);
+                    ri += al.len;
+                    matched_alias = true;
+                    break;
+                }
+                if (!matched_alias) {
+                    try rewritten.append(allocator, scol[ri]);
+                    ri += 1;
+                }
+            }
+            if (rewritten.items.len > 0) {
+                try new_select.appendSlice(allocator, rewritten.items);
+            } else {
+                try new_select.appendSlice(allocator, scol);
+            }
         }
     }
 

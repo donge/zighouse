@@ -98,33 +98,114 @@ pub fn plan_query(
     } else {
         // ── Aggregation ───────────────────────────────────────────────────
         // Split projs into key exprs (non-agg, in GROUP BY) and agg exprs.
+        // Also detect "__aj__*" helper columns produced by rewriteArrayJoin:
+        // these are arrayJoin expansion columns that serve as agg arguments
+        // but should NOT be GROUP BY keys themselves.
         var key_items_list:  std.ArrayListUnmanaged(ProjectItem) = .empty;
         var agg_items_list:  std.ArrayListUnmanaged(ProjectItem) = .empty;
 
+        // Check whether any non-agg projection has an "__aj__" alias (ARRAY JOIN helper).
+        var has_aj_cols = false;
         for (projs) |p| {
-            if (isAggregate(p.func)) {
-                const item = try aggExprToProjectItem(ctx, p) orelse return null;
-                try agg_items_list.append(ctx.alloc, item);
-            } else {
-                const item = try scalarExprToProjectItem(ctx, p) orelse return null;
-                try key_items_list.append(ctx.alloc, item);
+            if (!isAggregate(p.func)) {
+                const alias = p.alias orelse p.column orelse "";
+                if (std.mem.startsWith(u8, alias, "__aj__")) {
+                    has_aj_cols = true;
+                    break;
+                }
             }
         }
 
-        const key_items = try key_items_list.toOwnedSlice(ctx.alloc);
-        const agg_items = try agg_items_list.toOwnedSlice(ctx.alloc);
+        if (has_aj_cols) {
+            // ── ARRAY JOIN + GROUP BY path ────────────────────────────────
+            // Build a pre-project node that expands the arrayJoin columns.
+            // The pre-project emits: [key0, key1, ..., __aj__col0, __aj__col1, ...]
+            // Then hash_agg uses indices into the pre-project output.
 
-        const agg_node = try ctx.alloc.create(PhysicalNode);
-        if (key_items.len == 0) {
-            agg_node.* = .{ .scalar_agg = .{ .input = source, .aggs = agg_items } };
-        } else {
+            // Collect pre-project items: real keys first, then __aj__ helpers.
+            var pre_items_list: std.ArrayListUnmanaged(ProjectItem) = .empty;
+            var real_key_count: usize = 0;
+            // First pass: real (non-__aj__) key projections
+            for (projs) |p| {
+                if (isAggregate(p.func)) continue;
+                const alias = p.alias orelse p.column orelse "";
+                if (std.mem.startsWith(u8, alias, "__aj__")) continue;
+                const item = try scalarExprToProjectItem(ctx, p) orelse return null;
+                try pre_items_list.append(ctx.alloc, item);
+                real_key_count += 1;
+            }
+            // Second pass: __aj__ helper projections
+            for (projs) |p| {
+                if (isAggregate(p.func)) continue;
+                const alias = p.alias orelse p.column orelse "";
+                if (!std.mem.startsWith(u8, alias, "__aj__")) continue;
+                const item = try scalarExprToProjectItem(ctx, p) orelse return null;
+                try pre_items_list.append(ctx.alloc, item);
+            }
+            const pre_items = try pre_items_list.toOwnedSlice(ctx.alloc);
+
+            // Build pre-project node (performs arrayJoin row expansion).
+            const pre_proj_node = try ctx.alloc.create(PhysicalNode);
+            pre_proj_node.* = .{ .project = .{ .input = source, .items = pre_items } };
+
+            // Build hash_agg keys: real keys only, referencing pre-project output indices.
+            const hash_keys = try ctx.alloc.alloc(ProjectItem, real_key_count);
+            for (0..real_key_count) |ki| {
+                const src = pre_items[ki];
+                const ref = try ctx.alloc.create(plan.ColRef);
+                ref.* = .{ .index = ki, .name = src.alias };
+                hash_keys[ki] = .{
+                    .expr     = Expr{ .col_ref = ref.* },
+                    .alias    = src.alias,
+                    .out_type = src.out_type,
+                };
+            }
+
+            // Build agg items: each agg arg is looked up in the pre-project output.
+            for (projs) |p| {
+                if (!isAggregate(p.func)) continue;
+                // Build agg item with resolved arg from pre-project output.
+                const agg_item = try aggExprToProjectItemWithPreProject(
+                    ctx, p, pre_items, real_key_count,
+                ) orelse return null;
+                try agg_items_list.append(ctx.alloc, agg_item);
+            }
+            const agg_items = try agg_items_list.toOwnedSlice(ctx.alloc);
+
+            const agg_node = try ctx.alloc.create(PhysicalNode);
             agg_node.* = .{ .hash_agg = .{
-                .input = source,
-                .keys  = key_items,
+                .input = pre_proj_node,
+                .keys  = hash_keys,
                 .aggs  = agg_items,
             }};
+            source = agg_node;
+        } else {
+            // ── Normal aggregation (no ARRAY JOIN helpers) ────────────────
+            for (projs) |p| {
+                if (isAggregate(p.func)) {
+                    const item = try aggExprToProjectItem(ctx, p) orelse return null;
+                    try agg_items_list.append(ctx.alloc, item);
+                } else {
+                    const item = try scalarExprToProjectItem(ctx, p) orelse return null;
+                    try key_items_list.append(ctx.alloc, item);
+                }
+            }
+
+            const key_items = try key_items_list.toOwnedSlice(ctx.alloc);
+            const agg_items = try agg_items_list.toOwnedSlice(ctx.alloc);
+
+            const agg_node = try ctx.alloc.create(PhysicalNode);
+            if (key_items.len == 0) {
+                agg_node.* = .{ .scalar_agg = .{ .input = source, .aggs = agg_items } };
+            } else {
+                agg_node.* = .{ .hash_agg = .{
+                    .input = source,
+                    .keys  = key_items,
+                    .aggs  = agg_items,
+                }};
+            }
+            source = agg_node;
         }
-        source = agg_node;
 
         // HAVING → post-agg filter (where_text not supported in IR path)
         if (gplan.having_text != null) return null;
@@ -168,24 +249,64 @@ pub fn plan_query(
         }
         // else: ORDER BY references a column not in SELECT — skip silently.
     } else if (gplan.order_by_text) |ob_text| {
-        // For aggregate queries, a trailing ORDER BY that references a column not
-        // in SELECT output (e.g. "version DESC" appended by FINAL stripping) is
-        // meaningless — skip silently.
+        // For aggregate queries, support multi-column ORDER BY when all referenced
+        // columns are present in the output (e.g. "protocol, feature" after ARRAY JOIN).
+        // If a simple single ident is not in output (FINAL case), skip silently.
         if (has_agg) {
-            const trimmed_ob = std.mem.trim(u8, ob_text, " \t");
-            const col_part = blk: {
-                if (std.ascii.endsWithIgnoreCase(trimmed_ob, " desc"))
-                    break :blk std.mem.trimEnd(u8, trimmed_ob[0..trimmed_ob.len - 5], " \t");
-                if (std.ascii.endsWithIgnoreCase(trimmed_ob, " asc"))
-                    break :blk std.mem.trimEnd(u8, trimmed_ob[0..trimmed_ob.len - 4], " \t");
-                break :blk trimmed_ob;
-            };
-            const is_simple_ident = std.mem.indexOfAny(u8, col_part, " \t(,") == null;
-            if (is_simple_ident and findOutputColIdx(source, col_part) == null) {
-                // ORDER BY column not in SELECT output on an aggregate query — skip silently.
-            } else {
-                return null; // Complex or present-column ORDER BY — fall back.
+            // Parse comma-separated order items: "col1 [ASC|DESC], col2 [ASC|DESC], ..."
+            // Try to build SortKeys for all items. If any column is not in output → skip or fallback.
+            var sort_keys_list: std.ArrayListUnmanaged(SortKey) = .empty;
+            var all_found = true;
+            var skip_silently = false; // single unknown ident → silent skip (FINAL)
+
+            // Split by comma
+            var it = std.mem.splitScalar(u8, ob_text, ',');
+            while (it.next()) |raw_item| {
+                const item = std.mem.trim(u8, raw_item, " \t\r\n");
+                if (item.len == 0) continue;
+                // Strip trailing ASC/DESC
+                var desc = false;
+                const col_part = if (std.ascii.endsWithIgnoreCase(item, " desc")) blk: {
+                    desc = true;
+                    break :blk std.mem.trimEnd(u8, item[0..item.len - 5], " \t");
+                } else if (std.ascii.endsWithIgnoreCase(item, " asc")) blk: {
+                    break :blk std.mem.trimEnd(u8, item[0..item.len - 4], " \t");
+                } else item;
+
+                if (findOutputColIdx(source, col_part)) |col_idx| {
+                    try sort_keys_list.append(ctx.alloc, .{
+                        .col_idx = col_idx,
+                        .desc = desc,
+                        .nulls_first = false,
+                    });
+                } else {
+                    // Column not in output.
+                    const is_simple_ident = std.mem.indexOfAny(u8, col_part, " \t(,") == null;
+                    if (is_simple_ident and sort_keys_list.items.len == 0) {
+                        // Single unknown ident at start → FINAL-style skip.
+                        skip_silently = true;
+                    }
+                    all_found = false;
+                    break;
+                }
             }
+
+            if (all_found and sort_keys_list.items.len > 0) {
+                const sort_keys = try sort_keys_list.toOwnedSlice(ctx.alloc);
+                if (has_limit) {
+                    const k: u64 = @intCast(gplan.limit.?);
+                    const topk = try ctx.alloc.create(PhysicalNode);
+                    topk.* = .{ .top_k = .{ .input = source, .keys = sort_keys, .k = k } };
+                    source = topk;
+                } else {
+                    const ob = try ctx.alloc.create(PhysicalNode);
+                    ob.* = .{ .order_by = .{ .input = source, .keys = sort_keys } };
+                    source = ob;
+                }
+            } else if (!skip_silently and !all_found) {
+                return null; // Complex or unresolvable ORDER BY — fall back.
+            }
+            // else: skip_silently or empty → do nothing.
         } else {
             // Non-aggregate with complex ORDER BY — not supported in IR path.
             return null;
@@ -1163,7 +1284,8 @@ fn prattExpr(pctx: *ParseCtx, min_bp: u8) anyerror!?Expr {
                             std.ascii.eqlIgnoreCase(name, "splitByChar") or
                             std.ascii.eqlIgnoreCase(name, "startsWith") or
                             std.ascii.eqlIgnoreCase(name, "endsWith") or
-                            std.ascii.eqlIgnoreCase(name, "mapGet")) break :blk2 true;
+                            std.ascii.eqlIgnoreCase(name, "mapGet") or
+                            std.ascii.eqlIgnoreCase(name, "risk_score")) break :blk2 true;
                     }
                     if (args_slice.len == 3) {
                         if (std.ascii.eqlIgnoreCase(name, "if") or
@@ -1380,6 +1502,7 @@ fn inferExprType(ctx: *PlannerCtx, expr: Expr) ColumnType {
             if (std.mem.eql(u8, fc.name, "intDiv") or std.mem.eql(u8, fc.name, "modulo")) return .int64;
             if (std.mem.eql(u8, fc.name, "positionCaseInsensitive")) return .uint64;
             if (std.mem.eql(u8, fc.name, "concat")) return .string;
+            if (std.mem.eql(u8, fc.name, "risk_score")) return .float64;
             if (std.mem.eql(u8, fc.name, "splitByChar") or
                 std.mem.eql(u8, fc.name, "splitByString") or
                 std.mem.eql(u8, fc.name, "mapKeys") or
@@ -1519,6 +1642,78 @@ fn tryParseFnCallItem(ctx: *PlannerCtx, text: []const u8, alias: []const u8) !?P
         .alias    = alias,
         .out_type = out_type,
     };
+}
+
+
+/// Build an agg ProjectItem where the aggregate argument is looked up in the
+/// pre-project output (used for ARRAY JOIN + GROUP BY queries).
+/// `pre_items` is the ordered list of pre-project output items;
+/// `real_key_count` is the count of non-__aj__ key items at the front.
+/// For avg/min/max/sum, the col_name is expected to be "__aj__<alias>" and will
+/// be resolved to the corresponding pre-project output index.
+fn aggExprToProjectItemWithPreProject(
+    ctx: *PlannerCtx,
+    p:   generic_sql.Expr,
+    pre_items: []const ProjectItem,
+    real_key_count: usize,
+) !?ProjectItem {
+    _ = real_key_count;
+    const alias = p.alias orelse p.column orelse "?";
+    const col_name = p.column orelse "";
+
+    // Resolve a column name against pre-project output items by alias.
+    const resolvePreProjectCol = struct {
+        fn resolve(items: []const ProjectItem, name: []const u8) ?Expr {
+            for (items, 0..) |item, idx| {
+                if (std.ascii.eqlIgnoreCase(item.alias, name)) {
+                    return Expr{ .col_ref = .{ .index = idx, .name = item.alias } };
+                }
+            }
+            return null;
+        }
+    }.resolve;
+
+    const agg_call = try ctx.alloc.create(AggCall);
+    switch (p.func) {
+        .count_star => {
+            agg_call.* = .{ .kind = .count_star, .arg = null, .distinct = false };
+            return ProjectItem{ .expr = .{ .agg_call = agg_call }, .alias = alias, .out_type = .uint64 };
+        },
+        .count_if => {
+            agg_call.* = .{ .kind = .count_star, .arg = null, .distinct = false };
+            return ProjectItem{ .expr = .{ .agg_call = agg_call }, .alias = alias, .out_type = .uint64 };
+        },
+        .avg => {
+            const arg_expr = resolvePreProjectCol(pre_items, col_name) orelse
+                resolveColExpr(ctx, col_name) orelse
+                (try parseArithExpr(ctx, col_name)) orelse return null;
+            agg_call.* = .{ .kind = .avg, .arg = arg_expr, .distinct = false };
+            return ProjectItem{ .expr = .{ .agg_call = agg_call }, .alias = alias, .out_type = .float64 };
+        },
+        .min => {
+            const arg_expr = resolvePreProjectCol(pre_items, col_name) orelse
+                resolveColExpr(ctx, col_name) orelse
+                (try parseArithExpr(ctx, col_name)) orelse return null;
+            const col_type = inferExprType(ctx, arg_expr);
+            agg_call.* = .{ .kind = .min, .arg = arg_expr, .distinct = false };
+            return ProjectItem{ .expr = .{ .agg_call = agg_call }, .alias = alias, .out_type = col_type };
+        },
+        .max => {
+            const arg_expr = resolvePreProjectCol(pre_items, col_name) orelse
+                resolveColExpr(ctx, col_name) orelse
+                (try parseArithExpr(ctx, col_name)) orelse return null;
+            const col_type = inferExprType(ctx, arg_expr);
+            agg_call.* = .{ .kind = .max, .arg = arg_expr, .distinct = false };
+            return ProjectItem{ .expr = .{ .agg_call = agg_call }, .alias = alias, .out_type = col_type };
+        },
+        .sum => {
+            const arg_expr = resolvePreProjectCol(pre_items, col_name) orelse
+                resolveColExpr(ctx, col_name) orelse return null;
+            agg_call.* = .{ .kind = .sum, .arg = arg_expr, .distinct = false };
+            return ProjectItem{ .expr = .{ .agg_call = agg_call }, .alias = alias, .out_type = .float64 };
+        },
+        else => return aggExprToProjectItem(ctx, p),
+    }
 }
 
 fn aggExprToProjectItem(ctx: *PlannerCtx, p: generic_sql.Expr) !?ProjectItem {

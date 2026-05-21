@@ -1023,6 +1023,9 @@ fn evalFnCall(fc: *const plan.FnCall, row: []const ?Value, lambda_val: ?Value, a
     }
 
     // ── IP functions ──────────────────────────────────────────────────────────
+    // risk_score(protocol, features) — stub returning 0.0 (matches generic_executor behavior)
+    if (std.mem.eql(u8, name, "risk_score")) return Value{ .float64 = 0.0 };
+
     if (std.mem.eql(u8, name, "IPv4StringToNumOrDefault") or
         std.mem.eql(u8, name, "IPv4StringToNumOrZero"))
     {
