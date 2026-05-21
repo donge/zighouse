@@ -826,8 +826,11 @@ fn prattExpr(pctx: *ParseCtx, min_bp: u8) anyerror!?Expr {
                 },
                 else => return null,
             };
-            // CAST(x, 'Array(String)') → pass inner expression through as-is
-            if (std.mem.startsWith(u8, type_name, "Array(")) {
+            // CAST(x, 'Array(String)') or CAST(x AS LIST) → pass inner expression through as-is
+            if (std.mem.startsWith(u8, type_name, "Array(") or
+                std.ascii.eqlIgnoreCase(type_name, "LIST") or
+                std.ascii.eqlIgnoreCase(type_name, "LIST[]") or
+                std.mem.endsWith(u8, type_name, "[]")) {
                 break :blk_cast inner;
             }
             // Map target type to a kernels function
@@ -1060,6 +1063,27 @@ fn prattExpr(pctx: *ParseCtx, min_bp: u8) anyerror!?Expr {
                         };
                     }
                     break :blk Expr{ .dict_call = dc };
+                }
+
+                // list_value(...) — DuckDB internal name for array constructors []
+                // list_value() with no args → empty array literal
+                // list_value('a', 'b', ...) → lit_array with string values
+                if (std.ascii.eqlIgnoreCase(name, "list_value")) {
+                    if (args_slice.len == 0) {
+                        const items = try pctx.arena.alloc([]const u8, 0);
+                        break :blk Expr{ .lit_array = items };
+                    }
+                    // Build lit_array from string literal args
+                    const str_items = try pctx.arena.alloc([]const u8, args_slice.len);
+                    for (args_slice, 0..) |arg, ai| {
+                        switch (arg) {
+                            .lit_str => |s| str_items[ai] = s,
+                            .lit_i64 => |n| str_items[ai] = try std.fmt.allocPrint(pctx.arena, "{d}", .{n}),
+                            .lit_u64 => |n| str_items[ai] = try std.fmt.allocPrint(pctx.arena, "{d}", .{n}),
+                            else => return null,
+                        }
+                    }
+                    break :blk Expr{ .lit_array = str_items };
                 }
 
                 // Verify function is in known scalar_fns or 2-arg numerics

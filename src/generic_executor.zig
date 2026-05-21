@@ -4023,8 +4023,8 @@ fn splitTopLevelArgs(expr: []const u8) !SplitResult {
     while (i <= expr.len) : (i += 1) {
         const c = if (i < expr.len) expr[i] else ',';
         switch (c) {
-            '(' => depth += 1,
-            ')' => { if (depth > 0) depth -= 1; },
+            '(', '[' => depth += 1,
+            ')', ']' => { if (depth > 0) depth -= 1; },
             '\'' => {
                 i += 1;
                 while (i < expr.len and expr[i] != '\'') i += 1;

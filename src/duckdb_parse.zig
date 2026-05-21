@@ -1483,6 +1483,21 @@ fn exprToText(allocator: std.mem.Allocator, val: std.json.Value) !?[]const u8 {
     if (std.mem.eql(u8, class, "FUNCTION")) {
         const fn_name = obj.get("function_name").?.string;
         const children = obj.get("children").?.array.items;
+        // list_value() / list_value(a, b, ...) — DuckDB's internal name for array constructors [...]
+        if (std.mem.eql(u8, fn_name, "list_value")) {
+            if (children.len == 0) return try allocator.dupe(u8, "[]");
+            var buf: std.ArrayList(u8) = .empty;
+            defer buf.deinit(allocator);
+            try buf.appendSlice(allocator, "[");
+            for (children, 0..) |ch, i| {
+                if (i > 0) try buf.appendSlice(allocator, ", ");
+                const t = try exprToText(allocator, ch) orelse return null;
+                defer allocator.free(t);
+                try buf.appendSlice(allocator, t);
+            }
+            try buf.append(allocator, ']');
+            return try buf.toOwnedSlice(allocator);
+        }
         if (std.mem.eql(u8, fn_name, "isnotnull") and children.len == 1) {
             const t = try exprToText(allocator, children[0]) orelse return null;
             defer allocator.free(t);
