@@ -264,15 +264,28 @@ pub fn rewrite(allocator: std.mem.Allocator, sql: []const u8) !?[]u8 {
     const norm = try normalizeWhitespace(allocator, sql);
     defer allocator.free(norm);
 
+    // Rewrite count() → count(*): ClickHouse allows bare count() but DuckDB requires count(*).
+    const after_count: []const u8 = blk: {
+        if (std.ascii.indexOfIgnoreCase(norm, "count()") != null) {
+            const r1 = try std.mem.replaceOwned(u8, allocator, norm, "count()", "count(*)");
+            errdefer allocator.free(r1);
+            const r2 = try std.mem.replaceOwned(u8, allocator, r1, "COUNT()", "count(*)");
+            allocator.free(r1);
+            break :blk r2;
+        }
+        break :blk try allocator.dupe(u8, norm);
+    };
+    defer allocator.free(after_count);
+
     // If ARRAY JOIN is present, rewrite it first, then fall through to apply
     // function-rename rules (e.g. toDateTime→CAST) on the result.
     var after_aj: ?[]u8 = null;
-    if (std.ascii.indexOfIgnoreCase(norm, "ARRAY JOIN") != null) {
-        after_aj = try rewriteArrayJoin(allocator, norm) orelse return null;
+    if (std.ascii.indexOfIgnoreCase(after_count, "ARRAY JOIN") != null) {
+        after_aj = try rewriteArrayJoin(allocator, after_count) orelse return null;
     }
     // base points to either the ARRAY JOIN-rewritten SQL or the normalized SQL.
     // We dupe after_aj immediately so we can free it while base2 lives on.
-    const base: []const u8 = if (after_aj) |s| s else norm;
+    const base: []const u8 = if (after_aj) |s| s else after_count;
 
     // Pre-pass: rewrite CAST(expr, 'TypeName') → CAST(expr AS TypeName).
     // When after_aj is set we dupe base so sql2 and after_aj never alias,
@@ -281,7 +294,7 @@ pub fn rewrite(allocator: std.mem.Allocator, sql: []const u8) !?[]u8 {
     if (after_aj) |s| allocator.free(s);  // safe to free now; base2 is a fresh copy
     const sql2 = try rewriteCastStringType(allocator, base2);
     defer if (sql2.ptr != base2.ptr) allocator.free(sql2);
-    defer if (base2.ptr != norm.ptr) allocator.free(base2);
+    defer if (base2.ptr != after_count.ptr) allocator.free(base2);
 
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     try buf.ensureTotalCapacity(allocator, sql2.len + 64);

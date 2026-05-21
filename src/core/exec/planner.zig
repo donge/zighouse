@@ -167,9 +167,29 @@ pub fn plan_query(
             }
         }
         // else: ORDER BY references a column not in SELECT — skip silently.
-    } else if (gplan.order_by_text != null) {
-        // Complex ORDER BY expression — not supported in IR path.
-        return null;
+    } else if (gplan.order_by_text) |ob_text| {
+        // For aggregate queries, a trailing ORDER BY that references a column not
+        // in SELECT output (e.g. "version DESC" appended by FINAL stripping) is
+        // meaningless — skip silently.
+        if (has_agg) {
+            const trimmed_ob = std.mem.trim(u8, ob_text, " \t");
+            const col_part = blk: {
+                if (std.ascii.endsWithIgnoreCase(trimmed_ob, " desc"))
+                    break :blk std.mem.trimEnd(u8, trimmed_ob[0..trimmed_ob.len - 5], " \t");
+                if (std.ascii.endsWithIgnoreCase(trimmed_ob, " asc"))
+                    break :blk std.mem.trimEnd(u8, trimmed_ob[0..trimmed_ob.len - 4], " \t");
+                break :blk trimmed_ob;
+            };
+            const is_simple_ident = std.mem.indexOfAny(u8, col_part, " \t(,") == null;
+            if (is_simple_ident and findOutputColIdx(source, col_part) == null) {
+                // ORDER BY column not in SELECT output on an aggregate query — skip silently.
+            } else {
+                return null; // Complex or present-column ORDER BY — fall back.
+            }
+        } else {
+            // Non-aggregate with complex ORDER BY — not supported in IR path.
+            return null;
+        }
     }
 
     // ── LIMIT / OFFSET ────────────────────────────────────────────────────────
