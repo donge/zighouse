@@ -94,8 +94,53 @@ pub fn plan_query(
         if (isAggregate(p.func)) { has_agg = true; break; }
     }
 
+    var order_by_text_handled = false; // track if ORDER BY was consumed by sort-before-project
+
     if (!has_agg) {
         // ── Pure projection / scan ─────────────────────────────────────────
+        // If ORDER BY references a schema column not in SELECT output, we must
+        // sort the raw scan BEFORE projection (sort-before-project).
+        // Detect this case: order_by_text is a simple ident present in schema.
+        if (gplan.order_by_text) |ob_text| {
+            // Parse the order_by_text for non-agg: expect "col [DESC]" or "col".
+            const trimmed = std.mem.trim(u8, ob_text, " \t\r\n");
+            var desc = false;
+            const col_part = if (std.ascii.endsWithIgnoreCase(trimmed, " desc")) blk: {
+                desc = true;
+                break :blk std.mem.trimEnd(u8, trimmed[0..trimmed.len - 5], " \t");
+            } else if (std.ascii.endsWithIgnoreCase(trimmed, " asc")) blk: {
+                break :blk std.mem.trimEnd(u8, trimmed[0..trimmed.len - 4], " \t");
+            } else trimmed;
+            // Only handle simple idents (no parens, spaces, commas).
+            const is_simple = std.mem.indexOfAny(u8, col_part, " \t(,") == null;
+            if (is_simple) {
+                if (ctx.tbl) |tbl| {
+                    if (tbl.findColumn(col_part)) |schema_idx| {
+                        // Insert sort-before-project on the raw source (scan/filter).
+                        const sort_keys = try ctx.alloc.alloc(SortKey, 1);
+                        sort_keys[0] = .{ .col_idx = schema_idx, .desc = desc, .nulls_first = false };
+                        if (gplan.limit != null) {
+                            const k: u64 = @intCast(gplan.limit.?);
+                            const topk = try ctx.alloc.create(PhysicalNode);
+                            topk.* = .{ .top_k = .{ .input = source, .keys = sort_keys, .k = k } };
+                            source = topk;
+                        } else {
+                            const ob = try ctx.alloc.create(PhysicalNode);
+                            ob.* = .{ .order_by = .{ .input = source, .keys = sort_keys } };
+                            source = ob;
+                        }
+                        order_by_text_handled = true;
+                    } else {
+                        // Schema column not found — fall back.
+                        return null;
+                    }
+                } else {
+                    return null; // No schema to resolve column.
+                }
+            } else {
+                return null; // Complex expression ORDER BY — fall back.
+            }
+        }
         const items = try buildProjectItems(ctx, projs) orelse return null;
         const proj_node = try ctx.alloc.create(PhysicalNode);
         proj_node.* = .{ .project = .{ .input = source, .items = items } };
@@ -384,7 +429,8 @@ pub fn plan_query(
             // else: skip_silently or empty → do nothing.
         } else {
             // Non-aggregate with complex ORDER BY — not supported in IR path.
-            return null;
+            // (Simple schema-column ORDER BY is handled above in sort-before-project.)
+            if (!order_by_text_handled) return null;
         }
     }
 
@@ -648,6 +694,19 @@ fn scalarExprToProjectItem(ctx: *PlannerCtx, p: generic_sql.Expr) !?ProjectItem 
                 break :blk item;
             };
             const out_type = schemaColType(ctx, col_name);
+            // Look up narrow wire type override (e.g. UInt16, UInt32) from schema.
+            const ch_type_override: ?[]const u8 = ch_blk: {
+                if (ctx.tbl) |tbl| {
+                    if (tbl.findColumn(col_name)) |idx| {
+                        if (tbl.columns[idx].ch_type) |ch| {
+                            if (std.mem.eql(u8, ch, "UInt16") or std.mem.eql(u8, ch, "UInt32")) {
+                                break :ch_blk ch;
+                            }
+                        }
+                    }
+                }
+                break :ch_blk null;
+            };
             // Handle col + N / col - N (int_offset)
             const final_expr: Expr = if (p.int_offset != 0) expr: {
                 const binop = ctx.alloc.create(plan.BinOp) catch break :blk null;
@@ -658,6 +717,7 @@ fn scalarExprToProjectItem(ctx: *PlannerCtx, p: generic_sql.Expr) !?ProjectItem 
                 .expr     = final_expr,
                 .alias    = alias,
                 .out_type = out_type,
+                .ch_type  = ch_type_override,
             };
         },
         .int_literal => ProjectItem{
@@ -1856,13 +1916,16 @@ fn aggExprToProjectItem(ctx: *PlannerCtx, p: generic_sql.Expr) !?ProjectItem {
         },
         .group_uniq_array, .uniq_exact_if => {
             const arg_expr = resolveColExpr(ctx, col_name) orelse return null;
-            agg_call.* = .{ .kind = .group_uniq_array, .arg = arg_expr, .distinct = false };
-            return ProjectItem{ .expr = .{ .agg_call = agg_call }, .alias = alias, .out_type = .array_string };
+            agg_call.* = .{ .kind = .group_uniq_array, .arg = arg_expr, .distinct = false, .sep = p.sep };
+            // When sep is present (arrayStringConcat pattern), the result is a joined string.
+            const out: ColumnType = if (p.sep != null) .string else .array_string;
+            return ProjectItem{ .expr = .{ .agg_call = agg_call }, .alias = alias, .out_type = out };
         },
         .any_val => {
-            const arg_expr = resolveColExpr(ctx, col_name) orelse return null;
+            const arg_expr = resolveColExpr(ctx, col_name) orelse
+                (try parseArithExpr(ctx, col_name)) orelse return null;
             agg_call.* = .{ .kind = .any, .arg = arg_expr, .distinct = false };
-            const col_type = schemaColType(ctx, col_name);
+            const col_type = inferExprType(ctx, arg_expr);
             return ProjectItem{ .expr = .{ .agg_call = agg_call }, .alias = alias, .out_type = col_type };
         },
         else => return null,

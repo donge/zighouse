@@ -161,6 +161,9 @@ pub const ProjectItem = struct {
     alias: []const u8,
     /// The output type inferred by the Planner.
     out_type: ColumnType,
+    /// Optional wire type override forwarded to ColMeta.ch_type (e.g. "UInt16", "UInt32").
+    /// Null means no override (use out_type's default wire name).
+    ch_type: ?[]const u8 = null,
 };
 
 // ── Order / limit ─────────────────────────────────────────────────────────────

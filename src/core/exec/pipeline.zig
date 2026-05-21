@@ -488,7 +488,7 @@ fn valueToBool(v: ?Value) bool {
 fn projectRowList(inner: RowList, items: []const plan.ProjectItem, alloc: std.mem.Allocator) !RowList {
     const new_metas = try alloc.alloc(result.ColMeta, items.len);
     for (items, 0..) |item, ci| {
-        new_metas[ci] = .{ .name = item.alias, .col_type = item.out_type };
+        new_metas[ci] = .{ .name = item.alias, .col_type = item.out_type, .ch_type = item.ch_type };
     }
     var rl = RowList.init(new_metas);
 
@@ -586,8 +586,7 @@ fn executeScalarAgg(inner: RowList, aggs: []const plan.ProjectItem, alloc: std.m
     const out_row = try alloc.alloc(?Value, aggs.len);
     for (aggs, 0..) |item, ci| {
         metas[ci] = .{ .name = item.alias, .col_type = item.out_type };
-        out_row[ci] = accums[ci].toValue() catch
-            (try accums[ci].toArrayValue(alloc));
+        out_row[ci] = try finalizeAccum(accums[ci], item, alloc);
     }
     var rl = RowList.init(metas);
     try rl.append(alloc, out_row);
@@ -630,15 +629,15 @@ fn executeHashAgg(
         rl:       *RowList,
         alloc:    std.mem.Allocator,
         keys_len: usize,
+        aggs:     []const plan.ProjectItem,
     };
-    var emit_ctx = CtxT{ .rl = &rl, .alloc = alloc, .keys_len = keys.len };
+    var emit_ctx = CtxT{ .rl = &rl, .alloc = alloc, .keys_len = keys.len, .aggs = aggs };
     ht_agg.iterate(&emit_ctx, struct {
         fn cb(c: *CtxT, k: []const Value, bucket: []const AggAccum) void {
             const row = c.alloc.alloc(?Value, c.keys_len + bucket.len) catch return;
             for (k, 0..) |kv, i| row[i] = kv;
-            for (bucket, 0..) |acc, i| {
-                row[c.keys_len + i] = acc.toValue() catch
-                    (acc.toArrayValue(c.alloc) catch null);
+            for (bucket, c.aggs, 0..) |acc, item, i| {
+                row[c.keys_len + i] = finalizeAccum(acc, item, c.alloc) catch null;
             }
             c.rl.append(c.alloc, row) catch {};
         }
@@ -734,6 +733,36 @@ fn executeHashJoin(
 }
 
 // ── Aggregate helpers ─────────────────────────────────────────────────────────
+
+/// Finalize one accumulator for a ProjectItem.
+/// When the agg is group_uniq_array with a sep, joins the array into a string.
+fn finalizeAccum(acc: AggAccum, item: plan.ProjectItem, alloc: std.mem.Allocator) !?Value {
+    const sep: ?[]const u8 = switch (item.expr) {
+        .agg_call => |ac| ac.sep,
+        else => null,
+    };
+    if (sep) |s| {
+        const arr_val = try acc.toArrayValue(alloc);
+        const elems = arr_val.array_string;
+        if (elems.len == 0) return Value{ .string = "" };
+        // Calculate total length.
+        var total: usize = 0;
+        for (elems) |e| total += e.len;
+        total += s.len * (elems.len - 1);
+        const buf = try alloc.alloc(u8, total);
+        var pos: usize = 0;
+        for (elems, 0..) |e, idx| {
+            if (idx > 0) {
+                @memcpy(buf[pos..pos + s.len], s);
+                pos += s.len;
+            }
+            @memcpy(buf[pos..pos + e.len], e);
+            pos += e.len;
+        }
+        return Value{ .string = buf };
+    }
+    return acc.toValue() catch (try acc.toArrayValue(alloc));
+}
 
 fn initAccumForAgg(expr: plan.Expr) AggAccum {
     return switch (expr) {
