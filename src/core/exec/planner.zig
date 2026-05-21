@@ -341,23 +341,22 @@ fn resolveColExpr(ctx: *PlannerCtx, col: []const u8) ?Expr {
     }
     // Column reference
     if (ctx.tbl) |tbl| {
-        if (tbl.findColumn(col)) |idx| {
-            const ct = schemaColType(ctx, col);
-            // Raw Array/Map columns are not safe to use directly in IR:
-            // part_scan_bridge returns serialized bytes, not parsed values.
-            // Exception: Map(String, String) → allowed as source for ['key'] subscript.
-            if (ct == .array_string) {
-                const is_map_str_str: bool = blk: {
-                    if (tbl.columns[idx].ch_type) |ch| {
-                        break :blk std.mem.eql(u8, ch, "Map(String, String)") or
-                                   std.mem.eql(u8, ch, "Map(String,String)");
-                    }
-                    break :blk false;
-                };
-                if (!is_map_str_str) return null;
-            }
-            return Expr{ .col_ref = .{ .index = idx, .name = col } };
-        }
+         if (tbl.findColumn(col)) |idx| {
+             const ct = schemaColType(ctx, col);
+             if (ct == .array_string) {
+                 // Only Array(String) columns are supported in IR.
+                 // Map(String,*) is .string type now (custom blob format).
+                 // Non-string Arrays (Array(Float64) etc.) are not supported.
+                 if (tbl.columns[idx].ch_type) |ch| {
+                     if (!std.mem.startsWith(u8, ch, "Array(String)") and
+                         !std.mem.startsWith(u8, ch, "Array(LowCardinality(String))"))
+                         return null;
+                 } else {
+                     return null;
+                 }
+             }
+             return Expr{ .col_ref = .{ .index = idx, .name = col } };
+         }
     }
     // Unknown column — return null so the caller falls back to generic_executor.
     return null;
@@ -374,8 +373,9 @@ fn schemaColType(ctx: *PlannerCtx, col_name: []const u8) ColumnType {
 
 fn schemaToCore(ty: schema_mod.ColumnType, ch_type: ?[]const u8) ColumnType {
     if (ch_type) |ct| {
-        if (std.mem.startsWith(u8, ct, "Array(") or std.mem.startsWith(u8, ct, "Map("))
+        if (std.mem.startsWith(u8, ct, "Array("))
             return .array_string;
+        // Map(String,*) stays as .string (custom blob, not array_string)
     }
     return switch (ty) {
         .int8  => .bool_u8,

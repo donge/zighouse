@@ -902,9 +902,91 @@ pub const ColumnReader = struct {
         self.rows_read += count;
         return count;
     }
+
+    /// Read `n` rows of an Array(String) column.
+    ///
+    /// On-disk format (written by ZigHouse's part writer via consumeNativeTextRows):
+    ///   size.bin[i]: u64 LE byte-length of the concatenated element data for row i
+    ///   bin: concatenated blobs for all rows; each row's blob = repeated (varint(len) + bytes)
+    ///        until the byte-length is exhausted.
+    ///
+    /// The callback receives (ctx, [][]const u8) — a slice of strings for each row.
+    /// String slices point into `self.data`; array slices are allocated from `arena`.
+    pub fn readArrayStrings(
+        self: *ColumnReader,
+        n: usize,
+        arena: std.mem.Allocator,
+        ctx: anytype,
+        callback: anytype,
+    ) !usize {
+        switch (self.col.ty) {
+            .text, .char => {},
+            else => return error.NotAStringColumn,
+        }
+        const sd = self.size_data orelse return error.MissingSizeStream;
+        const remaining_rows = self.row_count - self.rows_read;
+        const count = @min(n, remaining_rows);
+        var read: usize = 0;
+        while (read < count) : (read += 1) {
+            // Read byte-length of this row's element blob from size sub-stream
+            if (self.size_cursor + 8 > sd.len) return error.UnexpectedEndOfData;
+            const blob_len: usize = @intCast(std.mem.readInt(u64, sd[self.size_cursor..][0..8], .little));
+            self.size_cursor += 8;
+            
+            if (self.cursor + blob_len > self.data.len) return error.UnexpectedEndOfData;
+            const blob = self.data[self.cursor .. self.cursor + blob_len];
+            self.cursor += blob_len;
+
+            // Count elements first to allocate the right size
+            var elem_count: usize = 0;
+            {
+                var off: usize = 0;
+                while (off < blob.len) {
+                    const r = readVarUIntLocal(blob[off..]) orelse return error.UnexpectedEndOfData;
+                    const slen = r[0];
+                    const lb = r[1];
+                    off += lb + slen;
+                    elem_count += 1;
+                }
+            }
+            const elems = try arena.alloc([]const u8, elem_count);
+            {
+                var off: usize = 0;
+                var ei: usize = 0;
+                while (off < blob.len) {
+                    const r = readVarUIntLocal(blob[off..]) orelse return error.UnexpectedEndOfData;
+                    const slen = r[0];
+                    const lb = r[1];
+                    off += lb;
+                    elems[ei] = try arena.dupe(u8, blob[off .. off + slen]);
+                    off += slen;
+                    ei += 1;
+                }
+            }
+            try callback(ctx, elems);
+        }
+        self.rows_read += count;
+        return count;
+    }
 };
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
+
+/// Read a variable-length unsigned integer (LEB128) from buf.
+/// Returns {value, bytes_consumed} or null if buf is empty or malformed.
+fn readVarUIntLocal(buf: []const u8) ?struct { usize, usize } {
+    if (buf.len == 0) return null;
+    var val: usize = 0;
+    var shift: u6 = 0;
+    var i: usize = 0;
+    while (i < buf.len and i < 10) : (i += 1) {
+        const b = buf[i];
+        val |= @as(usize, b & 0x7F) << shift;
+        if (b & 0x80 == 0) return .{ val, i + 1 };
+        shift += 7;
+    }
+    return null;
+}
 
 test "part write and verify files exist" {
     const allocator = std.testing.allocator;

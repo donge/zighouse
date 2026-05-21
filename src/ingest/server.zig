@@ -965,8 +965,22 @@ pub const Server = struct {
         // Make user-defined functions available to the executor.
         generic_executor.udf_registry = &self.functions;
 
+        // Strip FINAL modifier (same as handleSelect).
+        const sql_needs_free = std.ascii.indexOfIgnoreCase(sql, "FINAL") != null;
+        const sql_after_final = try removeFinal(self.allocator, sql);
+        errdefer if (sql_needs_free) self.allocator.free(sql_after_final);
+        const sql_clean: []const u8 = blk_sc: {
+            if (sql_needs_free and std.ascii.indexOfIgnoreCase(sql_after_final, "ORDER BY") == null) {
+                const s = try std.fmt.allocPrint(self.allocator, "{s} ORDER BY version DESC", .{sql_after_final});
+                self.allocator.free(sql_after_final);
+                break :blk_sc s;
+            }
+            break :blk_sc sql_after_final;
+        };
+        defer if (!std.mem.eql(u8, sql_clean, sql)) self.allocator.free(sql_clean);
+
         // Parse SQL into a Plan.
-        const plan = (try generic_sql.parse(self.allocator, sql)) orelse {
+        const plan = (try generic_sql.parse(self.allocator, sql_clean)) orelse {
             try sendResponse(request, out, .bad_request, "Cannot parse SELECT query\n");
             return;
         };
@@ -1048,7 +1062,7 @@ pub const Server = struct {
         }
 
         // ── IR execution path (native binary, no CSV intermediate) ────────────
-        if (try self.tryIrExecute(plan, &entry.table, parts.dirs(), sql)) |nb| {
+        if (try self.tryIrExecute(plan, &entry.table, parts.dirs(), sql_clean)) |nb| {
             defer self.allocator.free(nb);
             try sendNativeBlock(self.allocator, request, out, nb);
             return;

@@ -276,8 +276,13 @@ fn evalFnCall(fc: *const plan.FnCall, row: []const ?Value, arena: std.mem.Alloca
     // String functions
     if (std.mem.eql(u8, name, "length") or std.mem.eql(u8, name, "char_length")) {
         const v = args[0] orelse return null;
-        const s = v.toStr() orelse return null;
-        return Value{ .int64 = @intCast(s.len) };
+        switch (v) {
+            .array_string => |arr| return Value{ .int64 = @intCast(arr.len) },
+            else => {
+                const s = v.toStr() orelse return null;
+                return Value{ .int64 = @intCast(s.len) };
+            },
+        }
     }
     if (std.mem.eql(u8, name, "lower")) {
         const v = args[0] orelse return null;

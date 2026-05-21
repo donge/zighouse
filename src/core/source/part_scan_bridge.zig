@@ -42,6 +42,16 @@ fn toCoreColType(ty: schema.ColumnType) ColumnType {
     };
 }
 
+/// Like toCoreColType, but also checks ch_type for Array(String) types.
+/// Map columns still use .string (custom blob format for Map(String,String)).
+fn toCoreColTypeFull(col: schema.Column) ColumnType {
+    if (col.ch_type) |ch| {
+        if (std.mem.startsWith(u8, ch, "Array("))
+            return .array_string;
+    }
+    return toCoreColType(col.ty);
+}
+
 // ── ScanState — per-query state across all parts ──────────────────────────────
 
 /// Internal scan state: walks through a list of part directories, reading
@@ -67,7 +77,7 @@ const ScanState = struct {
         for (table.columns, 0..) |col, i| {
             metas[i] = .{
                 .name    = col.name,
-                .col_type = toCoreColType(col.ty),
+                .col_type = toCoreColTypeFull(col),
             };
         }
         const col_readers = try alloc.alloc(?part_mod.ColumnReader, table.columns.len);
@@ -139,7 +149,7 @@ const ScanState = struct {
         for (self.table.columns, 0..) |col, ci| {
             const null_mask = try chunk_alloc.alloc(u64, null_words);
             @memset(null_mask, 0);
-            const core_ty = toCoreColType(col.ty);
+            const core_ty = toCoreColTypeFull(col);
             const col_data: chunk.ColumnData = switch (core_ty) {
                 .int64, .datetime64_ms => blk: {
                     const buf = try chunk_alloc.alloc(i64, n);
@@ -195,9 +205,31 @@ const ScanState = struct {
                     break :blk .{ .string = sbuf };
                 },
                 .array_string => blk: {
-                    // array_string columns not stored in CH parts — produce empty slices
                     const sbuf = try chunk_alloc.alloc([][]const u8, n);
-                    @memset(sbuf, &.{});
+                    // Use readArrayStrings to decode Array(String) columns from parts.
+                    if (self.col_readers[ci]) |*cr| {
+                        const Ctx2 = struct {
+                            buf:   [][][]const u8,
+                            idx:   usize,
+                        };
+                        var ctx2 = Ctx2{ .buf = sbuf, .idx = 0 };
+                        _ = cr.readArrayStrings(n, chunk_alloc, &ctx2,
+                            struct {
+                                fn cb(c: *Ctx2, arr: [][]const u8) !void {
+                                    c.buf[c.idx] = arr;
+                                    c.idx += 1;
+                                }
+                            }.cb,
+                        ) catch |err| {
+                            // If readArrayStrings fails (wrong format), fall back to empty
+                            std.log.warn("readArrayStrings error at row {}: {}", .{ctx2.idx, err});
+                            @memset(sbuf[ctx2.idx..], &.{});
+                        };
+                        // Fill any unread rows with empty
+                        while (ctx2.idx < n) : (ctx2.idx += 1) sbuf[ctx2.idx] = &.{};
+                    } else {
+                        @memset(sbuf, &.{});
+                    }
                     break :blk .{ .array_string = sbuf };
                 },
             };

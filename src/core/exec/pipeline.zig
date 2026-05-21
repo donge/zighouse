@@ -389,7 +389,10 @@ fn executeNode(node: *const plan.PhysicalNode, ctx: *QueryContext) !RowList {
             var rl = RowList.init(metas);
             var c: DataChunk = undefined;
             while (try ctx.source.nextChunk(&c, ctx)) {
-                defer c.deinit();
+                // Note: do NOT defer c.deinit() here — row values hold slices
+                // into the chunk's arena (e.g. array_string elems). Those
+                // slices remain valid until qctx.deinit() frees the parent
+                // arena that owns the chunk sub-arenas.
                 for (0..c.num_rows) |r| {
                     const row = try c.readRow(r, alloc);
                     try rl.append(alloc, row);
