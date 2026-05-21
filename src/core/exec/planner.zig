@@ -574,6 +574,7 @@ const TokKind = enum {
     kw_in,       // IN
     lbracket,    // [
     rbracket,    // ]
+    arrow,       // ->
     eof,
 };
 
@@ -613,7 +614,14 @@ const Lexer = struct {
             ')' => { self.pos += 1; return .{ .kind = .rparen,  .text = self.src[start..self.pos] }; },
             ',' => { self.pos += 1; return .{ .kind = .comma,   .text = self.src[start..self.pos] }; },
             '+' => { self.pos += 1; return .{ .kind = .plus,    .text = self.src[start..self.pos] }; },
-            '-' => { self.pos += 1; return .{ .kind = .minus,   .text = self.src[start..self.pos] }; },
+            '-' => {
+                self.pos += 1;
+                if (self.pos < self.src.len and self.src[self.pos] == '>') {
+                    self.pos += 1;
+                    return .{ .kind = .arrow, .text = self.src[start..self.pos] };
+                }
+                return .{ .kind = .minus, .text = self.src[start..self.pos] };
+            },
             '*' => { self.pos += 1; return .{ .kind = .star,    .text = self.src[start..self.pos] }; },
             '/' => { self.pos += 1; return .{ .kind = .slash,    .text = self.src[start..self.pos] }; },
             '%' => { self.pos += 1; return .{ .kind = .percent,  .text = self.src[start..self.pos] }; },
@@ -757,6 +765,9 @@ const ParseCtx = struct {
     lex: Lexer,
     arena: std.mem.Allocator,
     plan_ctx: *PlannerCtx,
+    /// Current lambda parameter name (e.g. "x"), set while parsing lambda body.
+    /// References to this name compile to Expr.lambda_param.
+    lambda_param: ?[]const u8 = null,
 };
 
 /// Entry: try to parse `text` as a complete arithmetic/function expression.
@@ -937,9 +948,21 @@ fn prattExpr(pctx: *ParseCtx, min_bp: u8) anyerror!?Expr {
             break :blk Expr{ .lit_str = s };
         },
 
-        // Identifier: either a function call fn(…) or a column/literal
+        // Identifier: either a lambda (x -> body), function call fn(…), or column/literal
         .ident => blk: {
             const name = tok.text;
+            // Look ahead: is next token '->'?  → lambda expression
+            if (pctx.lex.peek().kind == .arrow) {
+                _ = pctx.lex.next(); // consume '->'
+                // Parse body with lambda_param bound to `name`
+                const saved_param = pctx.lambda_param;
+                pctx.lambda_param = name;
+                const body_expr = try prattExpr(pctx, 0) orelse return null;
+                pctx.lambda_param = saved_param;
+                const body_ptr = try pctx.arena.create(Expr);
+                body_ptr.* = body_expr;
+                break :blk Expr{ .lambda = .{ .param = name, .body = body_ptr } };
+            }
             // Look ahead: is next token '('?  → function call
             const next = pctx.lex.peek();
             if (next.kind == .lparen) {
@@ -1132,6 +1155,12 @@ fn prattExpr(pctx: *ParseCtx, min_bp: u8) anyerror!?Expr {
                         std.ascii.eqlIgnoreCase(name, "arrayFlatten") or
                         std.ascii.eqlIgnoreCase(name, "arrayMax") or
                         std.ascii.eqlIgnoreCase(name, "arrayMin"))) break :blk2 true;
+                    // Lambda-based array functions: arrayMap(x -> expr, arr), arrayFilter, arrayExists
+                    if (args_slice.len == 2 and (
+                        std.ascii.eqlIgnoreCase(name, "arrayMap") or
+                        std.ascii.eqlIgnoreCase(name, "arrayFilter") or
+                        std.ascii.eqlIgnoreCase(name, "arrayExists")) and
+                        args_slice[0] == .lambda) break :blk2 true;
                     break :blk2 false;
                 };
                 if (!is_known) return null;
@@ -1158,7 +1187,10 @@ fn prattExpr(pctx: *ParseCtx, min_bp: u8) anyerror!?Expr {
                 break :blk Expr{ .fn_call = fc };
             }
 
-            // Not a function call — resolve as column ref or literal
+            // Not a function call — check if it's the lambda param, then resolve as column ref or literal
+            if (pctx.lambda_param) |lp| {
+                if (std.mem.eql(u8, name, lp)) break :blk Expr{ .lambda_param = {} };
+            }
             break :blk resolveColExpr(pctx.plan_ctx, name) orelse return null;
         },
 

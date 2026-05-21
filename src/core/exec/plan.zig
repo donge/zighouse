@@ -73,6 +73,19 @@ pub const Expr = union(enum) {
 
     // Array literal: ['a', 'b', ...]  (string elements only)
     lit_array:  [][]const u8,
+
+    // Lambda expression: x -> body  (used as first arg to arrayMap/Filter/Exists)
+    lambda:      Lambda,
+
+    // Reference to the current lambda-bound element (replaces the param name inside body)
+    lambda_param,
+};
+
+pub const Lambda = struct {
+    /// Parameter name (e.g. "x") — used only during planning, not at eval time.
+    param: []const u8,
+    /// The body expression; references to `param` are compiled as `lambda_param`.
+    body:  *Expr,
 };
 
 pub const ColRef = struct {

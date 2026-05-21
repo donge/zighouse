@@ -47,7 +47,7 @@ pub var dict_get_fn: ?*const fn (
 ///          The lifetime of the returned Value matches `arena`.
 ///
 /// Returns null if the expression evaluates to SQL NULL.
-pub fn evalExpr(expr: Expr, row: []const ?Value, arena: std.mem.Allocator) anyerror!?Value {
+pub fn evalExpr(expr: Expr, row: []const ?Value, lambda_val: ?Value, arena: std.mem.Allocator) anyerror!?Value {
     switch (expr) {
         // Literals
         .lit_i64   => |v| return Value{ .int64   = v },
@@ -58,6 +58,13 @@ pub fn evalExpr(expr: Expr, row: []const ?Value, arena: std.mem.Allocator) anyer
         .lit_null  => return null,
         .lit_array => |arr| return Value{ .array_string = arr },
 
+        // Lambda param — return the currently-bound element
+        .lambda_param => return lambda_val,
+
+        // Lambda expression itself — should only appear as arg to arrayMap/Filter/Exists
+        // If evaluated standalone, return null.
+        .lambda => return null,
+
         // Column reference
         .col_ref => |ref| {
             if (ref.index >= row.len) return null;
@@ -66,51 +73,51 @@ pub fn evalExpr(expr: Expr, row: []const ?Value, arena: std.mem.Allocator) anyer
 
         // Arithmetic
         .add => |op| {
-            const l = (try evalExpr(op.left,  row, arena)) orelse return null;
-            const r = (try evalExpr(op.right, row, arena)) orelse return null;
+            const l = (try evalExpr(op.left,  row, lambda_val, arena)) orelse return null;
+            const r = (try evalExpr(op.right, row, lambda_val, arena)) orelse return null;
             return numericBinOp(l, r, .add);
         },
         .sub => |op| {
-            const l = (try evalExpr(op.left,  row, arena)) orelse return null;
-            const r = (try evalExpr(op.right, row, arena)) orelse return null;
+            const l = (try evalExpr(op.left,  row, lambda_val, arena)) orelse return null;
+            const r = (try evalExpr(op.right, row, lambda_val, arena)) orelse return null;
             return numericBinOp(l, r, .sub);
         },
         .mul => |op| {
-            const l = (try evalExpr(op.left,  row, arena)) orelse return null;
-            const r = (try evalExpr(op.right, row, arena)) orelse return null;
+            const l = (try evalExpr(op.left,  row, lambda_val, arena)) orelse return null;
+            const r = (try evalExpr(op.right, row, lambda_val, arena)) orelse return null;
             return numericBinOp(l, r, .mul);
         },
         .div => |op| {
-            const l = (try evalExpr(op.left,  row, arena)) orelse return null;
-            const r = (try evalExpr(op.right, row, arena)) orelse return null;
+            const l = (try evalExpr(op.left,  row, lambda_val, arena)) orelse return null;
+            const r = (try evalExpr(op.right, row, lambda_val, arena)) orelse return null;
             return numericBinOp(l, r, .div);
         },
         .mod => |op| {
-            const l = (try evalExpr(op.left,  row, arena)) orelse return null;
-            const r = (try evalExpr(op.right, row, arena)) orelse return null;
+            const l = (try evalExpr(op.left,  row, lambda_val, arena)) orelse return null;
+            const r = (try evalExpr(op.right, row, lambda_val, arena)) orelse return null;
             return numericBinOp(l, r, .mod);
         },
 
         // Comparisons — result is always bool_u8
-        .eq  => |op| return cmpOp(try evalExpr(op.left, row, arena), try evalExpr(op.right, row, arena), .eq),
-        .neq => |op| return cmpOp(try evalExpr(op.left, row, arena), try evalExpr(op.right, row, arena), .neq),
-        .lt  => |op| return cmpOp(try evalExpr(op.left, row, arena), try evalExpr(op.right, row, arena), .lt),
-        .lte => |op| return cmpOp(try evalExpr(op.left, row, arena), try evalExpr(op.right, row, arena), .lte),
-        .gt  => |op| return cmpOp(try evalExpr(op.left, row, arena), try evalExpr(op.right, row, arena), .gt),
-        .gte => |op| return cmpOp(try evalExpr(op.left, row, arena), try evalExpr(op.right, row, arena), .gte),
+        .eq  => |op| return cmpOp(try evalExpr(op.left, row, lambda_val, arena), try evalExpr(op.right, row, lambda_val, arena), .eq),
+        .neq => |op| return cmpOp(try evalExpr(op.left, row, lambda_val, arena), try evalExpr(op.right, row, lambda_val, arena), .neq),
+        .lt  => |op| return cmpOp(try evalExpr(op.left, row, lambda_val, arena), try evalExpr(op.right, row, lambda_val, arena), .lt),
+        .lte => |op| return cmpOp(try evalExpr(op.left, row, lambda_val, arena), try evalExpr(op.right, row, lambda_val, arena), .lte),
+        .gt  => |op| return cmpOp(try evalExpr(op.left, row, lambda_val, arena), try evalExpr(op.right, row, lambda_val, arena), .gt),
+        .gte => |op| return cmpOp(try evalExpr(op.left, row, lambda_val, arena), try evalExpr(op.right, row, lambda_val, arena), .gte),
 
         // Logical
         .@"and" => |op| {
-            const l = try evalExpr(op.left,  row, arena);
+            const l = try evalExpr(op.left,  row, lambda_val, arena);
             if (l) |lv| if (lv.bool_u8 == 0) return Value{ .bool_u8 = 0 };
-            const r = try evalExpr(op.right, row, arena);
+            const r = try evalExpr(op.right, row, lambda_val, arena);
             if (l == null or r == null) return null;
             return Value{ .bool_u8 = if (l.?.bool_u8 != 0 and r.?.bool_u8 != 0) 1 else 0 };
         },
         .@"or" => |op| {
-            const l = try evalExpr(op.left,  row, arena);
+            const l = try evalExpr(op.left,  row, lambda_val, arena);
             if (l) |lv| if (lv.bool_u8 != 0) return Value{ .bool_u8 = 1 };
-            const r = try evalExpr(op.right, row, arena);
+            const r = try evalExpr(op.right, row, lambda_val, arena);
             // SQL three-valued OR truth table:
             //   TRUE  OR anything = TRUE  (handled by short-circuit above)
             //   FALSE OR FALSE    = FALSE
@@ -123,26 +130,26 @@ pub fn evalExpr(expr: Expr, row: []const ?Value, arena: std.mem.Allocator) anyer
             return Value{ .bool_u8 = if (lv != 0 or rv != 0) 1 else 0 };
         },
         .not => |op| {
-            const v = try evalExpr(op.operand, row, arena) orelse return null;
+            const v = try evalExpr(op.operand, row, lambda_val, arena) orelse return null;
             return Value{ .bool_u8 = if (v.bool_u8 == 0) 1 else 0 };
         },
 
         // IS NULL / IS NOT NULL
         .is_null     => |op| {
-            const v = try evalExpr(op.operand, row, arena);
+            const v = try evalExpr(op.operand, row, lambda_val, arena);
             return Value{ .bool_u8 = if (v == null) 1 else 0 };
         },
         .is_not_null => |op| {
-            const v = try evalExpr(op.operand, row, arena);
+            const v = try evalExpr(op.operand, row, lambda_val, arena);
             return Value{ .bool_u8 = if (v != null) 1 else 0 };
         },
 
         // String
-        .like     => |op| return strLike(try evalExpr(op.left, row, arena), try evalExpr(op.right, row, arena), false),
-        .not_like => |op| return strLike(try evalExpr(op.left, row, arena), try evalExpr(op.right, row, arena), true),
+        .like     => |op| return strLike(try evalExpr(op.left, row, lambda_val, arena), try evalExpr(op.right, row, lambda_val, arena), false),
+        .not_like => |op| return strLike(try evalExpr(op.left, row, lambda_val, arena), try evalExpr(op.right, row, lambda_val, arena), true),
         .concat   => |op| {
-            const l = (try evalExpr(op.left,  row, arena)) orelse return null;
-            const r = (try evalExpr(op.right, row, arena)) orelse return null;
+            const l = (try evalExpr(op.left,  row, lambda_val, arena)) orelse return null;
+            const r = (try evalExpr(op.right, row, lambda_val, arena)) orelse return null;
             const ls = l.toStr() orelse return null;
             const rs = r.toStr() orelse return null;
             const out = try std.fmt.allocPrint(arena, "{s}{s}", .{ ls, rs });
@@ -152,10 +159,10 @@ pub fn evalExpr(expr: Expr, row: []const ?Value, arena: std.mem.Allocator) anyer
         // CASE WHEN
         .case_when => |cw| {
             for (cw.when, cw.then) |when_expr, then_expr| {
-                const cond = try evalExpr(when_expr, row, arena) orelse continue;
-                if (cond.bool_u8 != 0) return evalExpr(then_expr, row, arena);
+                const cond = try evalExpr(when_expr, row, lambda_val, arena) orelse continue;
+                if (cond.bool_u8 != 0) return evalExpr(then_expr, row, lambda_val, arena);
             }
-            if (cw.else_expr) |e| return evalExpr(e, row, arena);
+            if (cw.else_expr) |e| return evalExpr(e, row, lambda_val, arena);
             return null;
         },
 
@@ -163,16 +170,16 @@ pub fn evalExpr(expr: Expr, row: []const ?Value, arena: std.mem.Allocator) anyer
         .agg_call => return error.AggCallInScalarContext,
 
         // Scalar function calls — dispatch by name.
-        .fn_call => |fc| return evalFnCall(fc, row, arena),
+        .fn_call => |fc| return evalFnCall(fc, row, lambda_val, arena),
 
         // Cast
         .cast => |c| {
-            const v = (try evalExpr(c.expr, row, arena)) orelse return null;
+            const v = (try evalExpr(c.expr, row, lambda_val, arena)) orelse return null;
             return castValue(v, c.to_type, arena);
         },
 
         // Dictionary function calls
-        .dict_call => |dc| return evalDictCall(dc, row, arena),
+        .dict_call => |dc| return evalDictCall(dc, row, lambda_val, arena),
     }
 }
 
@@ -264,14 +271,78 @@ pub fn likeMatch(s: []const u8, pattern: []const u8) bool {
 
 // ── Scalar function dispatch ──────────────────────────────────────────────────
 
-fn evalFnCall(fc: *const plan.FnCall, row: []const ?Value, arena: std.mem.Allocator) !?Value {
-    // Evaluate all arguments first.
-    const args = try arena.alloc(?Value, fc.args.len);
-    for (fc.args, 0..) |arg, i| {
-        args[i] = try evalExpr(arg, row, arena);
+fn evalFnCall(fc: *const plan.FnCall, row: []const ?Value, lambda_val: ?Value, arena: std.mem.Allocator) !?Value {
+    const name = fc.name;
+
+    // ── Lambda-aware array functions (must NOT pre-eval the lambda arg) ────────
+    if (std.mem.eql(u8, name, "arrayMap") or
+        std.mem.eql(u8, name, "arrayFilter") or
+        std.mem.eql(u8, name, "arrayExists"))
+    {
+        if (fc.args.len < 2) return null;
+        // args[0] must be a lambda expr; args[1] is the array expression
+        const lam = switch (fc.args[0]) {
+            .lambda => |l| l,
+            else => return null,
+        };
+        const arr_val = (try evalExpr(fc.args[1], row, lambda_val, arena)) orelse return null;
+        const arr = switch (arr_val) {
+            .array_string => |s| blk: {
+                // Convert [][]const u8 to []?Value for uniform processing
+                const vals = try arena.alloc(?Value, s.len);
+                for (s, 0..) |elem, i| vals[i] = Value{ .string = elem };
+                break :blk vals;
+            },
+            else => return null,
+        };
+
+        if (std.mem.eql(u8, name, "arrayMap")) {
+            const out = try arena.alloc([]const u8, arr.len);
+            for (arr, 0..) |elem_v, i| {
+                const mapped = (try evalExpr(lam.body.*, row, elem_v, arena)) orelse Value{ .string = "" };
+                out[i] = mapped.toStr() orelse try std.fmt.allocPrint(arena, "{d}", .{mapped.toF64() orelse 0.0});
+            }
+            return Value{ .array_string = out };
+        }
+
+        if (std.mem.eql(u8, name, "arrayFilter")) {
+            var out: std.ArrayListUnmanaged([]const u8) = .empty;
+            for (arr) |elem_v| {
+                const cond = (try evalExpr(lam.body.*, row, elem_v, arena)) orelse continue;
+                const keep = switch (cond) {
+                    .bool_u8 => |b| b != 0,
+                    .int64   => |i| i != 0,
+                    .string  => |s| s.len > 0,
+                    else => false,
+                };
+                if (keep) {
+                    const s = (elem_v orelse continue).toStr() orelse continue;
+                    try out.append(arena, s);
+                }
+            }
+            return Value{ .array_string = try out.toOwnedSlice(arena) };
+        }
+
+        if (std.mem.eql(u8, name, "arrayExists")) {
+            for (arr) |elem_v| {
+                const cond = (try evalExpr(lam.body.*, row, elem_v, arena)) orelse continue;
+                const hit = switch (cond) {
+                    .bool_u8 => |b| b != 0,
+                    .int64   => |i| i != 0,
+                    .string  => |s| s.len > 0,
+                    else => false,
+                };
+                if (hit) return Value{ .bool_u8 = 1 };
+            }
+            return Value{ .bool_u8 = 0 };
+        }
     }
 
-    const name = fc.name;
+    // Evaluate all arguments first (non-lambda path).
+    const args = try arena.alloc(?Value, fc.args.len);
+    for (fc.args, 0..) |arg, i| {
+        args[i] = try evalExpr(arg, row, lambda_val, arena);
+    }
 
     // String functions
     if (std.mem.eql(u8, name, "length") or std.mem.eql(u8, name, "char_length")) {
@@ -1181,7 +1252,7 @@ test "evalExpr literal" {
     const row: []const ?Value = &.{};
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const v = try evalExpr(.{ .lit_i64 = 42 }, row, arena.allocator());
+    const v = try evalExpr(.{ .lit_i64 = 42 }, row, null, arena.allocator());
     try std.testing.expectEqual(Value{ .int64 = 42 }, v.?);
 }
 
@@ -1193,7 +1264,7 @@ test "evalExpr comparison" {
         .left  = .{ .col_ref = .{ .index = 0, .name = "a" } },
         .right = .{ .col_ref = .{ .index = 1, .name = "b" } },
     };
-    const v = try evalExpr(.{ .gt = &gt_expr }, &row, arena.allocator());
+    const v = try evalExpr(.{ .gt = &gt_expr }, &row, null, arena.allocator());
     try std.testing.expectEqual(Value{ .bool_u8 = 1 }, v.?);
 }
 
@@ -1216,7 +1287,7 @@ test "evalFnCall: substring" {
             .{ .lit_i64 = 5 },
         }),
     };
-    const v = try evalExpr(.{ .fn_call = &fc }, &row, arena.allocator());
+    const v = try evalExpr(.{ .fn_call = &fc }, &row, null, arena.allocator());
     try std.testing.expectEqualStrings("world", v.?.string);
 }
 
@@ -1231,7 +1302,7 @@ test "evalFnCall: startsWith" {
             .{ .lit_str = "::ffff:" },
         }),
     };
-    const v = try evalExpr(.{ .fn_call = &fc }, &row, arena.allocator());
+    const v = try evalExpr(.{ .fn_call = &fc }, &row, null, arena.allocator());
     try std.testing.expectEqual(Value{ .bool_u8 = 1 }, v.?);
 }
 
@@ -1241,8 +1312,8 @@ test "evalFnCall: floor and round" {
     const row = [_]Value{ .{ .float64 = 3.7 } };
     var fc_floor = plan.FnCall{ .name = "floor", .args = @constCast(&[_]plan.Expr{ .{ .col_ref = .{ .index = 0, .name = "x" } } }) };
     var fc_round = plan.FnCall{ .name = "round", .args = @constCast(&[_]plan.Expr{ .{ .col_ref = .{ .index = 0, .name = "x" } } }) };
-    const vf = try evalExpr(.{ .fn_call = &fc_floor }, &row, arena.allocator());
-    const vr = try evalExpr(.{ .fn_call = &fc_round }, &row, arena.allocator());
+    const vf = try evalExpr(.{ .fn_call = &fc_floor }, &row, null, arena.allocator());
+    const vr = try evalExpr(.{ .fn_call = &fc_round }, &row, null, arena.allocator());
     try std.testing.expectEqual(Value{ .float64 = 3.0 }, vf.?);
     try std.testing.expectEqual(Value{ .float64 = 4.0 }, vr.?);
 }
@@ -1262,24 +1333,24 @@ test "evalFnCall: multiIf" {
         }),
     };
     _ = row;
-    const v = try evalExpr(.{ .fn_call = &fc }, &.{}, arena.allocator());
+    const v = try evalExpr(.{ .fn_call = &fc }, &.{}, null, arena.allocator());
     try std.testing.expectEqualStrings("mid", v.?.string);
 }
 
 // ── Dictionary function evaluation ───────────────────────────────────────────
 
-fn evalDictCall(dc: *const plan.DictCall, row: []const ?Value, arena: std.mem.Allocator) !?Value {
+fn evalDictCall(dc: *const plan.DictCall, row: []const ?Value, lambda_val: ?Value, arena: std.mem.Allocator) !?Value {
     const store = dict_store orelse {
         // No dict store — return safe defaults.
         if (std.mem.eql(u8, dc.fn_name, "dictHas")) return Value{ .bool_u8 = 0 };
-        if (dc.default_expr) |de| return evalExpr(de, row, arena);
+        if (dc.default_expr) |de| return evalExpr(de, row, lambda_val, arena);
         return Value{ .string = "" };
     };
 
     // Evaluate key expressions to strings.
     const key_strs = try arena.alloc([:0]const u8, dc.keys.len);
     for (dc.keys, 0..) |key_expr, i| {
-        const kv = try evalExpr(key_expr, row, arena);
+        const kv = try evalExpr(key_expr, row, lambda_val, arena);
         const ks = if (kv) |v| v.toStr() orelse "" else "";
         key_strs[i] = try arena.dupeZ(u8, ks);
     }
@@ -1297,7 +1368,7 @@ fn evalDictCall(dc: *const plan.DictCall, row: []const ?Value, arena: std.mem.Al
 
     // dictGet / dictGetOrDefault / dictGetOrNull
     const get_fn = dict_get_fn orelse {
-        if (dc.default_expr) |de| return evalExpr(de, row, arena);
+        if (dc.default_expr) |de| return evalExpr(de, row, lambda_val, arena);
         return null;
     };
     const attr_namez = try arena.dupeZ(u8, dc.attr_name orelse "");
@@ -1309,7 +1380,7 @@ fn evalDictCall(dc: *const plan.DictCall, row: []const ?Value, arena: std.mem.Al
         return Value{ .string = out };
     }
     // No result — return default or null.
-    if (dc.default_expr) |de| return evalExpr(de, row, arena);
+    if (dc.default_expr) |de| return evalExpr(de, row, lambda_val, arena);
     return null;
 }
 
@@ -1320,7 +1391,7 @@ test "evalFnCall: IPv4StringToNumOrDefault" {
         .name = "IPv4StringToNumOrDefault",
         .args = @constCast(&[_]plan.Expr{ .{ .lit_str = "1.2.3.4" } }),
     };
-    const v = try evalExpr(.{ .fn_call = &fc }, &.{}, arena.allocator());
+    const v = try evalExpr(.{ .fn_call = &fc }, &.{}, null, arena.allocator());
     // 1*16777216 + 2*65536 + 3*256 + 4 = 16909060
     try std.testing.expectEqual(Value{ .uint64 = 16909060 }, v.?);
 }
@@ -1330,7 +1401,7 @@ test "evalFnCall: toYYYYMMDD" {
     defer arena.deinit();
     // 1970-01-01 = day 0
     var fc = plan.FnCall{ .name = "toYYYYMMDD", .args = @constCast(&[_]plan.Expr{ .{ .lit_i64 = 0 } }) };
-    const v = try evalExpr(.{ .fn_call = &fc }, &.{}, arena.allocator());
+    const v = try evalExpr(.{ .fn_call = &fc }, &.{}, null, arena.allocator());
     try std.testing.expectEqual(Value{ .uint64 = 19700101 }, v.?);
 }
 

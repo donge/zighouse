@@ -95,7 +95,7 @@ pub const FilterState = struct {
         for (0..c.num_rows) |r| {
             // Build row value slice.
             const row = try c.readRow(r, alloc);
-            const v = try kernels.evalExpr(self.predicate, row, alloc);
+            const v = try kernels.evalExpr(self.predicate, row, null, alloc);
             const keep = if (v) |val| val.bool_u8 != 0 else false;
             if (keep and write_pos == r) {
                 write_pos += 1; // no copy needed
@@ -149,7 +149,7 @@ pub const ProjectState = struct {
         for (0..n) |r| {
             const row = try c.readRow(r, alloc);
             for (self.items, 0..) |item, ci| {
-                const v_opt = try kernels.evalExpr(item.expr, row, alloc);
+                const v_opt = try kernels.evalExpr(item.expr, row, null, alloc);
                 if (v_opt) |v| {
                     setColumnValue(&out_cols[ci].data, r, v);
                 } else {
@@ -408,7 +408,7 @@ fn executeNode(node: *const plan.PhysicalNode, ctx: *QueryContext) !RowList {
             const inner = try executeNode(f.input, ctx);
             var rl = RowList.init(inner.metas);
             for (inner.rows.items) |row| {
-                const v_opt = try kernels.evalExpr(f.predicate, row, alloc);
+                const v_opt = try kernels.evalExpr(f.predicate, row, null, alloc);
                 const keep = valueToBool(v_opt);
                 if (keep) try rl.append(alloc, row);
             }
@@ -494,7 +494,7 @@ fn projectRowList(inner: RowList, items: []const plan.ProjectItem, alloc: std.me
     for (inner.rows.items) |row| {
         const new_row = try alloc.alloc(?Value, items.len);
         for (items, 0..) |item, ci| {
-            const v_opt = try kernels.evalExpr(item.expr, row, alloc);
+            const v_opt = try kernels.evalExpr(item.expr, row, null, alloc);
             new_row[ci] = v_opt;
         }
         try rl.append(alloc, new_row);
@@ -543,7 +543,7 @@ fn executeHashAgg(
     const key_buf = try alloc.alloc(Value, keys.len);
     for (inner.rows.items) |row| {
         for (keys, 0..) |k, ki| {
-            const v = try kernels.evalExpr(k.expr, row, alloc);
+            const v = try kernels.evalExpr(k.expr, row, null, alloc);
             key_buf[ki] = v orelse Value{ .int64 = 0 }; // NULL → zero sentinel for hashing
         }
         const bucket = try ht_agg.getOrInsert(key_buf, init_accums);
@@ -656,7 +656,7 @@ fn executeHashJoin(
             @memcpy(combined[0..lrow.len], lrow);
             @memcpy(combined[lrow.len..lrow.len + rrow.len], rrow);
             if (hj.filter) |filt| {
-                const keep_v = try kernels.evalExpr(filt, combined, alloc);
+                const keep_v = try kernels.evalExpr(filt, combined, null, alloc);
                 if (!valueToBool(keep_v)) continue;
             }
             try rl.append(alloc, combined);
@@ -685,8 +685,8 @@ fn initAccumForAgg(expr: plan.Expr) AggAccum {
 
 fn evalAggArg(expr: plan.Expr, row: []const ?Value, alloc: std.mem.Allocator) !?Value {
     return switch (expr) {
-        .agg_call => |ac| if (ac.arg) |arg| kernels.evalExpr(arg, row, alloc) else null,
-        else => kernels.evalExpr(expr, row, alloc),
+        .agg_call => |ac| if (ac.arg) |arg| kernels.evalExpr(arg, row, null, alloc) else null,
+        else => kernels.evalExpr(expr, row, null, alloc),
     };
 }
 
