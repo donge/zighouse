@@ -874,17 +874,27 @@ fn prattExpr(pctx: *ParseCtx, min_bp: u8) anyerror!?Expr {
 
         // Array literal: ['a', 'b', ...] — only string elements supported
         .lbracket => blk_arr: {
-            var elems: std.ArrayListUnmanaged([]const u8) = .empty;
-            // empty array: CAST([], ...) — both are supported
+            // empty array: [] → lit_array &.{}
             if (pctx.lex.peek().kind == .rbracket) {
                 _ = pctx.lex.next();
                 break :blk_arr Expr{ .lit_array = &.{} };
             }
+            // Parse elements as full Pratt expressions.
+            // Pure string-literal arrays → lit_array.
+            // Arrays with column refs / fn_calls → arrayConcat(e1,e2,…).
+            var str_elems: std.ArrayListUnmanaged([]const u8) = .empty;
+            var expr_elems: std.ArrayListUnmanaged(Expr) = .empty;
+            var all_str = true;
             while (true) {
-                const elem_tok = pctx.lex.next();
-                if (elem_tok.kind != .str_lit) return null;
-                const s = if (elem_tok.text.len >= 2) elem_tok.text[1..elem_tok.text.len - 1] else elem_tok.text;
-                try elems.append(pctx.arena, s);
+                const elem = try prattExpr(pctx, 1) orelse {
+                    all_str = false;
+                    break;
+                };
+                switch (elem) {
+                    .lit_str => |s| try str_elems.append(pctx.arena, s),
+                    else     => all_str = false,
+                }
+                try expr_elems.append(pctx.arena, elem);
                 const sep = pctx.lex.peek();
                 if (sep.kind == .comma) {
                     _ = pctx.lex.next();
@@ -894,8 +904,16 @@ fn prattExpr(pctx: *ParseCtx, min_bp: u8) anyerror!?Expr {
             }
             const rb = pctx.lex.next();
             if (rb.kind != .rbracket) return null;
-            const arr = try elems.toOwnedSlice(pctx.arena);
-            break :blk_arr Expr{ .lit_array = arr };
+            if (expr_elems.items.len == 0) break :blk_arr Expr{ .lit_array = &.{} };
+            if (all_str) {
+                const arr = try str_elems.toOwnedSlice(pctx.arena);
+                break :blk_arr Expr{ .lit_array = arr };
+            }
+            // Column-ref or mixed → arrayConcat(e1, e2, …)
+            const fc = try pctx.arena.create(plan.FnCall);
+            const args = try expr_elems.toOwnedSlice(pctx.arena);
+            fc.* = .{ .name = "arrayConcat", .args = args };
+            break :blk_arr Expr{ .fn_call = fc };
         },
 
         // CASE [WHEN cond THEN val]… [ELSE val] END → multiIf(cond1,val1,…,else)
