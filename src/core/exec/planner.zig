@@ -26,10 +26,15 @@ pub const SortKey       = plan.SortKey;
 
 /// All allocations go into a single arena that lives for the duration
 /// of the query.  The caller is responsible for freeing the arena.
+pub const VirtualCol = struct { name: []const u8, idx: usize, col_type: ColumnType };
+
 pub const PlannerCtx = struct {
     alloc: std.mem.Allocator,
     /// The schema of the table being scanned.
     tbl: ?schema_mod.Table,
+    /// Virtual columns from the agg output (alias → output index).
+    /// Used to resolve __ha__* references in post-agg scalar projections.
+    virtual_cols: []const VirtualCol = &.{},
 
     pub fn init(alloc: std.mem.Allocator, tbl: ?schema_mod.Table) PlannerCtx {
         return .{ .alloc = alloc, .tbl = tbl };
@@ -181,18 +186,29 @@ pub fn plan_query(
             source = agg_node;
         } else {
             // ── Normal aggregation (no ARRAY JOIN helpers) ────────────────
+            // Non-agg projections whose column text references "__ha__*" aliases
+            // are "post-agg scalars" — they must be evaluated after the agg node.
+            var post_agg_projs_list: std.ArrayListUnmanaged(generic_sql.Expr) = .empty;
             for (projs) |p| {
                 if (isAggregate(p.func)) {
                     const item = try aggExprToProjectItem(ctx, p) orelse return null;
                     try agg_items_list.append(ctx.alloc, item);
                 } else {
-                    const item = try scalarExprToProjectItem(ctx, p) orelse return null;
-                    try key_items_list.append(ctx.alloc, item);
+                    // Check if column text contains "__ha__" (post-agg scalar reference).
+                    const col_text = p.column orelse "";
+                    const has_ha = std.mem.indexOf(u8, col_text, "__ha__") != null;
+                    if (has_ha) {
+                        try post_agg_projs_list.append(ctx.alloc, p);
+                    } else {
+                        const item = try scalarExprToProjectItem(ctx, p) orelse return null;
+                        try key_items_list.append(ctx.alloc, item);
+                    }
                 }
             }
 
             const key_items = try key_items_list.toOwnedSlice(ctx.alloc);
             const agg_items = try agg_items_list.toOwnedSlice(ctx.alloc);
+            const post_agg_projs = try post_agg_projs_list.toOwnedSlice(ctx.alloc);
 
             const agg_node = try ctx.alloc.create(PhysicalNode);
             if (key_items.len == 0) {
@@ -205,6 +221,65 @@ pub fn plan_query(
                 }};
             }
             source = agg_node;
+
+            // If there are post-agg scalar projections (e.g. display_risk = 1 - __ha__max_conf),
+            // build a post-project node after the agg_node.
+            // The agg output columns are: [key_items..., agg_items...].
+            // We populate virtual_cols so resolveColExpr can find them by name.
+            if (post_agg_projs.len > 0) {
+                // Build virtual column list from agg output.
+                var vcols_list: std.ArrayListUnmanaged(VirtualCol) = .empty;
+                for (key_items, 0..) |ki, i| {
+                    try vcols_list.append(ctx.alloc, .{
+                        .name = ki.alias,
+                        .idx = i,
+                        .col_type = ki.out_type,
+                    });
+                }
+                for (agg_items, 0..) |ai, i| {
+                    try vcols_list.append(ctx.alloc, .{
+                        .name = ai.alias,
+                        .idx = key_items.len + i,
+                        .col_type = ai.out_type,
+                    });
+                }
+                ctx.virtual_cols = try vcols_list.toOwnedSlice(ctx.alloc);
+                defer { ctx.virtual_cols = &.{}; } // reset after this block
+
+                // Build post-project items: all key_items (as pass-through col refs)
+                // plus the post-agg scalar expressions (which reference __ha__* cols).
+                var post_items_list: std.ArrayListUnmanaged(ProjectItem) = .empty;
+                // Pass through key_items (GROUP BY cols) first.
+                for (key_items, 0..) |ki, i| {
+                    const ref = try ctx.alloc.create(plan.ColRef);
+                    ref.* = .{ .index = i, .name = ki.alias };
+                    try post_items_list.append(ctx.alloc, .{
+                        .expr = Expr{ .col_ref = ref.* },
+                        .alias = ki.alias,
+                        .out_type = ki.out_type,
+                    });
+                }
+                // Pass through agg_items as col refs (skip __ha__* hidden ones from final output).
+                for (agg_items, 0..) |ai, i| {
+                    if (std.mem.startsWith(u8, ai.alias, "__ha__")) continue;
+                    const ref = try ctx.alloc.create(plan.ColRef);
+                    ref.* = .{ .index = key_items.len + i, .name = ai.alias };
+                    try post_items_list.append(ctx.alloc, .{
+                        .expr = Expr{ .col_ref = ref.* },
+                        .alias = ai.alias,
+                        .out_type = ai.out_type,
+                    });
+                }
+                // Add post-agg scalar projections (using virtual_cols for __ha__* resolution).
+                for (post_agg_projs) |pp| {
+                    const item = try scalarExprToProjectItem(ctx, pp) orelse return null;
+                    try post_items_list.append(ctx.alloc, item);
+                }
+                const post_items = try post_items_list.toOwnedSlice(ctx.alloc);
+                const post_proj_node = try ctx.alloc.create(PhysicalNode);
+                post_proj_node.* = .{ .project = .{ .input = source, .items = post_items } };
+                source = post_proj_node;
+            }
         }
 
         // HAVING → post-agg filter (where_text not supported in IR path)
@@ -499,7 +574,12 @@ fn resolveColExpr(ctx: *PlannerCtx, col: []const u8) ?Expr {
              return Expr{ .col_ref = .{ .index = idx, .name = col } };
          }
     }
-    // Unknown column — return null so the caller falls back to generic_executor.
+    // Unknown column — check virtual columns (agg output) before giving up.
+    for (ctx.virtual_cols) |vc| {
+        if (std.mem.eql(u8, vc.name, col)) {
+            return Expr{ .col_ref = .{ .index = vc.idx, .name = col } };
+        }
+    }
     return null;
 }
 
