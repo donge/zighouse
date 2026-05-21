@@ -601,6 +601,72 @@ fn evalFnCall(fc: *const plan.FnCall, row: []const ?Value, arena: std.mem.Alloca
         }
         return Value{ .string = "" };
     }
+    // Map(String,Float64) blob: varint(N) + N×(varint_klen+key) + N×f64_le
+    if (std.mem.eql(u8, name, "mapGetFloat64")) {
+        const blob = (args[0] orelse return Value{ .float64 = 0.0 }).toStr() orelse return Value{ .float64 = 0.0 };
+        const key  = (args[1] orelse return Value{ .float64 = 0.0 }).toStr() orelse return Value{ .float64 = 0.0 };
+        if (blob.len == 0) return Value{ .float64 = 0.0 };
+        const readVarUInt = struct {
+            fn f(data: []const u8) ?struct { val: u64, adv: usize } {
+                var v: u64 = 0; var shift: u6 = 0; var i: usize = 0;
+                while (i < data.len and i < 9) {
+                    const b = data[i]; i += 1;
+                    v |= (@as(u64, b & 0x7F)) << shift;
+                    if (b & 0x80 == 0) return .{ .val = v, .adv = i };
+                    shift += 7;
+                }
+                return null;
+            }
+        }.f;
+        const cnt_r = readVarUInt(blob) orelse return Value{ .float64 = 0.0 };
+        const count = @as(usize, @intCast(cnt_r.val));
+        var kp: usize = cnt_r.adv;
+        var match_idx: ?usize = null;
+        for (0..count) |i| {
+            const kr = readVarUInt(blob[kp..]) orelse return Value{ .float64 = 0.0 };
+            const klen = @as(usize, @intCast(kr.val));
+            kp += kr.adv;
+            if (kp + klen > blob.len) return Value{ .float64 = 0.0 };
+            const k = blob[kp .. kp + klen];
+            if (match_idx == null and std.mem.eql(u8, k, key)) match_idx = i;
+            kp += klen;
+        }
+        if (match_idx == null) return Value{ .float64 = 0.0 };
+        // values start at kp; each is 8 bytes f64
+        const val_offset = kp + match_idx.? * 8;
+        if (val_offset + 8 > blob.len) return Value{ .float64 = 0.0 };
+        const bits = std.mem.readInt(u64, blob[val_offset..][0..8], .little);
+        return Value{ .float64 = @bitCast(bits) };
+    }
+    if (std.mem.eql(u8, name, "mapKeysFloat64")) {
+        const blob = (args[0] orelse return Value{ .array_string = &.{} }).toStr() orelse return Value{ .array_string = &.{} };
+        if (blob.len == 0) return Value{ .array_string = &.{} };
+        const readVarUInt = struct {
+            fn f(data: []const u8) ?struct { val: u64, adv: usize } {
+                var v: u64 = 0; var shift: u6 = 0; var i: usize = 0;
+                while (i < data.len and i < 9) {
+                    const b = data[i]; i += 1;
+                    v |= (@as(u64, b & 0x7F)) << shift;
+                    if (b & 0x80 == 0) return .{ .val = v, .adv = i };
+                    shift += 7;
+                }
+                return null;
+            }
+        }.f;
+        const cnt_r = readVarUInt(blob) orelse return Value{ .array_string = &.{} };
+        const count = @as(usize, @intCast(cnt_r.val));
+        const keys = try arena.alloc([]const u8, count);
+        var kp: usize = cnt_r.adv;
+        for (0..count) |i| {
+            const kr = readVarUInt(blob[kp..]) orelse return Value{ .array_string = &.{} };
+            const klen = @as(usize, @intCast(kr.val));
+            kp += kr.adv;
+            if (kp + klen > blob.len) return Value{ .array_string = &.{} };
+            keys[i] = blob[kp .. kp + klen];
+            kp += klen;
+        }
+        return Value{ .array_string = keys };
+    }
     if (std.mem.eql(u8, name, "splitByChar")) {
         const delim = (args[0] orelse return null).toStr() orelse return null;
         const s     = (args[1] orelse return null).toStr() orelse return null;

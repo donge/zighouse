@@ -1138,7 +1138,23 @@ fn prattExpr(pctx: *ParseCtx, min_bp: u8) anyerror!?Expr {
 
                 const fc = try pctx.arena.create(plan.FnCall);
                 // Normalize the function name to canonical casing that kernels.zig expects.
-                fc.* = .{ .name = canonFnName(name), .args = args_slice };
+                var canon = canonFnName(name);
+                // mapKeys/mapValues on Map(String,Float64) → use Float64 variant
+                if (std.mem.eql(u8, canon, "mapKeys") and args_slice.len == 1) {
+                    if (args_slice[0] == .col_ref) {
+                        if (pctx.plan_ctx.tbl) |tbl| {
+                            if (tbl.findColumn(args_slice[0].col_ref.name)) |idx| {
+                                if (tbl.columns[idx].ch_type) |ch| {
+                                    if (std.mem.startsWith(u8, ch, "Map(") and
+                                        (std.mem.indexOf(u8, ch, "Float64") != null or
+                                         std.mem.indexOf(u8, ch, "Float32") != null))
+                                        canon = "mapKeysFloat64";
+                                }
+                            }
+                        }
+                    }
+                }
+                fc.* = .{ .name = canon, .args = args_slice };
                 break :blk Expr{ .fn_call = fc };
             }
 
@@ -1191,7 +1207,7 @@ fn prattExpr(pctx: *ParseCtx, min_bp: u8) anyerror!?Expr {
             continue;
         }
 
-        // MAP SUBSCRIPT: lhs['key']  →  mapGet(lhs, key)
+        // MAP SUBSCRIPT: lhs['key']  →  mapGet(lhs, key) or mapGetFloat64(lhs, key)
         if (op.kind == .lbracket) {
             _ = pctx.lex.next(); // consume '['
             const key_tok = pctx.lex.next();
@@ -1203,7 +1219,23 @@ fn prattExpr(pctx: *ParseCtx, min_bp: u8) anyerror!?Expr {
             const fc_args = try pctx.arena.alloc(Expr, 2);
             fc_args[0] = lhs;
             fc_args[1] = Expr{ .lit_str = key_str };
-            fc.* = .{ .name = "mapGet", .args = fc_args };
+            // Choose function based on map value type
+            const fn_name = blk: {
+                if (lhs == .col_ref) {
+                    if (pctx.plan_ctx.tbl) |tbl| {
+                        if (tbl.findColumn(lhs.col_ref.name)) |idx| {
+                            if (tbl.columns[idx].ch_type) |ch| {
+                                if (std.mem.startsWith(u8, ch, "Map(") and
+                                    (std.mem.indexOf(u8, ch, "Float64") != null or
+                                     std.mem.indexOf(u8, ch, "Float32") != null))
+                                    break :blk "mapGetFloat64";
+                            }
+                        }
+                    }
+                }
+                break :blk "mapGet";
+            };
+            fc.* = .{ .name = fn_name, .args = fc_args };
             lhs = Expr{ .fn_call = fc };
             continue;
         }
@@ -1278,6 +1310,7 @@ fn inferExprType(ctx: *PlannerCtx, expr: Expr) ColumnType {
             if (std.mem.eql(u8, fc.name, "splitByChar") or
                 std.mem.eql(u8, fc.name, "splitByString") or
                 std.mem.eql(u8, fc.name, "mapKeys") or
+                std.mem.eql(u8, fc.name, "mapKeysFloat64") or
                 std.mem.eql(u8, fc.name, "mapValues") or
                 std.mem.eql(u8, fc.name, "arrayConcat") or
                 std.mem.eql(u8, fc.name, "arrayDistinct") or
@@ -1288,6 +1321,7 @@ fn inferExprType(ctx: *PlannerCtx, expr: Expr) ColumnType {
             if (std.mem.eql(u8, fc.name, "substring") or std.mem.eql(u8, fc.name, "substr")) return .string;
             if (std.mem.eql(u8, fc.name, "startsWith") or std.mem.eql(u8, fc.name, "endsWith")) return .bool_u8;
             if (std.mem.eql(u8, fc.name, "mapGet")) return .string;
+            if (std.mem.eql(u8, fc.name, "mapGetFloat64")) return .float64;
             if (std.mem.eql(u8, fc.name, "if") or std.mem.eql(u8, fc.name, "multiIf")) {
                 if (fc.args.len >= 2) return inferExprType(ctx, fc.args[1]);
             }
