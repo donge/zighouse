@@ -1560,19 +1560,22 @@ fn aggExprToProjectItem(ctx: *PlannerCtx, p: generic_sql.Expr) !?ProjectItem {
             return ProjectItem{ .expr = .{ .agg_call = agg_call }, .alias = alias, .out_type = out_type };
         },
         .avg => {
-            const arg_expr = resolveColExpr(ctx, col_name) orelse return null;
+            const arg_expr = resolveColExpr(ctx, col_name) orelse
+                (try parseArithExpr(ctx, col_name)) orelse return null;
             agg_call.* = .{ .kind = .avg, .arg = arg_expr, .distinct = false };
             return ProjectItem{ .expr = .{ .agg_call = agg_call }, .alias = alias, .out_type = .float64 };
         },
         .min => {
-            const col_type = schemaColType(ctx, col_name);
-            const arg_expr = resolveColExpr(ctx, col_name) orelse return null;
+            const arg_expr = resolveColExpr(ctx, col_name) orelse
+                (try parseArithExpr(ctx, col_name)) orelse return null;
+            const col_type = inferExprType(ctx, arg_expr);
             agg_call.* = .{ .kind = .min, .arg = arg_expr, .distinct = false };
             return ProjectItem{ .expr = .{ .agg_call = agg_call }, .alias = alias, .out_type = col_type };
         },
         .max => {
-            const col_type = schemaColType(ctx, col_name);
-            const arg_expr = resolveColExpr(ctx, col_name) orelse return null;
+            const arg_expr = resolveColExpr(ctx, col_name) orelse
+                (try parseArithExpr(ctx, col_name)) orelse return null;
+            const col_type = inferExprType(ctx, arg_expr);
             agg_call.* = .{ .kind = .max, .arg = arg_expr, .distinct = false };
             return ProjectItem{ .expr = .{ .agg_call = agg_call }, .alias = alias, .out_type = col_type };
         },
