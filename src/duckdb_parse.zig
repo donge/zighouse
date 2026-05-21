@@ -475,8 +475,11 @@ fn translateWhere(allocator: std.mem.Allocator, val: std.json.Value) !*generic_s
         const left  = obj.get("left").?;
         const right = obj.get("right").?;
 
-        const col_name = columnName(left) orelse return error.UnsupportedWhereNode;
-        const col = try allocator.dupe(u8, col_name);
+        const col_name: []const u8 = if (columnName(left)) |cn|
+            try allocator.dupe(u8, cn)
+        else
+            try exprToText(allocator, left) orelse return error.UnsupportedWhereNode;
+        const col = col_name;
         errdefer allocator.free(col);
 
         // right is integer constant
