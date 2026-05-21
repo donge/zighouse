@@ -344,6 +344,42 @@ fn evalFnCall(fc: *const plan.FnCall, row: []const ?Value, lambda_val: ?Value, a
         args[i] = try evalExpr(arg, row, lambda_val, arena);
     }
 
+    // Logical operators encoded as fn_call by the planner
+    if (std.mem.eql(u8, name, "and")) {
+        if (args.len < 2) return null;
+        const isTruthy = struct {
+            fn check(v: ?Value) bool {
+                return switch (v orelse return false) {
+                    .bool_u8 => |b| b != 0,
+                    .int64   => |i| i != 0,
+                    .uint64  => |u| u != 0,
+                    .float64 => |f| f != 0.0,
+                    .string  => |s| s.len > 0,
+                    else => false,
+                };
+            }
+        }.check;
+        for (args) |a| { if (!isTruthy(a)) return Value{ .bool_u8 = 0 }; }
+        return Value{ .bool_u8 = 1 };
+    }
+    if (std.mem.eql(u8, name, "or")) {
+        if (args.len < 2) return null;
+        const isTruthy = struct {
+            fn check(v: ?Value) bool {
+                return switch (v orelse return false) {
+                    .bool_u8 => |b| b != 0,
+                    .int64   => |i| i != 0,
+                    .uint64  => |u| u != 0,
+                    .float64 => |f| f != 0.0,
+                    .string  => |s| s.len > 0,
+                    else => false,
+                };
+            }
+        }.check;
+        for (args) |a| { if (isTruthy(a)) return Value{ .bool_u8 = 1 }; }
+        return Value{ .bool_u8 = 0 };
+    }
+
     // String functions
     if (std.mem.eql(u8, name, "length") or std.mem.eql(u8, name, "char_length")) {
         const v = args[0] orelse return null;

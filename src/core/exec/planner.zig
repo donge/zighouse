@@ -738,6 +738,7 @@ fn canonFnName(name: []const u8) []const u8 {
         "has", "hasAny", "hasAll",
         "arrayConcat", "arrayDistinct", "arrayFlatten", "arrayReverse",
         "arraySlice", "arrayMax", "arrayMin",
+        "arrayMap", "arrayFilter", "arrayExists",
         "mapKeys", "mapValues",
         "tuple",
     };
@@ -1354,6 +1355,9 @@ fn inferExprType(ctx: *PlannerCtx, expr: Expr) ColumnType {
             if (std.mem.eql(u8, fc.name, "startsWith") or std.mem.eql(u8, fc.name, "endsWith")) return .bool_u8;
             if (std.mem.eql(u8, fc.name, "mapGet")) return .string;
             if (std.mem.eql(u8, fc.name, "mapGetFloat64")) return .float64;
+            if (std.mem.eql(u8, fc.name, "arrayExists")) return .bool_u8;
+            if (std.mem.eql(u8, fc.name, "arrayMap") or std.mem.eql(u8, fc.name, "arrayFilter")) return .array_string;
+            if (std.mem.eql(u8, fc.name, "and") or std.mem.eql(u8, fc.name, "or")) return .uint64;
             if (std.mem.eql(u8, fc.name, "if") or std.mem.eql(u8, fc.name, "multiIf")) {
                 if (fc.args.len >= 2) return inferExprType(ctx, fc.args[1]);
             }
