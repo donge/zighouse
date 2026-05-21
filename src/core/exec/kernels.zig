@@ -295,6 +295,11 @@ fn evalFnCall(fc: *const plan.FnCall, row: []const ?Value, arena: std.mem.Alloca
     }
     if (std.mem.eql(u8, name, "toString") or std.mem.eql(u8, name, "CAST_str")) {
         const v = args[0] orelse return null;
+        // FixedString(16) IPv6: raw 16 bytes → format as IPv6 address string
+        if (v == .string and v.string.len == 16) {
+            return Value{ .string = try ipv6BytesToStr(v.string, arena) };
+        }
+        if (v.toStr()) |s| return Value{ .string = s };
         const out = try std.fmt.allocPrint(arena, "{}", .{v});
         return Value{ .string = out };
     }
@@ -993,6 +998,60 @@ fn parseIPv4(s: []const u8) ?u64 {
 fn isIPv6(s: []const u8) bool {
     return std.mem.indexOfScalar(u8, s, ':') != null and
            std.mem.indexOfScalar(u8, s, '.') == null;
+}
+
+/// Format 16 raw bytes as an IPv6 address string (RFC 5952 / ClickHouse format).
+/// IPv4-mapped addresses (::ffff:x.x.x.x) use mixed notation.
+fn ipv6BytesToStr(bytes: []const u8, arena: std.mem.Allocator) ![]const u8 {
+    if (bytes.len != 16) return bytes;
+
+    // IPv4-mapped: first 10 bytes zero, bytes 10-11 = 0xff 0xff
+    const is_ipv4_mapped = blk: {
+        for (bytes[0..10]) |b| if (b != 0) break :blk false;
+        break :blk bytes[10] == 0xff and bytes[11] == 0xff;
+    };
+    if (is_ipv4_mapped) {
+        return std.fmt.allocPrint(arena, "::ffff:{d}.{d}.{d}.{d}", .{
+            bytes[12], bytes[13], bytes[14], bytes[15],
+        });
+    }
+
+    // Build groups of 16-bit words
+    var groups: [8]u16 = undefined;
+    for (&groups, 0..) |*g, i| {
+        g.* = (@as(u16, bytes[i * 2]) << 8) | bytes[i * 2 + 1];
+    }
+    // Find longest run of consecutive zero groups (length >= 2) for :: compression
+    var best_start: usize = 8; // 8 = none
+    var best_len: usize = 0;
+    var run_start: usize = 0;
+    var run_len: usize = 0;
+    for (groups, 0..) |g, i| {
+        if (g == 0) {
+            if (run_len == 0) run_start = i;
+            run_len += 1;
+            if (run_len > best_len and run_len >= 2) { best_len = run_len; best_start = run_start; }
+        } else {
+            run_len = 0;
+        }
+    }
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    var i: usize = 0;
+    var after_dc = false;
+    while (i < 8) {
+        if (best_len >= 2 and i == best_start) {
+            try buf.appendSlice(arena, "::");
+            i += best_len;
+            after_dc = true;
+            continue;
+        }
+        if (i > 0 and !after_dc) try buf.append(arena, ':');
+        after_dc = false;
+        const hex = try std.fmt.allocPrint(arena, "{x}", .{groups[i]});
+        try buf.appendSlice(arena, hex);
+        i += 1;
+    }
+    return buf.toOwnedSlice(arena);
 }
 
 fn castValue(v: Value, to: ColumnType, arena: std.mem.Allocator) !?Value {

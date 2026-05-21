@@ -236,7 +236,8 @@ fn outputLen(node: *const PhysicalNode) usize {
 fn whereNodeToExpr(ctx: *PlannerCtx, wn: *const generic_sql.WhereNode) ?Expr {
     switch (wn.*) {
         .cmp_int => |c| {
-            const col_expr = resolveColExpr(ctx, c.col) orelse return null;
+            const col_expr = resolveColExpr(ctx, c.col) orelse
+                (parseArithExpr(ctx, c.col) catch null) orelse return null;
             const binop = ctx.alloc.create(plan.BinOp) catch return null;
             binop.* = .{
                 .left  = col_expr,
@@ -252,7 +253,8 @@ fn whereNodeToExpr(ctx: *PlannerCtx, wn: *const generic_sql.WhereNode) ?Expr {
             };
         },
         .cmp_str => |c| {
-            const col_expr = resolveColExpr(ctx, c.col) orelse return null;
+            const col_expr = resolveColExpr(ctx, c.col) orelse
+                (parseArithExpr(ctx, c.col) catch null) orelse return null;
             const binop = ctx.alloc.create(plan.BinOp) catch return null;
             binop.* = .{
                 .left  = col_expr,
@@ -725,6 +727,11 @@ fn canonFnName(name: []const u8) []const u8 {
         "if", "multiIf",
         "substring", "substr", "startsWith", "endsWith",
         "mapGet",
+        "has", "hasAny", "hasAll",
+        "arrayConcat", "arrayDistinct", "arrayFlatten", "arrayReverse",
+        "arraySlice", "arrayMax", "arrayMin",
+        "mapKeys", "mapValues",
+        "tuple",
     };
     for (canon_names) |cn| {
         if (std.ascii.eqlIgnoreCase(cn, name)) return cn;
@@ -1001,20 +1008,14 @@ fn prattExpr(pctx: *ParseCtx, min_bp: u8) anyerror!?Expr {
                         }
                     }.do;
 
-                    // Helper: resolve CAST([], 'Array(String)') → lit_null as empty default
-                    const resolveDefault = struct {
-                        fn do(e: Expr) Expr {
-                            // CAST is parsed as fn_call{name="CAST_arr"} or falls back;
-                            // accept any fn_call starting with "CAST" as null/empty-array default
-                            switch (e) {
-                                .fn_call => |fc| {
-                                    if (std.ascii.startsWithIgnoreCase(fc.name, "CAST")) return Expr{ .lit_null = {} };
-                                },
-                                else => {},
-                            }
-                            return e;
-                        }
-                    }.do;
+                     // Helper: resolve CAST([], 'Array(String)') → lit_array &.{}
+                     // The Pratt parser now handles CAST([], ...) → lit_array directly.
+                     // This is a pass-through; kept for any fallback cases.
+                     const resolveDefault = struct {
+                         fn do(e: Expr) Expr {
+                             return e;
+                         }
+                     }.do;
 
                     const dc = try pctx.arena.create(plan.DictCall);
                     if (std.ascii.eqlIgnoreCase(name, "dictHas")) {
@@ -1082,22 +1083,28 @@ fn prattExpr(pctx: *ParseCtx, min_bp: u8) anyerror!?Expr {
                             std.ascii.eqlIgnoreCase(name, "substring") or
                             std.ascii.eqlIgnoreCase(name, "substr")) break :blk2 true;
                     }
+                    // substring/substr with 2 args (no length) — from position to end
+                    if (args_slice.len == 2 and (
+                        std.ascii.eqlIgnoreCase(name, "substring") or
+                        std.ascii.eqlIgnoreCase(name, "substr"))) break :blk2 true;
                     if (args_slice.len >= 2 and std.ascii.eqlIgnoreCase(name, "concat")) break :blk2 true;
                     if (args_slice.len >= 1 and std.ascii.eqlIgnoreCase(name, "tuple")) break :blk2 true;
                     if (args_slice.len >= 3 and std.ascii.eqlIgnoreCase(name, "multiIf")) break :blk2 true;
-                    // Array functions
+                    // Array functions (2-arg)
                     if (args_slice.len == 2 and (
                         std.ascii.eqlIgnoreCase(name, "has") or
                         std.ascii.eqlIgnoreCase(name, "hasAny") or
                         std.ascii.eqlIgnoreCase(name, "hasAll") or
                         std.ascii.eqlIgnoreCase(name, "arrayMax") or
-                        std.ascii.eqlIgnoreCase(name, "arrayMin") or
-                        std.ascii.eqlIgnoreCase(name, "arrayConcat") or
-                        std.ascii.eqlIgnoreCase(name, "arrayDistinct"))) break :blk2 true;
+                        std.ascii.eqlIgnoreCase(name, "arrayMin"))) break :blk2 true;
+                    // arrayConcat: 2 or more args
+                    if (args_slice.len >= 2 and std.ascii.eqlIgnoreCase(name, "arrayConcat")) break :blk2 true;
+                    // arrayDistinct: 1 or 2 args
+                    if (args_slice.len >= 1 and args_slice.len <= 2 and
+                        std.ascii.eqlIgnoreCase(name, "arrayDistinct")) break :blk2 true;
                     if (args_slice.len == 1 and (
                         std.ascii.eqlIgnoreCase(name, "mapKeys") or
                         std.ascii.eqlIgnoreCase(name, "mapValues") or
-                        std.ascii.eqlIgnoreCase(name, "arrayDistinct") or
                         std.ascii.eqlIgnoreCase(name, "arrayFlatten") or
                         std.ascii.eqlIgnoreCase(name, "arrayMax") or
                         std.ascii.eqlIgnoreCase(name, "arrayMin"))) break :blk2 true;
@@ -1264,6 +1271,11 @@ fn inferExprType(ctx: *PlannerCtx, expr: Expr) ColumnType {
         },
         .dict_call => |dc| {
             if (std.ascii.eqlIgnoreCase(dc.fn_name, "dictHas")) return .bool_u8;
+            // If the default expression is an array, the result is array_string
+            if (dc.default_expr) |de| {
+                const dt = inferExprType(ctx, de);
+                if (dt == .array_string) return .array_string;
+            }
             return .string;
         },
         else => .float64,
