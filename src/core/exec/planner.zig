@@ -739,6 +739,7 @@ fn canonFnName(name: []const u8) []const u8 {
         "arrayConcat", "arrayDistinct", "arrayFlatten", "arrayReverse",
         "arraySlice", "arrayMax", "arrayMin",
         "arrayMap", "arrayFilter", "arrayExists",
+        "arrayJoin",
         "mapKeys", "mapValues",
         "tuple",
     };
@@ -1154,6 +1155,7 @@ fn prattExpr(pctx: *ParseCtx, min_bp: u8) anyerror!?Expr {
                         std.ascii.eqlIgnoreCase(name, "mapKeys") or
                         std.ascii.eqlIgnoreCase(name, "mapValues") or
                         std.ascii.eqlIgnoreCase(name, "arrayFlatten") or
+                        std.ascii.eqlIgnoreCase(name, "arrayJoin") or
                         std.ascii.eqlIgnoreCase(name, "arrayMax") or
                         std.ascii.eqlIgnoreCase(name, "arrayMin"))) break :blk2 true;
                     // Lambda-based array functions: arrayMap(x -> expr, arr), arrayFilter, arrayExists
@@ -1356,6 +1358,7 @@ fn inferExprType(ctx: *PlannerCtx, expr: Expr) ColumnType {
             if (std.mem.eql(u8, fc.name, "mapGet")) return .string;
             if (std.mem.eql(u8, fc.name, "mapGetFloat64")) return .float64;
             if (std.mem.eql(u8, fc.name, "arrayExists")) return .bool_u8;
+            if (std.mem.eql(u8, fc.name, "arrayJoin")) return .string;
             if (std.mem.eql(u8, fc.name, "arrayMap") or std.mem.eql(u8, fc.name, "arrayFilter")) return .array_string;
             if (std.mem.eql(u8, fc.name, "and") or std.mem.eql(u8, fc.name, "or")) return .uint64;
             if (std.mem.eql(u8, fc.name, "if") or std.mem.eql(u8, fc.name, "multiIf")) {

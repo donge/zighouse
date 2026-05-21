@@ -491,13 +491,57 @@ fn projectRowList(inner: RowList, items: []const plan.ProjectItem, alloc: std.me
         new_metas[ci] = .{ .name = item.alias, .col_type = item.out_type };
     }
     var rl = RowList.init(new_metas);
-    for (inner.rows.items) |row| {
-        const new_row = try alloc.alloc(?Value, items.len);
-        for (items, 0..) |item, ci| {
-            const v_opt = try kernels.evalExpr(item.expr, row, null, alloc);
-            new_row[ci] = v_opt;
+
+    // Detect whether any item is an arrayJoin(expr) call.
+    // If so, we expand each row: arrayJoin col emits one row per element,
+    // other columns repeat their value for each element.
+    var aj_idx: ?usize = null;
+    for (items, 0..) |item, ci| {
+        switch (item.expr) {
+            .fn_call => |fc| if (std.mem.eql(u8, fc.name, "arrayJoin")) {
+                aj_idx = ci;
+                break;
+            },
+            else => {},
         }
-        try rl.append(alloc, new_row);
+    }
+
+    for (inner.rows.items) |row| {
+        if (aj_idx) |ai| {
+            // Evaluate the arrayJoin argument → array of strings
+            const aj_expr = switch (items[ai].expr) {
+                .fn_call => |fc| fc.args[0],
+                else => unreachable,
+            };
+            const arr_val = try kernels.evalExpr(aj_expr, row, null, alloc);
+            const elements: []const []const u8 = switch (arr_val orelse Value{ .array_string = &.{} }) {
+                .array_string => |a| a,
+                else => &.{},
+            };
+            // Emit one output row per element (or one null row if empty)
+            const n = if (elements.len > 0) elements.len else @as(usize, 1);
+            for (0..n) |ei| {
+                const new_row = try alloc.alloc(?Value, items.len);
+                for (items, 0..) |item, ci| {
+                    if (ci == ai) {
+                        new_row[ci] = if (elements.len > 0)
+                            Value{ .string = elements[ei] }
+                        else
+                            null;
+                    } else {
+                        new_row[ci] = try kernels.evalExpr(item.expr, row, null, alloc);
+                    }
+                }
+                try rl.append(alloc, new_row);
+            }
+        } else {
+            const new_row = try alloc.alloc(?Value, items.len);
+            for (items, 0..) |item, ci| {
+                const v_opt = try kernels.evalExpr(item.expr, row, null, alloc);
+                new_row[ci] = v_opt;
+            }
+            try rl.append(alloc, new_row);
+        }
     }
     return rl;
 }
