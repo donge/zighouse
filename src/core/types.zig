@@ -247,9 +247,11 @@ pub const AggAccum = union(enum) {
     str_max:   ?[]const u8,
     /// groupUniqArray — collect unique strings
     uniq_strs: std.StringHashMapUnmanaged(void),
+    /// any() — first non-null value seen
+    any_val: ?Value,
 
     /// Convert a scalar accumulator to a Value.
-    /// For uniq_strs, call toArrayValue() instead — this returns an error.
+    /// For uniq_strs/any_val(array), call toArrayValue() instead.
     pub fn toValue(self: AggAccum) error{UseToArrayValue}!Value {
         return switch (self) {
             .i64_sum   => |v| .{ .int64   = v },
@@ -265,10 +267,15 @@ pub const AggAccum = union(enum) {
             .str_min   => |v| .{ .string  = v orelse "" },
             .str_max   => |v| .{ .string  = v orelse "" },
             .uniq_strs => return error.UseToArrayValue,
+            .any_val   => |v| if (v) |val| blk: {
+                // If the stored value is an array, direct callers to toArrayValue.
+                if (val == .array_string) return error.UseToArrayValue;
+                break :blk val;
+            } else .{ .string = "" },
         };
     }
 
-    /// Convert a uniq_strs accumulator to an array_string Value.
+    /// Convert a uniq_strs or any_val(array) accumulator to an array_string Value.
     /// Strings are duped into `alloc`.
     pub fn toArrayValue(self: AggAccum, alloc: std.mem.Allocator) !Value {
         switch (self) {
@@ -280,6 +287,12 @@ pub const AggAccum = union(enum) {
                     arr[i] = try alloc.dupe(u8, k.*);
                 }
                 return Value{ .array_string = arr };
+            },
+            .any_val => |v| {
+                if (v) |val| {
+                    if (val == .array_string) return val;
+                }
+                return Value{ .array_string = &.{} };
             },
             else => return error.NotUniqStrs,
         }

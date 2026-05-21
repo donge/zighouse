@@ -674,7 +674,7 @@ fn initAccumForAgg(expr: plan.Expr) AggAccum {
             .min  => .{ .i64_min = std.math.maxInt(i64) },
             .max  => .{ .i64_max = std.math.minInt(i64) },
             .group_uniq_array => .{ .uniq_strs = .{} },
-            .any  => .{ .str_max = null },
+            .any  => .{ .any_val = null },
         },
         else => .{ .count = 0 },
     };

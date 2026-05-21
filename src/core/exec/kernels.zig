@@ -16,6 +16,28 @@ pub const AggAccum   = types.AggAccum;
 pub const ColumnType = types.ColumnType;
 pub const Expr       = plan.Expr;
 
+// ── Dict vtable (set by server before each IR query) ─────────────────────────
+
+/// Opaque pointer to the dict store (server.DictStore).
+pub var dict_store: ?*anyopaque = null;
+
+/// dictHas(store, dict_name, keys_ptr, n_keys) → 0/1
+pub var dict_has_fn: ?*const fn (
+    store:         *anyopaque,
+    dict_name:     [*:0]const u8,
+    keys_ptr:      [*]const [*:0]const u8,
+    n_keys:        usize,
+) u8 = null;
+
+/// dictGet(store, dict_name, attr_name, keys_ptr, n_keys) → null-terminated string or null
+pub var dict_get_fn: ?*const fn (
+    store:     *anyopaque,
+    dict_name: [*:0]const u8,
+    attr_name: [*:0]const u8,
+    keys_ptr:  [*]const [*:0]const u8,
+    n_keys:    usize,
+) ?[*:0]const u8 = null;
+
 // ── Scalar expression evaluation ──────────────────────────────────────────────
 
 /// Evaluate a scalar Expr against a single row of values.
@@ -34,6 +56,7 @@ pub fn evalExpr(expr: Expr, row: []const ?Value, arena: std.mem.Allocator) anyer
         .lit_str   => |v| return Value{ .string  = v },
         .lit_bool  => |v| return Value{ .bool_u8 = if (v) 1 else 0 },
         .lit_null  => return null,
+        .lit_array => |arr| return Value{ .array_string = arr },
 
         // Column reference
         .col_ref => |ref| {
@@ -147,6 +170,9 @@ pub fn evalExpr(expr: Expr, row: []const ?Value, arena: std.mem.Allocator) anyer
             const v = (try evalExpr(c.expr, row, arena)) orelse return null;
             return castValue(v, c.to_type, arena);
         },
+
+        // Dictionary function calls
+        .dict_call => |dc| return evalDictCall(dc, row, arena),
     }
 }
 
@@ -518,8 +544,11 @@ fn evalFnCall(fc: *const plan.FnCall, row: []const ?Value, arena: std.mem.Alloca
         for (out) |*c| c.* = std.ascii.toUpper(c.*);
         return Value{ .string = out };
     }
+    // tuple(...) — used as dict key wrapper; return first arg as-is (kernels just passes through)
+    if (std.mem.eql(u8, name, "tuple")) {
+        return if (args.len > 0) args[0] else null;
+    }
     if (std.mem.eql(u8, name, "mapGet")) {
-        // mapGet(blob, key) → look up key in ClickHouse Map blob.
         // Blob format: varint N | N×(varint+key_bytes) | N×(varint+value_bytes)
         const blob = (args[0] orelse return Value{ .string = "" }).toStr() orelse return Value{ .string = "" };
         const key  = (args[1] orelse return Value{ .string = "" }).toStr() orelse return Value{ .string = "" };
@@ -838,10 +867,75 @@ fn evalFnCall(fc: *const plan.FnCall, row: []const ?Value, arena: std.mem.Alloca
         return Value{ .string = s };
     }
 
+    if (std.mem.eql(u8, name, "hasAny")) {
+        const arr  = args[0] orelse return Value{ .bool_u8 = 0 };
+        const need = args[1] orelse return Value{ .bool_u8 = 0 };
+        const haystack = switch (arr)  { .array_string => |a| a, else => return Value{ .bool_u8 = 0 } };
+        const needles  = switch (need) { .array_string => |a| a, else => return Value{ .bool_u8 = 0 } };
+        for (needles) |n| for (haystack) |h| if (std.mem.eql(u8, h, n)) return Value{ .bool_u8 = 1 };
+        return Value{ .bool_u8 = 0 };
+    }
+    if (std.mem.eql(u8, name, "hasAll")) {
+        const arr  = args[0] orelse return Value{ .bool_u8 = 0 };
+        const need = args[1] orelse return Value{ .bool_u8 = 0 };
+        const haystack = switch (arr)  { .array_string => |a| a, else => return Value{ .bool_u8 = 0 } };
+        const needles  = switch (need) { .array_string => |a| a, else => return Value{ .bool_u8 = 0 } };
+        for (needles) |n| {
+            var found = false;
+            for (haystack) |h| if (std.mem.eql(u8, h, n)) { found = true; break; };
+            if (!found) return Value{ .bool_u8 = 0 };
+        }
+        return Value{ .bool_u8 = 1 };
+    }
+    if (std.mem.eql(u8, name, "arrayConcat")) {
+        var out: std.ArrayListUnmanaged([]const u8) = .empty;
+        for (args) |a| {
+            if (a == null) continue;
+            switch (a.?) {
+                .array_string => |elems| try out.appendSlice(arena, elems),
+                else => {},
+            }
+        }
+        return Value{ .array_string = try out.toOwnedSlice(arena) };
+    }
+    if (std.mem.eql(u8, name, "arrayFlatten")) {
+        // Flatten one level: array of arrays → flat array (we store as array_string)
+        const arr = args[0] orelse return Value{ .array_string = &.{} };
+        return arr; // already flat in our representation
+    }
+    if (std.mem.eql(u8, name, "arrayMax")) {
+        const arr = args[0] orelse return null;
+        switch (arr) {
+            .array_string => |elems| {
+                if (elems.len == 0) return null;
+                var best: []const u8 = elems[0];
+                for (elems[1..]) |e| if (std.mem.lessThan(u8, best, e)) { best = e; };
+                return Value{ .string = best };
+            },
+            else => return null,
+        }
+    }
+    if (std.mem.eql(u8, name, "arrayMin")) {
+        const arr = args[0] orelse return null;
+        switch (arr) {
+            .array_string => |elems| {
+                if (elems.len == 0) return null;
+                var best: []const u8 = elems[0];
+                for (elems[1..]) |e| if (std.mem.lessThan(u8, e, best)) { best = e; };
+                return Value{ .string = best };
+            },
+            else => return null,
+        }
+    }
+    // mapKeys / mapValues — our Map blob is raw bytes; return empty array
+    // (real parsing of the Map blob is complex; stub with empty for now)
+    if (std.mem.eql(u8, name, "mapKeys") or std.mem.eql(u8, name, "mapValues")) {
+        return Value{ .array_string = &.{} };
+    }
+
     // Unknown function — return an error so callers can surface it.
     return error.UnknownFunction;
 }
-
 // ── Date helpers ──────────────────────────────────────────────────────────────
 
 /// Convert days-since-epoch (1970-01-01) to [year, month, day].
@@ -947,6 +1041,7 @@ pub fn updateAccum(accum: *AggAccum, v: ?Value, arena: std.mem.Allocator) !void 
             const owned = try arena.dupe(u8, s);
             try accum.uniq_strs.put(arena, owned, {});
         }},
+        .any_val   => if (accum.any_val == null) { accum.any_val = v; },
     }
 }
 
@@ -1039,6 +1134,53 @@ test "evalFnCall: multiIf" {
     _ = row;
     const v = try evalExpr(.{ .fn_call = &fc }, &.{}, arena.allocator());
     try std.testing.expectEqualStrings("mid", v.?.string);
+}
+
+// ── Dictionary function evaluation ───────────────────────────────────────────
+
+fn evalDictCall(dc: *const plan.DictCall, row: []const ?Value, arena: std.mem.Allocator) !?Value {
+    const store = dict_store orelse {
+        // No dict store — return safe defaults.
+        if (std.mem.eql(u8, dc.fn_name, "dictHas")) return Value{ .bool_u8 = 0 };
+        if (dc.default_expr) |de| return evalExpr(de, row, arena);
+        return Value{ .string = "" };
+    };
+
+    // Evaluate key expressions to strings.
+    const key_strs = try arena.alloc([:0]const u8, dc.keys.len);
+    for (dc.keys, 0..) |key_expr, i| {
+        const kv = try evalExpr(key_expr, row, arena);
+        const ks = if (kv) |v| v.toStr() orelse "" else "";
+        key_strs[i] = try arena.dupeZ(u8, ks);
+    }
+    // Build C-string pointer array.
+    const keys_ptrs = try arena.alloc([*:0]const u8, key_strs.len);
+    for (key_strs, 0..) |ks, i| keys_ptrs[i] = ks.ptr;
+
+    const dict_namez = try arena.dupeZ(u8, dc.dict_name);
+
+    if (std.mem.eql(u8, dc.fn_name, "dictHas")) {
+        const has_fn = dict_has_fn orelse return Value{ .bool_u8 = 0 };
+        const result = has_fn(store, dict_namez.ptr, keys_ptrs.ptr, key_strs.len);
+        return Value{ .bool_u8 = result };
+    }
+
+    // dictGet / dictGetOrDefault / dictGetOrNull
+    const get_fn = dict_get_fn orelse {
+        if (dc.default_expr) |de| return evalExpr(de, row, arena);
+        return null;
+    };
+    const attr_namez = try arena.dupeZ(u8, dc.attr_name orelse "");
+    const result_ptr = get_fn(store, dict_namez.ptr, attr_namez.ptr, keys_ptrs.ptr, key_strs.len);
+
+    if (result_ptr) |ptr| {
+        const s = std.mem.sliceTo(ptr, 0);
+        const out = try arena.dupe(u8, s);
+        return Value{ .string = out };
+    }
+    // No result — return default or null.
+    if (dc.default_expr) |de| return evalExpr(de, row, arena);
+    return null;
 }
 
 test "evalFnCall: IPv4StringToNumOrDefault" {

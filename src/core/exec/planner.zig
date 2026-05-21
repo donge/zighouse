@@ -340,10 +340,20 @@ fn resolveColExpr(ctx: *PlannerCtx, col: []const u8) ?Expr {
     // Column reference
     if (ctx.tbl) |tbl| {
         if (tbl.findColumn(col)) |idx| {
-            // Array/Map columns are not supported in the IR path — the part scan
-            // bridge returns empty slices for them; they must go through generic_executor.
             const ct = schemaColType(ctx, col);
-            if (ct == .array_string) return null;
+            // Raw Array/Map columns are not safe to use directly in IR:
+            // part_scan_bridge returns serialized bytes, not parsed values.
+            // Exception: Map(String, String) → allowed as source for ['key'] subscript.
+            if (ct == .array_string) {
+                const is_map_str_str: bool = blk: {
+                    if (tbl.columns[idx].ch_type) |ch| {
+                        break :blk std.mem.eql(u8, ch, "Map(String, String)") or
+                                   std.mem.eql(u8, ch, "Map(String,String)");
+                    }
+                    break :blk false;
+                };
+                if (!is_map_str_str) return null;
+            }
             return Expr{ .col_ref = .{ .index = idx, .name = col } };
         }
     }
@@ -692,6 +702,13 @@ const Lexer = struct {
 
 /// Normalize a function name (which may be lowercase from duckdb AST) to the
 /// canonical casing used by kernels.zig. Falls back to the original if unknown.
+fn isDictFn(name: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(name, "dictHas") or
+           std.ascii.eqlIgnoreCase(name, "dictGet") or
+           std.ascii.eqlIgnoreCase(name, "dictGetOrDefault") or
+           std.ascii.eqlIgnoreCase(name, "dictGetOrNull");
+}
+
 fn canonFnName(name: []const u8) []const u8 {
     const canon_names = [_][]const u8{
         "lower", "upper", "length", "char_length", "lowerUTF8", "upperUTF8",
@@ -775,17 +792,42 @@ fn prattExpr(pctx: *ParseCtx, min_bp: u8) anyerror!?Expr {
             const lp = pctx.lex.next();
             if (lp.kind != .lparen) return null;
             const inner = try prattExpr(pctx, 0) orelse return null;
-            const as_tok = pctx.lex.next();
-            if (as_tok.kind != .kw_as) return null;
-            const type_tok = pctx.lex.next();
-            if (type_tok.kind != .ident) return null;
-            const rp = pctx.lex.next();
-            if (rp.kind != .rparen) return null;
-            const type_name = type_tok.text;
+            // CAST supports two forms:
+            //   CAST(expr AS type)       — SQL standard
+            //   CAST(expr, 'type')       — ClickHouse shorthand
+            const sep_tok = pctx.lex.next();
+            const type_name: []const u8 = switch (sep_tok.kind) {
+                .kw_as => blk_as: {
+                    const type_tok = pctx.lex.next();
+                    const rp = pctx.lex.next();
+                    if (rp.kind != .rparen) return null;
+                    break :blk_as switch (type_tok.kind) {
+                        .ident   => type_tok.text,
+                        .str_lit => if (type_tok.text.len >= 2) type_tok.text[1..type_tok.text.len - 1] else type_tok.text,
+                        else     => return null,
+                    };
+                },
+                .comma => blk_comma: {
+                    const type_tok = pctx.lex.next();
+                    const rp = pctx.lex.next();
+                    if (rp.kind != .rparen) return null;
+                    break :blk_comma switch (type_tok.kind) {
+                        .str_lit => if (type_tok.text.len >= 2) type_tok.text[1..type_tok.text.len - 1] else type_tok.text,
+                        .ident   => type_tok.text,
+                        else     => return null,
+                    };
+                },
+                else => return null,
+            };
+            // CAST(x, 'Array(String)') → pass inner expression through as-is
+            if (std.mem.startsWith(u8, type_name, "Array(")) {
+                break :blk_cast inner;
+            }
             // Map target type to a kernels function
             const fn_name: []const u8 = if (std.ascii.eqlIgnoreCase(type_name, "DATE"))
                 "toDate"
-            else if (std.ascii.eqlIgnoreCase(type_name, "VARCHAR"))
+            else if (std.ascii.eqlIgnoreCase(type_name, "VARCHAR") or
+                     std.ascii.eqlIgnoreCase(type_name, "String"))
                 "toString"
             else
                 return null; // unsupported cast type
@@ -806,6 +848,32 @@ fn prattExpr(pctx: *ParseCtx, min_bp: u8) anyerror!?Expr {
 
         // NULL literal → lit_i64 0 (treated as null/zero in kernels)
         .kw_null => Expr{ .lit_null = {} },
+
+        // Array literal: ['a', 'b', ...] — only string elements supported
+        .lbracket => blk_arr: {
+            var elems: std.ArrayListUnmanaged([]const u8) = .empty;
+            // empty array: CAST([], ...) — both are supported
+            if (pctx.lex.peek().kind == .rbracket) {
+                _ = pctx.lex.next();
+                break :blk_arr Expr{ .lit_array = &.{} };
+            }
+            while (true) {
+                const elem_tok = pctx.lex.next();
+                if (elem_tok.kind != .str_lit) return null;
+                const s = if (elem_tok.text.len >= 2) elem_tok.text[1..elem_tok.text.len - 1] else elem_tok.text;
+                try elems.append(pctx.arena, s);
+                const sep = pctx.lex.peek();
+                if (sep.kind == .comma) {
+                    _ = pctx.lex.next();
+                } else {
+                    break;
+                }
+            }
+            const rb = pctx.lex.next();
+            if (rb.kind != .rbracket) return null;
+            const arr = try elems.toOwnedSlice(pctx.arena);
+            break :blk_arr Expr{ .lit_array = arr };
+        },
 
         // CASE [WHEN cond THEN val]… [ELSE val] END → multiIf(cond1,val1,…,else)
         .kw_case => blk_case: {
@@ -906,6 +974,93 @@ fn prattExpr(pctx: *ParseCtx, min_bp: u8) anyerror!?Expr {
                     return null;
                 }
 
+                // Dict function calls: dictHas(dict, key), dictGet(dict, attr, key),
+                // dictGetOrDefault(dict, attr, key, default), dictGetOrNull(dict, attr, key)
+                // Keys may be wrapped in tuple(...) — unwrap if so.
+                if (isDictFn(name) and args_slice.len >= 2) {
+                    // args[0] must be string literal → dict name
+                    const dict_name: []const u8 = switch (args_slice[0]) {
+                        .lit_str => |s| s,
+                        else => return null,
+                    };
+
+                    // Helper: unwrap tuple(a,b,...) → []Expr, else single-element slice
+                    const unwrapKeys = struct {
+                        fn do(arena: std.mem.Allocator, key_expr: Expr) ![]Expr {
+                            switch (key_expr) {
+                                .fn_call => |fc| {
+                                    if (std.ascii.eqlIgnoreCase(fc.name, "tuple")) {
+                                        return fc.args;
+                                    }
+                                },
+                                else => {},
+                            }
+                            const s = try arena.alloc(Expr, 1);
+                            s[0] = key_expr;
+                            return s;
+                        }
+                    }.do;
+
+                    // Helper: resolve CAST([], 'Array(String)') → lit_null as empty default
+                    const resolveDefault = struct {
+                        fn do(e: Expr) Expr {
+                            // CAST is parsed as fn_call{name="CAST_arr"} or falls back;
+                            // accept any fn_call starting with "CAST" as null/empty-array default
+                            switch (e) {
+                                .fn_call => |fc| {
+                                    if (std.ascii.startsWithIgnoreCase(fc.name, "CAST")) return Expr{ .lit_null = {} };
+                                },
+                                else => {},
+                            }
+                            return e;
+                        }
+                    }.do;
+
+                    const dc = try pctx.arena.create(plan.DictCall);
+                    if (std.ascii.eqlIgnoreCase(name, "dictHas")) {
+                        // dictHas(dict, key_or_tuple)
+                        const keys = try unwrapKeys(pctx.arena, args_slice[1]);
+                        dc.* = .{
+                            .fn_name      = "dictHas",
+                            .dict_name    = dict_name,
+                            .attr_name    = null,
+                            .keys         = keys,
+                            .default_expr = null,
+                        };
+                    } else if (std.ascii.eqlIgnoreCase(name, "dictGetOrDefault") and args_slice.len >= 4) {
+                        // dictGetOrDefault(dict, attr, key_or_tuple, default)
+                        const attr: []const u8 = switch (args_slice[1]) {
+                            .lit_str => |s| s,
+                            else => return null,
+                        };
+                        const keys = try unwrapKeys(pctx.arena, args_slice[2]);
+                        const default_e = resolveDefault(args_slice[args_slice.len - 1]);
+                        dc.* = .{
+                            .fn_name      = "dictGetOrDefault",
+                            .dict_name    = dict_name,
+                            .attr_name    = attr,
+                            .keys         = keys,
+                            .default_expr = default_e,
+                        };
+                    } else {
+                        // dictGet / dictGetOrNull(dict, attr, key_or_tuple)
+                        const attr: []const u8 = if (args_slice.len >= 3) switch (args_slice[1]) {
+                            .lit_str => |s| s,
+                            else => return null,
+                        } else "";
+                        const key_idx: usize = if (args_slice.len >= 3) 2 else 1;
+                        const keys = try unwrapKeys(pctx.arena, args_slice[key_idx]);
+                        dc.* = .{
+                            .fn_name      = name,
+                            .dict_name    = dict_name,
+                            .attr_name    = attr,
+                            .keys         = keys,
+                            .default_expr = null,
+                        };
+                    }
+                    break :blk Expr{ .dict_call = dc };
+                }
+
                 // Verify function is in known scalar_fns or 2-arg numerics
                 const is_known = blk2: {
                     for (scalar_fns) |sf| {
@@ -928,7 +1083,24 @@ fn prattExpr(pctx: *ParseCtx, min_bp: u8) anyerror!?Expr {
                             std.ascii.eqlIgnoreCase(name, "substr")) break :blk2 true;
                     }
                     if (args_slice.len >= 2 and std.ascii.eqlIgnoreCase(name, "concat")) break :blk2 true;
+                    if (args_slice.len >= 1 and std.ascii.eqlIgnoreCase(name, "tuple")) break :blk2 true;
                     if (args_slice.len >= 3 and std.ascii.eqlIgnoreCase(name, "multiIf")) break :blk2 true;
+                    // Array functions
+                    if (args_slice.len == 2 and (
+                        std.ascii.eqlIgnoreCase(name, "has") or
+                        std.ascii.eqlIgnoreCase(name, "hasAny") or
+                        std.ascii.eqlIgnoreCase(name, "hasAll") or
+                        std.ascii.eqlIgnoreCase(name, "arrayMax") or
+                        std.ascii.eqlIgnoreCase(name, "arrayMin") or
+                        std.ascii.eqlIgnoreCase(name, "arrayConcat") or
+                        std.ascii.eqlIgnoreCase(name, "arrayDistinct"))) break :blk2 true;
+                    if (args_slice.len == 1 and (
+                        std.ascii.eqlIgnoreCase(name, "mapKeys") or
+                        std.ascii.eqlIgnoreCase(name, "mapValues") or
+                        std.ascii.eqlIgnoreCase(name, "arrayDistinct") or
+                        std.ascii.eqlIgnoreCase(name, "arrayFlatten") or
+                        std.ascii.eqlIgnoreCase(name, "arrayMax") or
+                        std.ascii.eqlIgnoreCase(name, "arrayMin"))) break :blk2 true;
                     break :blk2 false;
                 };
                 if (!is_known) return null;
@@ -1052,6 +1224,7 @@ fn inferExprType(ctx: *PlannerCtx, expr: Expr) ColumnType {
         .lit_str            => .string,
         .lit_bool           => .bool_u8,
         .lit_null           => .int64,
+        .lit_array          => .array_string,
         .col_ref => |ref| schemaColType(ctx, ref.name),
         .add, .sub, .mul => |op| {
             const lt = inferExprType(ctx, op.left);
@@ -1071,7 +1244,16 @@ fn inferExprType(ctx: *PlannerCtx, expr: Expr) ColumnType {
             if (std.mem.eql(u8, fc.name, "intDiv") or std.mem.eql(u8, fc.name, "modulo")) return .int64;
             if (std.mem.eql(u8, fc.name, "positionCaseInsensitive")) return .uint64;
             if (std.mem.eql(u8, fc.name, "concat")) return .string;
-            if (std.mem.eql(u8, fc.name, "splitByChar")) return .array_string;
+            if (std.mem.eql(u8, fc.name, "splitByChar") or
+                std.mem.eql(u8, fc.name, "splitByString") or
+                std.mem.eql(u8, fc.name, "mapKeys") or
+                std.mem.eql(u8, fc.name, "mapValues") or
+                std.mem.eql(u8, fc.name, "arrayConcat") or
+                std.mem.eql(u8, fc.name, "arrayDistinct") or
+                std.mem.eql(u8, fc.name, "arrayFlatten")) return .array_string;
+            if (std.mem.eql(u8, fc.name, "has") or
+                std.mem.eql(u8, fc.name, "hasAny") or
+                std.mem.eql(u8, fc.name, "hasAll")) return .bool_u8;
             if (std.mem.eql(u8, fc.name, "substring") or std.mem.eql(u8, fc.name, "substr")) return .string;
             if (std.mem.eql(u8, fc.name, "startsWith") or std.mem.eql(u8, fc.name, "endsWith")) return .bool_u8;
             if (std.mem.eql(u8, fc.name, "mapGet")) return .string;
@@ -1079,6 +1261,10 @@ fn inferExprType(ctx: *PlannerCtx, expr: Expr) ColumnType {
                 if (fc.args.len >= 2) return inferExprType(ctx, fc.args[1]);
             }
             return .float64;
+        },
+        .dict_call => |dc| {
+            if (std.ascii.eqlIgnoreCase(dc.fn_name, "dictHas")) return .bool_u8;
+            return .string;
         },
         else => .float64,
     };

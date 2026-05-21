@@ -67,6 +67,12 @@ pub const Expr = union(enum) {
 
     // Cast
     cast:       *Cast,
+
+    // Dictionary function call
+    dict_call:  *DictCall,
+
+    // Array literal: ['a', 'b', ...]  (string elements only)
+    lit_array:  [][]const u8,
 };
 
 pub const ColRef = struct {
@@ -108,11 +114,23 @@ pub const AggCall = struct {
     kind:     Kind,
     arg:      ?Expr,    // null for count(*)
     distinct: bool,
+    /// Optional separator for group_uniq_array — if set, output is a string (joined).
+    sep:      ?[]const u8 = null,
 };
 
 pub const FnCall = struct {
     name: []const u8,
     args: []Expr,
+};
+
+/// Dictionary function call — dictHas / dictGet / dictGetOrDefault / dictGetOrNull.
+/// Keys are the tuple arguments (after dict name and optional attr name).
+pub const DictCall = struct {
+    fn_name:   []const u8,   // "dictHas", "dictGet", "dictGetOrDefault", "dictGetOrNull"
+    dict_name: []const u8,   // e.g. "vprobe.dict_intel"
+    attr_name: ?[]const u8,  // null for dictHas; attribute name for dictGet*
+    keys:      []Expr,       // key expressions
+    default_expr: ?Expr,     // for dictGetOrDefault; null otherwise
 };
 
 pub const Cast = struct {
