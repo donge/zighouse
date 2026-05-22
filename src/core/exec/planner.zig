@@ -702,6 +702,22 @@ fn isAggregate(func: generic_sql.AggregateFn) bool {
 }
 
 fn buildProjectItems(ctx: *PlannerCtx, projs: []const generic_sql.Expr) !?[]ProjectItem {
+    // Check for SELECT * (single column_ref with null column).
+    if (projs.len == 1 and projs[0].func == .column_ref and projs[0].column == null) {
+        const tbl = ctx.tbl orelse return null;
+        const ncols = tbl.columns.len;
+        if (ncols == 0) return null;
+        const items = try ctx.alloc.alloc(ProjectItem, ncols);
+        for (tbl.columns, 0..) |col, i| {
+            const ct = schemaToCore(col.ty, col.ch_type);
+            items[i] = ProjectItem{
+                .expr     = Expr{ .col_ref = .{ .index = i, .name = col.name } },
+                .alias    = col.name,
+                .out_type = ct,
+            };
+        }
+        return items;
+    }
     const items = try ctx.alloc.alloc(ProjectItem, projs.len);
     for (projs, 0..) |p, i| {
         items[i] = try scalarExprToProjectItem(ctx, p) orelse return null;
