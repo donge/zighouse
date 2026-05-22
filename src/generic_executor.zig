@@ -1397,7 +1397,7 @@ const AggState = struct {
             .max => {
                 if (self.max == null or Value.order(v, self.max.?) == .gt) self.max = v;
             },
-            .column_ref, .int_literal, .float_literal => {},
+            .column_ref, .int_literal, .float_literal, .case_when => {},
         }
     }
 
@@ -1428,7 +1428,7 @@ const AggState = struct {
                 break :blk Value{ .str = buf.toOwnedSlice(alloc) catch "" };
             },
             .any_val => self.first orelse Value{ .str = "" },
-            .column_ref, .int_literal, .float_literal => Value{ .null_val = {} },
+            .column_ref, .int_literal, .float_literal, .case_when => Value{ .null_val = {} },
         };
     }
 
@@ -2776,6 +2776,7 @@ fn evalProjectionExpr(proj: generic_sql.Expr, row: *const RowCtx) Value {
             if (row.get(col)) |v| return v;
             return evalTextExpr(col, row) orelse Value{ .null_val = {} };
         },
+        .case_when => return Value{ .null_val = {} }, // handled by IR planner path only
     }
 }
 
@@ -4162,6 +4163,7 @@ fn writeExprHeader(out: *std.ArrayList(u8), allocator: std.mem.Allocator, proj: 
         .uniq_exact_if => try out.print(allocator, "uniqExactIf({s},...)", .{proj.column orelse ""}),
         .group_uniq_array => try out.print(allocator, "groupUniqArray({s})", .{proj.column orelse ""}),
         .any_val => try out.print(allocator, "any({s})", .{proj.column orelse ""}),
+        .case_when => try out.appendSlice(allocator, proj.alias orelse "case_when"),
     }
 }
 
@@ -4202,7 +4204,7 @@ fn allAggregates(projections: []const generic_sql.Expr) bool {
             .sum, .avg, .min, .max,
             .uniq_exact, .uniq_exact_if,
             .group_uniq_array, .any_val => {},
-            .column_ref, .int_literal, .float_literal => return false,
+            .column_ref, .int_literal, .float_literal, .case_when => return false,
         }
     }
     return projections.len > 0;
@@ -4215,7 +4217,7 @@ fn anyAggregate(projections: []const generic_sql.Expr) bool {
             .sum, .avg, .min, .max,
             .uniq_exact, .uniq_exact_if,
             .group_uniq_array, .any_val => return true,
-            .column_ref, .int_literal, .float_literal => {},
+            .column_ref, .int_literal, .float_literal, .case_when => {},
         }
     }
     return false;

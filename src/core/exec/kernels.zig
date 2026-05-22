@@ -1000,6 +1000,43 @@ fn evalFnCall(fc: *const plan.FnCall, row: []const ?Value, lambda_val: ?Value, a
         const day_ms: i64 = 86400 * 1000;
         return Value{ .datetime64_ms = @divTrunc(ms, day_ms) * day_ms };
     }
+    // date_part(unit_str, ts) / extract(unit FROM ts) → integer component
+    if (std.mem.eql(u8, name, "date_part") and args.len == 2) {
+        const unit_val = args[0] orelse return null;
+        const ts_val   = args[1] orelse return null;
+        const unit_str: []const u8 = switch (unit_val) {
+            .string => |s| s,
+            else => return null,
+        };
+        const ms: i64 = switch (ts_val) {
+            .datetime64_ms => |m| m,
+            .int64         => |i| i * 1000,
+            else           => return null,
+        };
+        const secs = @divTrunc(ms, 1000);
+        if (std.mem.eql(u8, unit_str, "minute") or std.mem.eql(u8, unit_str, "min")) {
+            return Value{ .int64 = @mod(@divTrunc(secs, 60), 60) };
+        }
+        if (std.mem.eql(u8, unit_str, "hour")) {
+            return Value{ .int64 = @mod(@divTrunc(secs, 3600), 24) };
+        }
+        if (std.mem.eql(u8, unit_str, "day") or std.mem.eql(u8, unit_str, "dayofmonth")) {
+            const days = @divTrunc(ms, 86400 * 1000);
+            const ymd = daysToYMD(if (days >= 0) days else 0);
+            return Value{ .int64 = @intCast(ymd[2]) };
+        }
+        if (std.mem.eql(u8, unit_str, "month")) {
+            const days = @divTrunc(ms, 86400 * 1000);
+            const ymd = daysToYMD(if (days >= 0) days else 0);
+            return Value{ .int64 = @intCast(ymd[1]) };
+        }
+        if (std.mem.eql(u8, unit_str, "year")) {
+            const days = @divTrunc(ms, 86400 * 1000);
+            const ymd = daysToYMD(if (days >= 0) days else 0);
+            return Value{ .int64 = @intCast(ymd[0]) };
+        }
+        return null;
+    }
     if (std.mem.eql(u8, name, "now")) {
         return Value{ .datetime64_ms = 0 }; // stub: no wall clock in this context
     }

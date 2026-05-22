@@ -354,10 +354,14 @@ fn translateSelectNode(allocator: std.mem.Allocator, node_obj: std.json.ObjectMa
     // ── HAVING ───────────────────────────────────────────────────────────────
     const having_val = node_obj.get("having");
     var having_text: ?[]const u8 = null;
+    var having_expr: ?*generic_sql.WhereNode = null;
     if (having_val != null and having_val.? != .null) {
         having_text = try exprToText(allocator, having_val.?);
+        // Also try to parse as a structured WhereNode for IR planner.
+        having_expr = translateWhere(allocator, having_val.?) catch null;
     }
     errdefer if (having_text) |s| allocator.free(s);
+    errdefer if (having_expr) |he| generic_sql.freeWhereNode(allocator, he);
 
     // ── ORDER BY ─────────────────────────────────────────────────────────────
     var order_by_count_desc = false;
@@ -427,6 +431,7 @@ fn translateSelectNode(allocator: std.mem.Allocator, node_obj: std.json.ObjectMa
         .where_expr = where_expr,
         .where_text = where_text,
         .group_by = group_by,
+        .having_expr = having_expr,
         .having_text = having_text,
         .order_by_count_desc = order_by_count_desc,
         .order_by_alias = order_by_alias,
@@ -1105,15 +1110,9 @@ fn translateExpr(allocator: std.mem.Allocator, val: std.json.Value) !?generic_sq
             const fn_text_dt = try exprToText(allocator, val) orelse return null;
             return .{ .func = .column_ref, .column = fn_text_dt, .alias = alias };
         }
-        // date_part('minute', EventTime) / extract(minute FROM EventTime) → EventMinuteOfHour
-        if (std.mem.eql(u8, fn_name, "date_part") and children.len == 2) {
-            if (isConstantString(children[0], "minute")) {
-                if (columnName(children[1])) |_| {
-                    const col = try allocator.dupe(u8, "EventMinuteOfHour");
-                    return .{ .func = .column_ref, .column = col, .alias = alias };
-                }
-            }
-        }
+        // date_part('minute', EventTime) / extract(minute FROM EventTime)
+        // → render as text "date_part('minute', EventTime)" for parseArithExpr
+        // (falls through to exprToText fallback below)
         // Wrap-aggregate pattern: outerFn(groupUniqArray(col), ...) → group_uniq_array with post_fn
         // Handles: arraySlice, arrayDistinct, arrayFilter, arrayMap, arrayConcat,
         //          arrayFlatten, arrayExists, arrayReverse, arraySort, arrayUniq
@@ -1350,6 +1349,40 @@ fn translateExpr(allocator: std.mem.Allocator, val: std.json.Value) !?generic_sq
 
     if (std.mem.eql(u8, class, "STAR")) {
         return .{ .func = .column_ref, .column = null, .alias = alias };
+    }
+
+    // ── CASE WHEN … THEN … ELSE … END ────────────────────────────────────────
+    if (std.mem.eql(u8, class, "CASE")) {
+        const checks = obj.get("case_checks").?.array.items;
+        var when_texts = try allocator.alloc([]const u8, checks.len);
+        var n_when: usize = 0;
+        errdefer {
+            for (when_texts[0..n_when]) |t| allocator.free(t);
+            allocator.free(when_texts);
+        }
+        var then_texts = try allocator.alloc([]const u8, checks.len);
+        var n_then: usize = 0;
+        errdefer {
+            for (then_texts[0..n_then]) |t| allocator.free(t);
+            allocator.free(then_texts);
+        }
+        for (checks) |check| {
+            const when_t = try exprToText(allocator, check.object.get("when_expr").?) orelse return null;
+            when_texts[n_when] = when_t;
+            n_when += 1;
+            const then_t = try exprToText(allocator, check.object.get("then_expr").?) orelse return null;
+            then_texts[n_then] = then_t;
+            n_then += 1;
+        }
+        var else_text: ?[]const u8 = null;
+        if (obj.get("else_expr")) |else_val| {
+            if (else_val != .null) {
+                else_text = try exprToText(allocator, else_val);
+            }
+        }
+        const cwd = try allocator.create(generic_sql.CaseWhenData);
+        cwd.* = .{ .when_texts = when_texts, .then_texts = then_texts, .else_text = else_text };
+        return generic_sql.Expr{ .func = .case_when, .alias = alias, .case_when_data = cwd };
     }
 
     const text = try exprToText(allocator, val) orelse return null;

@@ -10,6 +10,7 @@ pub const AggregateFn = enum {
     uniq_exact_if,    // uniqExactIf(col, cond) — conditional exact distinct
     group_uniq_array, // groupUniqArray(col) — array of distinct values (joined as string)
     any_val,          // any(col) — first non-null value
+    case_when,        // CASE WHEN … THEN … ELSE … END — data in case_when_data field
 };
 
 /// Optional inline condition for countIf / uniqExactIf:
@@ -38,6 +39,18 @@ pub const Expr = struct {
     /// Example: "arraySlice($, 1, 5)"
     /// Heap-allocated; freed in deinit when plan.owned=true.
     post_fn: ?[]const u8 = null,
+    /// For case_when: parallel when/then text slices + optional else text. Heap-allocated.
+    case_when_data: ?*CaseWhenData = null,
+};
+
+/// Parallel when/then text pairs for CASE WHEN expressions.
+pub const CaseWhenData = struct {
+    /// Each element is a heap-allocated SQL text for the WHEN condition.
+    when_texts: [][]const u8,
+    /// Each element is a heap-allocated SQL text for the THEN value.
+    then_texts: [][]const u8,
+    /// Optional ELSE text (heap-allocated).
+    else_text: ?[]const u8,
 };
 
 // ── WhereNode: generic predicate tree ─────────────────────────────────────────
@@ -102,10 +115,11 @@ pub const Plan = struct {
     /// Typed WHERE predicate tree (superset of `filter`).
     /// Populated by the DuckDB-backed parser; null when using the legacy parser.
     /// Free with freeWhereNode(allocator, where_expr) before calling deinit.
-    where_expr: ?*WhereNode = null,
-    where_text: ?[]const u8 = null,
-    group_by: ?[]const u8 = null,
-    having_text: ?[]const u8 = null,
+     where_expr: ?*WhereNode = null,
+     where_text: ?[]const u8 = null,
+     group_by: ?[]const u8 = null,
+     having_expr: ?*WhereNode = null,
+     having_text: ?[]const u8 = null,
     order_by_count_desc: bool = false,
     order_by_alias: ?[]const u8 = null,
     /// When true, order_by_alias is ascending; when false (default), it is descending.
@@ -136,6 +150,7 @@ pub fn deinit(allocator: std.mem.Allocator, plan: Plan) void {
     if (plan.subquery_source) |sq| { deinit(allocator, sq.*); allocator.destroy(sq); }
     if (plan.union_other) |uo| { deinit(allocator, uo.*); allocator.destroy(uo); }
     if (plan.where_expr) |we| freeWhereNode(allocator, we);
+    if (plan.having_expr) |he| freeWhereNode(allocator, he);
     // Always free cond expressions in projections (they are always heap-allocated).
     for (plan.projections) |expr| {
         if (expr.cond) |c| {
@@ -158,6 +173,14 @@ pub fn deinit(allocator: std.mem.Allocator, plan: Plan) void {
             if (expr.column) |col| allocator.free(col);
             if (expr.sep) |s| allocator.free(s);
             if (expr.post_fn) |s| allocator.free(s);
+            if (expr.case_when_data) |cwd| {
+                for (cwd.when_texts) |t| allocator.free(t);
+                for (cwd.then_texts) |t| allocator.free(t);
+                allocator.free(cwd.when_texts);
+                allocator.free(cwd.then_texts);
+                if (cwd.else_text) |t| allocator.free(t);
+                allocator.destroy(cwd);
+            }
         }
     }
     allocator.free(plan.projections);

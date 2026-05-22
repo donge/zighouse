@@ -327,8 +327,35 @@ pub fn plan_query(
             }
         }
 
-        // HAVING → post-agg filter (where_text not supported in IR path)
-        if (gplan.having_text != null) return null;
+        // HAVING → post-agg filter
+        if (gplan.having_expr) |he| {
+            // Build virtual_cols from the current agg output so resolveColExpr
+            // can look up agg-output alias names (e.g. "c", "l") used in HAVING.
+            var vcols_list: std.ArrayListUnmanaged(VirtualCol) = .empty;
+            switch (source.*) {
+                .hash_agg => |ha| {
+                    for (ha.keys, 0..) |ki, i| try vcols_list.append(ctx.alloc, .{ .name = ki.alias, .idx = i, .col_type = ki.out_type });
+                    for (ha.aggs, 0..) |ai, i| try vcols_list.append(ctx.alloc, .{ .name = ai.alias, .idx = ha.keys.len + i, .col_type = ai.out_type });
+                },
+                .scalar_agg => |sa| {
+                    for (sa.aggs, 0..) |ai, i| try vcols_list.append(ctx.alloc, .{ .name = ai.alias, .idx = i, .col_type = ai.out_type });
+                },
+                else => {},
+            }
+            const saved_vcols = ctx.virtual_cols;
+            ctx.virtual_cols = try vcols_list.toOwnedSlice(ctx.alloc);
+            defer {
+                ctx.alloc.free(ctx.virtual_cols);
+                ctx.virtual_cols = saved_vcols;
+            }
+            const pred = whereNodeToExpr(ctx, he) orelse return null;
+            const filter_node = try ctx.alloc.create(PhysicalNode);
+            filter_node.* = .{ .filter = .{ .input = source, .predicate = pred } };
+            source = filter_node;
+        } else if (gplan.having_text != null) {
+            // having_text present but no structured expr — fall back.
+            return null;
+        }
     }
 
     // ── ORDER BY ─────────────────────────────────────────────────────────────
@@ -670,7 +697,7 @@ fn isAggregate(func: generic_sql.AggregateFn) bool {
         .sum, .avg, .min, .max,
         .uniq_exact, .uniq_exact_if,
         .group_uniq_array, .any_val => true,
-        .column_ref, .int_literal, .float_literal => false,
+        .column_ref, .int_literal, .float_literal, .case_when => false,
     };
 }
 
@@ -690,7 +717,15 @@ fn scalarExprToProjectItem(ctx: *PlannerCtx, p: generic_sql.Expr) !?ProjectItem 
             const col_expr = resolveColExpr(ctx, col_name) orelse {
                 // col_name might be a function call like "lower(protocol)" — try to
                 // parse it as a known scalar fn and build an fn_call Expr.
-                const item = try tryParseFnCallItem(ctx, col_name, alias) orelse break :blk null;
+                const item = try tryParseFnCallItem(ctx, col_name, alias) orelse {
+                    // Last resort: try parseArithExpr for multi-arg fns like date_part.
+                    const expr = try parseArithExpr(ctx, col_name) orelse break :blk null;
+                    break :blk ProjectItem{
+                        .expr     = expr,
+                        .alias    = alias,
+                        .out_type = .int64,
+                    };
+                };
                 break :blk item;
             };
             const out_type = schemaColType(ctx, col_name);
@@ -729,6 +764,30 @@ fn scalarExprToProjectItem(ctx: *PlannerCtx, p: generic_sql.Expr) !?ProjectItem 
             .expr     = .{ .lit_f64 = p.float_val },
             .alias    = alias,
             .out_type = .float64,
+        },
+        .case_when => blk: {
+            const cwd = p.case_when_data orelse break :blk null;
+            const n = cwd.when_texts.len;
+            const when_exprs = ctx.alloc.alloc(plan.Expr, n) catch break :blk null;
+            const then_exprs = ctx.alloc.alloc(plan.Expr, n) catch break :blk null;
+            for (cwd.when_texts, 0..) |wt, i| {
+                when_exprs[i] = (resolveColExpr(ctx, wt) orelse
+                    (parseArithExpr(ctx, wt) catch null) orelse break :blk null);
+            }
+            for (cwd.then_texts, 0..) |tt, i| {
+                then_exprs[i] = (resolveColExpr(ctx, tt) orelse
+                    (parseArithExpr(ctx, tt) catch null) orelse break :blk null);
+            }
+            const else_expr: ?plan.Expr = if (cwd.else_text) |et|
+                (resolveColExpr(ctx, et) orelse (parseArithExpr(ctx, et) catch null))
+            else null;
+            const cw = ctx.alloc.create(plan.CaseWhen) catch break :blk null;
+            cw.* = .{ .when = when_exprs, .then = then_exprs, .else_expr = else_expr };
+            break :blk ProjectItem{
+                .expr     = Expr{ .case_when = cw },
+                .alias    = alias,
+                .out_type = .string, // CASE WHEN output is typically string
+            };
         },
         else => null, // aggregate in scalar context — caller handles
     };
@@ -1306,6 +1365,16 @@ fn prattExpr(pctx: *ParseCtx, min_bp: u8) anyerror!?Expr {
                         }
                     }
                     return null;
+                }
+
+                // date_part special-case: date_part('unit', col) → fn_call "date_part"
+                if (std.mem.eql(u8, name, "date_part") and args_slice.len == 2) {
+                    const fc = try pctx.arena.create(plan.FnCall);
+                    const fc_args = try pctx.arena.alloc(Expr, 2);
+                    fc_args[0] = args_slice[0];
+                    fc_args[1] = args_slice[1];
+                    fc.* = .{ .name = "date_part", .args = fc_args };
+                    break :blk Expr{ .fn_call = fc };
                 }
 
                 // Dict function calls: dictHas(dict, key), dictGet(dict, attr, key),
