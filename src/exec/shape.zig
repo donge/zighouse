@@ -180,7 +180,7 @@ fn classifyProjections(projections: []const generic_sql.Expr) ProjectionKind {
             .sum, .avg, .min, .max => has_aggregate = true,
             .count_star, .count_distinct, .count_if,
             .uniq_exact, .uniq_exact_if, .group_uniq_array, .any_val,
-            .column_ref, .int_literal => {},
+            .column_ref, .int_literal, .float_literal => {},
         }
     }
     return if (has_aggregate) .mixed_aggregates else .unknown;
