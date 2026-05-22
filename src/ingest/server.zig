@@ -230,7 +230,7 @@ pub const Server = struct {
         if (asciiStartsWith(trimmed, "INSERT")) {
             try self.handleInsert(request, out, trimmed);
         } else if (asciiStartsWith(trimmed, "SELECT") or asciiStartsWith(trimmed, "WITH")) {
-            try self.handleSelect(request, out, trimmed);
+            try self.handleSelectNoDrain(request, out, trimmed);
         } else if (asciiStartsWith(trimmed, "CREATE")) {
             try self.handleCreate(request, out, trimmed);
         } else if (asciiStartsWith(trimmed, "TRUNCATE")) {
@@ -607,132 +607,6 @@ pub const Server = struct {
         try sess.finish();
     }
 
-    // ── SELECT handler ─────────────────────────────────────────────────────────
-
-    fn handleSelect(self: *Server, request: *std.http.Server.Request, out: *std.Io.Writer, sql: []const u8) !void {
-        // Drain body (ignore for SELECT).
-        var body_buf: [64]u8 = undefined;
-        _ = request.readerExpectNone(&body_buf);
-
-        // Strip FINAL modifier (ReplacingMergeTree FINAL — dedup handled separately).
-        var final_mode = false;
-        const sql_clean: []const u8 = blk: {
-            if (std.ascii.indexOfIgnoreCase(sql, " FINAL") != null) {
-                final_mode = true;
-                // Remove all " FINAL" occurrences (case-insensitive via two passes)
-                const c1 = try std.mem.replaceOwned(u8, self.allocator, sql, " FINAL", "");
-                errdefer self.allocator.free(c1);
-                const c2 = try std.mem.replaceOwned(u8, self.allocator, c1, " final", "");
-                self.allocator.free(c1);
-                // Add ORDER BY version DESC for ReplacingMergeTree dedup
-                // (if query doesn't already have an ORDER BY)
-                if (std.ascii.indexOfIgnoreCase(c2, "ORDER BY") == null) {
-                    const c3 = try std.fmt.allocPrint(self.allocator, "{s} ORDER BY version DESC", .{c2});
-                    self.allocator.free(c2);
-                    break :blk c3;
-                }
-                break :blk c2;
-            }
-            break :blk sql;
-        };
-        defer if (final_mode) self.allocator.free(sql_clean);
-
-         // Parse SQL into a Plan.
-         const plan = (try generic_sql.parse(self.allocator, sql_clean)) orelse {
-             std.debug.print("Cannot parse SELECT query: {s}\n", .{sql_clean[0..@min(200, sql_clean.len)]});
-             try sendResponse(request, out, .bad_request, "Cannot parse SELECT query\n");
-             return;
-         };
-        defer generic_sql.deinit(self.allocator, plan);
-        _ = &final_mode;
-
-        // Subquery in FROM clause: run inner plan first, then outer plan over result rows.
-        if (plan.subquery_source) |inner_plan| {
-            try self.handleSubquerySelect(request, out, plan, inner_plan.*);
-            return;
-        }
-
-        // UNION ALL: run both plans, concatenate rows (skip second header).
-        if (plan.union_other) |right_plan| {
-            try self.handleUnionSelect(request, out, plan, right_plan.*);
-            return;
-        }
-
-        // Resolve db.table from plan.table (may be "db.table" or bare "table").
-        const db_table = splitDbTable(plan.table);
-
-        // Make user-defined functions available to the executor.
-        generic_executor.udf_registry = &self.functions;
-
-        // Handle system.one — virtual single-row table (dummy UInt8 column).
-        if (asciiEql(db_table.db, "system") and asciiEql(db_table.table, "one")) {
-            const dummy_table = schema.Table{
-                .name = "one",
-                .columns = &.{},
-            };
-            const result = try generic_executor.runWithSource(
-                self.allocator, self.io, plan, .{ .csv_rows = "dummy\n0\n" }, &dummy_table,
-            );
-            defer self.allocator.free(result);
-            try sendResponse(request, out, .ok, result);
-            return;
-        }
-
-        // Look up schema; if not found check if it's a registered view.
-        const entry = self.schemas.find(db_table.db, db_table.table) orelse {
-            // Try view registry: short name or db.table full name
-            const view_sql = self.views.get(db_table.table) orelse
-                self.views.get(plan.table) orelse {
-                const msg = try std.fmt.allocPrint(self.allocator,
-                    "Unknown table '{s}.{s}'\n",
-                    .{ db_table.db, db_table.table });
-                defer self.allocator.free(msg);
-                try sendResponse(request, out, .bad_request, msg);
-                return;
-            };
-            // Rewrite: run the view's SELECT SQL directly (view has no extra filters in zhtest)
-            try self.handleSelect(request, out, view_sql);
-            return;
-        };
-
-        // Enumerate parts.
-        var parts = try part_scanner.scan(
-            self.allocator, self.io,
-            self.config.data_dir, db_table.db, db_table.table,
-        );
-        defer parts.deinit();
-
-        if (parts.dirs().len == 0) {
-            // No data yet — run the plan against empty source so aggregates return 0.
-            const result = try generic_executor.runWithSource(
-                self.allocator, self.io,
-                plan,
-                .{ .ch_parts = &.{} },
-                &entry.table,
-            );
-            defer self.allocator.free(result);
-            try sendResponse(request, out, .ok, result);
-            return;
-        }
-
-        // ── IR execution path (CSV output, no intermediate generic_executor) ──
-        if (try self.tryIrExecuteCsv(plan, &entry.table, parts.dirs(), sql)) |csv| {
-            defer self.allocator.free(csv);
-            try sendResponse(request, out, .ok, csv);
-            return;
-        }
-
-        // ── Fallback: generic_executor → CSV ──────────────────────────────────
-        const result = try generic_executor.runWithSource(
-            self.allocator, self.io,
-            plan,
-            .{ .ch_parts = parts.dirs() },
-            &entry.table,
-        );
-        defer self.allocator.free(result);
-        try sendResponse(request, out, .ok, result);
-    }
-
     /// Try to execute `gplan` via the IR planner + pipeline.
     /// Returns an owned native-block []u8 on success, or null if the plan
     /// shape is not yet supported (caller should fall back to generic_executor).
@@ -788,106 +662,6 @@ pub const Server = struct {
         const nb = try serializer.toNativeBlock(self.allocator, rs);
         return nb;
     }
-
-    /// Same as tryIrExecute but serialises the ResultSet to CSV instead of a
-    /// native block.  Used by the ?query= HTTP GET path (handleSelect).
-    fn tryIrExecuteCsv(
-        self: *Server,
-        gplan: generic_sql.Plan,
-        table: *const schema.Table,
-        part_dirs: []const []const u8,
-        orig_sql: []const u8,
-    ) !?[]u8 {
-        var arena = std.heap.ArenaAllocator.init(self.allocator);
-        errdefer arena.deinit();
-        const alloc = arena.allocator();
-
-        var pctx = ir_planner.PlannerCtx.init(alloc, table.*);
-        const node = ir_planner.plan_query(&pctx, gplan) catch |err| {
-            std.log.warn("ir_planner error (csv): {}", .{err});
-            arena.deinit();
-            return null;
-        };
-        if (node == null) {
-            std.log.warn("IR fallback (csv): {s}", .{orig_sql});
-            arena.deinit();
-            return null;
-        }
-
-        var bridge = part_scan_bridge.PartScanBridge.init(
-            self.allocator, self.io, table.*, part_dirs,
-        ) catch |err| {
-            std.log.warn("part_scan_bridge init error (csv): {}", .{err});
-            arena.deinit();
-            return null;
-        };
-        defer bridge.deinit();
-
-        var qctx = core.exec.pipeline.QueryContext.init(self.allocator, bridge.source());
-        defer qctx.deinit();
-
-        var rs = core.exec.pipeline.executePlan(node.?, &qctx) catch |err| {
-            std.log.warn("pipeline executePlan error (csv): {}", .{err});
-            arena.deinit();
-            return null;
-        };
-        defer rs.deinit();
-        arena.deinit();
-
-        const csv = try serializer.toCsv(self.allocator, rs);
-        return csv;
-    }
-
-    /// Handle SELECT with a subquery in FROM: materialize inner plan, then run outer.
-    fn handleSubquerySelect(self: *Server, request: *std.http.Server.Request, out: *std.Io.Writer, outer: generic_sql.Plan, inner: generic_sql.Plan) !void {
-        const db_table = splitDbTable(inner.table);
-        const entry = self.schemas.find(db_table.db, db_table.table) orelse {
-            try sendResponse(request, out, .bad_request, "Unknown table in subquery\n");
-            return;
-        };
-        var parts = try part_scanner.scan(self.allocator, self.io, self.config.data_dir, db_table.db, db_table.table);
-        defer parts.deinit();
-        const inner_csv = try generic_executor.runWithSource(self.allocator, self.io, inner, .{ .ch_parts = parts.dirs() }, &entry.table);
-        defer self.allocator.free(inner_csv);
-        // Run outer plan over the CSV rows materialized from inner plan.
-        const result = try generic_executor.runOverCsv(self.allocator, outer, inner_csv, &entry.table);
-        defer self.allocator.free(result);
-        try sendResponse(request, out, .ok, result);
-    }
-
-    /// UNION ALL: run both halves, return left CSV header + all data rows from both.
-    fn handleUnionSelect(self: *Server, request: *std.http.Server.Request, out: *std.Io.Writer, left: generic_sql.Plan, right: generic_sql.Plan) !void {
-        const left_csv = try self.runPlanToCSV(left) orelse {
-            try sendResponse(request, out, .bad_request, "Cannot execute left side of UNION\n");
-            return;
-        };
-        defer self.allocator.free(left_csv);
-        const right_csv = try self.runPlanToCSV(right) orelse {
-            try sendResponse(request, out, .bad_request, "Cannot execute right side of UNION\n");
-            return;
-        };
-        defer self.allocator.free(right_csv);
-        // Combine: left CSV header + left data rows + right data rows (skip right header)
-        var combined: std.ArrayList(u8) = .empty;
-        defer combined.deinit(self.allocator);
-        try combined.appendSlice(self.allocator, left_csv);
-        // Find end of header line in right_csv and append only data lines
-        if (std.mem.indexOfScalar(u8, right_csv, '\n')) |nl| {
-            try combined.appendSlice(self.allocator, right_csv[nl + 1 ..]);
-        }
-        try sendResponse(request, out, .ok, combined.items);
-    }
-
-    /// Run a Plan against its table's parts, return CSV string (caller frees). Returns null on unknown table.
-    fn runPlanToCSV(self: *Server, plan: generic_sql.Plan) !?[]u8 {
-        const db_table = splitDbTable(plan.table);
-        const entry = self.schemas.find(db_table.db, db_table.table) orelse return null;
-        var parts = try part_scanner.scan(self.allocator, self.io, self.config.data_dir, db_table.db, db_table.table);
-        defer parts.deinit();
-        return try generic_executor.runWithSource(self.allocator, self.io, plan, .{ .ch_parts = parts.dirs() }, &entry.table);
-    }
-
-
 
     /// DESCRIBE TABLE handler for body-SQL mode.
     /// clickhouse-go sends "DESCRIBE TABLE db.table" to discover column types before INSERT batch.
@@ -965,7 +739,7 @@ pub const Server = struct {
         // Make user-defined functions available to the executor.
         generic_executor.udf_registry = &self.functions;
 
-        // Strip FINAL modifier (same as handleSelect).
+        // Strip FINAL modifier.
         const sql_needs_free = std.ascii.indexOfIgnoreCase(sql, "FINAL") != null;
         const sql_after_final = try removeFinal(self.allocator, sql);
         errdefer if (sql_needs_free) self.allocator.free(sql_after_final);

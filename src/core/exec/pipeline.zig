@@ -245,36 +245,6 @@ pub const PhysicalOperator = union(enum) {
     limit:   LimitState,
 };
 
-// ── Simple pipeline (no breakers) ────────────────────────────────────────────
-
-/// Execute a linear pipeline: source → transforms → collect into ResultSet.
-/// This handles queries with no pipeline breakers (no GROUP BY, no ORDER BY,
-/// no JOINs). For queries with breakers, use executePlan().
-pub fn runLinearPipeline(
-    source: SourceIface,
-    transforms: []PhysicalOperator,
-    parent_alloc: std.mem.Allocator,
-) !ResultSet {
-    var ctx  = QueryContext.init(parent_alloc, source);
-    defer ctx.deinit();
-
-    var sink = ResultSink.init(parent_alloc);
-
-    var c: DataChunk = undefined;
-    while (try source.nextChunk(&c, &ctx)) {
-        for (transforms) |*op| {
-            switch (op.*) {
-                .filter  => |*f| try f.apply(&c, &ctx),
-                .project => |*p| try p.apply(&c, &ctx),
-                .limit   => |*l| l.apply(&c),
-            }
-            if (c.num_rows == 0) break;
-        }
-        if (c.num_rows > 0) try sink.consume(c);
-    }
-    return sink.finish();
-}
-
 // ── executePlan ───────────────────────────────────────────────────────────────
 
 /// Internal row list used during plan execution.

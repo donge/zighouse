@@ -1,82 +1,33 @@
 const std = @import("std");
 const build_options = @import("build_options");
-const backend = @import("backend.zig");
 const clickbench_schema = schema.clickbench;
 const catalog = @import("catalog.zig");
 const schema_infer = @import("schema_infer.zig");
 const loader = @import("loader.zig");
 const generic_executor = @import("generic_executor");
 const generic_sql = @import("generic_sql");
-const duckdb = if (build_options.duckdb) @import("duckdb.zig") else @import("duckdb_stub.zig");
 const parquet = @import("parquet");
 const storage = @import("storage.zig");
 const schema = @import("schema");
-const bind = @import("exec/bind.zig");
-const shape = @import("exec/shape.zig");
 
 const usage =
-    \\zighouse - minimal ClickBench-oriented analytical database
+    \\zighouse - ClickHouse-compatible analytical database
     \\
     \\Usage:
     \\  zighouse schema
     \\  zighouse queries
     \\  zighouse init <data_dir>
-    \\  zighouse import <hits.parquet> <data_dir>
-    \\  zighouse import-hot <hits.parquet> <data_dir>
     \\  zighouse import-parquet [--format=generic|ch|ch-http] [--pk=<col>] <parquet_path> <store_dir> <table_name>
     \\  zighouse serve --data-dir=<dir> [--schemas=<schemas.json>] [--port=<port>]
     \\  zighouse generic-query <store_dir> <table_name> <sql>
-    \\  zighouse import-clickbench-csv-hot <hits.csv> <data_dir>
     \\  zighouse import-clickbench-parquet-hot <hits.parquet> <data_dir> [limit_rows]
-    \\  zighouse import-clickbench-parquet-native-hot <hits.parquet> <data_dir> [limit_rows]
-    \\  zighouse import-clickbench-parquet-duckdb-vector-hot <hits.parquet> <data_dir> [limit_rows]
-    \\  zighouse import-clickbench-parquet-duckdb-csv-hot <hits.parquet> <data_dir> [limit_rows]
-    \\  zighouse import-clickbench-parquet-duckdb-vector-fixed-hot <hits.parquet> <data_dir> [limit_rows]
-    \\  zighouse import-clickbench-parquet-native-fixed-hot <hits.parquet> <data_dir> [limit_rows]
     \\  zighouse parquet-inspect <hits.parquet>
-    \\  zighouse parquet-page-inspect <hits.parquet> <row_group> <column> [max_pages]
-    \\  zighouse parquet-decode-fixed <hits.parquet> <row_group> <column> [limit_values]
-    \\  zighouse parquet-decode-byte-array <hits.parquet> <row_group> <column> [limit_values]
-    \\  zighouse parquet-scan-all <hits.parquet> <table_name>
-    \\  zighouse parquet-scan-byte-array <hits.parquet> <column> [limit_rows]
-    \\  zighouse duckdb-vector-smoke <hits.parquet> [limit_rows]
-    \\  zighouse import-hot-extra <hits.parquet> <data_dir>
-    \\  zighouse convert-hot <data_dir>
-    \\  zighouse build-stats <data_dir>
-    \\  zighouse convert-i16-csv <csv_path> <out_path>
-    \\  zighouse build-string-column <data_dir> <col>
-    \\  zighouse build-clickbench-mobile-phone-model <data_dir>
-    \\  zighouse build-clickbench-search-phrase <data_dir>
-    \\  zighouse build-clickbench-url <data_dir>
-    \\  zighouse build-q23-candidates <data_dir>
-    \\  zighouse build-q25-candidates <data_dir>
-    \\  zighouse build-q33-result <data_dir>
-    \\  zighouse build-q29-domain-stats <data_dir>
-    \\  zighouse build-q40-result <data_dir>
-    \\  zighouse build-q21-count-google <data_dir>
-    \\  zighouse build-referer-sidecars <data_dir>
-    \\  zighouse query-csv <csv_path> <sql>  tables: csv (header), csv_no_header
-    \\  zighouse query <data_dir> <sql> [--parquet <hits.parquet>]
-    \\  zighouse query-timed <data_dir> <sql> [--parquet <hits.parquet>]
-    \\  zighouse compare-duckdb-native <data_dir> <queries.sql> [first] [limit]
     \\  zighouse store-info <data_dir>
-    \\  zighouse native-status <data_dir>
-    \\  zighouse bench <data_dir> <queries.sql>
-    \\  zighouse bench-one <data_dir> <queries.sql> <query_num>
-    \\  zighouse bench-range <data_dir> <queries.sql> <first> <limit>
     \\
-    \\Options:
-    \\  --backend duckdb|native|chdb|clickhouse  default: duckdb
-    \\  ZIGHOUSE_CHDB_PYTHON                  chDB python executable, default: python3
-    \\  ZIGHOUSE_CLICKHOUSE_CONTAINER         ClickHouse docker container, default: sw_asdb
-    \\  ZIGHOUSE_CLICKHOUSE_DATABASE          ClickHouse database, default: default
-    \\  ZIGHOUSE_CLICKHOUSE_PASSWORD          ClickHouse password, default: Sw@123456
-    \\  ZIGHOUSE_IMPORT_TRACE                 print import phase timings
-    \\  ZIGHOUSE_IMPORT_TINY_CACHES           write Q24/Q29/Q40 result artifacts during import
-    \\  ZIGHOUSE_QUERY_PATH                   specialized|generic|compare, default: specialized
-    \\
-    \\Current milestone:
-    \\  compare explicit duckdb and native backends; native has no DuckDB fallback.
+    \\Environment:
+    \\  ZIGHOUSE_IMPORT_TRACE       print import phase timings
+    \\  ZIGHOUSE_CLICKBENCH_SUBMIT  enable ClickBench submission format
+    \\  ZIGHOUSE_QUERY_PATH         specialized|generic|compare, default: specialized
     \\
 ;
 
@@ -89,24 +40,10 @@ pub fn main(init: std.process.Init) !void {
     defer args.deinit();
 
     _ = args.next();
-    var options = backend.Options.fromEnv(init.environ_map);
-    while (true) {
-        const maybe_arg = args.next() orelse return printUsage(init.io);
-        if (std.mem.eql(u8, maybe_arg, "--backend")) {
-            const value = args.next() orelse return error.MissingBackend;
-            options.kind = try backend.Kind.parse(value);
-            continue;
-        }
-        if (std.mem.startsWith(u8, maybe_arg, "--backend=")) {
-            options.kind = try backend.Kind.parse(maybe_arg["--backend=".len..]);
-            continue;
-        }
-        const command = maybe_arg;
-        const command_started = wallNow();
-        try runCommand(init, allocator, &args, command, options);
-        traceMainWall(command, command_started);
-        return;
-    }
+    const command = args.next() orelse return printUsage(init.io);
+    const command_started = wallNow();
+    try runCommand(init, allocator, &args, command);
+    traceMainWall(command, command_started);
 }
 
 fn importTraceEnabled() bool {
@@ -128,7 +65,7 @@ fn traceMainWall(name: []const u8, started: i128) void {
     std.debug.print("import_wall_phase main.{s} seconds={d:.6}\n", .{ name, seconds });
 }
 
-fn runCommand(init: std.process.Init, allocator: std.mem.Allocator, args: *std.process.Args.Iterator, command: []const u8, options: backend.Options) !void {
+fn runCommand(init: std.process.Init, allocator: std.mem.Allocator, args: *std.process.Args.Iterator, command: []const u8) !void {
     if (std.mem.eql(u8, command, "schema")) {
         try printSchema(init.io);
     } else if (std.mem.eql(u8, command, "queries")) {
@@ -139,20 +76,7 @@ fn runCommand(init: std.process.Init, allocator: std.mem.Allocator, args: *std.p
         const data_dir = args.next() orelse return error.MissingDataDir;
         try storage.initStore(init.io, data_dir);
         try printOut(init.io, "initialized {s}\n", .{data_dir});
-    } else if (std.mem.eql(u8, command, "import")) {
-        const parquet_path = args.next() orelse return error.MissingParquetPath;
-        const data_dir = args.next() orelse return error.MissingDataDir;
-        try storage.initStore(init.io, data_dir);
-        try storage.writeImportManifest(init.io, allocator, data_dir, parquet_path);
-        try printOut(init.io, "imported {s} -> {s}\n", .{ parquet_path, data_dir });
-    } else if (std.mem.eql(u8, command, "import-hot")) {
-        const parquet_path = args.next() orelse return error.MissingParquetPath;
-        const data_dir = args.next() orelse return error.MissingDataDir;
-        var selected = backend.Backend.init(allocator, init.io, data_dir, options);
-        defer selected.deinit();
-        try selected.importParquet(parquet_path);
-        try printOut(init.io, "imported hot columns {s} -> {s}\n", .{ parquet_path, data_dir });
-     } else if (std.mem.eql(u8, command, "import-parquet")) {
+    } else if (std.mem.eql(u8, command, "import-parquet")) {
         // Generic Parquet import: infer schema, write generic_part store, write catalog manifest.
         // Usage: zighouse import-parquet [--format=<generic|ch>] [--pk=<col>] <parquet_path> <store_dir> <table_name>
         var format: enum { generic, ch, ch_http } = .generic;
@@ -251,13 +175,6 @@ fn runCommand(init: std.process.Init, allocator: std.mem.Allocator, args: *std.p
         const output = try generic_executor.runWithSource(allocator, init.io, plan, source, &inferred.table);
         defer allocator.free(output);
         try writeOut(init.io, output);
-    } else if (std.mem.eql(u8, command, "import-clickbench-csv-hot")) {
-        const csv_path = args.next() orelse return error.MissingCsvPath;
-        const data_dir = args.next() orelse return error.MissingDataDir;
-        var native_backend = @import("native.zig").Native.init(allocator, init.io, data_dir);
-        defer native_backend.deinit();
-        try native_backend.importClickBenchCsvHot(csv_path);
-        try printOut(init.io, "imported ClickBench CSV hot columns {s} -> {s}\n", .{ csv_path, data_dir });
     } else if (std.mem.eql(u8, command, "import-clickbench-parquet-hot")) {
         const parquet_path = args.next() orelse return error.MissingParquetPath;
         const data_dir = args.next() orelse return error.MissingDataDir;
@@ -266,46 +183,6 @@ fn runCommand(init: std.process.Init, allocator: std.mem.Allocator, args: *std.p
         defer native_backend.deinit();
         try native_backend.importClickBenchParquetHot(parquet_path, limit_rows);
         try printOut(init.io, "imported ClickBench Parquet hot columns {s} -> {s}\n", .{ parquet_path, data_dir });
-    } else if (std.mem.eql(u8, command, "import-clickbench-parquet-native-hot")) {
-        const parquet_path = args.next() orelse return error.MissingParquetPath;
-        const data_dir = args.next() orelse return error.MissingDataDir;
-        const limit_rows = if (args.next()) |raw| try std.fmt.parseInt(u64, raw, 10) else null;
-        var native_backend = @import("native.zig").Native.init(allocator, init.io, data_dir);
-        defer native_backend.deinit();
-        try native_backend.importClickBenchParquetNativeHot(parquet_path, limit_rows);
-        try printOut(init.io, "imported ClickBench Parquet hot columns via native decoder {s} -> {s}\n", .{ parquet_path, data_dir });
-    } else if (std.mem.eql(u8, command, "import-clickbench-parquet-duckdb-csv-hot")) {
-        const parquet_path = args.next() orelse return error.MissingParquetPath;
-        const data_dir = args.next() orelse return error.MissingDataDir;
-        const limit_rows = if (args.next()) |raw| try std.fmt.parseInt(u64, raw, 10) else null;
-        var native_backend = @import("native.zig").Native.init(allocator, init.io, data_dir);
-        defer native_backend.deinit();
-        try native_backend.importClickBenchParquetHotDuckDbCsv(parquet_path, limit_rows);
-        try printOut(init.io, "imported ClickBench Parquet hot columns via DuckDB CSV {s} -> {s}\n", .{ parquet_path, data_dir });
-    } else if (std.mem.eql(u8, command, "import-clickbench-parquet-duckdb-vector-hot")) {
-        const parquet_path = args.next() orelse return error.MissingParquetPath;
-        const data_dir = args.next() orelse return error.MissingDataDir;
-        const limit_rows = if (args.next()) |raw| try std.fmt.parseInt(u64, raw, 10) else null;
-        var native_backend = @import("native.zig").Native.init(allocator, init.io, data_dir);
-        defer native_backend.deinit();
-        try native_backend.importClickBenchParquetDuckDbVectorHot(parquet_path, limit_rows);
-        try printOut(init.io, "imported ClickBench Parquet hot columns via DuckDB vectors {s} -> {s}\n", .{ parquet_path, data_dir });
-    } else if (std.mem.eql(u8, command, "import-clickbench-parquet-duckdb-vector-fixed-hot")) {
-        const parquet_path = args.next() orelse return error.MissingParquetPath;
-        const data_dir = args.next() orelse return error.MissingDataDir;
-        const limit_rows = if (args.next()) |raw| try std.fmt.parseInt(u64, raw, 10) else null;
-        var native_backend = @import("native.zig").Native.init(allocator, init.io, data_dir);
-        defer native_backend.deinit();
-        try native_backend.importClickBenchParquetDuckDbVectorFixedHot(parquet_path, limit_rows);
-        try printOut(init.io, "imported ClickBench Parquet fixed hot columns via DuckDB vectors {s} -> {s}\n", .{ parquet_path, data_dir });
-    } else if (std.mem.eql(u8, command, "import-clickbench-parquet-native-fixed-hot")) {
-        const parquet_path = args.next() orelse return error.MissingParquetPath;
-        const data_dir = args.next() orelse return error.MissingDataDir;
-        const limit_rows = if (args.next()) |raw| try std.fmt.parseInt(u64, raw, 10) else null;
-        var native_backend = @import("native.zig").Native.init(allocator, init.io, data_dir);
-        defer native_backend.deinit();
-        try native_backend.importClickBenchParquetNativeFixedHot(parquet_path, limit_rows);
-        try printOut(init.io, "imported ClickBench Parquet hot columns via native decoder {s} -> {s}\n", .{ parquet_path, data_dir });
     } else if (std.mem.eql(u8, command, "parquet-inspect")) {
         const parquet_path = args.next() orelse return error.MissingParquetPath;
         const output = try parquet.inspectPath(allocator, init.io, parquet_path);
@@ -372,17 +249,6 @@ fn runCommand(init: std.process.Init, allocator: std.mem.Allocator, args: *std.p
         const output = try parquet.scanByteArrayPath(allocator, init.io, parquet_path, column, limit_rows);
         defer allocator.free(output);
         try writeOut(init.io, output);
-    } else if (std.mem.eql(u8, command, "duckdb-vector-smoke")) {
-        const parquet_path = args.next() orelse return error.MissingParquetPath;
-        const limit_rows = if (args.next()) |raw| try std.fmt.parseInt(u64, raw, 10) else 1_000_000;
-        try duckdb.vectorSmoke(allocator, init.io, parquet_path, limit_rows);
-    } else if (std.mem.eql(u8, command, "compare-duckdb-native")) {
-        const data_dir = args.next() orelse return error.MissingDataDir;
-        const queries_path = args.next() orelse return error.MissingQueriesPath;
-        const first = if (args.next()) |raw| try std.fmt.parseInt(usize, raw, 10) else 1;
-        const limit = if (args.next()) |raw| try std.fmt.parseInt(usize, raw, 10) else null;
-        try storage.ensureStore(init.io, data_dir);
-        try compareDuckDbNative(allocator, init.io, data_dir, queries_path, .{ .first = first, .limit = limit });
     } else if (std.mem.eql(u8, command, "store-info")) {
         const data_dir = args.next() orelse return error.MissingDataDir;
         try storage.ensureStore(init.io, data_dir);
@@ -397,215 +263,6 @@ fn runCommand(init: std.process.Init, allocator: std.mem.Allocator, args: *std.p
         try writeOut(init.io, "[import.zig-house]\n");
         try writeOut(init.io, import_manifest);
         if (import_manifest.len == 0 or import_manifest[import_manifest.len - 1] != '\n') try writeOut(init.io, "\n");
-    } else if (std.mem.eql(u8, command, "import-hot-extra")) {
-        const parquet_path = args.next() orelse return error.MissingParquetPath;
-        const data_dir = args.next() orelse return error.MissingDataDir;
-        var native_backend = @import("native.zig").Native.init(allocator, init.io, data_dir);
-        defer native_backend.deinit();
-        try native_backend.importExtraHotColumns(parquet_path);
-        try printOut(init.io, "imported extra hot columns {s} -> {s}\n", .{ parquet_path, data_dir });
-    } else if (std.mem.eql(u8, command, "import-search-phrase-hot")) {
-        const parquet_path = args.next() orelse return error.MissingParquetPath;
-        const data_dir = args.next() orelse return error.MissingDataDir;
-        var native_backend = @import("native.zig").Native.init(allocator, init.io, data_dir);
-        defer native_backend.deinit();
-        try native_backend.importSearchPhraseHot(parquet_path);
-        try printOut(init.io, "imported SearchPhrase hot data {s} -> {s}\n", .{ parquet_path, data_dir });
-    } else if (std.mem.eql(u8, command, "convert-hot")) {
-        const data_dir = args.next() orelse return error.MissingDataDir;
-        var native_backend = @import("native.zig").Native.init(allocator, init.io, data_dir);
-        defer native_backend.deinit();
-        try native_backend.convertExistingHotCsv();
-        try printOut(init.io, "converted hot.csv -> binary hot columns in {s}\n", .{data_dir});
-    } else if (std.mem.eql(u8, command, "convert-search-phrase-id")) {
-        const data_dir = args.next() orelse return error.MissingDataDir;
-        var native_backend = @import("native.zig").Native.init(allocator, init.io, data_dir);
-        defer native_backend.deinit();
-        try native_backend.convertSearchPhraseToId();
-    } else if (std.mem.eql(u8, command, "import-url-dict")) {
-        const parquet_path = args.next() orelse return error.MissingParquetPath;
-        const data_dir = args.next() orelse return error.MissingDataDir;
-        var native_backend = @import("native.zig").Native.init(allocator, init.io, data_dir);
-        defer native_backend.deinit();
-        try native_backend.importUrlDict(parquet_path);
-        try printOut(init.io, "imported URL.dict.tsv {s} -> {s}\n", .{ parquet_path, data_dir });
-    } else if (std.mem.eql(u8, command, "convert-url-id")) {
-        const data_dir = args.next() orelse return error.MissingDataDir;
-        var native_backend = @import("native.zig").Native.init(allocator, init.io, data_dir);
-        defer native_backend.deinit();
-        try native_backend.convertUrlToId();
-    } else if (std.mem.eql(u8, command, "convert-i64-csv")) {
-        const csv_path = args.next() orelse return error.MissingCsvPath;
-        const out_path = args.next() orelse return error.MissingOutputPath;
-        try @import("native.zig").convertU64CsvToI64BinaryStreaming(allocator, init.io, csv_path, out_path);
-        try printOut(init.io, "converted {s} -> {s}\n", .{ csv_path, out_path });
-    } else if (std.mem.eql(u8, command, "convert-i16-csv")) {
-        const csv_path = args.next() orelse return error.MissingCsvPath;
-        const out_path = args.next() orelse return error.MissingOutputPath;
-        try @import("native.zig").convertI16CsvToBinaryStreaming(allocator, init.io, csv_path, out_path);
-        try printOut(init.io, "converted {s} -> {s}\n", .{ csv_path, out_path });
-    } else if (std.mem.eql(u8, command, "build-string-column")) {
-        const data_dir = args.next() orelse return error.MissingDataDir;
-        const col = args.next() orelse return error.MissingColumnName;
-        var native_backend = @import("native.zig").Native.init(allocator, init.io, data_dir);
-        defer native_backend.deinit();
-        try native_backend.buildStringColumn(col);
-    } else if (std.mem.eql(u8, command, "build-clickbench-mobile-phone-model")) {
-        const data_dir = args.next() orelse return error.MissingDataDir;
-        var native_backend = @import("native.zig").Native.init(allocator, init.io, data_dir);
-        defer native_backend.deinit();
-        try native_backend.buildClickBenchMobilePhoneModel();
-    } else if (std.mem.eql(u8, command, "build-clickbench-search-phrase")) {
-        const data_dir = args.next() orelse return error.MissingDataDir;
-        var native_backend = @import("native.zig").Native.init(allocator, init.io, data_dir);
-        defer native_backend.deinit();
-        try native_backend.buildClickBenchSearchPhrase();
-    } else if (std.mem.eql(u8, command, "build-clickbench-url")) {
-        const data_dir = args.next() orelse return error.MissingDataDir;
-        var native_backend = @import("native.zig").Native.init(allocator, init.io, data_dir);
-        defer native_backend.deinit();
-        try native_backend.buildClickBenchUrl();
-    } else if (std.mem.eql(u8, command, "build-q23-candidates")) {
-        const data_dir = args.next() orelse return error.MissingDataDir;
-        var native_backend = @import("native.zig").Native.init(allocator, init.io, data_dir);
-        defer native_backend.deinit();
-        try native_backend.buildQ23Candidates();
-    } else if (std.mem.eql(u8, command, "build-q25-candidates")) {
-        const data_dir = args.next() orelse return error.MissingDataDir;
-        var native_backend = @import("native.zig").Native.init(allocator, init.io, data_dir);
-        defer native_backend.deinit();
-        try native_backend.buildQ25Candidates();
-    } else if (std.mem.eql(u8, command, "build-q33-result")) {
-        const data_dir = args.next() orelse return error.MissingDataDir;
-        var native_backend = @import("native.zig").Native.init(allocator, init.io, data_dir);
-        defer native_backend.deinit();
-        try native_backend.buildQ33Result();
-    } else if (std.mem.eql(u8, command, "build-q29-domain-stats")) {
-        const data_dir = args.next() orelse return error.MissingDataDir;
-        var native_backend = @import("native.zig").Native.init(allocator, init.io, data_dir);
-        defer native_backend.deinit();
-        try native_backend.buildQ29DomainStats(options.chdb_python);
-    } else if (std.mem.eql(u8, command, "build-q40-result")) {
-        const data_dir = args.next() orelse return error.MissingDataDir;
-        var native_backend = @import("native.zig").Native.init(allocator, init.io, data_dir);
-        defer native_backend.deinit();
-        try native_backend.buildQ40Result(options.chdb_python);
-    } else if (std.mem.eql(u8, command, "build-q21-count-google")) {
-        const data_dir = args.next() orelse return error.MissingDataDir;
-        var native_backend = @import("native.zig").Native.init(allocator, init.io, data_dir);
-        defer native_backend.deinit();
-        try native_backend.buildQ21CountGoogle();
-    } else if (std.mem.eql(u8, command, "build-referer-sidecars")) {
-        const data_dir = args.next() orelse return error.MissingDataDir;
-        var native_backend = @import("native.zig").Native.init(allocator, init.io, data_dir);
-        defer native_backend.deinit();
-        try native_backend.buildRefererSidecars();
-    } else if (std.mem.eql(u8, command, "convert-user-id-id")) {
-        const data_dir = args.next() orelse return error.MissingDataDir;
-        var native_backend = @import("native.zig").Native.init(allocator, init.io, data_dir);
-        defer native_backend.deinit();
-        try native_backend.convertUserIdToId();
-    } else if (std.mem.eql(u8, command, "import-d-cols")) {
-        const parquet_path = args.next() orelse return error.MissingParquetPath;
-        const data_dir = args.next() orelse return error.MissingDataDir;
-        var native_backend = @import("native.zig").Native.init(allocator, init.io, data_dir);
-        defer native_backend.deinit();
-        try native_backend.importDColumns(parquet_path);
-    } else if (std.mem.eql(u8, command, "build-stats")) {
-        const data_dir = args.next() orelse return error.MissingDataDir;
-        var native_backend = @import("native.zig").Native.init(allocator, init.io, data_dir);
-        defer native_backend.deinit();
-        try native_backend.buildSegmentStats();
-        try printOut(init.io, "built segment stats in {s}\n", .{data_dir});
-    } else if (std.mem.eql(u8, command, "query")) {
-        const data_dir = args.next() orelse return error.MissingDataDir;
-        const sql = args.next() orelse return error.MissingSql;
-        // Optional: --parquet <path>  enables the generic parquet-streaming fallback
-        var parquet_override: ?[]const u8 = null;
-        while (args.next()) |flag| {
-            if (std.mem.eql(u8, flag, "--parquet")) {
-                parquet_override = args.next() orelse return error.MissingParquetPath;
-            }
-        }
-        try storage.ensureStore(init.io, data_dir);
-        var selected = backend.Backend.init(allocator, init.io, data_dir, options);
-        defer selected.deinit();
-        if (parquet_override) |pq| {
-            if (selected == .native) selected.native.parquet_path = pq;
-        }
-        const output = try selected.query(sql);
-        defer allocator.free(output);
-        try writeOut(init.io, output);
-    } else if (std.mem.eql(u8, command, "query-timed")) {
-        const data_dir = args.next() orelse return error.MissingDataDir;
-        const sql = args.next() orelse return error.MissingSql;
-        var parquet_override: ?[]const u8 = null;
-        while (args.next()) |flag| {
-            if (std.mem.eql(u8, flag, "--parquet")) {
-                parquet_override = args.next() orelse return error.MissingParquetPath;
-            }
-        }
-        try storage.ensureStore(init.io, data_dir);
-        var selected = backend.Backend.init(allocator, init.io, data_dir, options);
-        defer selected.deinit();
-        if (parquet_override) |pq| {
-            if (selected == .native) selected.native.parquet_path = pq;
-        }
-        const started = std.Io.Clock.Timestamp.now(init.io, .awake);
-        const output = try selected.query(sql);
-        const ended = std.Io.Clock.Timestamp.now(init.io, .awake);
-        defer allocator.free(output);
-        try writeOut(init.io, output);
-        const elapsed_ns: u64 = @intCast(started.durationTo(ended).raw.nanoseconds);
-        try printErr(init.io, "{d:.6}\n", .{@as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_s});
-    } else if (std.mem.eql(u8, command, "query-csv")) {
-        const csv_path = args.next() orelse return error.MissingCsvPath;
-        const sql = args.next() orelse return error.MissingSql;
-        const physical = @import("planner.zig").planCsv(sql) orelse return error.UnsupportedCsvQuery;
-        var csv_reader = @import("reader.zig").CsvReader.init(allocator, init.io, csv_path);
-        const output = try @import("executor.zig").executeCsv(allocator, &csv_reader, physical);
-        defer allocator.free(output);
-        try writeOut(init.io, output);
-    } else if (std.mem.eql(u8, command, "native-status")) {
-        const data_dir = args.next() orelse return error.MissingDataDir;
-        try storage.ensureStore(init.io, data_dir);
-        const hot = storage.hasHotBinary(init.io, data_dir) or storage.hasHotCsv(init.io, data_dir);
-        const extra_hot = storage.hasExtraHotBinary(init.io, data_dir);
-        const search_phrase_hot = storage.hasSearchPhraseHot(init.io, data_dir);
-        try printOut(init.io, "native q1: yes (parquet metadata)\n", .{});
-        try printOut(init.io, "native q2/q3/q4/q7/q8/q20/q30: {s}\n", .{if (hot) "yes (hot columns)" else "no (run import-hot)"});
-        try printOut(init.io, "native q5/q6/q9-q15: yes if id/dict hot data exists (run convert-user-id-id, import-search-phrase-hot, convert-search-phrase-id, import-d-cols)\n", .{});
-        try printOut(init.io, "native q6/q13 SearchPhrase hot: {s}\n", .{if (search_phrase_hot) "yes" else "no (run import-search-phrase-hot and convert-search-phrase-id)"});
-        try printOut(init.io, "native q28: {s}\n", .{if (hot and extra_hot) "yes (extra hot columns)" else "no (run import-hot-extra)"});
-        try printOut(init.io, "native q37/q38/q39/q40: yes with ClickBench CSV hot import artifacts\n", .{});
-        try printOut(init.io, "native q41/q42/q43: {s}\n", .{if (hot and extra_hot) "yes (segment stats recommended; run build-stats)" else "no (run import-hot-extra and build-stats)"});
-    } else if (std.mem.eql(u8, command, "bench")) {
-        const data_dir = args.next() orelse return error.MissingDataDir;
-        const queries_path = args.next() orelse return error.MissingQueriesPath;
-        try storage.ensureStore(init.io, data_dir);
-        var selected = backend.Backend.init(allocator, init.io, data_dir, options);
-        defer selected.deinit();
-        try selected.bench(queries_path, .{});
-    } else if (std.mem.eql(u8, command, "bench-one")) {
-        const data_dir = args.next() orelse return error.MissingDataDir;
-        const queries_path = args.next() orelse return error.MissingQueriesPath;
-        const query_num_text = args.next() orelse return error.MissingQueryNum;
-        const query_num = try std.fmt.parseInt(usize, query_num_text, 10);
-        try storage.ensureStore(init.io, data_dir);
-        var selected = backend.Backend.init(allocator, init.io, data_dir, options);
-        defer selected.deinit();
-        try selected.bench(queries_path, .{ .first = query_num, .limit = 1 });
-    } else if (std.mem.eql(u8, command, "bench-range")) {
-        const data_dir = args.next() orelse return error.MissingDataDir;
-        const queries_path = args.next() orelse return error.MissingQueriesPath;
-        const first_text = args.next() orelse return error.MissingQueryNum;
-        const limit_text = args.next() orelse return error.MissingQueryLimit;
-        const first = try std.fmt.parseInt(usize, first_text, 10);
-        const limit = try std.fmt.parseInt(usize, limit_text, 10);
-        try storage.ensureStore(init.io, data_dir);
-        var selected = backend.Backend.init(allocator, init.io, data_dir, options);
-        defer selected.deinit();
-        try selected.bench(queries_path, .{ .first = first, .limit = limit });
     } else if (std.mem.eql(u8, command, "serve")) {
         // HTTP RowBinary ingest + query server.
         // Usage: zighouse serve --data-dir=<dir> [--schemas=<schemas.json>] [--port=<port>]
@@ -663,69 +320,6 @@ fn parseCatalogField(content: []const u8, key: []const u8) ?[]const u8 {
         return line[eq + 1 ..];
     }
     return null;
-}
-
-fn compareDuckDbNative(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8, queries_path: []const u8, range: duckdb.QueryRange) !void {
-    const native_mod = @import("native.zig");
-    var duck = duckdb.DuckDb.init(allocator, io, data_dir);
-    defer duck.deinit();
-    var native_backend = native_mod.Native.init(allocator, io, data_dir);
-    defer native_backend.deinit();
-    const compare_limit = try readImportRowLimit(allocator, io, data_dir);
-
-    const queries = try std.Io.Dir.cwd().readFileAlloc(io, queries_path, allocator, .limited(512 * 1024));
-    defer allocator.free(queries);
-
-    var checked: usize = 0;
-    var passed: usize = 0;
-    var failed: usize = 0;
-    var errored: usize = 0;
-    var query_num: usize = 1;
-    var line_it = std.mem.splitScalar(u8, queries, '\n');
-    while (line_it.next()) |raw_line| : (query_num += 1) {
-        const query_text = std.mem.trim(u8, raw_line, " \t\r");
-        if (query_text.len == 0) continue;
-        if (!range.contains(query_num)) continue;
-
-        checked += 1;
-        const duck_out = duck.queryLimited(query_text, compare_limit) catch |err| {
-            errored += 1;
-            try printOut(io, "q{d}: ERROR duckdb {s}\n", .{ query_num, @errorName(err) });
-            continue;
-        };
-        defer allocator.free(duck_out);
-
-        const native_out = native_backend.query(query_text) catch |err| {
-            errored += 1;
-            try printOut(io, "q{d}: ERROR native {s}\n", .{ query_num, @errorName(err) });
-            continue;
-        };
-        defer allocator.free(native_out);
-
-        const duck_norm = normalizeCompareOutput(duck_out);
-        const native_norm = normalizeCompareOutput(native_out);
-        if (compareOutputsForQuery(query_text, duck_norm, native_norm)) {
-            passed += 1;
-            try printOut(io, "q{d}: PASS\n", .{query_num});
-        } else {
-            failed += 1;
-            try printOut(io, "q{d}: FAIL duckdb_len={d} native_len={d}\n", .{ query_num, duck_norm.len, native_norm.len });
-            try printSnippet(io, "  duckdb", duck_norm);
-            try printSnippet(io, "  native", native_norm);
-        }
-    }
-
-    try printOut(io, "summary: checked={d} passed={d} failed={d} errors={d}\n", .{ checked, passed, failed, errored });
-    if (failed != 0 or errored != 0) return error.QueryMismatch;
-}
-
-fn readImportRowLimit(allocator: std.mem.Allocator, io: std.Io, data_dir: []const u8) !?u64 {
-    const info = storage.readImportInfo(io, allocator, data_dir) catch |err| switch (err) {
-        error.FileNotFound => return null,
-        else => return err,
-    };
-    defer info.deinit(allocator);
-    return info.rowLimit();
 }
 
 fn normalizeCompareOutput(bytes: []const u8) []const u8 {
@@ -999,197 +593,6 @@ comptime {
 
 test "schema has ClickBench column count" {
     try std.testing.expectEqual(@as(usize, 105), clickbench_schema.hits.columns.len);
-}
-
-test "BoundColumn name returns variant name" {
-    const c1 = bind.BoundColumn{ .fixed_i16 = .{ .name = "AdvEngineID", .values = &.{} } };
-    try std.testing.expectEqualStrings("AdvEngineID", c1.name());
-
-    const c2 = bind.BoundColumn{ .fixed_date = .{ .name = "EventDate", .values = &.{} } };
-    try std.testing.expectEqualStrings("EventDate", c2.name());
-
-    const c3 = bind.BoundColumn{ .derived = .{ .name = "URLLength", .expr = .length } };
-    try std.testing.expectEqualStrings("URLLength", c3.name());
-}
-
-test "BoundColumn tag matches active variant" {
-    const c1 = bind.BoundColumn{ .fixed_i16 = .{ .name = "X", .values = &.{} } };
-    try std.testing.expectEqual(schema.CapabilityTag.fixed_i16, c1.tag());
-
-    const c2 = bind.BoundColumn{ .fixed_i64 = .{ .name = "X", .values = &.{} } };
-    try std.testing.expectEqual(schema.CapabilityTag.fixed_i64, c2.tag());
-
-    const c3 = bind.BoundColumn{ .lazy_text = .{
-        .name = "X",
-        .source = .{ .column_name = "X" },
-        .capabilities = .{},
-    } };
-    try std.testing.expectEqual(schema.CapabilityTag.lazy_text, c3.tag());
-}
-
-test "lookupCapability returns tag for known columns and null for missing" {
-    // Known fixed numeric column.
-    try std.testing.expectEqual(
-        @as(?schema.CapabilityTag, schema.CapabilityTag.fixed_i16),
-        bind.lookupCapability(&clickbench_schema.hits, "AdvEngineID"),
-    );
-    // Known date column.
-    try std.testing.expectEqual(
-        @as(?schema.CapabilityTag, schema.CapabilityTag.fixed_date),
-        bind.lookupCapability(&clickbench_schema.hits, "EventDate"),
-    );
-    // Known lowcard column.
-    try std.testing.expectEqual(
-        @as(?schema.CapabilityTag, schema.CapabilityTag.lowcard_text),
-        bind.lookupCapability(&clickbench_schema.hits, "MobilePhoneModel"),
-    );
-    // URL is lowcard_text with hash_sidecar capability (PR-A4).
-    try std.testing.expectEqual(
-        @as(?schema.CapabilityTag, schema.CapabilityTag.lowcard_text),
-        bind.lookupCapability(&clickbench_schema.hits, "URL"),
-    );
-    // Missing column returns null.
-    try std.testing.expectEqual(
-        @as(?schema.CapabilityTag, null),
-        bind.lookupCapability(&clickbench_schema.hits, "NoSuchColumn"),
-    );
-    // Case-insensitive match.
-    try std.testing.expectEqual(
-        @as(?schema.CapabilityTag, schema.CapabilityTag.fixed_i16),
-        bind.lookupCapability(&clickbench_schema.hits, "advengineid"),
-    );
-}
-
-fn parseHitsPlan(allocator: std.mem.Allocator, sql: []const u8) !generic_sql.Plan {
-    const plan_opt = try generic_sql.parse(allocator, sql);
-    return plan_opt orelse return error.ParseFailed;
-}
-
-test "inferShape: scalar aggregates with no group_by" {
-    const allocator = std.testing.allocator;
-    const cases = [_]struct { sql: []const u8, want: shape.PlanShape }{
-        .{ .sql = "SELECT COUNT(*) FROM hits", .want = .scalar_aggregate },
-        .{ .sql = "SELECT AVG(UserID) FROM hits", .want = .scalar_aggregate },
-        .{ .sql = "SELECT MIN(EventDate), MAX(EventDate) FROM hits", .want = .scalar_aggregate },
-        .{ .sql = "SELECT SUM(AdvEngineID), COUNT(*), AVG(ResolutionWidth) FROM hits", .want = .scalar_aggregate },
-        // Simple int filter still scalar (plan.filter populated, not where_text alone).
-        .{ .sql = "SELECT COUNT(*) FROM hits WHERE AdvEngineID <> 0", .want = .scalar_aggregate },
-    };
-    for (cases) |c| {
-        const plan = try parseHitsPlan(allocator, c.sql);
-        defer generic_sql.deinit(allocator, plan);
-        try std.testing.expectEqual(c.want, shape.inferShape(plan, &clickbench_schema.hits));
-    }
-}
-
-test "inferShape: filtered_scalar for LIKE filters" {
-    const allocator = std.testing.allocator;
-    const plan = try parseHitsPlan(allocator, "SELECT COUNT(*) FROM hits WHERE URL LIKE '%google%'");
-    defer generic_sql.deinit(allocator, plan);
-    try std.testing.expectEqual(shape.PlanShape.filtered_scalar, shape.inferShape(plan, &clickbench_schema.hits));
-}
-
-test "inferShape: lowcard_count_top for q13 SearchPhrase" {
-    const allocator = std.testing.allocator;
-    const plan = try parseHitsPlan(
-        allocator,
-        "SELECT SearchPhrase, COUNT(*) AS c FROM hits WHERE SearchPhrase <> '' GROUP BY SearchPhrase ORDER BY c DESC LIMIT 10",
-    );
-    defer generic_sql.deinit(allocator, plan);
-    try std.testing.expectEqual(shape.PlanShape.lowcard_count_top, shape.inferShape(plan, &clickbench_schema.hits));
-}
-
-test "inferShape: lowcard_distinct_top for q11/q14" {
-    const allocator = std.testing.allocator;
-    const cases = [_][]const u8{
-        "SELECT MobilePhoneModel, COUNT(DISTINCT UserID) AS u FROM hits WHERE MobilePhoneModel <> '' GROUP BY MobilePhoneModel ORDER BY u DESC LIMIT 10",
-        "SELECT SearchPhrase, COUNT(DISTINCT UserID) AS u FROM hits WHERE SearchPhrase <> '' GROUP BY SearchPhrase ORDER BY u DESC LIMIT 10",
-    };
-    for (cases) |sql| {
-        const plan = try parseHitsPlan(allocator, sql);
-        defer generic_sql.deinit(allocator, plan);
-        try std.testing.expectEqual(shape.PlanShape.lowcard_distinct_top, shape.inferShape(plan, &clickbench_schema.hits));
-    }
-}
-
-test "inferShape: fixed_distinct_top for q9 RegionID" {
-    const allocator = std.testing.allocator;
-    const plan = try parseHitsPlan(
-        allocator,
-        "SELECT RegionID, COUNT(DISTINCT UserID) AS u FROM hits GROUP BY RegionID ORDER BY u DESC LIMIT 10",
-    );
-    defer generic_sql.deinit(allocator, plan);
-    try std.testing.expectEqual(shape.PlanShape.fixed_distinct_top, shape.inferShape(plan, &clickbench_schema.hits));
-}
-
-test "inferShape: dense_count_group for q8 AdvEngineID (no LIMIT)" {
-    const allocator = std.testing.allocator;
-    const plan = try parseHitsPlan(
-        allocator,
-        "SELECT AdvEngineID, COUNT(*) FROM hits WHERE AdvEngineID <> 0 GROUP BY AdvEngineID ORDER BY COUNT(*) DESC",
-    );
-    defer generic_sql.deinit(allocator, plan);
-    try std.testing.expectEqual(shape.PlanShape.dense_count_group, shape.inferShape(plan, &clickbench_schema.hits));
-}
-
-test "inferShape: dense_avg_count_top for q10 RegionID stats" {
-    const allocator = std.testing.allocator;
-    const plan = try parseHitsPlan(
-        allocator,
-        "SELECT RegionID, SUM(AdvEngineID), COUNT(*) AS c, AVG(ResolutionWidth), COUNT(DISTINCT UserID) FROM hits GROUP BY RegionID ORDER BY c DESC LIMIT 10",
-    );
-    defer generic_sql.deinit(allocator, plan);
-    try std.testing.expectEqual(shape.PlanShape.dense_avg_count_top, shape.inferShape(plan, &clickbench_schema.hits));
-}
-
-test "inferShape: tuple_agg_top for composite group keys" {
-    const allocator = std.testing.allocator;
-    const cases = [_][]const u8{
-        // q12 mobile_phone+model
-        "SELECT MobilePhone, MobilePhoneModel, COUNT(DISTINCT UserID) AS u FROM hits WHERE MobilePhoneModel <> '' GROUP BY MobilePhone, MobilePhoneModel ORDER BY u DESC LIMIT 10",
-        // q15 search_engine+phrase
-        "SELECT SearchEngineID, SearchPhrase, COUNT(*) AS c FROM hits WHERE SearchPhrase <> '' GROUP BY SearchEngineID, SearchPhrase ORDER BY c DESC LIMIT 10",
-        // q16 user_id+search_phrase
-        "SELECT UserID, SearchPhrase, COUNT(*) FROM hits GROUP BY UserID, SearchPhrase ORDER BY COUNT(*) DESC LIMIT 10",
-        // q19 client_ip_agg_top
-        "SELECT SearchEngineID, ClientIP, COUNT(*) AS c, SUM(IsRefresh), AVG(ResolutionWidth) FROM hits WHERE SearchPhrase <> '' GROUP BY SearchEngineID, ClientIP ORDER BY c DESC LIMIT 10",
-    };
-    for (cases) |sql| {
-        const plan = try parseHitsPlan(allocator, sql);
-        defer generic_sql.deinit(allocator, plan);
-        try std.testing.expectEqual(shape.PlanShape.tuple_agg_top, shape.inferShape(plan, &clickbench_schema.hits));
-    }
-}
-
-test "inferShape: hashed_late_materialize_top for q21 URL" {
-    const allocator = std.testing.allocator;
-    const plan = try parseHitsPlan(
-        allocator,
-        "SELECT URL, COUNT(*) AS c FROM hits GROUP BY URL ORDER BY c DESC LIMIT 10",
-    );
-    defer generic_sql.deinit(allocator, plan);
-    try std.testing.expectEqual(shape.PlanShape.hashed_late_materialize_top, shape.inferShape(plan, &clickbench_schema.hits));
-}
-
-test "inferShape: offset_count_top for dashboards with OFFSET" {
-    const allocator = std.testing.allocator;
-    // q41 url_count_top_filtered_offset_dashboard (single-column GROUP BY URL with OFFSET)
-    const plan = try parseHitsPlan(
-        allocator,
-        "SELECT URL, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND IsRefresh = 0 AND IsLink <> 0 AND IsDownload = 0 GROUP BY URL ORDER BY PageViews DESC LIMIT 10 OFFSET 1000",
-    );
-    defer generic_sql.deinit(allocator, plan);
-    try std.testing.expectEqual(shape.PlanShape.offset_count_top, shape.inferShape(plan, &clickbench_schema.hits));
-}
-
-test "inferShape: unknown for projection-only top-N" {
-    const allocator = std.testing.allocator;
-    const plan = try parseHitsPlan(
-        allocator,
-        "SELECT SearchPhrase FROM hits WHERE SearchPhrase <> '' ORDER BY EventTime LIMIT 10",
-    );
-    defer generic_sql.deinit(allocator, plan);
-    try std.testing.expectEqual(shape.PlanShape.unknown, shape.inferShape(plan, &clickbench_schema.hits));
 }
 
 test "URL and Title carry hash_sidecar capability after PR-A4" {
