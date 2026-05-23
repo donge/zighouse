@@ -668,7 +668,7 @@ fn executeHashAggChunked(
     const alloc = ctx.allocator();
     // Pre-size hash table when input is a bare scan (no filter reduces cardinality).
     // Use min(row_count, 2M) to avoid excessive memory that degrades subsequent queries.
-    const MAX_PRESIZED: u64 = 2_000_000;
+    const MAX_PRESIZED: u64 = 8_000_000;
     const est_rows: u64 = switch (input.*) {
         .part_scan, .mem_scan, .chunk_source => @min(ctx.source.rowCount(), MAX_PRESIZED),
         else => 0,
