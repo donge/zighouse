@@ -140,7 +140,7 @@ pub fn readCountTxt(io: std.Io, allocator: std.mem.Allocator, part: []const u8) 
     defer file.close(io);
     var buf: [32]u8 = undefined;
     const n = try file.readPositionalAll(io, &buf, 0);
-    const trimmed = std.mem.trimRight(u8, buf[0..n], " \t\r\n");
+    const trimmed = std.mem.trimEnd(u8, buf[0..n], " \t\r\n");
     return std.fmt.parseInt(u64, trimmed, 10);
 }
 
@@ -149,7 +149,7 @@ pub fn readCountTxt(io: std.Io, allocator: std.mem.Allocator, part: []const u8) 
 pub fn MapResult(comptime T: type) type {
     return struct {
         values: []const T,
-        ptr: []align(std.mem.page_size) u8,
+        ptr: []align(std.heap.page_size_min) u8,
 
         pub fn deinit(self: @This(), allocator: std.mem.Allocator) void {
             _ = allocator;
@@ -165,7 +165,7 @@ pub fn mmapColumn(comptime T: type, io: std.Io, allocator: std.mem.Allocator, pa
     defer file.close(io);
     const stat = try file.stat(io);
     if (stat.size == 0) return error.EmptyColumn;
-    const ptr = try std.posix.mmap(null, stat.size, std.posix.PROT.READ, .{ .TYPE = .PRIVATE }, file.handle, 0);
+    const ptr = try std.posix.mmap(null, stat.size, .{ .READ = true }, .{ .TYPE = .PRIVATE }, file.handle, 0);
     const values = std.mem.bytesAsSlice(T, ptr[0..stat.size]);
     return .{ .values = values, .ptr = ptr };
 }

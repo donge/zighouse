@@ -610,17 +610,7 @@ pub const Server = struct {
     /// Walk a PhysicalNode tree to find the first part_scan and return its columns.
     /// Returns empty slice if no part_scan found or scan reads all columns.
     fn findPrunedCols(node: *ir_planner.PhysicalNode) []const []const u8 {
-        return switch (node.*) {
-            .part_scan  => |ps| ps.columns,
-            .filter     => |f|  findPrunedCols(f.input),
-            .project    => |p|  findPrunedCols(p.input),
-            .hash_agg   => |a|  findPrunedCols(a.input),
-            .scalar_agg => |a|  findPrunedCols(a.input),
-            .top_k      => |t|  findPrunedCols(t.input),
-            .limit      => |l|  findPrunedCols(l.input),
-            .order_by   => |o|  findPrunedCols(o.input),
-            else        =>      &.{},
-        };
+        return ir_planner.findPrunedCols(node);
     }
 
     /// Try to execute `gplan` via the IR planner + pipeline.

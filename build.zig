@@ -212,13 +212,14 @@ pub fn build(b: *std.Build) void {
     });
     const schema_infer_test_cmd = b.addRunArtifact(schema_infer_tests);
 
-    const generic_store_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/generic_store.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
+    const generic_store_mod = b.createModule(.{
+        .root_source_file = b.path("src/generic_store.zig"),
+        .target   = target,
+        .optimize = optimize,
     });
+    generic_store_mod.addImport("schema", schema_mod);
+
+    const generic_store_tests = b.addTest(.{ .root_module = generic_store_mod });
     generic_store_tests.root_module.link_libc = true;
     const generic_store_test_cmd = b.addRunArtifact(generic_store_tests);
 
@@ -245,17 +246,6 @@ pub fn build(b: *std.Build) void {
         generic_sql_mod.addRPath(.{ .cwd_relative = duckdb_lib_path });
         generic_sql_mod.linkSystemLibrary("duckdb", .{});
     }
-
-    const loader_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/loader.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    loader_tests.root_module.link_libc = true;
-    loader_tests.root_module.addImport("parquet", parquet_mod);
-    const loader_test_cmd = b.addRunArtifact(loader_tests);
 
     // ── clickhouse_format tests ─────────────────────────────────────────────
     const lz4_prefix = b.option([]const u8, "lz4-prefix", "LZ4 installation prefix") orelse "/opt/homebrew/opt/lz4";
@@ -376,6 +366,18 @@ pub fn build(b: *std.Build) void {
         .root_module = ch_part_mod,
     });
     const ch_part_test_cmd = b.addRunArtifact(ch_part_tests);
+
+    // ── loader module ────────────────────────────────────────────────────────
+    const loader_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/loader.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    loader_tests.root_module.link_libc = true;
+    loader_tests.root_module.addImport("parquet", parquet_mod);
+    const loader_test_cmd = b.addRunArtifact(loader_tests);
 
     // ── Wire schema_mod + ch_part_mod + lz4 into exe and all test targets ──────
     // All src/ files now use @import("schema") named module. Inject schema_mod
@@ -542,6 +544,7 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addImport("generic_executor", generic_executor_mod);
     exe.root_module.addImport("generic_sql", generic_sql_mod);
     exe.root_module.addImport("parquet", parquet_mod);
+
     unit_tests.root_module.addImport("ingest_server", ingest_server_mod);
     unit_tests.root_module.addImport("ingest_schema_config", schema_config_mod);
     unit_tests.root_module.addImport("generic_executor", generic_executor_mod);
@@ -585,6 +588,9 @@ pub fn build(b: *std.Build) void {
     part_scan_bridge_mod.addLibraryPath(.{ .cwd_relative = lz4_lib });
     part_scan_bridge_mod.addRPath(.{ .cwd_relative = lz4_lib });
     part_scan_bridge_mod.linkSystemLibrary("lz4", .{});
+
+    exe.root_module.addImport("ir_planner", ir_planner_mod);
+    exe.root_module.addImport("core",       core_mod);
 
     // ── serializer module (ResultSet → Native block) ─────────────────────────
     const serializer_mod = b.createModule(.{

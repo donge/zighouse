@@ -291,6 +291,93 @@ fn runCommand(init: std.process.Init, allocator: std.mem.Allocator, args: *std.p
         var native_backend = native_mod.Native.init(allocator, init.io, data_dir);
         defer native_backend.deinit();
         try native_backend.bench(queries_path, bench_range);
+    } else if (std.mem.eql(u8, command, "bench-ir")) {
+        // IR-pipeline bench: reads a generic_store part and runs queries through
+        // the IR planner + pipeline, timing each query three times.
+        //
+        // Usage: zighouse bench-ir <store_dir> <table_name> <queries_path>
+        //        zighouse bench-ir-one <store_dir> <table_name> <queries_path> <query_num>
+        //        zighouse bench-ir-range <store_dir> <table_name> <queries_path> <first> <limit>
+        const duckdb = @import("duckdb.zig");
+        const QueryRange = duckdb.QueryRange;
+        const ir_planner = @import("ir_planner");
+        const core = @import("core");
+        const gsb = @import("core/source/generic_store_bridge.zig");
+
+        const store_dir   = args.next() orelse return error.MissingStoreDir;
+        const table_name  = args.next() orelse return error.MissingTableName;
+        const queries_path_ir = args.next() orelse return error.MissingQueriesPath;
+        const bench_range_ir: QueryRange = .{};
+
+        // Resolve table schema from clickbench schema.
+        const table: schema.Table = blk: {
+            if (std.mem.eql(u8, table_name, "hits")) break :blk clickbench_schema.hits;
+            return error.UnknownTableName;
+        };
+
+        const part_dir = try std.fmt.allocPrint(allocator, "{s}/{s}/parts/all_1_1_0", .{ store_dir, table_name });
+        defer allocator.free(part_dir);
+
+        // Runner struct for benchWithRunner.
+        const IrRunner = struct {
+            alloc:     std.mem.Allocator,
+            io:        std.Io,
+            part_dir:  []const u8,
+            table:     schema.Table,
+
+            pub fn runQuery(self: *const @This(), query_text: []const u8) !?[]u8 {
+                // Parse SQL.
+                const maybe_gplan = generic_sql.parse(self.alloc, query_text) catch return null;
+                const gplan = maybe_gplan orelse return null;
+                defer generic_sql.deinit(self.alloc, gplan);
+
+                // Plan to IR.
+                var arena = std.heap.ArenaAllocator.init(self.alloc);
+                errdefer arena.deinit();
+                var pctx = ir_planner.PlannerCtx.init(arena.allocator(), self.table);
+                const node = ir_planner.plan_query(&pctx, gplan) catch {
+                    arena.deinit();
+                    return null;
+                };
+                if (node == null) {
+                    arena.deinit();
+                    return null;
+                }
+
+                // Build source bridge.
+                const pruned_cols = ir_planner.findPrunedCols(node.?);
+                var bridge = gsb.GenericStoreBridge.init(
+                    self.alloc, self.io, self.part_dir, self.table, pruned_cols,
+                ) catch {
+                    arena.deinit();
+                    return null;
+                };
+                defer bridge.deinit();
+
+                // Execute plan.
+                var qctx = core.exec.pipeline.QueryContext.init(self.alloc, bridge.source());
+                defer qctx.deinit();
+                var rs = core.exec.pipeline.executePlan(node.?, &qctx) catch {
+                    arena.deinit();
+                    return null;
+                };
+                defer rs.deinit();
+                arena.deinit();
+
+                // Return a minimal non-null string so benchWithRunner records a timing.
+                // The actual result content doesn't matter for benchmarking.
+                const out = try std.fmt.allocPrint(self.alloc, "rows={d}\n", .{rs.num_rows});
+                return out;
+            }
+        };
+
+        const runner = IrRunner{
+            .alloc    = allocator,
+            .io       = init.io,
+            .part_dir = part_dir,
+            .table    = table,
+        };
+        try duckdb.benchWithRunner(allocator, init.io, queries_path_ir, bench_range_ir, &runner);
     } else if (std.mem.eql(u8, command, "serve")) {
         // HTTP RowBinary ingest + query server.
         // Usage: zighouse serve --data-dir=<dir> [--schemas=<schemas.json>] [--port=<port>]

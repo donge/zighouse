@@ -151,6 +151,23 @@ fn pushdownColumns(
 
 /// Translate a generic_sql.Plan into a PhysicalNode tree.
 /// Returns null if the plan cannot be translated (e.g. unsupported construct).
+/// Walk the physical plan tree to find the columns list on the innermost
+/// PartScanNode.  Returns an empty slice when the node is not a scan-based
+/// plan (e.g. a VALUES literal) or when column pruning was not applied.
+pub fn findPrunedCols(node: *const PhysicalNode) []const []const u8 {
+    return switch (node.*) {
+        .part_scan  => |ps| ps.columns,
+        .filter     => |f|  findPrunedCols(f.input),
+        .project    => |p|  findPrunedCols(p.input),
+        .hash_agg   => |a|  findPrunedCols(a.input),
+        .scalar_agg => |a|  findPrunedCols(a.input),
+        .top_k      => |t|  findPrunedCols(t.input),
+        .limit      => |l|  findPrunedCols(l.input),
+        .order_by   => |o|  findPrunedCols(o.input),
+        else        =>      &.{},
+    };
+}
+
 pub fn plan_query(
     ctx: *PlannerCtx,
     gplan: generic_sql.Plan,
