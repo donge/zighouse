@@ -804,6 +804,27 @@ fn updateAccumsFromChunk(
                                         else => {},
                                     }
                                 },
+                                // SUM(col + int_literal): vectorized sum of (val + k)
+                                .add => |bo| {
+                                    const cr_opt: ?plan.ColRef = switch (bo.left) { .col_ref => |c2| c2, else => null };
+                                    const k_opt: ?i64 = switch (bo.right) { .lit_i64 => |v| v, else => null };
+                                    if (cr_opt != null and k_opt != null) {
+                                        const cr = cr_opt.?;
+                                        const k = k_opt.?;
+                                        const col = c.columns[cr.index];
+                                        switch (col.data) {
+                                            .int64 => |vals| {
+                                                if (acc_ptr.* == .i64_sum) {
+                                                    for (0..c.num_rows) |r| {
+                                                        if (!chunk.isNull(col.null_mask, r)) acc_ptr.i64_sum +%= vals[r] + k;
+                                                    }
+                                                    handled = true;
+                                                }
+                                            },
+                                            else => {},
+                                        }
+                                    }
+                                },
                                 else => {},
                             }
                         }
