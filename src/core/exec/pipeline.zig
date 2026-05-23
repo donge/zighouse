@@ -929,6 +929,7 @@ fn executeLimitChunked(node: *const plan.PhysicalNode, ctx: *QueryContext) !RowL
     var skipped: u64 = 0;
     var emitted: u64 = 0;
     var row_ref_indices: ?[]usize = null;
+    var row_buf: []?Value = &.{}; // allocated once on first chunk
 
     while (try ctx.source.nextChunk(&c, ctx)) {
         if (filter_state) |*fs| try fs.apply(&c, ctx);
@@ -945,10 +946,11 @@ fn executeLimitChunked(node: *const plan.PhysicalNode, ctx: *QueryContext) !RowL
             var wi: usize = 0;
             for (mask, 0..) |m, j| { if (m) { idxs[wi] = j; wi += 1; } }
             row_ref_indices = idxs;
+            // Allocate row_buf once (reused across all chunks).
+            row_buf = try alloc.alloc(?Value, c.columns.len);
+            @memset(row_buf, null);
         }
         const refs = row_ref_indices orelse &[_]usize{};
-        const row_buf = try alloc.alloc(?Value, c.columns.len);
-        @memset(row_buf, null);
 
         for (0..c.num_rows) |r| {
             if (skipped < lim_state.offset) { skipped += 1; continue; }
