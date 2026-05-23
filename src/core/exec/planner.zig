@@ -43,6 +43,112 @@ pub const PlannerCtx = struct {
 
 // ── Public entry point ────────────────────────────────────────────────────────
 
+/// Collect all col_ref indices used in an Expr tree into a bitset.
+fn collectExprCols(expr: Expr, used: *std.bit_set.IntegerBitSet(256)) void {
+    switch (expr) {
+        .col_ref => |r| { if (r.index < 256) used.set(r.index); },
+        .add, .sub, .mul, .div, .mod,
+        .eq, .neq, .lt, .lte, .gt, .gte,
+        .@"and", .@"or",
+        .like, .not_like, .concat => |b| {
+            collectExprCols(b.left, used);
+            collectExprCols(b.right, used);
+        },
+        .not, .is_null, .is_not_null => |u| collectExprCols(u.operand, used),
+        .case_when => |cw| {
+            for (cw.when) |c| collectExprCols(c, used);
+            for (cw.then) |r| collectExprCols(r, used);
+            if (cw.else_expr) |e| collectExprCols(e, used);
+        },
+        .agg_call => |a| {
+            if (a.arg) |arg| collectExprCols(arg, used);
+        },
+        .fn_call => |f| for (f.args) |a| collectExprCols(a, used),
+        .cast => |c| collectExprCols(c.expr, used),
+        .dict_call => |d| for (d.keys) |k| collectExprCols(k, used),
+        .lambda => |l| collectExprCols(l.body.*, used),
+        else => {},
+    }
+}
+
+/// Walk the plan tree and collect all col_ref indices into `used`.
+fn collectPlanCols(node: *const PhysicalNode, used: *std.bit_set.IntegerBitSet(256)) void {
+    switch (node.*) {
+        .part_scan  => {},  // leaf — no exprs
+        .mem_scan   => {},
+        .chunk_source => |cs| collectPlanCols(cs.input, used),
+        .filter => |f| {
+            collectPlanCols(f.input, used);
+            collectExprCols(f.predicate, used);
+        },
+        .project => |p| {
+            collectPlanCols(p.input, used);
+            for (p.items) |item| collectExprCols(item.expr, used);
+        },
+        .hash_agg => |ha| {
+            collectPlanCols(ha.input, used);
+            for (ha.keys) |k| collectExprCols(k.expr, used);
+            for (ha.aggs) |a| collectExprCols(a.expr, used);
+        },
+        .scalar_agg => |sa| {
+            collectPlanCols(sa.input, used);
+            for (sa.aggs) |a| collectExprCols(a.expr, used);
+        },
+        .hash_join => |hj| {
+            collectPlanCols(hj.left, used);
+            collectPlanCols(hj.right, used);
+        },
+        .order_by => |ob| collectPlanCols(ob.input, used),
+        .top_k => |tk| collectPlanCols(tk.input, used),
+        .limit => |lm| collectPlanCols(lm.input, used),
+    }
+}
+
+/// Find the PartScanNode and push down a column list.
+/// `used` is the bitset of referenced column indices; `tbl` provides names.
+fn pushdownColumns(
+    node: *PhysicalNode,
+    used: std.bit_set.IntegerBitSet(256),
+    tbl: schema_mod.Table,
+    alloc: std.mem.Allocator,
+) !void {
+    switch (node.*) {
+        .part_scan => |*ps| {
+            // Count referenced columns.
+            var n: usize = 0;
+            var it = used.iterator(.{});
+            while (it.next()) |idx| {
+                if (idx < tbl.columns.len) n += 1;
+            }
+            // If all columns are referenced (SELECT *), don't pushdown.
+            if (n == 0 or n >= tbl.columns.len) return;
+            const cols = try alloc.alloc([]const u8, n);
+            var i: usize = 0;
+            var it2 = used.iterator(.{});
+            while (it2.next()) |idx| {
+                if (idx < tbl.columns.len) {
+                    cols[i] = tbl.columns[idx].name;
+                    i += 1;
+                }
+            }
+            ps.columns = cols;
+        },
+        .chunk_source => |cs| try pushdownColumns(cs.input, used, tbl, alloc),
+        .filter => |f| try pushdownColumns(f.input, used, tbl, alloc),
+        .project => |p| try pushdownColumns(p.input, used, tbl, alloc),
+        .hash_agg => |ha| try pushdownColumns(ha.input, used, tbl, alloc),
+        .scalar_agg => |sa| try pushdownColumns(sa.input, used, tbl, alloc),
+        .hash_join => |hj| {
+            try pushdownColumns(hj.left, used, tbl, alloc);
+            try pushdownColumns(hj.right, used, tbl, alloc);
+        },
+        .order_by => |ob| try pushdownColumns(ob.input, used, tbl, alloc),
+        .top_k => |tk| try pushdownColumns(tk.input, used, tbl, alloc),
+        .limit => |lm| try pushdownColumns(lm.input, used, tbl, alloc),
+        .mem_scan => {},
+    }
+}
+
 /// Translate a generic_sql.Plan into a PhysicalNode tree.
 /// Returns null if the plan cannot be translated (e.g. unsupported construct).
 pub fn plan_query(
@@ -477,6 +583,13 @@ pub fn plan_query(
             }};
             source = lim_node;
         }
+    }
+
+    // ── Column pruning: push down only referenced columns to part_scan ────────
+    if (ctx.tbl) |tbl| {
+        var used = std.bit_set.IntegerBitSet(256).initEmpty();
+        collectPlanCols(source, &used);
+        try pushdownColumns(source, used, tbl, ctx.alloc);
     }
 
     return source;

@@ -607,6 +607,22 @@ pub const Server = struct {
         try sess.finish();
     }
 
+    /// Walk a PhysicalNode tree to find the first part_scan and return its columns.
+    /// Returns empty slice if no part_scan found or scan reads all columns.
+    fn findPrunedCols(node: *ir_planner.PhysicalNode) []const []const u8 {
+        return switch (node.*) {
+            .part_scan  => |ps| ps.columns,
+            .filter     => |f|  findPrunedCols(f.input),
+            .project    => |p|  findPrunedCols(p.input),
+            .hash_agg   => |a|  findPrunedCols(a.input),
+            .scalar_agg => |a|  findPrunedCols(a.input),
+            .top_k      => |t|  findPrunedCols(t.input),
+            .limit      => |l|  findPrunedCols(l.input),
+            .order_by   => |o|  findPrunedCols(o.input),
+            else        =>      &.{},
+        };
+    }
+
     /// Try to execute `gplan` via the IR planner + pipeline.
     /// Returns an owned native-block []u8 on success, or null if the plan
     /// shape is not yet supported (caller should fall back to generic_executor).
@@ -637,8 +653,10 @@ pub const Server = struct {
         }
 
         // ── 2. Build SourceIface via PartScanBridge ───────────────────────────
+        // Extract pruned column list from the scan node (empty = read all).
+        const pruned_cols: []const []const u8 = findPrunedCols(node.?);
         var bridge = part_scan_bridge.PartScanBridge.init(
-            self.allocator, self.io, table.*, part_dirs,
+            self.allocator, self.io, table.*, part_dirs, pruned_cols,
         ) catch |err| {
             std.log.warn("part_scan_bridge init error: {}", .{err});
             arena.deinit();

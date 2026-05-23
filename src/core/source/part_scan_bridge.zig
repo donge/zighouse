@@ -66,12 +66,17 @@ const ScanState = struct {
     rows_read:   u64,                        // rows read from current part
     col_readers: []?part_mod.ColumnReader,   // one per table column; null if unopened
     metas:       []ColMeta,                  // schema metas (allocated once)
+    /// If non-null, only columns marked `true` are read from disk.
+    /// Length == table.columns.len.  null means read all.
+    needed_cols: ?[]const bool,
 
     fn init(
         alloc: std.mem.Allocator,
         io: std.Io,
         table: schema.Table,
         part_dirs: []const []const u8,
+        /// Optional list of column names to read. Empty slice = read all.
+        pruned_columns: []const []const u8,
     ) !ScanState {
         const metas = try alloc.alloc(ColMeta, table.columns.len);
         for (table.columns, 0..) |col, i| {
@@ -82,6 +87,19 @@ const ScanState = struct {
         }
         const col_readers = try alloc.alloc(?part_mod.ColumnReader, table.columns.len);
         @memset(col_readers, null);
+
+        // Build needed_cols mask if pruned list is provided.
+        const needed_cols: ?[]bool = if (pruned_columns.len == 0) null else blk: {
+            const mask = try alloc.alloc(bool, table.columns.len);
+            @memset(mask, false);
+            for (pruned_columns) |name| {
+                for (table.columns, 0..) |col, i| {
+                    if (std.mem.eql(u8, col.name, name)) { mask[i] = true; break; }
+                }
+            }
+            break :blk mask;
+        };
+
         return .{
             .alloc       = alloc,
             .io          = io,
@@ -92,6 +110,7 @@ const ScanState = struct {
             .rows_read   = 0,
             .col_readers = col_readers,
             .metas       = metas,
+            .needed_cols = needed_cols,
         };
     }
 
@@ -99,6 +118,7 @@ const ScanState = struct {
         self.closeCurrentPart();
         self.alloc.free(self.col_readers);
         self.alloc.free(self.metas);
+        if (self.needed_cols) |nc| self.alloc.free(nc);
     }
 
     fn closeCurrentPart(self: *ScanState) void {
@@ -117,6 +137,10 @@ const ScanState = struct {
         self.part_idx += 1;
         self.opened = try part_mod.OpenedPart.open(self.io, self.alloc, dir, self.table);
         for (self.table.columns, 0..) |_, i| {
+            // Skip columns not in the needed set (column pruning).
+            if (self.needed_cols) |nc| {
+                if (!nc[i]) continue;
+            }
             self.col_readers[i] = try self.opened.?.columnReader(i);
         }
         return true;
@@ -150,62 +174,91 @@ const ScanState = struct {
             const null_mask = try chunk_alloc.alloc(u64, null_words);
             @memset(null_mask, 0);
             const core_ty = toCoreColTypeFull(col);
+            // Pruned column: produce zero/empty data without reading from disk.
+            const is_pruned = self.col_readers[ci] == null and
+                (self.needed_cols != null and !self.needed_cols.?[ci]);
             const col_data: chunk.ColumnData = switch (core_ty) {
                 .int64, .datetime64_ms => blk: {
                     const buf = try chunk_alloc.alloc(i64, n);
-                    const actual = try self.col_readers[ci].?.readFixed(buf);
-                    // Zero out any unread tail (shouldn't happen in well-formed parts)
-                    if (actual < n) @memset(buf[actual..], 0);
+                    if (is_pruned) {
+                        @memset(buf, 0);
+                    } else {
+                        const actual = try self.col_readers[ci].?.readFixed(buf);
+                        if (actual < n) @memset(buf[actual..], 0);
+                    }
                     break :blk if (core_ty == .int64) .{ .int64 = buf } else .{ .datetime64_ms = buf };
                 },
                 .float64 => blk: {
-                    const ibuf = try chunk_alloc.alloc(i64, n);
-                    _ = try self.col_readers[ci].?.readFixed(ibuf);
                     const fbuf = try chunk_alloc.alloc(f64, n);
-                    for (ibuf, 0..) |iv, i| fbuf[i] = @bitCast(iv);
+                    if (is_pruned) {
+                        @memset(fbuf, 0.0);
+                    } else {
+                        const ibuf = try chunk_alloc.alloc(i64, n);
+                        _ = try self.col_readers[ci].?.readFixed(ibuf);
+                        for (ibuf, 0..) |iv, i| fbuf[i] = @bitCast(iv);
+                    }
                     break :blk .{ .float64 = fbuf };
                 },
                 .date_u16 => blk: {
-                    const ibuf = try chunk_alloc.alloc(i64, n);
-                    _ = try self.col_readers[ci].?.readFixed(ibuf);
                     const ubuf = try chunk_alloc.alloc(u16, n);
-                    for (ibuf, 0..) |iv, i| ubuf[i] = @intCast(@as(u16, @truncate(@as(u64, @bitCast(iv)))));
+                    if (is_pruned) {
+                        @memset(ubuf, 0);
+                    } else {
+                        const ibuf = try chunk_alloc.alloc(i64, n);
+                        _ = try self.col_readers[ci].?.readFixed(ibuf);
+                        for (ibuf, 0..) |iv, i| ubuf[i] = @intCast(@as(u16, @truncate(@as(u64, @bitCast(iv)))));
+                    }
                     break :blk .{ .date_u16 = ubuf };
                 },
                 .bool_u8 => blk: {
-                    const ibuf = try chunk_alloc.alloc(i64, n);
-                    _ = try self.col_readers[ci].?.readFixed(ibuf);
                     const bbuf = try chunk_alloc.alloc(u8, n);
-                    for (ibuf, 0..) |iv, i| bbuf[i] = @intCast(@as(u8, @truncate(@as(u64, @bitCast(iv)))));
+                    if (is_pruned) {
+                        @memset(bbuf, 0);
+                    } else {
+                        const ibuf = try chunk_alloc.alloc(i64, n);
+                        _ = try self.col_readers[ci].?.readFixed(ibuf);
+                        for (ibuf, 0..) |iv, i| bbuf[i] = @intCast(@as(u8, @truncate(@as(u64, @bitCast(iv)))));
+                    }
                     break :blk .{ .bool_u8 = bbuf };
                 },
                 .uint64 => blk: {
-                    const ibuf = try chunk_alloc.alloc(i64, n);
-                    _ = try self.col_readers[ci].?.readFixed(ibuf);
                     const ubuf = try chunk_alloc.alloc(u64, n);
-                    for (ibuf, 0..) |iv, i| ubuf[i] = @bitCast(iv);
+                    if (is_pruned) {
+                        @memset(ubuf, 0);
+                    } else {
+                        const ibuf = try chunk_alloc.alloc(i64, n);
+                        _ = try self.col_readers[ci].?.readFixed(ibuf);
+                        for (ibuf, 0..) |iv, i| ubuf[i] = @bitCast(iv);
+                    }
                     break :blk .{ .uint64 = ubuf };
                 },
                 .string => blk: {
                     const sbuf = try chunk_alloc.alloc([]const u8, n);
-                    const Ctx = struct {
-                        buf:   [][]const u8,
-                        idx:   usize,
-                        alloc: std.mem.Allocator,
-                    };
-                    var sctx = Ctx{ .buf = sbuf, .idx = 0, .alloc = chunk_alloc };
-                    _ = try self.col_readers[ci].?.readStrings(n, &sctx,
-                        struct {
-                            fn cb(c: *Ctx, str: []const u8) !void {
-                                c.buf[c.idx] = try c.alloc.dupe(u8, str);
-                                c.idx += 1;
-                            }
-                        }.cb,
-                    );
+                    if (is_pruned) {
+                        @memset(sbuf, "");
+                    } else {
+                        const Ctx = struct {
+                            buf:   [][]const u8,
+                            idx:   usize,
+                            alloc: std.mem.Allocator,
+                        };
+                        var sctx = Ctx{ .buf = sbuf, .idx = 0, .alloc = chunk_alloc };
+                        _ = try self.col_readers[ci].?.readStrings(n, &sctx,
+                            struct {
+                                fn cb(c: *Ctx, str: []const u8) !void {
+                                    c.buf[c.idx] = try c.alloc.dupe(u8, str);
+                                    c.idx += 1;
+                                }
+                            }.cb,
+                        );
+                    }
                     break :blk .{ .string = sbuf };
                 },
                 .array_string => blk: {
                     const sbuf = try chunk_alloc.alloc([][]const u8, n);
+                    if (is_pruned) {
+                        @memset(sbuf, &.{});
+                    } else {
                     // Use readArrayStrings to decode Array(String) columns from parts.
                     if (self.col_readers[ci]) |*cr| {
                         const Ctx2 = struct {
@@ -230,6 +283,7 @@ const ScanState = struct {
                     } else {
                         @memset(sbuf, &.{});
                     }
+                    } // end else (not pruned)
                     break :blk .{ .array_string = sbuf };
                 },
             };
@@ -261,9 +315,10 @@ pub const PartScanBridge = struct {
         io: std.Io,
         table: schema.Table,
         part_dirs: []const []const u8,
+        pruned_columns: []const []const u8,
     ) !PartScanBridge {
         const s = try alloc.create(ScanState);
-        s.* = try ScanState.init(alloc, io, table, part_dirs);
+        s.* = try ScanState.init(alloc, io, table, part_dirs, pruned_columns);
         return .{ .state = s, .alloc = alloc };
     }
 

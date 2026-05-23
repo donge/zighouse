@@ -40,7 +40,14 @@ pub fn main(init: std.process.Init) !void {
     defer args.deinit();
 
     _ = args.next();
-    const command = args.next() orelse return printUsage(init.io);
+    // Skip any legacy --backend=<x> or --backend <x> flags before the command.
+    var command_raw = args.next() orelse return printUsage(init.io);
+    while (std.mem.startsWith(u8, command_raw, "--backend")) {
+        // If it's "--backend value" (two tokens), consume the value token too.
+        if (std.mem.eql(u8, command_raw, "--backend")) _ = args.next();
+        command_raw = args.next() orelse return printUsage(init.io);
+    }
+    const command = command_raw;
     const command_started = wallNow();
     try runCommand(init, allocator, &args, command);
     traceMainWall(command, command_started);
@@ -263,6 +270,27 @@ fn runCommand(init: std.process.Init, allocator: std.mem.Allocator, args: *std.p
         try writeOut(init.io, "[import.zig-house]\n");
         try writeOut(init.io, import_manifest);
         if (import_manifest.len == 0 or import_manifest[import_manifest.len - 1] != '\n') try writeOut(init.io, "\n");
+    } else if (std.mem.eql(u8, command, "bench") or std.mem.eql(u8, command, "bench-one") or std.mem.eql(u8, command, "bench-range")) {
+        // Legacy bench: delegates to native engine until Phase 3.
+        const native_mod = @import("native.zig");
+        const BenchRange = @typeInfo(@TypeOf(native_mod.Native.bench)).@"fn".params[2].type.?;
+        const data_dir = args.next() orelse return error.MissingDataDir;
+        const queries_path = args.next() orelse return error.MissingQueriesPath;
+        const bench_range: BenchRange = blk: {
+            if (std.mem.eql(u8, command, "bench-one")) {
+                const n = try std.fmt.parseInt(usize, args.next() orelse return error.MissingQueryNum, 10);
+                break :blk .{ .first = n, .limit = 1 };
+            } else if (std.mem.eql(u8, command, "bench-range")) {
+                const first = try std.fmt.parseInt(usize, args.next() orelse return error.MissingQueryNum, 10);
+                const limit = try std.fmt.parseInt(usize, args.next() orelse return error.MissingQueryLimit, 10);
+                break :blk .{ .first = first, .limit = limit };
+            }
+            break :blk .{};
+        };
+        try storage.ensureStore(init.io, data_dir);
+        var native_backend = native_mod.Native.init(allocator, init.io, data_dir);
+        defer native_backend.deinit();
+        try native_backend.bench(queries_path, bench_range);
     } else if (std.mem.eql(u8, command, "serve")) {
         // HTTP RowBinary ingest + query server.
         // Usage: zighouse serve --data-dir=<dir> [--schemas=<schemas.json>] [--port=<port>]
