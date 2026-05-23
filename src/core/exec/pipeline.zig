@@ -67,6 +67,8 @@ pub const SourceIface = struct {
         reset: *const fn (ptr: *anyopaque) void,
         /// Return column metadata for this source's schema.
         schema: *const fn (ptr: *anyopaque) []const result.ColMeta,
+        /// Return an upper-bound row count estimate (0 = unknown).
+        rowCount: *const fn (ptr: *anyopaque) u64,
     };
 
     pub fn nextChunk(self: SourceIface, out: *DataChunk, ctx: *QueryContext) !bool {
@@ -79,6 +81,10 @@ pub const SourceIface = struct {
 
     pub fn schema(self: SourceIface) []const result.ColMeta {
         return self.vtable.schema(self.ptr);
+    }
+
+    pub fn rowCount(self: SourceIface) u64 {
+        return self.vtable.rowCount(self.ptr);
     }
 };
 
@@ -660,7 +666,14 @@ fn executeHashAggChunked(
     ctx:   *QueryContext,
 ) !RowList {
     const alloc = ctx.allocator();
-    var ht_agg = try ht.AggHashTable.init(alloc, keys.len, aggs.len);
+    // Pre-size hash table when input is a bare scan (no filter reduces cardinality).
+    // Use min(row_count, 2M) to avoid excessive memory that degrades subsequent queries.
+    const MAX_PRESIZED: u64 = 2_000_000;
+    const est_rows: u64 = switch (input.*) {
+        .part_scan, .mem_scan, .chunk_source => @min(ctx.source.rowCount(), MAX_PRESIZED),
+        else => 0,
+    };
+    var ht_agg = try ht.AggHashTable.initWithCapacity(alloc, keys.len, aggs.len, est_rows);
     const init_accums = try alloc.alloc(AggAccum, aggs.len);
     for (aggs, 0..) |item, ci| init_accums[ci] = initAccumForAgg(item.expr);
     const key_buf = try alloc.alloc(Value, keys.len);
@@ -1223,6 +1236,7 @@ const MockSource = struct {
         .nextChunk = nextChunk,
         .reset     = reset,
         .schema    = schema,
+        .rowCount  = struct { fn f(_: *anyopaque) u64 { return 0; } }.f,
     };
 
     fn iface(self: *MockSource) SourceIface {

@@ -58,7 +58,21 @@ pub const AggHashTable = struct {
         num_keys: usize,
         num_aggs: usize,
     ) !AggHashTable {
-        const cap = INITIAL_CAP;
+        return initWithCapacity(arena, num_keys, num_aggs, 0);
+    }
+
+    /// Like init but pre-sizes the table for `est_rows` rows (0 = use default).
+    pub fn initWithCapacity(
+        arena: std.mem.Allocator,
+        num_keys: usize,
+        num_aggs: usize,
+        est_rows: u64,
+    ) !AggHashTable {
+        const cap = if (est_rows > 0)
+            // Round up to next power of 2 at 70% load factor.
+            nextPow2(@as(usize, @intCast(@min(est_rows * 100 / 70 + 1, std.math.maxInt(u32)))))
+        else
+            INITIAL_CAP;
         const keys     = try arena.alloc([]Value,    cap);
         const accums   = try arena.alloc([]AggAccum, cap);
         const occupied = try arena.alloc(bool,       cap);
@@ -73,6 +87,13 @@ pub const AggHashTable = struct {
             .num_aggs = num_aggs,
             .arena    = arena,
         };
+    }
+
+    fn nextPow2(n: usize) usize {
+        if (n <= 1) return 1;
+        var p: usize = 1;
+        while (p < n) p <<= 1;
+        return p;
     }
 
     /// Look up a key. Returns a pointer to the accumulators for that key,

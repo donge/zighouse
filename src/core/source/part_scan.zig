@@ -77,9 +77,12 @@ pub const PartScanSource = struct {
         return self.schema_metas;
     }
 
+    fn rowCountFn(_: *anyopaque) u64 { return 0; }
+
     const vtable = SourceIface.VTable{
         .nextChunk = nextChunkFn,
         .reset     = resetFn,
         .schema    = schemaFn,
+        .rowCount  = rowCountFn,
     };
 };

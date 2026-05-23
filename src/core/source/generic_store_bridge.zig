@@ -435,9 +435,15 @@ pub const GenericStoreBridge = struct {
         return self.state.metas;
     }
 
+    fn rowCountFn(ptr: *anyopaque) u64 {
+        const self: *GenericStoreBridge = @ptrCast(@alignCast(ptr));
+        return self.state.row_count;
+    }
+
     const vtable = SourceIface.VTable{
         .nextChunk = nextChunkFn,
         .reset     = resetFn,
         .schema    = schemaFn,
+        .rowCount  = rowCountFn,
     };
 };
