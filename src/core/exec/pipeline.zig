@@ -96,10 +96,12 @@ pub const FilterState = struct {
     predicate: plan.Expr,
     /// Column indices referenced by the predicate; populated lazily on first apply().
     ref_indices: ?[]usize = null,
+    /// Row buffer reused across chunk calls (allocated on first apply).
+    row_buf: ?[]?Value = null,
 
     pub fn apply(self: *FilterState, c: *DataChunk, ctx: *QueryContext) !void {
         const alloc = ctx.allocator();
-        // Build ref_indices on first call (once per query).
+        // Build ref_indices and row_buf on first call (once per query).
         if (self.ref_indices == null) {
             const mask = try alloc.alloc(bool, c.columns.len);
             @memset(mask, false);
@@ -110,12 +112,12 @@ pub const FilterState = struct {
             var wi: usize = 0;
             for (mask, 0..) |m, j| { if (m) { indices[wi] = j; wi += 1; } }
             self.ref_indices = indices;
+            const row = try alloc.alloc(?Value, c.columns.len);
+            @memset(row, null);
+            self.row_buf = row;
         }
         const ref = self.ref_indices.?;
-
-        // Row buffer: only fill referenced columns; others stay undefined/null.
-        const row = try alloc.alloc(?Value, c.columns.len);
-        @memset(row, null);
+        const row = self.row_buf.?;
 
         var write_pos: usize = 0;
         for (0..c.num_rows) |r| {
