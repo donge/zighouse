@@ -88,27 +88,69 @@ pub const SourceIface = struct {
 /// Non-matching rows are compacted out — chunk.num_rows shrinks.
 pub const FilterState = struct {
     predicate: plan.Expr,
+    /// Column indices referenced by the predicate; populated lazily on first apply().
+    ref_indices: ?[]usize = null,
 
     pub fn apply(self: *FilterState, c: *DataChunk, ctx: *QueryContext) !void {
         const alloc = ctx.allocator();
+        // Build ref_indices on first call (once per query).
+        if (self.ref_indices == null) {
+            const mask = try alloc.alloc(bool, c.columns.len);
+            @memset(mask, false);
+            collectColRefs(self.predicate, mask);
+            var count: usize = 0;
+            for (mask) |m| { if (m) count += 1; }
+            const indices = try alloc.alloc(usize, count);
+            var wi: usize = 0;
+            for (mask, 0..) |m, j| { if (m) { indices[wi] = j; wi += 1; } }
+            self.ref_indices = indices;
+        }
+        const ref = self.ref_indices.?;
+
+        // Row buffer: only fill referenced columns; others stay undefined/null.
+        const row = try alloc.alloc(?Value, c.columns.len);
+        @memset(row, null);
+
         var write_pos: usize = 0;
         for (0..c.num_rows) |r| {
-            // Build row value slice.
-            const row = try c.readRow(r, alloc);
+            for (ref) |j| {
+                const col = c.columns[j];
+                row[j] = if (col.isRowNull(r)) null else col.data.get(r);
+            }
             const v = try kernels.evalExpr(self.predicate, row, null, alloc);
             const keep = if (v) |val| val.bool_u8 != 0 else false;
             if (keep and write_pos == r) {
-                write_pos += 1; // no copy needed
+                write_pos += 1;
             } else if (keep) {
                 copyRow(c, r, write_pos);
                 write_pos += 1;
             }
         }
         c.num_rows = write_pos;
-        // Update column lens.
         for (c.columns) |*col| col.len = write_pos;
     }
 };
+
+/// Recursively collect column reference indices from an expression into a mask.
+fn collectColRefs(expr: plan.Expr, mask: []bool) void {
+    switch (expr) {
+        .col_ref => |cr| if (cr.index < mask.len) { mask[cr.index] = true; },
+        .add, .sub, .mul, .div, .mod => |op| { collectColRefs(op.left, mask); collectColRefs(op.right, mask); },
+        .eq, .neq, .lt, .lte, .gt, .gte => |op| { collectColRefs(op.left, mask); collectColRefs(op.right, mask); },
+        .@"and", .@"or" => |op| { collectColRefs(op.left, mask); collectColRefs(op.right, mask); },
+        .not => |inner| collectColRefs(inner.operand, mask),
+        .like, .not_like, .concat => |op| { collectColRefs(op.left, mask); collectColRefs(op.right, mask); },
+        .is_null, .is_not_null => |inner| collectColRefs(inner.operand, mask),
+        .cast => |c| collectColRefs(c.expr, mask),
+        .fn_call => |fc| for (fc.args) |arg| collectColRefs(arg, mask),
+        .agg_call => |ac| if (ac.arg) |arg| collectColRefs(arg, mask),
+        .case_when => |cw| {
+            for (cw.when, cw.then) |wh, th| { collectColRefs(wh, mask); collectColRefs(th, mask); }
+            if (cw.else_expr) |e| collectColRefs(e, mask);
+        },
+        else => {},
+    }
+}
 
 fn copyRow(c: *DataChunk, from: usize, to: usize) void {
     for (c.columns) |*col| {
@@ -209,6 +251,10 @@ pub const LimitState = struct {
     offset:  u64,
     emitted: u64 = 0,
     skipped: u64 = 0,
+
+    pub fn done(self: LimitState) bool {
+        return self.emitted >= self.limit;
+    }
 
     pub fn apply(self: *LimitState, c: *DataChunk) void {
         // Handle offset.
@@ -408,12 +454,18 @@ fn executeNode(node: *const plan.PhysicalNode, ctx: *QueryContext) !RowList {
 
         // ── ScalarAgg ─────────────────────────────────────────────────────────
         .scalar_agg => |sa| {
+            if (isScannable(sa.input)) {
+                return executeScalarAggChunked(sa.input, sa.aggs, ctx);
+            }
             const inner = try executeNode(sa.input, ctx);
             return executeScalarAgg(inner, sa.aggs, alloc);
         },
 
         // ── HashAgg ───────────────────────────────────────────────────────────
         .hash_agg => |ha| {
+            if (isScannable(ha.input)) {
+                return executeHashAggChunked(ha.input, ha.keys, ha.aggs, ctx);
+            }
             const inner = try executeNode(ha.input, ctx);
             return executeHashAgg(inner, ha.keys, ha.aggs, alloc);
         },
@@ -537,6 +589,268 @@ fn projectRowList(inner: RowList, items: []const plan.ProjectItem, alloc: std.me
         }
     }
     return rl;
+}
+
+// ── Chunked agg helpers ───────────────────────────────────────────────────────
+
+/// Returns true if node is a direct source (part_scan/mem_scan) or a
+/// filter/project/limit over a direct source — i.e. no pipeline breakers.
+fn isScannable(node: *const plan.PhysicalNode) bool {
+    return switch (node.*) {
+        .part_scan, .mem_scan, .chunk_source => true,
+        .filter  => |f| isScannable(f.input),
+        .project => |p| isScannable(p.input),
+        .limit   => |l| isScannable(l.input),
+        else => false,
+    };
+}
+
+/// Drive the source (and optional filter/project/limit pipeline) chunk by
+/// chunk and accumulate scalar aggregates without materialising any rows.
+fn executeScalarAggChunked(
+    input: *const plan.PhysicalNode,
+    aggs:  []const plan.ProjectItem,
+    ctx:   *QueryContext,
+) !RowList {
+    const alloc = ctx.allocator();
+    const accums = try alloc.alloc(AggAccum, aggs.len);
+    for (aggs, 0..) |item, ci| accums[ci] = initAccumForAgg(item.expr);
+
+    var filter_state: ?FilterState = extractFilter(input);
+    var lim_state:    ?LimitState  = extractLimit(input);
+
+    var c: DataChunk = undefined;
+    ctx.source.reset();
+    while (try ctx.source.nextChunk(&c, ctx)) {
+        if (filter_state) |*fs| try fs.apply(&c, ctx);
+        if (lim_state)    |*ls| ls.apply(&c);
+        if (c.num_rows == 0) {
+            if (lim_state) |ls| if (ls.done()) break;
+            continue;
+        }
+        try updateAccumsFromChunk(accums, aggs, &c, alloc);
+        if (lim_state) |ls| if (ls.done()) break;
+    }
+
+    const metas   = try alloc.alloc(result.ColMeta, aggs.len);
+    const out_row = try alloc.alloc(?Value, aggs.len);
+    for (aggs, 0..) |item, ci| {
+        metas[ci]   = .{ .name = item.alias, .col_type = item.out_type };
+        out_row[ci] = try finalizeAccum(accums[ci], item, alloc);
+    }
+    var rl = RowList.init(metas);
+    try rl.append(alloc, out_row);
+    return rl;
+}
+
+/// Drive the source chunk by chunk and build a hash aggregate without rows.
+fn executeHashAggChunked(
+    input: *const plan.PhysicalNode,
+    keys:  []const plan.ProjectItem,
+    aggs:  []const plan.ProjectItem,
+    ctx:   *QueryContext,
+) !RowList {
+    const alloc = ctx.allocator();
+    var ht_agg = try ht.AggHashTable.init(alloc, keys.len, aggs.len);
+    const init_accums = try alloc.alloc(AggAccum, aggs.len);
+    for (aggs, 0..) |item, ci| init_accums[ci] = initAccumForAgg(item.expr);
+    const key_buf = try alloc.alloc(Value, keys.len);
+
+    var filter_state: ?FilterState = extractFilter(input);
+
+    // Compute which column indices are referenced by keys and aggs.
+    ctx.source.reset();
+    var ref_indices: ?[]usize = null;
+
+    var c: DataChunk = undefined;
+    var row_buf: []?Value = &.{};
+    while (try ctx.source.nextChunk(&c, ctx)) {
+        if (filter_state) |*fs| try fs.apply(&c, ctx);
+        if (c.num_rows == 0) continue;
+        // Build ref_indices once (on first non-empty chunk).
+        if (ref_indices == null) {
+            row_buf = try alloc.alloc(?Value, c.columns.len);
+            @memset(row_buf, null);
+            const mask = try alloc.alloc(bool, c.columns.len);
+            @memset(mask, false);
+            for (keys) |k| collectColRefs(k.expr, mask);
+            for (aggs) |a| collectColRefs(a.expr, mask);
+            var cnt: usize = 0;
+            for (mask) |m| { if (m) cnt += 1; }
+            const idxs = try alloc.alloc(usize, cnt);
+            var wi: usize = 0;
+            for (mask, 0..) |m, j| { if (m) { idxs[wi] = j; wi += 1; } }
+            ref_indices = idxs;
+        }
+        const refs = ref_indices.?;
+        for (0..c.num_rows) |r| {
+            // Fill only referenced columns.
+            for (refs) |j| {
+                const col = c.columns[j];
+                row_buf[j] = if (col.isRowNull(r)) null else col.data.get(r);
+            }
+            for (keys, 0..) |k, ki| {
+                const v = try kernels.evalExpr(k.expr, row_buf, null, alloc);
+                key_buf[ki] = v orelse Value{ .int64 = 0 };
+            }
+            const bucket = try ht_agg.getOrInsert(key_buf, init_accums);
+            for (aggs, 0..) |item, ci| {
+                const v_opt = try evalAggArg(item.expr, row_buf, alloc);
+                try kernels.updateAccum(&bucket[ci], v_opt, alloc);
+            }
+        }
+    }
+
+    const out_metas = try alloc.alloc(result.ColMeta, keys.len + aggs.len);
+    for (keys, 0..) |k, ki| out_metas[ki] = .{ .name = k.alias, .col_type = k.out_type };
+    for (aggs, 0..) |a, ai| out_metas[keys.len + ai] = .{ .name = a.alias, .col_type = a.out_type };
+
+    var rl = RowList.init(out_metas);
+    const CtxT = struct {
+        rl: *RowList, alloc: std.mem.Allocator, keys_len: usize, aggs: []const plan.ProjectItem,
+    };
+    var emit_ctx = CtxT{ .rl = &rl, .alloc = alloc, .keys_len = keys.len, .aggs = aggs };
+    ht_agg.iterate(&emit_ctx, struct {
+        fn cb(ec: *CtxT, k: []const Value, bucket: []const AggAccum) void {
+            const row = ec.alloc.alloc(?Value, ec.keys_len + bucket.len) catch return;
+            for (k, 0..) |kv, i| row[i] = kv;
+            for (bucket, ec.aggs, 0..) |acc, item, i| {
+                row[ec.keys_len + i] = finalizeAccum(acc, item, ec.alloc) catch null;
+            }
+            ec.rl.append(ec.alloc, row) catch {};
+        }
+    }.cb);
+    return rl;
+}
+
+/// Accumulate aggregate state from one DataChunk without building a row slice.
+/// Fast-path: count_star and sum(col_ref) work vectorially on column slices.
+/// Fallback: all other aggs are handled in a single per-row pass at the end.
+fn updateAccumsFromChunk(
+    accums: []AggAccum,
+    aggs:   []const plan.ProjectItem,
+    c:      *const DataChunk,
+    alloc:  std.mem.Allocator,
+) !void {
+    // Track which aggs need a per-row fallback pass (one pass covers all of them).
+    var needs_fallback = false;
+    // Temp boolean array to mark which indices need fallback.
+    const fb_mask = try alloc.alloc(bool, aggs.len);
+    @memset(fb_mask, false);
+
+    for (aggs, 0..) |item, ci| {
+        const acc_ptr = &accums[ci];
+        var handled = false;
+        switch (item.expr) {
+            .agg_call => |ac| {
+                switch (ac.kind) {
+                    .count_star => {
+                        acc_ptr.count += c.num_rows;
+                        handled = true;
+                    },
+                    .count => {
+                        if (ac.arg) |arg| {
+                            switch (arg) {
+                                .col_ref => |cr| {
+                                    const col = c.columns[cr.index];
+                                    for (0..c.num_rows) |r| {
+                                        if (!chunk.isNull(col.null_mask, r)) acc_ptr.count += 1;
+                                    }
+                                    handled = true;
+                                },
+                                else => {},
+                            }
+                        } else {
+                            acc_ptr.count += c.num_rows;
+                            handled = true;
+                        }
+                    },
+                    .sum => {
+                        if (ac.arg) |arg| {
+                            switch (arg) {
+                                .col_ref => |cr| {
+                                    const col = c.columns[cr.index];
+                                    switch (col.data) {
+                                        .int64 => |vals| {
+                                            if (acc_ptr.* == .i64_sum) {
+                                                for (vals[0..c.num_rows]) |v| acc_ptr.i64_sum +%= v;
+                                                handled = true;
+                                            }
+                                        },
+                                        .uint64 => |vals| {
+                                            if (acc_ptr.* == .u64_sum) {
+                                                for (vals[0..c.num_rows]) |v| acc_ptr.u64_sum +%= v;
+                                                handled = true;
+                                            } else if (acc_ptr.* == .i64_sum) {
+                                                for (vals[0..c.num_rows]) |v| acc_ptr.i64_sum +%= @bitCast(v);
+                                                handled = true;
+                                            }
+                                        },
+                                        .float64 => |vals| {
+                                            if (acc_ptr.* == .f64_sum) {
+                                                for (vals[0..c.num_rows]) |v| acc_ptr.f64_sum += v;
+                                                handled = true;
+                                            }
+                                        },
+                                        else => {},
+                                    }
+                                },
+                                else => {},
+                            }
+                        }
+                    },
+                    else => {},
+                }
+            },
+            else => {},
+        }
+        if (!handled) {
+            fb_mask[ci] = true;
+            needs_fallback = true;
+        }
+    }
+
+    if (!needs_fallback) return;
+
+    // Collect referenced columns for all fallback aggs.
+    const ref_mask2 = try alloc.alloc(bool, c.columns.len);
+    @memset(ref_mask2, false);
+    for (aggs, 0..) |item, ci| { if (fb_mask[ci]) collectColRefs(item.expr, ref_mask2); }
+
+    // Single per-row pass for all fallback aggs.
+    const row = try alloc.alloc(?Value, c.columns.len);
+    @memset(row, null);
+    for (0..c.num_rows) |r| {
+        for (ref_mask2, 0..) |m, j| if (m) {
+            const col = c.columns[j];
+            row[j] = if (col.isRowNull(r)) null else col.data.get(r);
+        };
+        for (aggs, 0..) |item, ci| {
+            if (!fb_mask[ci]) continue;
+            const v_opt = try evalAggArg(item.expr, row, alloc);
+            try kernels.updateAccum(&accums[ci], v_opt, alloc);
+        }
+    }
+}
+
+/// Extract the filter predicate from the outermost filter/limit/project wrapping a scan.
+fn extractFilter(node: *const plan.PhysicalNode) ?FilterState {
+    return switch (node.*) {
+        .filter  => |f| .{ .predicate = f.predicate },
+        .limit   => |l| extractFilter(l.input),
+        .project => |p| extractFilter(p.input),
+        else => null,
+    };
+}
+
+/// Extract the limit state from the outermost limit wrapping a scan.
+fn extractLimit(node: *const plan.PhysicalNode) ?LimitState {
+    return switch (node.*) {
+        .limit   => |l| .{ .limit = l.limit, .offset = l.offset, .emitted = 0 },
+        .filter  => |f| extractLimit(f.input),
+        .project => |p| extractLimit(p.input),
+        else => null,
+    };
 }
 
 // ── ScalarAgg helper ──────────────────────────────────────────────────────────

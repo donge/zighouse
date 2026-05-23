@@ -121,7 +121,17 @@ fn pushdownColumns(
                 if (idx < tbl.columns.len) n += 1;
             }
             // If all columns are referenced (SELECT *), don't pushdown.
-            if (n == 0 or n >= tbl.columns.len) return;
+            if (n >= tbl.columns.len) return;
+            if (n == 0) {
+                // COUNT(*)-style: no columns referenced.  Pick the first column
+                // so the source can still emit chunks with the correct num_rows.
+                if (tbl.columns.len > 0) {
+                    const cols = try alloc.alloc([]const u8, 1);
+                    cols[0] = tbl.columns[0].name;
+                    ps.columns = cols;
+                }
+                return;
+            }
             const cols = try alloc.alloc([]const u8, n);
             var i: usize = 0;
             var it2 = used.iterator(.{});

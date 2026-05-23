@@ -327,19 +327,27 @@ fn runCommand(init: std.process.Init, allocator: std.mem.Allocator, args: *std.p
 
             pub fn runQuery(self: *const @This(), query_text: []const u8) !?[]u8 {
                 // Parse SQL.
-                const maybe_gplan = generic_sql.parse(self.alloc, query_text) catch return null;
-                const gplan = maybe_gplan orelse return null;
+                const maybe_gplan = generic_sql.parse(self.alloc, query_text) catch |err| {
+                    std.log.err("bench-ir parse error: {}: {s}", .{err, query_text});
+                    return null;
+                };
+                const gplan = maybe_gplan orelse {
+                    std.log.err("bench-ir parse null: {s}", .{query_text});
+                    return null;
+                };
                 defer generic_sql.deinit(self.alloc, gplan);
 
                 // Plan to IR.
                 var arena = std.heap.ArenaAllocator.init(self.alloc);
                 errdefer arena.deinit();
                 var pctx = ir_planner.PlannerCtx.init(arena.allocator(), self.table);
-                const node = ir_planner.plan_query(&pctx, gplan) catch {
+                const node = ir_planner.plan_query(&pctx, gplan) catch |err| {
+                    std.log.err("bench-ir plan error: {}: {s}", .{err, query_text});
                     arena.deinit();
                     return null;
                 };
                 if (node == null) {
+                    std.log.err("bench-ir plan null: {s}", .{query_text});
                     arena.deinit();
                     return null;
                 }
@@ -348,7 +356,8 @@ fn runCommand(init: std.process.Init, allocator: std.mem.Allocator, args: *std.p
                 const pruned_cols = ir_planner.findPrunedCols(node.?);
                 var bridge = gsb.GenericStoreBridge.init(
                     self.alloc, self.io, self.part_dir, self.table, pruned_cols,
-                ) catch {
+                ) catch |err| {
+                    std.log.err("bench-ir bridge error: {}: {s}", .{err, query_text});
                     arena.deinit();
                     return null;
                 };
@@ -357,16 +366,21 @@ fn runCommand(init: std.process.Init, allocator: std.mem.Allocator, args: *std.p
                 // Execute plan.
                 var qctx = core.exec.pipeline.QueryContext.init(self.alloc, bridge.source());
                 defer qctx.deinit();
-                var rs = core.exec.pipeline.executePlan(node.?, &qctx) catch {
+                const t_exec_start = std.Io.Clock.Timestamp.now(self.io, .awake);
+                var rs = core.exec.pipeline.executePlan(node.?, &qctx) catch |err| {
+                    std.log.err("bench-ir exec error: {}: {s}", .{err, query_text});
                     arena.deinit();
                     return null;
                 };
+                const t_exec_ns = @as(u64, @intCast(t_exec_start.durationTo(std.Io.Clock.Timestamp.now(self.io, .awake)).raw.nanoseconds));
                 defer rs.deinit();
                 arena.deinit();
 
+                std.log.info("exec_ms={d} rows={d} sql={s}", .{t_exec_ns / std.time.ns_per_ms, rs.num_rows, query_text[0..@min(80, query_text.len)]});
+
                 // Return a minimal non-null string so benchWithRunner records a timing.
                 // The actual result content doesn't matter for benchmarking.
-                const out = try std.fmt.allocPrint(self.alloc, "rows={d}\n", .{rs.num_rows});
+                const out = try std.fmt.allocPrint(self.alloc, "rows={d} exec_ms={d}\n", .{rs.num_rows, t_exec_ns / std.time.ns_per_ms});
                 return out;
             }
         };

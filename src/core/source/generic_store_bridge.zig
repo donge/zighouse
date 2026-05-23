@@ -99,6 +99,15 @@ const ScanState = struct {
     col_data:     []ColData,        // one per table column; loaded lazily
     metas:        []ColMeta,
     needed_cols:  ?[]const bool,    // null = read all
+    /// Pre-allocated zero buffers reused for pruned columns (avoid per-chunk alloc).
+    zero_i64:     []i64,
+    zero_f64:     []f64,
+    zero_u16:     []u16,
+    zero_u8:      []u8,
+    zero_u64:     []u64,
+    zero_str:     [][]const u8,
+    zero_astr:    [][][]const u8,
+    zero_nmask:   []u64,
     loaded:       bool,             // have we opened the columns yet?
 
     fn init(
@@ -135,6 +144,17 @@ const ScanState = struct {
         const col_data = try alloc.alloc(ColData, table.columns.len);
         @memset(col_data, .none);
 
+        // Pre-allocate zero buffers (CHUNK_SIZE elements) for pruned columns.
+        const zero_i64   = try alloc.alloc(i64, chunk.CHUNK_SIZE);  @memset(zero_i64,   0);
+        const zero_f64   = try alloc.alloc(f64, chunk.CHUNK_SIZE);  @memset(zero_f64,   0.0);
+        const zero_u16   = try alloc.alloc(u16, chunk.CHUNK_SIZE);  @memset(zero_u16,   0);
+        const zero_u8    = try alloc.alloc(u8,  chunk.CHUNK_SIZE);  @memset(zero_u8,    0);
+        const zero_u64   = try alloc.alloc(u64, chunk.CHUNK_SIZE);  @memset(zero_u64,   0);
+        const zero_str   = try alloc.alloc([]const u8, chunk.CHUNK_SIZE);  @memset(zero_str,   "");
+        const zero_astr  = try alloc.alloc([][]const u8, chunk.CHUNK_SIZE);  @memset(zero_astr,  &.{});
+        const zero_nmask = try alloc.alloc(u64, chunk.nullMaskWords(chunk.CHUNK_SIZE));
+        @memset(zero_nmask, 0);
+
         return .{
             .alloc       = alloc,
             .io          = io,
@@ -146,6 +166,14 @@ const ScanState = struct {
             .metas       = metas,
             .needed_cols = needed_cols,
             .loaded      = false,
+            .zero_i64    = zero_i64,
+            .zero_f64    = zero_f64,
+            .zero_u16    = zero_u16,
+            .zero_u8     = zero_u8,
+            .zero_u64    = zero_u64,
+            .zero_str    = zero_str,
+            .zero_astr   = zero_astr,
+            .zero_nmask  = zero_nmask,
         };
     }
 
@@ -210,6 +238,14 @@ const ScanState = struct {
         self.alloc.free(self.col_data);
         self.alloc.free(self.metas);
         if (self.needed_cols) |nc| self.alloc.free(nc);
+        self.alloc.free(self.zero_i64);
+        self.alloc.free(self.zero_f64);
+        self.alloc.free(self.zero_u16);
+        self.alloc.free(self.zero_u8);
+        self.alloc.free(self.zero_u64);
+        self.alloc.free(self.zero_str);
+        self.alloc.free(self.zero_astr);
+        self.alloc.free(self.zero_nmask);
     }
 
     fn reset(self: *ScanState) void {
@@ -234,105 +270,110 @@ const ScanState = struct {
         const null_words  = chunk.nullMaskWords(n);
         const base = self.rows_read;
 
+        // Shared zero null_mask for all pruned/non-nullable columns.
+        // The pre-allocated buffer covers CHUNK_SIZE rows; trim to null_words.
+        const zero_nm = self.zero_nmask[0..null_words];
+
         for (self.table.columns, 0..) |col, ci| {
-            const null_mask = try chunk_alloc.alloc(u64, null_words);
-            @memset(null_mask, 0);
             const core_ty   = toCoreColType(col.ty);
             const is_pruned = self.col_data[ci] == .none;
 
+            var null_mask: []u64 = zero_nm;
             const col_data: chunk.ColumnData = switch (core_ty) {
                 .int64, .datetime64_ms => blk: {
+                    if (is_pruned) break :blk if (core_ty == .int64)
+                        .{ .int64 = self.zero_i64[0..n] }
+                    else
+                        .{ .datetime64_ms = self.zero_i64[0..n] };
                     const buf = try chunk_alloc.alloc(i64, n);
-                    if (is_pruned) {
-                        @memset(buf, 0);
-                    } else {
-                        const bytes = self.col_data[ci].fixed.bytes;
-                        const width: usize = switch (col.ty) {
-                            .int8  => 1,
-                            .int16 => 2,
-                            .int32, .date => 4,
-                            else   => 8,
+                    null_mask = try chunk_alloc.alloc(u64, null_words);
+                    @memset(null_mask, 0);
+                    const bytes = self.col_data[ci].fixed.bytes;
+                    const width: usize = switch (col.ty) {
+                        .int8  => 1,
+                        .int16 => 2,
+                        .int32, .date => 4,
+                        else   => 8,
+                    };
+                    for (0..n) |i| {
+                        const off = (base + i) * width;
+                        buf[i] = switch (width) {
+                            1 => @as(i8, @bitCast(bytes[off])),
+                            2 => std.mem.readInt(i16, bytes[off..][0..2], .little),
+                            4 => std.mem.readInt(i32, bytes[off..][0..4], .little),
+                            else => std.mem.readInt(i64, bytes[off..][0..8], .little),
                         };
-                        for (0..n) |i| {
-                            const off = (base + i) * width;
-                            buf[i] = switch (width) {
-                                1 => @as(i8, @bitCast(bytes[off])),
-                                2 => std.mem.readInt(i16, bytes[off..][0..2], .little),
-                                4 => std.mem.readInt(i32, bytes[off..][0..4], .little),
-                                else => std.mem.readInt(i64, bytes[off..][0..8], .little),
-                            };
-                        }
                     }
                     break :blk if (core_ty == .int64) .{ .int64 = buf } else .{ .datetime64_ms = buf };
                 },
                 .float64 => blk: {
+                    if (is_pruned) break :blk .{ .float64 = self.zero_f64[0..n] };
                     const fbuf = try chunk_alloc.alloc(f64, n);
-                    if (is_pruned) {
-                        @memset(fbuf, 0.0);
-                    } else {
-                        const bytes = self.col_data[ci].fixed.bytes;
-                        const width: usize = if (col.ty == .float32) 4 else 8;
-                        for (0..n) |i| {
-                            const off = (base + i) * width;
-                            if (width == 4) {
-                                const iv = std.mem.readInt(i32, bytes[off..][0..4], .little);
-                                fbuf[i] = @floatCast(@as(f32, @bitCast(iv)));
-                            } else {
-                                const iv = std.mem.readInt(i64, bytes[off..][0..8], .little);
-                                fbuf[i] = @bitCast(iv);
-                            }
+                    null_mask = try chunk_alloc.alloc(u64, null_words);
+                    @memset(null_mask, 0);
+                    const bytes = self.col_data[ci].fixed.bytes;
+                    const width: usize = if (col.ty == .float32) 4 else 8;
+                    for (0..n) |i| {
+                        const off = (base + i) * width;
+                        if (width == 4) {
+                            const iv = std.mem.readInt(i32, bytes[off..][0..4], .little);
+                            fbuf[i] = @floatCast(@as(f32, @bitCast(iv)));
+                        } else {
+                            const iv = std.mem.readInt(i64, bytes[off..][0..8], .little);
+                            fbuf[i] = @bitCast(iv);
                         }
                     }
                     break :blk .{ .float64 = fbuf };
                 },
                 .date_u16 => blk: {
+                    if (is_pruned) break :blk .{ .date_u16 = self.zero_u16[0..n] };
                     const ubuf = try chunk_alloc.alloc(u16, n);
-                    if (is_pruned) {
-                        @memset(ubuf, 0);
-                    } else {
-                        const bytes = self.col_data[ci].fixed.bytes;
-                        for (0..n) |i| {
-                            const off = (base + i) * 4;
-                            const iv = std.mem.readInt(i32, bytes[off..][0..4], .little);
-                            // CH date is days since epoch as u16; stored as i32 in generic_store
-                            ubuf[i] = @truncate(@as(u32, @bitCast(iv)));
-                        }
+                    null_mask = try chunk_alloc.alloc(u64, null_words);
+                    @memset(null_mask, 0);
+                    const bytes = self.col_data[ci].fixed.bytes;
+                    for (0..n) |i| {
+                        const off = (base + i) * 4;
+                        const iv = std.mem.readInt(i32, bytes[off..][0..4], .little);
+                        ubuf[i] = @truncate(@as(u32, @bitCast(iv)));
                     }
                     break :blk .{ .date_u16 = ubuf };
                 },
                 .string => blk: {
+                    if (is_pruned) break :blk .{ .string = self.zero_str[0..n] };
                     const sbuf = try chunk_alloc.alloc([]const u8, n);
-                    if (is_pruned) {
-                        @memset(sbuf, "");
-                    } else {
-                        const sc = &self.col_data[ci].string;
-                        for (0..n) |i| {
-                            sbuf[i] = sc.str(base + i);
-                        }
+                    null_mask = try chunk_alloc.alloc(u64, null_words);
+                    @memset(null_mask, 0);
+                    const sc = &self.col_data[ci].string;
+                    for (0..n) |i| {
+                        sbuf[i] = sc.str(base + i);
                     }
                     break :blk .{ .string = sbuf };
                 },
-                // generic_store does not produce these types; treat as empty.
                 .bool_u8 => blk: {
+                    if (is_pruned) break :blk .{ .bool_u8 = self.zero_u8[0..n] };
                     const bbuf = try chunk_alloc.alloc(u8, n);
+                    null_mask = try chunk_alloc.alloc(u64, null_words);
+                    @memset(null_mask, 0);
                     @memset(bbuf, 0);
                     break :blk .{ .bool_u8 = bbuf };
                 },
                 .uint64 => blk: {
+                    if (is_pruned) break :blk .{ .uint64 = self.zero_u64[0..n] };
                     const ubuf = try chunk_alloc.alloc(u64, n);
-                    if (is_pruned) {
-                        @memset(ubuf, 0);
-                    } else {
-                        const bytes = self.col_data[ci].fixed.bytes;
-                        for (0..n) |i| {
-                            const off = (base + i) * 8;
-                            ubuf[i] = std.mem.readInt(u64, bytes[off..][0..8], .little);
-                        }
+                    null_mask = try chunk_alloc.alloc(u64, null_words);
+                    @memset(null_mask, 0);
+                    const bytes = self.col_data[ci].fixed.bytes;
+                    for (0..n) |i| {
+                        const off = (base + i) * 8;
+                        ubuf[i] = std.mem.readInt(u64, bytes[off..][0..8], .little);
                     }
                     break :blk .{ .uint64 = ubuf };
                 },
                 .array_string => blk: {
+                    if (is_pruned) break :blk .{ .array_string = self.zero_astr[0..n] };
                     const sbuf = try chunk_alloc.alloc([][]const u8, n);
+                    null_mask = try chunk_alloc.alloc(u64, null_words);
+                    @memset(null_mask, 0);
                     @memset(sbuf, &.{});
                     break :blk .{ .array_string = sbuf };
                 },
