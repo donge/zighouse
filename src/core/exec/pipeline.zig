@@ -842,6 +842,41 @@ fn updateAccumsFromChunk(
                              }
                          }
                     },
+                    .avg => {
+                        // AVG accumulates into f64_sum (finalization divides by count elsewhere).
+                        if (ac.arg) |arg| {
+                            if (arg == .col_ref) {
+                                const col = c.columns[arg.col_ref.index];
+                                switch (col.data) {
+                                    .int64 => |vals| {
+                                        if (acc_ptr.* == .f64_sum) {
+                                            for (0..c.num_rows) |r| {
+                                                if (!chunk.isNull(col.null_mask, r))
+                                                    acc_ptr.f64_sum += @floatFromInt(vals[r]);
+                                            }
+                                            handled = true;
+                                        }
+                                    },
+                                    .uint64 => |vals| {
+                                        if (acc_ptr.* == .f64_sum) {
+                                            for (0..c.num_rows) |r| {
+                                                if (!chunk.isNull(col.null_mask, r))
+                                                    acc_ptr.f64_sum += @floatFromInt(vals[r]);
+                                            }
+                                            handled = true;
+                                        }
+                                    },
+                                    .float64 => |vals| {
+                                        if (acc_ptr.* == .f64_sum) {
+                                            for (vals[0..c.num_rows]) |v| acc_ptr.f64_sum += v;
+                                            handled = true;
+                                        }
+                                    },
+                                    else => {},
+                                }
+                            }
+                        }
+                    },
                     .min => {
                         if (ac.arg) |arg| {
                             if (arg == .col_ref) {
