@@ -103,15 +103,16 @@ pub const AggHashTable = struct {
         key: []const Value,
         init_accums: []const AggAccum,
     ) ![]AggAccum {
-        // Grow if over load factor.
-        if (self.count + 1 > @as(usize, @intFromFloat(@as(f64, @floatFromInt(self.capacity)) * LOAD_FACTOR))) {
+        // Grow if over load factor (capacity is always a power of 2).
+        if (self.count + 1 > (self.capacity * 7) / 10) {
             try self.grow();
         }
 
+        const mask = self.capacity - 1;
         const h    = hashKey(key);
-        var  slot  = h % self.capacity;
+        var  slot  = h & mask;
 
-        while (true) : (slot = (slot + 1) % self.capacity) {
+        while (true) : (slot = (slot + 1) & mask) {
             if (!self.occupied[slot]) {
                 // New entry
                 const k = try self.arena.dupe(Value, key);
@@ -130,6 +131,7 @@ pub const AggHashTable = struct {
 
     fn grow(self: *AggHashTable) !void {
         const new_cap  = self.capacity * 2;
+        const new_mask = new_cap - 1;
         const new_keys     = try self.arena.alloc([]Value,    new_cap);
         const new_accums   = try self.arena.alloc([]AggAccum, new_cap);
         const new_occupied = try self.arena.alloc(bool,       new_cap);
@@ -138,8 +140,8 @@ pub const AggHashTable = struct {
         for (0..self.capacity) |i| {
             if (!self.occupied[i]) continue;
             const h   = hashKey(self.keys[i]);
-            var  slot = h % new_cap;
-            while (new_occupied[slot]) : (slot = (slot + 1) % new_cap) {}
+            var  slot = h & new_mask;
+            while (new_occupied[slot]) : (slot = (slot + 1) & new_mask) {}
             new_keys[slot]     = self.keys[i];
             new_accums[slot]   = self.accums[i];
             new_occupied[slot] = true;
