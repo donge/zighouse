@@ -833,12 +833,108 @@ fn updateAccumsFromChunk(
                                                     }
                                                     handled = true;
                                                 }
-                                            },
-                                            else => {},
+                                             },
+                                             else => {},
+                                         }
+                                     }
+                                 },
+                                 else => {},
+                             }
+                         }
+                    },
+                    .min => {
+                        if (ac.arg) |arg| {
+                            if (arg == .col_ref) {
+                                const col = c.columns[arg.col_ref.index];
+                                switch (col.data) {
+                                    .int64 => |vals| {
+                                        if (acc_ptr.* == .i64_min) {
+                                            for (0..c.num_rows) |r| {
+                                                if (!chunk.isNull(col.null_mask, r) and vals[r] < acc_ptr.i64_min)
+                                                    acc_ptr.i64_min = vals[r];
+                                            }
+                                            handled = true;
                                         }
-                                    }
-                                },
-                                else => {},
+                                     },
+                                    .uint64 => |vals| {
+                                        if (acc_ptr.* == .u64_min) {
+                                            for (0..c.num_rows) |r| {
+                                                if (!chunk.isNull(col.null_mask, r) and vals[r] < acc_ptr.u64_min)
+                                                    acc_ptr.u64_min = vals[r];
+                                            }
+                                            handled = true;
+                                        }
+                                    },
+                                    .float64 => |vals| {
+                                        if (acc_ptr.* == .f64_min) {
+                                            for (0..c.num_rows) |r| {
+                                                if (!chunk.isNull(col.null_mask, r) and vals[r] < acc_ptr.f64_min)
+                                                    acc_ptr.f64_min = vals[r];
+                                            }
+                                            handled = true;
+                                        }
+                                    },
+                                    .date_u16 => |vals| {
+                                        if (acc_ptr.* == .i64_min) {
+                                            for (0..c.num_rows) |r| {
+                                                if (!chunk.isNull(col.null_mask, r)) {
+                                                    const v: i64 = vals[r];
+                                                    if (v < acc_ptr.i64_min) acc_ptr.i64_min = v;
+                                                }
+                                            }
+                                            handled = true;
+                                        }
+                                    },
+                                    else => {},
+                                }
+                            }
+                        }
+                    },
+                    .max => {
+                        if (ac.arg) |arg| {
+                            if (arg == .col_ref) {
+                                const col = c.columns[arg.col_ref.index];
+                                switch (col.data) {
+                                    .int64 => |vals| {
+                                        if (acc_ptr.* == .i64_max) {
+                                            for (0..c.num_rows) |r| {
+                                                if (!chunk.isNull(col.null_mask, r) and vals[r] > acc_ptr.i64_max)
+                                                    acc_ptr.i64_max = vals[r];
+                                            }
+                                            handled = true;
+                                        }
+                                    },
+                                    .uint64 => |vals| {
+                                        if (acc_ptr.* == .u64_max) {
+                                            for (0..c.num_rows) |r| {
+                                                if (!chunk.isNull(col.null_mask, r) and vals[r] > acc_ptr.u64_max)
+                                                    acc_ptr.u64_max = vals[r];
+                                            }
+                                            handled = true;
+                                        }
+                                    },
+                                    .float64 => |vals| {
+                                        if (acc_ptr.* == .f64_max) {
+                                            for (0..c.num_rows) |r| {
+                                                if (!chunk.isNull(col.null_mask, r) and vals[r] > acc_ptr.f64_max)
+                                                    acc_ptr.f64_max = vals[r];
+                                            }
+                                            handled = true;
+                                        }
+                                    },
+                                    .date_u16 => |vals| {
+                                        if (acc_ptr.* == .i64_max) {
+                                            for (0..c.num_rows) |r| {
+                                                if (!chunk.isNull(col.null_mask, r)) {
+                                                    const v: i64 = vals[r];
+                                                    if (v > acc_ptr.i64_max) acc_ptr.i64_max = v;
+                                                }
+                                            }
+                                            handled = true;
+                                        }
+                                    },
+                                    else => {},
+                                }
                             }
                         }
                     },
