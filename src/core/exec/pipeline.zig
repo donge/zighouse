@@ -733,6 +733,33 @@ fn executeHashAggChunked(
                         }
                         break :blk try kernels.evalExpr(k.expr, row_buf, null, alloc);
                     },
+                    .fn_call => |fc| blk: {
+                        // Fast path: date_part('minute'/'hour', col_ref) — avoids arg eval + string dispatch.
+                        if (fc.args.len == 2 and
+                            fc.args[0] == .lit_str and
+                            fc.args[1] == .col_ref)
+                        {
+                            const unit = fc.args[0].lit_str;
+                            const col_idx = fc.args[1].col_ref.index;
+                            if (row_buf[col_idx]) |ts_val| {
+                                const ms: i64 = switch (ts_val) {
+                                    .datetime64_ms => |m| m,
+                                    .int64         => |i| i * 1000,
+                                    else           => {
+                                        break :blk try kernels.evalExpr(k.expr, row_buf, null, alloc);
+                                    },
+                                };
+                                const secs = @divTrunc(ms, 1000);
+                                if (std.mem.eql(u8, unit, "minute") or std.mem.eql(u8, unit, "min")) {
+                                    break :blk Value{ .int64 = @mod(@divTrunc(secs, 60), 60) };
+                                }
+                                if (std.mem.eql(u8, unit, "hour")) {
+                                    break :blk Value{ .int64 = @mod(@divTrunc(secs, 3600), 24) };
+                                }
+                            }
+                        }
+                        break :blk try kernels.evalExpr(k.expr, row_buf, null, alloc);
+                    },
                     else => try kernels.evalExpr(k.expr, row_buf, null, alloc),
                 };
                 key_buf[ki] = v orelse Value{ .int64 = 0 };
