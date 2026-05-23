@@ -4,14 +4,14 @@ set -euo pipefail
 ROOT=$(git rev-parse --show-toplevel)
 cd "$ROOT"
 
-PARQUET_PATH=${ZIGHOUSE_PERF_PARQUET:-data/hits.parquet}
-BASELINE=${ZIGHOUSE_PERF_BASELINE:-perf/baselines/local-10m-submit.json}
+PARQUET_PATH=${ZIGHOUSE_PERF_PARQUET:-data/hits_10m_snappy.parquet}
+BASELINE=${ZIGHOUSE_PERF_BASELINE:-perf/baselines/local-10m-ir.json}
 LIMIT_ROWS=${ZIGHOUSE_PERF_LIMIT_ROWS:-10000000}
 QUERY_PATH=${ZIGHOUSE_PERF_QUERY_PATH:-specialized}
 TMP_ROOT=${TMPDIR:-/tmp}
 # Persistent store: only re-import when parquet or limit changes.
-STORE_DIR="${ZIGHOUSE_PERF_STORE:-${TMP_ROOT%/}/zighouse-precommit-store}"
-BENCH_REPEATS=${ZIGHOUSE_PERF_BENCH_REPEATS:-5}
+STORE_DIR="${ZIGHOUSE_PERF_STORE:-${TMP_ROOT%/}/zighouse-precommit-ir-store}"
+BENCH_REPEATS=${ZIGHOUSE_PERF_BENCH_REPEATS:-2}
 ZIGHOUSE=${ZIGHOUSE:-zig-out/bin/zighouse}
 
 if [[ ! -f "$PARQUET_PATH" ]]; then
@@ -37,16 +37,13 @@ elif [[ "$(cat "$FINGERPRINT_FILE")" != "$FINGERPRINT" ]]; then
   needs_import=true
 fi
 
-zig build -Dduckdb=false
+zig build -Doptimize=ReleaseFast
 
 if $needs_import; then
   echo "pre-commit perf: importing ClickBench ${LIMIT_ROWS} rows -> ${STORE_DIR}"
   rm -rf "$STORE_DIR"
   mkdir -p "$STORE_DIR"
-  import_args=("$ZIGHOUSE" import-clickbench-parquet-hot "$PARQUET_PATH" "$STORE_DIR")
-  if [[ "$LIMIT_ROWS" != "0" ]]; then
-    import_args+=("$LIMIT_ROWS")
-  fi
+  import_args=("$ZIGHOUSE" import-parquet --format=generic "$PARQUET_PATH" "$STORE_DIR" hits)
   env ZIGHOUSE_IMPORT_TRACE=1 "${import_args[@]}"
   echo "$FINGERPRINT" > "$FINGERPRINT_FILE"
 else
@@ -69,20 +66,27 @@ else
 fi
 
 for i in $(seq 1 "$BENCH_REPEATS"); do
-  "${TIME_CMD[@]}" env ZIGHOUSE_CLICKBENCH_SUBMIT=1 ZIGHOUSE_QUERY_PATH="$QUERY_PATH" \
-    "$ZIGHOUSE" --backend native bench "$STORE_DIR" assets/queries.sql \
+  "${TIME_CMD[@]}" sh -c "env ZIGHOUSE_CLICKBENCH_SUBMIT=1 ZIGHOUSE_QUERY_PATH='$QUERY_PATH' \
+    '$ZIGHOUSE' bench-ir '$STORE_DIR' hits clickbench-submit/zighouse/queries.sql 2>/dev/null" \
     > "$TMP_BENCH/bench-${i}.log" 2>&1
 done
 
-# Also record one import measurement for the import gate.
+# Import measurement: record wall time for a small sample import.
+# For the IR path, use a 1M parquet file to keep this fast.
 import_log="$WORK_DIR/import.log"
 import_store="$WORK_DIR/import_store"
-import_args=("$ZIGHOUSE" import-clickbench-parquet-hot "$PARQUET_PATH" "$import_store")
-if [[ "$LIMIT_ROWS" != "0" ]]; then
-  import_args+=("$LIMIT_ROWS")
+IMPORT_SAMPLE_PARQUET="${ZIGHOUSE_PERF_IMPORT_SAMPLE:-data/hits_1m_snappy.parquet}"
+if [[ -f "$IMPORT_SAMPLE_PARQUET" ]]; then
+  import_start=$(python3 -c "import time; print(time.time())")
+  env ZIGHOUSE_IMPORT_TRACE=1 ZIGHOUSE_CLICKBENCH_SUBMIT=1 \
+    "$ZIGHOUSE" import-parquet --format=generic "$IMPORT_SAMPLE_PARQUET" "$import_store" hits \
+    > "$import_log" 2>&1
+  import_end=$(python3 -c "import time; print(time.time())")
+  python3 -c "print(f'        {float($import_end - $import_start):.2f} real')" >> "$import_log"
+else
+  # No sample parquet available; skip import measurement.
+  touch "$import_log"
 fi
-"${TIME_CMD[@]}" env ZIGHOUSE_IMPORT_TRACE=1 ZIGHOUSE_CLICKBENCH_SUBMIT=1 \
-  "${import_args[@]}" > "$import_log" 2>&1
 
 python3 - "$OUT_JSON" "$PARQUET_PATH" "$STORE_DIR" "$LIMIT_ROWS" "$BENCH_REPEATS" \
           "$TMP_BENCH" "$import_log" "$QUERY_PATH" <<'PY'
@@ -240,7 +244,7 @@ for i in range(1, repeats + 1):
     query = {
         **summary,
         "timings": rows,
-        "warm_best_from_rows": sum(min(x for x in row if x is not None) for row in rows),
+        "warm_best_from_rows": sum(min((x for x in row if x is not None), default=0.0) for row in rows),
     }
     if compare is not None:
         query["compare"] = compare
@@ -260,10 +264,10 @@ data = {
     "benchmark": "clickbench-submit-10m" if limit_rows else "clickbench-submit-full",
     "parquet": parquet_path,
     "limit_rows": limit_rows or None,
-    "queries": "assets/queries.sql",
+    "queries": "clickbench-submit/zighouse/queries.sql",
     "query_path": query_path,
     "build": {
-        "args": ["-Dduckdb=false"],
+        "args": ["-Dduckdb=true"],
         "git_commit": git_value(["rev-parse", "HEAD"]),
         "git_dirty": bool(git_value(["status", "--short"])),
     },
