@@ -14,14 +14,25 @@ pub const AggAccum = types.AggAccum;
 
 // ── Key hashing ───────────────────────────────────────────────────────────────
 
-/// Hash a composite key (slice of Values).
+/// Hash a composite key (slice of Values) using a single Wyhash pass.
+/// All key components are fed into one hasher for better throughput.
 pub fn hashKey(key: []const Value) u64 {
-    var h: u64 = 0xcbf29ce484222325; // FNV offset basis
+    var h = std.hash.Wyhash.init(0);
     for (key) |v| {
-        h ^= v.hash();
-        h *%= 0x100000001b3; // FNV prime
+        const tag: u8 = @intFromEnum(@as(types.ColumnType, v));
+        h.update(&[1]u8{tag});
+        switch (v) {
+            .int64         => |x| h.update(std.mem.asBytes(&x)),
+            .uint64        => |x| h.update(std.mem.asBytes(&x)),
+            .float64       => |x| { const n: f64 = if (x == 0.0) 0.0 else x; h.update(std.mem.asBytes(&n)); },
+            .date_u16      => |x| h.update(std.mem.asBytes(&x)),
+            .datetime64_ms => |x| h.update(std.mem.asBytes(&x)),
+            .bool_u8       => |x| h.update(std.mem.asBytes(&x)),
+            .string        => |x| h.update(x),
+            .array_string  => |arr| { for (arr) |s| h.update(s); },
+        }
     }
-    return h;
+    return h.final();
 }
 
 /// Compare two composite keys for equality.
