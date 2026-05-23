@@ -58,6 +58,7 @@ pub const AggHashTable = struct {
     keys:     [][]Value,          // each entry: slice of num_key_cols Values
     accums:   [][]AggAccum,       // each entry: slice of num_agg_cols AggAccums
     occupied: []bool,
+    hashes:   []u64,              // cached hash per slot — avoids key comparison on probe miss
     capacity: usize,
     count:    usize,
     num_keys: usize,
@@ -87,11 +88,13 @@ pub const AggHashTable = struct {
         const keys     = try arena.alloc([]Value,    cap);
         const accums   = try arena.alloc([]AggAccum, cap);
         const occupied = try arena.alloc(bool,       cap);
+        const hashes   = try arena.alloc(u64,        cap);
         @memset(occupied, false);
         return .{
             .keys     = keys,
             .accums   = accums,
             .occupied = occupied,
+            .hashes   = hashes,
             .capacity = cap,
             .count    = 0,
             .num_keys = num_keys,
@@ -130,11 +133,13 @@ pub const AggHashTable = struct {
                 const a = try self.arena.dupe(AggAccum, init_accums);
                 self.keys[slot]     = k;
                 self.accums[slot]   = a;
+                self.hashes[slot]   = h;
                 self.occupied[slot] = true;
                 self.count += 1;
                 return self.accums[slot];
             }
-            if (eqlKey(self.keys[slot], key)) {
+            // Fast hash check before full key comparison.
+            if (self.hashes[slot] == h and eqlKey(self.keys[slot], key)) {
                 return self.accums[slot];
             }
         }
@@ -146,21 +151,24 @@ pub const AggHashTable = struct {
         const new_keys     = try self.arena.alloc([]Value,    new_cap);
         const new_accums   = try self.arena.alloc([]AggAccum, new_cap);
         const new_occupied = try self.arena.alloc(bool,       new_cap);
+        const new_hashes   = try self.arena.alloc(u64,        new_cap);
         @memset(new_occupied, false);
 
         for (0..self.capacity) |i| {
             if (!self.occupied[i]) continue;
-            const h   = hashKey(self.keys[i]);
+            const h   = self.hashes[i];
             var  slot = h & new_mask;
             while (new_occupied[slot]) : (slot = (slot + 1) & new_mask) {}
             new_keys[slot]     = self.keys[i];
             new_accums[slot]   = self.accums[i];
+            new_hashes[slot]   = h;
             new_occupied[slot] = true;
         }
 
         self.keys     = new_keys;
         self.accums   = new_accums;
         self.occupied = new_occupied;
+        self.hashes   = new_hashes;
         self.capacity = new_cap;
     }
 
