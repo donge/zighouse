@@ -714,7 +714,27 @@ fn executeHashAggChunked(
                 row_buf[j] = if (col.isRowNull(r)) null else col.data.get(r);
             }
             for (keys, 0..) |k, ki| {
-                const v = try kernels.evalExpr(k.expr, row_buf, null, alloc);
+                // Inline fast path for common key expressions (avoids evalExpr dispatch).
+                const v: ?Value = switch (k.expr) {
+                    .col_ref => |cr| row_buf[cr.index],
+                    .add => |op| blk: {
+                        if (op.left == .col_ref and op.right == .lit_i64) {
+                            if (row_buf[op.left.col_ref.index]) |base| {
+                                if (base.toI64()) |bv| break :blk Value{ .int64 = bv +% op.right.lit_i64 };
+                            }
+                        }
+                        break :blk try kernels.evalExpr(k.expr, row_buf, null, alloc);
+                    },
+                    .sub => |op| blk: {
+                        if (op.left == .col_ref and op.right == .lit_i64) {
+                            if (row_buf[op.left.col_ref.index]) |base| {
+                                if (base.toI64()) |bv| break :blk Value{ .int64 = bv -% op.right.lit_i64 };
+                            }
+                        }
+                        break :blk try kernels.evalExpr(k.expr, row_buf, null, alloc);
+                    },
+                    else => try kernels.evalExpr(k.expr, row_buf, null, alloc),
+                };
                 key_buf[ki] = v orelse Value{ .int64 = 0 };
             }
             const bucket = try ht_agg.getOrInsert(key_buf, init_accums);
