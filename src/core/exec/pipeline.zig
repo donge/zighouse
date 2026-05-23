@@ -421,6 +421,9 @@ fn executeNode(node: *const plan.PhysicalNode, ctx: *QueryContext) !RowList {
 
         // ── Filter ────────────────────────────────────────────────────────────
         .filter => |f| {
+            if (isScannable(f.input)) {
+                return executeLimitChunked(node, ctx);
+            }
             const inner = try executeNode(f.input, ctx);
             var rl = RowList.init(inner.metas);
             for (inner.rows.items) |row| {
@@ -433,12 +436,18 @@ fn executeNode(node: *const plan.PhysicalNode, ctx: *QueryContext) !RowList {
 
         // ── Project ───────────────────────────────────────────────────────────
         .project => |p| {
+            if (isScannable(p.input)) {
+                return executeLimitChunked(node, ctx);
+            }
             const inner = try executeNode(p.input, ctx);
             return projectRowList(inner, p.items, alloc);
         },
 
         // ── Limit ─────────────────────────────────────────────────────────────
         .limit => |lim| {
+            if (isScannable(node)) {
+                return executeLimitChunked(node, ctx);
+            }
             const inner = try executeNode(lim.input, ctx);
             var rl = RowList.init(inner.metas);
             var skipped: u64 = 0;
@@ -851,6 +860,84 @@ fn extractLimit(node: *const plan.PhysicalNode) ?LimitState {
         .project => |p| extractLimit(p.input),
         else => null,
     };
+}
+
+// ── Chunked limit helper ──────────────────────────────────────────────────────
+
+/// Chunked streaming execution for limit/project/filter/scan patterns.
+fn executeLimitChunked(node: *const plan.PhysicalNode, ctx: *QueryContext) !RowList {
+    const alloc = ctx.allocator();
+
+    var filter_state: ?FilterState = null;
+    var project_items: ?[]const plan.ProjectItem = null;
+    var lim_state: LimitState = .{ .limit = std.math.maxInt(u64), .offset = 0 };
+
+    var cur = node;
+    while (true) {
+        switch (cur.*) {
+            .limit => |lim| { lim_state = .{ .limit = lim.limit, .offset = lim.offset }; cur = lim.input; },
+            .filter => |f| { if (filter_state == null) filter_state = .{ .predicate = f.predicate }; cur = f.input; },
+            .project => |p| { if (project_items == null) project_items = p.items; cur = p.input; },
+            else => break,
+        }
+    }
+
+    const schema_metas = ctx.source.schema();
+    const out_metas: []result.ColMeta = if (project_items) |items| blk: {
+        const m = try alloc.alloc(result.ColMeta, items.len);
+        for (items, 0..) |item, i| m[i] = .{ .name = item.alias, .col_type = item.out_type };
+        break :blk m;
+    } else try alloc.dupe(result.ColMeta, schema_metas);
+    var rl = RowList.init(out_metas);
+
+    ctx.source.reset();
+    var c: DataChunk = undefined;
+    var skipped: u64 = 0;
+    var emitted: u64 = 0;
+    var row_ref_indices: ?[]usize = null;
+
+    while (try ctx.source.nextChunk(&c, ctx)) {
+        if (filter_state) |*fs| try fs.apply(&c, ctx);
+        if (c.num_rows == 0) continue;
+
+        if (row_ref_indices == null and c.columns.len > 0) {
+            const mask = try alloc.alloc(bool, c.columns.len);
+            @memset(mask, false);
+            if (project_items) |items| { for (items) |item| collectColRefs(item.expr, mask); }
+            else @memset(mask, true);
+            var cnt: usize = 0;
+            for (mask) |m| { if (m) cnt += 1; }
+            const idxs = try alloc.alloc(usize, cnt);
+            var wi: usize = 0;
+            for (mask, 0..) |m, j| { if (m) { idxs[wi] = j; wi += 1; } }
+            row_ref_indices = idxs;
+        }
+        const refs = row_ref_indices orelse &[_]usize{};
+        const row_buf = try alloc.alloc(?Value, c.columns.len);
+        @memset(row_buf, null);
+
+        for (0..c.num_rows) |r| {
+            if (skipped < lim_state.offset) { skipped += 1; continue; }
+            if (emitted >= lim_state.limit) break;
+            for (refs) |j| {
+                const col = c.columns[j];
+                row_buf[j] = if (col.isRowNull(r)) null else col.data.get(r);
+            }
+            const out_row: []?Value = if (project_items) |items| blk: {
+                const out = try alloc.alloc(?Value, items.len);
+                for (items, 0..) |item, i| out[i] = try kernels.evalExpr(item.expr, row_buf, null, alloc);
+                break :blk out;
+            } else blk: {
+                const out = try alloc.alloc(?Value, c.columns.len);
+                for (c.columns, 0..) |col, j| out[j] = if (col.isRowNull(r)) null else col.data.get(r);
+                break :blk out;
+            };
+            try rl.append(alloc, out_row);
+            emitted += 1;
+        }
+        if (emitted >= lim_state.limit) break;
+    }
+    return rl;
 }
 
 // ── ScalarAgg helper ──────────────────────────────────────────────────────────
