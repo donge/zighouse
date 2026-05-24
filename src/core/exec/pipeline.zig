@@ -815,6 +815,13 @@ fn executeHashAggChunked(
     const IntKeyDesc = struct { col_idx: usize, addend: i64 };
     const int_key_descs = try alloc.alloc(IntKeyDesc, keys.len);
 
+    // Agg descriptors for the int-key fast path.
+    const AggKind2 = enum { count_star, count_col, sum_i64, sum_u64, sum_f64, fallback };
+    const IntAggDesc = struct { kind: AggKind2, col_idx: usize };
+    const int_agg_descs = try alloc.alloc(IntAggDesc, aggs.len);
+    @memset(int_agg_descs, .{ .kind = .fallback, .col_idx = 0 });
+    var int_agg_descs_ready: bool = false; // set after first chunk type check
+
     // Compute which column indices are referenced by keys and aggs.
     ctx.source.reset();
     var ref_indices: ?[]usize = null;
@@ -865,6 +872,38 @@ fn executeHashAggChunked(
                     int_key_descs[ki] = .{ .col_idx = col_idx, .addend = addend };
                 }
                 use_int_path = all_int;
+                // Build agg descriptors for the int-key path.
+                if (use_int_path) {
+                    for (aggs, 0..) |item, ci| {
+                        const ac = switch (item.expr) {
+                            .agg_call => |a| a,
+                            else => { int_agg_descs[ci] = .{ .kind = .fallback, .col_idx = 0 }; continue; },
+                        };
+                        if (ac.kind == .count and ac.arg == null) {
+                            // COUNT(*) — no column needed.
+                            int_agg_descs[ci] = .{ .kind = .count_star, .col_idx = 0 };
+                            continue;
+                        }
+                        const arg = ac.arg orelse { int_agg_descs[ci] = .{ .kind = .fallback, .col_idx = 0 }; continue; };
+                        const col_idx: usize = switch (arg) {
+                            .col_ref => |cr| cr.index,
+                            else     => { int_agg_descs[ci] = .{ .kind = .fallback, .col_idx = 0 }; continue; },
+                        };
+                        const col_data = c.columns[col_idx].data;
+                        const kind2: AggKind2 = switch (ac.kind) {
+                            .sum => switch (col_data) {
+                                .int64  => .sum_i64,
+                                .uint64 => .sum_u64,
+                                .float64 => .sum_f64,
+                                else     => .fallback,
+                            },
+                            .count => .count_col, // count(col) = count non-null
+                            else => .fallback,
+                        };
+                        int_agg_descs[ci] = .{ .kind = kind2, .col_idx = col_idx };
+                    }
+                    int_agg_descs_ready = true;
+                }
             }
         }
         const refs = ref_indices.?;
@@ -886,14 +925,47 @@ fn executeHashAggChunked(
                 }
                 if (!key_valid) continue;
                 const bucket = try ht_int.?.getOrInsert(int_key_buf, init_accums);
-                // Update accumulators (still uses row_buf for agg args).
-                for (refs) |j| {
-                    const col = c.columns[j];
-                    row_buf[j] = if (col.isRowNull(r)) null else col.data.get(r);
+                // Update accumulators: inline fast paths avoid row_buf boxing.
+                var needs_row_buf = false;
+                for (int_agg_descs) |d| { if (d.kind == .fallback) { needs_row_buf = true; break; } }
+                if (needs_row_buf) {
+                    for (refs) |j| {
+                        const col = c.columns[j];
+                        row_buf[j] = if (col.isRowNull(r)) null else col.data.get(r);
+                    }
                 }
-                for (aggs, 0..) |item, ci| {
-                    const v_opt = try evalAggArg(item.expr, row_buf, alloc);
-                    try kernels.updateAccum(&bucket[ci], v_opt, alloc);
+                for (int_agg_descs, 0..) |d, ci| {
+                    switch (d.kind) {
+                        .count_star => {
+                            bucket[ci].count +%= 1;
+                        },
+                        .count_col => {
+                            const col = c.columns[d.col_idx];
+                            if (!chunk.isNull(col.null_mask, r)) bucket[ci].count +%= 1;
+                        },
+                        .sum_i64 => {
+                            const col = c.columns[d.col_idx];
+                            if (!chunk.isNull(col.null_mask, r)) {
+                                bucket[ci].i64_sum +%= col.data.int64[r];
+                            }
+                        },
+                        .sum_u64 => {
+                            const col = c.columns[d.col_idx];
+                            if (!chunk.isNull(col.null_mask, r)) {
+                                bucket[ci].u64_sum +%= col.data.uint64[r];
+                            }
+                        },
+                        .sum_f64 => {
+                            const col = c.columns[d.col_idx];
+                            if (!chunk.isNull(col.null_mask, r)) {
+                                bucket[ci].f64_sum += col.data.float64[r];
+                            }
+                        },
+                        .fallback => {
+                            const v_opt = try evalAggArg(aggs[ci].expr, row_buf, alloc);
+                            try kernels.updateAccum(&bucket[ci], v_opt, alloc);
+                        },
+                    }
                 }
             }
         } else {
