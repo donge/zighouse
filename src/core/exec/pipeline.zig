@@ -146,6 +146,51 @@ pub const FilterState = struct {
                     }
                 }
             },
+            // Fast path: AND where left side is col_ref LIKE/NOT_LIKE lit_str.
+            // Evaluate LIKE first (without boxing row_buf), then only fill row_buf for matches.
+            .@"and" => |op| {
+                const like_side: ?struct { col_idx: usize, pattern: []const u8, negate: bool } = blk: {
+                    if (op.left == .like or op.left == .not_like) {
+                        const lop = if (op.left == .like) op.left.like else op.left.not_like;
+                        if (lop.left == .col_ref and lop.right == .lit_str) {
+                            break :blk .{
+                                .col_idx = lop.left.col_ref.index,
+                                .pattern = lop.right.lit_str,
+                                .negate = op.left == .not_like,
+                            };
+                        }
+                    }
+                    break :blk null;
+                };
+                if (like_side) |ls| {
+                    const like_col = c.columns[ls.col_idx];
+                    if (like_col.data == .string) {
+                        var write_pos: usize = 0;
+                        for (0..c.num_rows) |r| {
+                            // Check LIKE first (no boxing).
+                            const s = if (like_col.isRowNull(r)) "" else like_col.data.string[r];
+                            const like_ok = kernels.likeMatch(s, ls.pattern) != ls.negate;
+                            if (!like_ok) continue;
+                            // LIKE matched — now fill row_buf and evaluate full predicate.
+                            for (ref) |j| {
+                                const col = c.columns[j];
+                                row[j] = if (col.isRowNull(r)) null else col.data.get(r);
+                            }
+                            const v = try kernels.evalExpr(self.predicate, row, null, alloc);
+                            const keep = if (v) |val| val.bool_u8 != 0 else false;
+                            if (keep and write_pos == r) {
+                                write_pos += 1;
+                            } else if (keep) {
+                                copyRow(c, r, write_pos);
+                                write_pos += 1;
+                            }
+                        }
+                        c.num_rows = write_pos;
+                        for (c.columns) |*col2| col2.len = write_pos;
+                        return;
+                    }
+                }
+            },
             else => {},
         }
 
