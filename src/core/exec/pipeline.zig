@@ -766,6 +766,43 @@ fn executeHashAggChunked(
             }
             const bucket = try ht_agg.getOrInsert(key_buf, init_accums);
             for (aggs, 0..) |item, ci| {
+                // Inline fast path for common agg expressions in hash agg.
+                switch (item.expr) {
+                    .agg_call => |ac| switch (ac.kind) {
+                        .count_star => { bucket[ci].count += 1; continue; },
+                        .count => if (ac.arg) |arg| {
+                            if (arg == .col_ref) {
+                                if (row_buf[arg.col_ref.index] != null) bucket[ci].count += 1;
+                                continue;
+                            }
+                        },
+                        .sum => if (ac.arg) |arg| {
+                            if (arg == .col_ref) {
+                                if (row_buf[arg.col_ref.index]) |val| {
+                                    switch (bucket[ci]) {
+                                        .i64_sum => if (val.toI64()) |i| { bucket[ci].i64_sum +%= i; },
+                                        .u64_sum => if (val.toU64()) |u| { bucket[ci].u64_sum +%= u; },
+                                        .f64_sum => if (val.toF64()) |f| { bucket[ci].f64_sum += f; },
+                                        else => {},
+                                    }
+                                }
+                                continue;
+                            }
+                        },
+                        .avg => if (ac.arg) |arg| {
+                            if (arg == .col_ref) {
+                                if (row_buf[arg.col_ref.index]) |val| {
+                                    if (bucket[ci] == .f64_sum) {
+                                        if (val.toF64()) |f| bucket[ci].f64_sum += f;
+                                    }
+                                }
+                                continue;
+                            }
+                        },
+                        else => {},
+                    },
+                    else => {},
+                }
                 const v_opt = try evalAggArg(item.expr, row_buf, alloc);
                 try kernels.updateAccum(&bucket[ci], v_opt, alloc);
             }
