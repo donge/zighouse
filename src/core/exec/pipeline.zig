@@ -761,6 +761,20 @@ fn executeScalarAggChunked(
     return rl;
 }
 
+/// Returns true if all GROUP BY keys are `col_ref` or `col_ref ± lit_i64` —
+/// a necessary (but not sufficient) condition for the int-key fast path.
+fn keysAreIntExpr(keys: []const plan.ProjectItem) bool {
+    for (keys) |k| {
+        switch (k.expr) {
+            .col_ref => {},
+            .add => |op| { if (op.left != .col_ref or op.right != .lit_i64) return false; },
+            .sub => |op| { if (op.left != .col_ref or op.right != .lit_i64) return false; },
+            else => return false,
+        }
+    }
+    return true;
+}
+
 /// Drive the source chunk by chunk and build a hash aggregate without rows.
 fn executeHashAggChunked(
     input: *const plan.PhysicalNode,
@@ -776,12 +790,30 @@ fn executeHashAggChunked(
         .part_scan, .mem_scan, .chunk_source => @min(ctx.source.rowCount(), MAX_PRESIZED),
         else => 0,
     };
+
+    // Fast path: if all keys are integer col_ref / col_ref±lit expressions, try
+    // IntKeyHashTable (no []Value boxing, inline key storage).
+    const maybe_int_keys = keysAreIntExpr(keys);
+
     var ht_agg = try ht.AggHashTable.initWithCapacity(alloc, keys.len, aggs.len, est_rows);
+    var ht_int: ?ht.IntKeyHashTable = if (maybe_int_keys)
+        try ht.IntKeyHashTable.initWithCapacity(alloc, keys.len, aggs.len, est_rows)
+    else null;
+
     const init_accums = try alloc.alloc(AggAccum, aggs.len);
     for (aggs, 0..) |item, ci| init_accums[ci] = initAccumForAgg(item.expr);
-    const key_buf = try alloc.alloc(Value, keys.len);
+    const key_buf     = try alloc.alloc(Value, keys.len);
+    const int_key_buf = try alloc.alloc(i64,   keys.len);
 
     var filter_state: ?FilterState = extractFilter(input);
+    // Once we've verified on the first chunk that all key columns are int64/uint64,
+    // this flag is set to true and we use ht_int for all subsequent rows.
+    var use_int_path: bool = false;
+    var int_path_checked: bool = false;
+
+    // Column descriptors for int key path: per key, col index and addend.
+    const IntKeyDesc = struct { col_idx: usize, addend: i64 };
+    const int_key_descs = try alloc.alloc(IntKeyDesc, keys.len);
 
     // Compute which column indices are referenced by keys and aggs.
     ctx.source.reset();
@@ -807,68 +839,127 @@ fn executeHashAggChunked(
             for (mask, 0..) |m, j| { if (m) { idxs[wi] = j; wi += 1; } }
             ref_indices = idxs;
         }
+        // Verify int-key eligibility on first chunk.
+        if (!int_path_checked) {
+            int_path_checked = true;
+            if (maybe_int_keys) {
+                var all_int = true;
+                for (keys, 0..) |k, ki| {
+                    const col_idx: usize = switch (k.expr) {
+                        .col_ref => |cr| cr.index,
+                        .add     => |op| op.left.col_ref.index,
+                        .sub     => |op| op.left.col_ref.index,
+                        else => { all_int = false; break; },
+                    };
+                    const addend: i64 = switch (k.expr) {
+                        .col_ref => 0,
+                        .add     => |op| op.right.lit_i64,
+                        .sub     => |op| -op.right.lit_i64,
+                        else     => 0,
+                    };
+                    const cd = c.columns[col_idx];
+                    switch (cd.data) {
+                        .int64, .uint64 => {},
+                        else => { all_int = false; break; },
+                    }
+                    int_key_descs[ki] = .{ .col_idx = col_idx, .addend = addend };
+                }
+                use_int_path = all_int;
+            }
+        }
         const refs = ref_indices.?;
-        for (0..c.num_rows) |r| {
-            // Fill only referenced columns.
-            for (refs) |j| {
-                const col = c.columns[j];
-                row_buf[j] = if (col.isRowNull(r)) null else col.data.get(r);
+
+        if (use_int_path) {
+            // ── Integer-key fast path ──────────────────────────────────────────
+            for (0..c.num_rows) |r| {
+                // Build int key without Value boxing.
+                var key_valid = true;
+                for (int_key_descs, 0..) |desc, ki| {
+                    const col = c.columns[desc.col_idx];
+                    if (chunk.isNull(col.null_mask, r)) { key_valid = false; break; }
+                    const raw: i64 = switch (col.data) {
+                        .int64  => |v| v[r],
+                        .uint64 => |v| @bitCast(v[r]),
+                        else    => { key_valid = false; break; },
+                    };
+                    int_key_buf[ki] = raw +% desc.addend;
+                }
+                if (!key_valid) continue;
+                const bucket = try ht_int.?.getOrInsert(int_key_buf, init_accums);
+                // Update accumulators (still uses row_buf for agg args).
+                for (refs) |j| {
+                    const col = c.columns[j];
+                    row_buf[j] = if (col.isRowNull(r)) null else col.data.get(r);
+                }
+                for (aggs, 0..) |item, ci| {
+                    const v_opt = try evalAggArg(item.expr, row_buf, alloc);
+                    try kernels.updateAccum(&bucket[ci], v_opt, alloc);
+                }
             }
-            for (keys, 0..) |k, ki| {
-                // Inline fast path for common key expressions (avoids evalExpr dispatch).
-                const v: ?Value = switch (k.expr) {
-                    .col_ref => |cr| row_buf[cr.index],
-                    .add => |op| blk: {
-                        if (op.left == .col_ref and op.right == .lit_i64) {
-                            if (row_buf[op.left.col_ref.index]) |base| {
-                                if (base.toI64()) |bv| break :blk Value{ .int64 = bv +% op.right.lit_i64 };
-                            }
-                        }
-                        break :blk try kernels.evalExpr(k.expr, row_buf, null, alloc);
-                    },
-                    .sub => |op| blk: {
-                        if (op.left == .col_ref and op.right == .lit_i64) {
-                            if (row_buf[op.left.col_ref.index]) |base| {
-                                if (base.toI64()) |bv| break :blk Value{ .int64 = bv -% op.right.lit_i64 };
-                            }
-                        }
-                        break :blk try kernels.evalExpr(k.expr, row_buf, null, alloc);
-                    },
-                    .fn_call => |fc| blk: {
-                        // Fast path: date_part('minute'/'hour', col_ref) — avoids arg eval + string dispatch.
-                        if (fc.args.len == 2 and
-                            fc.args[0] == .lit_str and
-                            fc.args[1] == .col_ref)
-                        {
-                            const unit = fc.args[0].lit_str;
-                            const col_idx = fc.args[1].col_ref.index;
-                            if (row_buf[col_idx]) |ts_val| {
-                                const ms: i64 = switch (ts_val) {
-                                    .datetime64_ms => |m| m,
-                                    .int64         => |i| i * 1000,
-                                    else           => {
-                                        break :blk try kernels.evalExpr(k.expr, row_buf, null, alloc);
-                                    },
-                                };
-                                const secs = @divTrunc(ms, 1000);
-                                if (std.mem.eql(u8, unit, "minute") or std.mem.eql(u8, unit, "min")) {
-                                    break :blk Value{ .int64 = @mod(@divTrunc(secs, 60), 60) };
-                                }
-                                if (std.mem.eql(u8, unit, "hour")) {
-                                    break :blk Value{ .int64 = @mod(@divTrunc(secs, 3600), 24) };
+        } else {
+            // ── General path ──────────────────────────────────────────────────
+            for (0..c.num_rows) |r| {
+                // Fill only referenced columns.
+                for (refs) |j| {
+                    const col = c.columns[j];
+                    row_buf[j] = if (col.isRowNull(r)) null else col.data.get(r);
+                }
+                for (keys, 0..) |k, ki| {
+                    // Inline fast path for common key expressions (avoids evalExpr dispatch).
+                    const v: ?Value = switch (k.expr) {
+                        .col_ref => |cr| row_buf[cr.index],
+                        .add => |op| blk: {
+                            if (op.left == .col_ref and op.right == .lit_i64) {
+                                if (row_buf[op.left.col_ref.index]) |base| {
+                                    if (base.toI64()) |bv| break :blk Value{ .int64 = bv +% op.right.lit_i64 };
                                 }
                             }
-                        }
-                        break :blk try kernels.evalExpr(k.expr, row_buf, null, alloc);
-                    },
-                    else => try kernels.evalExpr(k.expr, row_buf, null, alloc),
-                };
-                key_buf[ki] = v orelse Value{ .int64 = 0 };
-            }
-            const bucket = try ht_agg.getOrInsert(key_buf, init_accums);
-            for (aggs, 0..) |item, ci| {
-                const v_opt = try evalAggArg(item.expr, row_buf, alloc);
-                try kernels.updateAccum(&bucket[ci], v_opt, alloc);
+                            break :blk try kernels.evalExpr(k.expr, row_buf, null, alloc);
+                        },
+                        .sub => |op| blk: {
+                            if (op.left == .col_ref and op.right == .lit_i64) {
+                                if (row_buf[op.left.col_ref.index]) |base| {
+                                    if (base.toI64()) |bv| break :blk Value{ .int64 = bv -% op.right.lit_i64 };
+                                }
+                            }
+                            break :blk try kernels.evalExpr(k.expr, row_buf, null, alloc);
+                        },
+                        .fn_call => |fc| blk: {
+                            // Fast path: date_part('minute'/'hour', col_ref) — avoids arg eval + string dispatch.
+                            if (fc.args.len == 2 and
+                                fc.args[0] == .lit_str and
+                                fc.args[1] == .col_ref)
+                            {
+                                const unit = fc.args[0].lit_str;
+                                const col_idx = fc.args[1].col_ref.index;
+                                if (row_buf[col_idx]) |ts_val| {
+                                    const ms: i64 = switch (ts_val) {
+                                        .datetime64_ms => |m| m,
+                                        .int64         => |i| i * 1000,
+                                        else           => {
+                                            break :blk try kernels.evalExpr(k.expr, row_buf, null, alloc);
+                                        },
+                                    };
+                                    const secs = @divTrunc(ms, 1000);
+                                    if (std.mem.eql(u8, unit, "minute") or std.mem.eql(u8, unit, "min")) {
+                                        break :blk Value{ .int64 = @mod(@divTrunc(secs, 60), 60) };
+                                    }
+                                    if (std.mem.eql(u8, unit, "hour")) {
+                                        break :blk Value{ .int64 = @mod(@divTrunc(secs, 3600), 24) };
+                                    }
+                                }
+                            }
+                            break :blk try kernels.evalExpr(k.expr, row_buf, null, alloc);
+                        },
+                        else => try kernels.evalExpr(k.expr, row_buf, null, alloc),
+                    };
+                    key_buf[ki] = v orelse Value{ .int64 = 0 };
+                }
+                const bucket = try ht_agg.getOrInsert(key_buf, init_accums);
+                for (aggs, 0..) |item, ci| {
+                    const v_opt = try evalAggArg(item.expr, row_buf, alloc);
+                    try kernels.updateAccum(&bucket[ci], v_opt, alloc);
+                }
             }
         }
     }
@@ -878,20 +969,48 @@ fn executeHashAggChunked(
     for (aggs, 0..) |a, ai| out_metas[keys.len + ai] = .{ .name = a.alias, .col_type = a.out_type };
 
     var rl = RowList.init(out_metas);
-    const CtxT = struct {
-        rl: *RowList, alloc: std.mem.Allocator, keys_len: usize, aggs: []const plan.ProjectItem,
-    };
-    var emit_ctx = CtxT{ .rl = &rl, .alloc = alloc, .keys_len = keys.len, .aggs = aggs };
-    ht_agg.iterate(&emit_ctx, struct {
-        fn cb(ec: *CtxT, k: []const Value, bucket: []const AggAccum) void {
-            const row = ec.alloc.alloc(?Value, ec.keys_len + bucket.len) catch return;
-            for (k, 0..) |kv, i| row[i] = kv;
-            for (bucket, ec.aggs, 0..) |acc, item, i| {
-                row[ec.keys_len + i] = finalizeAccum(acc, item, ec.alloc) catch null;
+
+    if (use_int_path) {
+        // Emit from IntKeyHashTable: convert i64 keys back to Values.
+        const EmitCtxI = struct {
+            rl: *RowList, alloc: std.mem.Allocator,
+            keys: []const plan.ProjectItem,
+            aggs: []const plan.ProjectItem,
+            descs: []const IntKeyDesc,
+        };
+        var emit_ctx_i = EmitCtxI{
+            .rl = &rl, .alloc = alloc, .keys = keys, .aggs = aggs, .descs = int_key_descs,
+        };
+        ht_int.?.iterate(&emit_ctx_i, struct {
+            fn cb(ec: *EmitCtxI, k: []const i64, bucket: []const AggAccum) void {
+                const row = ec.alloc.alloc(?Value, ec.keys.len + bucket.len) catch return;
+                for (k, ec.descs, 0..) |raw_val, desc, i| {
+                    // Convert back: if column was uint64, re-interpret; otherwise int64.
+                    _ = desc;
+                    row[i] = Value{ .int64 = raw_val };
+                }
+                for (bucket, ec.aggs, 0..) |acc, item, i| {
+                    row[ec.keys.len + i] = finalizeAccum(acc, item, ec.alloc) catch null;
+                }
+                ec.rl.append(ec.alloc, row) catch {};
             }
-            ec.rl.append(ec.alloc, row) catch {};
-        }
-    }.cb);
+        }.cb);
+    } else {
+        const CtxT = struct {
+            rl: *RowList, alloc: std.mem.Allocator, keys_len: usize, aggs: []const plan.ProjectItem,
+        };
+        var emit_ctx = CtxT{ .rl = &rl, .alloc = alloc, .keys_len = keys.len, .aggs = aggs };
+        ht_agg.iterate(&emit_ctx, struct {
+            fn cb(ec: *CtxT, k: []const Value, bucket: []const AggAccum) void {
+                const row = ec.alloc.alloc(?Value, ec.keys_len + bucket.len) catch return;
+                for (k, 0..) |kv, i| row[i] = kv;
+                for (bucket, ec.aggs, 0..) |acc, item, i| {
+                    row[ec.keys_len + i] = finalizeAccum(acc, item, ec.alloc) catch null;
+                }
+                ec.rl.append(ec.alloc, row) catch {};
+            }
+        }.cb);
+    }
     return rl;
 }
 
