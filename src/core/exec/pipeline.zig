@@ -910,6 +910,57 @@ fn updateAccumsFromChunk(
     const fb_mask = try alloc.alloc(bool, aggs.len);
     @memset(fb_mask, false);
 
+    // Fast path: all aggs are SUM(same_col) or SUM(same_col + k) for int64 column —
+    // compute SUM(col) + count*k in a single pass instead of one pass per agg.
+    // Saves O(90) passes for Q30 (90× SUM(ResolutionWidth + k)).
+    if (aggs.len > 1) blk: {
+        var base_col_idx: ?usize = null;
+        for (aggs) |item| {
+            const ac = switch (item.expr) { .agg_call => |a| a, else => break :blk };
+            if (ac.kind != .sum) break :blk;
+            const arg = ac.arg orelse break :blk;
+            switch (arg) {
+                .col_ref => |cr| {
+                    if (base_col_idx == null) base_col_idx = cr.index
+                    else if (base_col_idx.? != cr.index) break :blk;
+                },
+                .add => |bo| {
+                    const cr = switch (bo.left) { .col_ref => |c2| c2, else => break :blk };
+                    _ = switch (bo.right) { .lit_i64 => {}, else => break :blk };
+                    if (base_col_idx == null) base_col_idx = cr.index
+                    else if (base_col_idx.? != cr.index) break :blk;
+                },
+                else => break :blk,
+            }
+        }
+        const col_idx = base_col_idx orelse break :blk;
+        const col = c.columns[col_idx];
+        const vals = switch (col.data) { .int64 => |v| v, else => break :blk };
+        // Verify all accumulators are i64_sum.
+        for (0..aggs.len) |ci| {
+            if (accums[ci] != .i64_sum) break :blk;
+        }
+        // Single pass: accumulate col_sum and non_null_count.
+        var col_sum: i64 = 0;
+        var non_null_count: i64 = 0;
+        for (0..c.num_rows) |r| {
+            if (!chunk.isNull(col.null_mask, r)) {
+                col_sum +%= vals[r];
+                non_null_count += 1;
+            }
+        }
+        // Update each accumulator analytically: SUM(col+k) = SUM(col) + count*k.
+        for (aggs, 0..) |item, ci| {
+            const k: i64 = switch (item.expr.agg_call.arg.?) {
+                .col_ref => 0,
+                .add => |bo| bo.right.lit_i64,
+                else => 0,
+            };
+            accums[ci].i64_sum +%= col_sum + non_null_count * k;
+        }
+        return;
+    }
+
     for (aggs, 0..) |item, ci| {
         const acc_ptr = &accums[ci];
         var handled = false;
