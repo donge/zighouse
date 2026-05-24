@@ -235,43 +235,47 @@ pub fn plan_query(
         // sort the raw scan BEFORE projection (sort-before-project).
         // Detect this case: order_by_text is a simple ident present in schema.
         if (gplan.order_by_text) |ob_text| {
-            // Parse the order_by_text for non-agg: expect "col [DESC]" or "col".
-            const trimmed = std.mem.trim(u8, ob_text, " \t\r\n");
-            var desc = false;
-            const col_part = if (std.ascii.endsWithIgnoreCase(trimmed, " desc")) blk: {
-                desc = true;
-                break :blk std.mem.trimEnd(u8, trimmed[0..trimmed.len - 5], " \t");
-            } else if (std.ascii.endsWithIgnoreCase(trimmed, " asc")) blk: {
-                break :blk std.mem.trimEnd(u8, trimmed[0..trimmed.len - 4], " \t");
-            } else trimmed;
-            // Only handle simple idents (no parens, spaces, commas).
-            const is_simple = std.mem.indexOfAny(u8, col_part, " \t(,") == null;
-            if (is_simple) {
-                if (ctx.tbl) |tbl| {
-                    if (tbl.findColumn(col_part)) |schema_idx| {
-                        // Insert sort-before-project on the raw source (scan/filter).
-                        const sort_keys = try ctx.alloc.alloc(SortKey, 1);
-                        sort_keys[0] = .{ .col_idx = schema_idx, .desc = desc, .nulls_first = false };
-                        if (gplan.limit != null) {
-                            const k: u64 = @intCast(gplan.limit.?);
-                            const topk = try ctx.alloc.create(PhysicalNode);
-                            topk.* = .{ .top_k = .{ .input = source, .keys = sort_keys, .k = k } };
-                            source = topk;
-                        } else {
-                            const ob = try ctx.alloc.create(PhysicalNode);
-                            ob.* = .{ .order_by = .{ .input = source, .keys = sort_keys } };
-                            source = ob;
-                        }
-                        order_by_text_handled = true;
-                    } else {
-                        // Schema column not found — fall back.
-                        return null;
-                    }
+            // Parse the order_by_text for non-agg: comma-separated list of "col [DESC]".
+            // All columns must be simple schema identifiers (no function calls, no parens).
+            const tbl = ctx.tbl orelse return null;
+            var sort_keys_list: std.ArrayListUnmanaged(SortKey) = .empty;
+            var all_resolved = true;
+            var col_it = std.mem.splitScalar(u8, ob_text, ',');
+            while (col_it.next()) |raw_item| {
+                const item = std.mem.trim(u8, raw_item, " \t\r\n");
+                if (item.len == 0) continue;
+                var desc = false;
+                const col_part = if (std.ascii.endsWithIgnoreCase(item, " desc")) blk: {
+                    desc = true;
+                    break :blk std.mem.trimEnd(u8, item[0..item.len - 5], " \t");
+                } else if (std.ascii.endsWithIgnoreCase(item, " asc")) blk: {
+                    break :blk std.mem.trimEnd(u8, item[0..item.len - 4], " \t");
+                } else item;
+                // Only simple schema column idents (no parens, spaces, commas within a single item).
+                const is_simple = std.mem.indexOfAny(u8, col_part, " \t(") == null;
+                if (!is_simple) { all_resolved = false; break; }
+                if (tbl.findColumn(col_part)) |schema_idx| {
+                    try sort_keys_list.append(ctx.alloc, .{ .col_idx = schema_idx, .desc = desc, .nulls_first = false });
                 } else {
-                    return null; // No schema to resolve column.
+                    all_resolved = false;
+                    break;
                 }
+            }
+            if (all_resolved and sort_keys_list.items.len > 0) {
+                const sort_keys = try sort_keys_list.toOwnedSlice(ctx.alloc);
+                if (gplan.limit != null) {
+                    const k: u64 = @intCast(gplan.limit.?);
+                    const topk = try ctx.alloc.create(PhysicalNode);
+                    topk.* = .{ .top_k = .{ .input = source, .keys = sort_keys, .k = k } };
+                    source = topk;
+                } else {
+                    const ob = try ctx.alloc.create(PhysicalNode);
+                    ob.* = .{ .order_by = .{ .input = source, .keys = sort_keys } };
+                    source = ob;
+                }
+                order_by_text_handled = true;
             } else {
-                return null; // Complex expression ORDER BY — fall back.
+                return null; // Unresolvable or complex ORDER BY — fall back.
             }
         }
         const items = try buildProjectItems(ctx, projs) orelse return null;
@@ -464,14 +468,29 @@ pub fn plan_query(
         if (gplan.having_expr) |he| {
             // Build virtual_cols from the current agg output so resolveColExpr
             // can look up agg-output alias names (e.g. "c", "l") used in HAVING.
+            // Also register canonical function-name forms (e.g. "count_star()")
+            // since DuckDB's exprToText may produce those instead of aliases.
             var vcols_list: std.ArrayListUnmanaged(VirtualCol) = .empty;
             switch (source.*) {
                 .hash_agg => |ha| {
                     for (ha.keys, 0..) |ki, i| try vcols_list.append(ctx.alloc, .{ .name = ki.alias, .idx = i, .col_type = ki.out_type });
-                    for (ha.aggs, 0..) |ai, i| try vcols_list.append(ctx.alloc, .{ .name = ai.alias, .idx = ha.keys.len + i, .col_type = ai.out_type });
+                    for (ha.aggs, 0..) |ai, i| {
+                        const out_idx = ha.keys.len + i;
+                        try vcols_list.append(ctx.alloc, .{ .name = ai.alias, .idx = out_idx, .col_type = ai.out_type });
+                        // Also register by canonical agg function name so HAVING COUNT(*) > N works
+                        // even when the alias differs from the function text.
+                        if (aggCanonName(ai.expr)) |canon| {
+                            try vcols_list.append(ctx.alloc, .{ .name = canon, .idx = out_idx, .col_type = ai.out_type });
+                        }
+                    }
                 },
                 .scalar_agg => |sa| {
-                    for (sa.aggs, 0..) |ai, i| try vcols_list.append(ctx.alloc, .{ .name = ai.alias, .idx = i, .col_type = ai.out_type });
+                    for (sa.aggs, 0..) |ai, i| {
+                        try vcols_list.append(ctx.alloc, .{ .name = ai.alias, .idx = i, .col_type = ai.out_type });
+                        if (aggCanonName(ai.expr)) |canon| {
+                            try vcols_list.append(ctx.alloc, .{ .name = canon, .idx = i, .col_type = ai.out_type });
+                        }
+                    }
                 },
                 else => {},
             }
@@ -661,6 +680,19 @@ fn outputLen(node: *const PhysicalNode) usize {
 }
 
 // ── WhereNode → plan.Expr ─────────────────────────────────────────────────────
+
+/// Return the canonical DuckDB exprToText form for a simple agg_call ProjectItem,
+/// e.g. count(*) → "count_star()", sum(col) → null (too variable).
+/// Used to register extra virtual_cols so HAVING COUNT(*) > N works regardless of alias.
+fn aggCanonName(expr: plan.Expr) ?[]const u8 {
+    if (expr != .agg_call) return null;
+    const ac = expr.agg_call;
+    return switch (ac.kind) {
+        .count_star => "count_star()",
+        .count      => "count()",
+        else        => null,
+    };
+}
 
 fn whereNodeToExpr(ctx: *PlannerCtx, wn: *const generic_sql.WhereNode) ?Expr {
     switch (wn.*) {
@@ -1238,6 +1270,7 @@ fn canonFnName(name: []const u8) []const u8 {
         "arrayJoin",
         "mapKeys", "mapValues",
         "tuple",
+        "regexp_replace", "replaceRegexpOne",
     };
     for (canon_names) |cn| {
         if (std.ascii.eqlIgnoreCase(cn, name)) return cn;
@@ -1655,7 +1688,9 @@ fn prattExpr(pctx: *ParseCtx, min_bp: u8) anyerror!?Expr {
                     if (args_slice.len == 3) {
                         if (std.ascii.eqlIgnoreCase(name, "if") or
                             std.ascii.eqlIgnoreCase(name, "substring") or
-                            std.ascii.eqlIgnoreCase(name, "substr")) break :blk2 true;
+                            std.ascii.eqlIgnoreCase(name, "substr") or
+                            std.ascii.eqlIgnoreCase(name, "regexp_replace") or
+                            std.ascii.eqlIgnoreCase(name, "replaceRegexpOne")) break :blk2 true;
                     }
                     // substring/substr with 2 args (no length) — from position to end
                     if (args_slice.len == 2 and (

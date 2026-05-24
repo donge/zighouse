@@ -456,11 +456,11 @@ test "parses dashboard string top shapes" {
     const q43 = (try parse(std.testing.allocator, "SELECT DATE_TRUNC('minute', EventTime) AS M, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= '2013-07-14' AND EventDate <= '2013-07-15' AND IsRefresh = 0 AND DontCountHits = 0 GROUP BY DATE_TRUNC('minute', EventTime) ORDER BY DATE_TRUNC('minute', EventTime) LIMIT 10 OFFSET 1000")) orelse return error.ParseNull;
     defer deinit(std.testing.allocator, q43);
     try std.testing.expect(q43.where_text != null);
-    try std.testing.expectEqualStrings("EventMinute", q43.projections[0].column orelse return error.NullColumn);
+    try std.testing.expectEqualStrings("date_trunc('minute', EventTime)", q43.projections[0].column orelse return error.NullColumn);
     try std.testing.expectEqualStrings("M", q43.projections[0].alias orelse return error.NullAlias);
     try std.testing.expectEqualStrings("date_trunc('minute', EventTime)", q43.group_by orelse return error.NullGroupBy);
-    try std.testing.expectEqualStrings("date_trunc('minute', EventTime) ASC", q43.order_by_text orelse return error.NullOrderByText);
-    try std.testing.expect(q43.order_by_alias == null);
+    try std.testing.expectEqualStrings("M", q43.order_by_alias orelse return error.NullOrderByAlias);
+    try std.testing.expect(q43.order_by_text == null);
     try std.testing.expectEqual(@as(?usize, 10), q43.limit);
     try std.testing.expectEqual(@as(?usize, 1000), q43.offset);
 }

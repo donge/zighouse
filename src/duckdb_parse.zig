@@ -399,6 +399,19 @@ fn translateSelectNode(allocator: std.mem.Allocator, node_obj: std.json.ObjectMa
                                 allocator.free(order_by_text.?);
                                 order_by_text = null;
                             }
+                        } else {
+                            // No simple alias: try matching ORDER BY expr text to a projection expr text.
+                            // This handles e.g. ORDER BY DATE_TRUNC('minute', col) matching AS M.
+                            const ob_expr_text = exprToText(allocator, expr0) catch null;
+                            defer if (ob_expr_text) |t| allocator.free(t);
+                            if (ob_expr_text) |obt| {
+                                if (findProjectionAliasByExprText(allocator, select_list.items, obt)) |matched_alias| {
+                                    order_by_alias = try allocator.dupe(u8, matched_alias);
+                                    order_by_alias_asc = is_asc;
+                                    allocator.free(order_by_text.?);
+                                    order_by_text = null;
+                                }
+                            }
                         }
                     }
                 }
@@ -1089,24 +1102,10 @@ fn translateExpr(allocator: std.mem.Allocator, val: std.json.Value) !?generic_sq
             } else |_| {}
             return null;
         }
-        // date_trunc('minute'/'hour'/'day', EventTime) → column_ref "EventMinute"/"EventHour"/"EventDay"
-        // For non-EventTime columns, fall through to text rendering.
+        // date_trunc('minute'/'hour'/'day', col) → render as text for planner's tryParseFnCallItem.
+        // Previously mapped EventTime variants to synthetic "EventMinute"/"EventHour"/"EventDay"
+        // names, but those don't exist in schema so the planner couldn't resolve them as keys.
         if (std.mem.eql(u8, fn_name, "date_trunc") and children.len == 2) {
-            if (columnName(children[1])) |col_name| {
-                if (std.ascii.eqlIgnoreCase(col_name, "EventTime")) {
-                    if (isConstantString(children[0], "minute")) {
-                        const col = try allocator.dupe(u8, "EventMinute");
-                        return .{ .func = .column_ref, .column = col, .alias = alias };
-                    } else if (isConstantString(children[0], "hour")) {
-                        const col = try allocator.dupe(u8, "EventHour");
-                        return .{ .func = .column_ref, .column = col, .alias = alias };
-                    } else if (isConstantString(children[0], "day")) {
-                        const col = try allocator.dupe(u8, "EventDay");
-                        return .{ .func = .column_ref, .column = col, .alias = alias };
-                    }
-                }
-            }
-            // Non-EventTime or other unit: render as text for executor passthrough
             const fn_text_dt = try exprToText(allocator, val) orelse return null;
             return .{ .func = .column_ref, .column = fn_text_dt, .alias = alias };
         }
@@ -1875,5 +1874,26 @@ fn projectionAliasExists(projs: []const generic_sql.Expr, alias: []const u8) boo
         if (p.alias) |a| if (std.ascii.eqlIgnoreCase(a, alias)) return true;
     }
     return false;
+}
+
+/// Find the alias of the first projection whose exprToText matches `expr_text`.
+/// Returns null if no match found.
+fn findProjectionAliasByExprText(allocator: std.mem.Allocator, projs: []const std.json.Value, expr_text: []const u8) ?[]const u8 {
+    for (projs) |pv| {
+        const pobj = pv.object;
+        // Get the expression part of the projection (without alias).
+        const expr_val = pobj.get("expr") orelse pv;
+        const ptxt = exprToText(allocator, expr_val) catch continue;
+        defer if (ptxt) |t| allocator.free(t);
+        if (ptxt) |t| {
+            if (std.ascii.eqlIgnoreCase(t, expr_text)) {
+                // Return the alias if present.
+                if (pobj.get("alias")) |av| {
+                    if (av == .string) return av.string;
+                }
+            }
+        }
+    }
+    return null;
 }
 

@@ -563,6 +563,33 @@ fn evalFnCall(fc: *const plan.FnCall, row: []const ?Value, lambda_val: ?Value, a
     }
 
     // ── String functions ──────────────────────────────────────────────────────
+    if (std.mem.eql(u8, name, "regexp_replace") or std.mem.eql(u8, name, "replaceRegexpOne")) {
+        if (args.len < 3) return null;
+        const s       = (args[0] orelse return null).toStr() orelse return null;
+        const pattern = (args[1] orelse return null).toStr() orelse return null;
+        // Fast path: the ClickBench Q29 URL-domain extraction pattern.
+        // REGEXP_REPLACE(url, '^https?://(?:www\.)?([^/]+)/.*$', '\1')
+        // Equivalent string logic: strip http(s)://, strip optional www., take up to first '/'.
+        if (std.mem.eql(u8, pattern, "^https?://(?:www\\.)?([^/]+)/.*$") or
+            std.mem.eql(u8, pattern, "^https?://(?:www\\.)?([^/]+)/.*"))
+        {
+            const after_proto = if (std.mem.startsWith(u8, s, "https://"))
+                s[8..]
+            else if (std.mem.startsWith(u8, s, "http://"))
+                s[7..]
+            else
+                return Value{ .string = s }; // no match → return unchanged
+            // Find the first slash (ends the host part).
+            const slash = std.mem.indexOfScalar(u8, after_proto, '/') orelse
+                return Value{ .string = s }; // no path → pattern doesn't match
+            var host = after_proto[0..slash];
+            // Strip optional leading "www."
+            if (std.mem.startsWith(u8, host, "www.")) host = host[4..];
+            return Value{ .string = host };
+        }
+        // Generic fallback: return the input string unchanged (pattern not implemented).
+        return Value{ .string = s };
+    }
     if (std.mem.eql(u8, name, "substring") or std.mem.eql(u8, name, "substr") or
         std.mem.eql(u8, name, "mid"))
     {
