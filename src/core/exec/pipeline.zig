@@ -92,7 +92,12 @@ pub const SourceIface = struct {
 
 /// Filter: evaluates predicate on each row, zeroes out non-matching rows.
 /// Non-matching rows are compacted out — chunk.num_rows shrinks.
-pub const LikeGuard = struct { col_idx: usize, pattern: []const u8, negate: bool };
+pub const LikeGuard = struct {
+    col_idx: usize,
+    pattern: []const u8,
+    negate: bool,
+    matcher: kernels.LikeMatcher,
+};
 
 pub const FilterState = struct {
     predicate: plan.Expr,
@@ -150,7 +155,7 @@ pub const FilterState = struct {
                     var write_pos: usize = 0;
                     for (0..c.num_rows) |r| {
                         const s = if (col.isRowNull(r)) "" else col.data.string[r];
-                        const keep = kernels.likeMatch(s, lg.pattern) != lg.negate;
+                        const keep = lg.matcher.match(s) != lg.negate;
                         if (keep and write_pos == r) {
                             write_pos += 1;
                         } else if (keep) {
@@ -219,7 +224,7 @@ pub const FilterState = struct {
                 for (guards) |lg| {
                     const col = c.columns[lg.col_idx];
                     const s = if (col.isRowNull(r)) "" else col.data.string[r];
-                    if (kernels.likeMatch(s, lg.pattern) == lg.negate) continue :row_loop;
+                    if (lg.matcher.match(s) == lg.negate) continue :row_loop;
                 }
                 // All LIKE guards passed — fill row_buf and evaluate full predicate.
                 for (ref) |j| {
@@ -270,6 +275,7 @@ fn collectLikeGuards(expr: plan.Expr, guards: *std.ArrayListUnmanaged(LikeGuard)
                     .col_idx = op.left.col_ref.index,
                     .pattern = op.right.lit_str,
                     .negate  = expr == .not_like,
+                    .matcher = kernels.LikeMatcher.compile(op.right.lit_str),
                 }) catch {};
             }
         },
@@ -821,6 +827,15 @@ fn keysAreIntExpr(keys: []const plan.ProjectItem) bool {
     return true;
 }
 
+/// Returns true if all keys are plain col_ref expressions.
+fn keysAreColRef(keys: []const plan.ProjectItem) bool {
+    for (keys) |k| {
+        if (k.expr != .col_ref) return false;
+    }
+    return true;
+}
+
+
 /// Drive the source chunk by chunk and build a hash aggregate without rows.
 fn executeHashAggChunked(
     input: *const plan.PhysicalNode,
@@ -881,6 +896,26 @@ fn executeHashAggChunked(
     var ht_int: ?ht.IntKeyHashTable = if (maybe_int_keys)
         try ht.IntKeyHashTable.initWithCapacity(alloc, keys.len, aggs.len, est_rows)
     else null;
+
+    // StrCountHashTable fast path: exactly one col_ref key (others may be constants) + count(*) agg.
+    // Handles Q34 (GROUP BY URL) and Q35 (GROUP BY 1, URL).
+    const maybe_str_count = blk: {
+        if (aggs.len != 1) break :blk false;
+        if (aggs[0].expr != .agg_call) break :blk false;
+        if (aggs[0].expr.agg_call.kind != .count_star) break :blk false;
+        var col_ref_count: usize = 0;
+        for (keys) |k| {
+            switch (k.expr) {
+                .col_ref => col_ref_count += 1,
+                .lit_i64, .lit_str => {},
+                else => break :blk false,
+            }
+        }
+        break :blk col_ref_count == 1;
+    };
+    var ht_str_count: ?ht.StrCountHashTable = null;
+    var str_count_col_idx: usize = 0;
+    var use_str_count_path: bool = false;
 
     const init_accums = try alloc.alloc(AggAccum, aggs.len);
     for (aggs, 0..) |item, ci| init_accums[ci] = initAccumForAgg(item.expr);
@@ -948,8 +983,38 @@ fn executeHashAggChunked(
                 }
                 use_int_path = all_int;
             }
+            // Verify str-count eligibility (single string key col).
+            if (maybe_str_count and !use_int_path) {
+                // Find the single col_ref key (others are literals).
+                var found_col_ref: ?usize = null;
+                for (keys) |k| {
+                    if (k.expr == .col_ref) { found_col_ref = k.expr.col_ref.index; break; }
+                }
+                if (found_col_ref) |col_idx| {
+                    if (col_idx < c.columns.len) {
+                        switch (c.columns[col_idx].data) {
+                            .string => {
+                                str_count_col_idx = col_idx;
+                                ht_str_count = try ht.StrCountHashTable.initWithCapacity(alloc, est_rows);
+                                use_str_count_path = true;
+                            },
+                            else => {},
+                        }
+                    }
+                }
+            }
         }
         const refs = ref_indices.?;
+
+        if (use_str_count_path) {
+            // ── String-key count(*) fast path ─────────────────────────────────
+            const col = c.columns[str_count_col_idx];
+            const strs = col.data.string;
+            for (0..c.num_rows) |r| {
+                try ht_str_count.?.increment(strs[r]);
+            }
+            continue;
+        }
 
         if (use_int_path) {
             // ── Integer-key fast path ──────────────────────────────────────────
@@ -1120,7 +1185,29 @@ fn executeHashAggChunked(
 
     var rl = RowList.init(out_metas);
 
-    if (use_int_path) {
+    if (use_str_count_path) {
+        // Emit from StrCountHashTable. Keys may include literals (e.g. Q35: GROUP BY 1, URL).
+        const EmitCtxS = struct {
+            rl: *RowList, alloc: std.mem.Allocator,
+            keys: []const plan.ProjectItem,
+        };
+        var emit_ctx_s = EmitCtxS{ .rl = &rl, .alloc = alloc, .keys = keys };
+        ht_str_count.?.iterate(&emit_ctx_s, struct {
+            fn cb(ec: *EmitCtxS, s: []const u8, count: u64) void {
+                const row = ec.alloc.alloc(?Value, ec.keys.len + 1) catch return;
+                for (ec.keys, 0..) |k, i| {
+                    row[i] = switch (k.expr) {
+                        .col_ref => Value{ .string = s },
+                        .lit_i64 => |v| Value{ .int64 = v },
+                        .lit_str => |v| Value{ .string = v },
+                        else => Value{ .int64 = 0 },
+                    };
+                }
+                row[ec.keys.len] = Value{ .uint64 = count };
+                ec.rl.append(ec.alloc, row) catch {};
+            }
+        }.cb);
+    } else if (use_int_path) {
         // Emit from IntKeyHashTable: convert i64 keys back to Values.
         const EmitCtxI = struct {
             rl: *RowList, alloc: std.mem.Allocator,
