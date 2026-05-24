@@ -119,6 +119,36 @@ pub const FilterState = struct {
         const ref = self.ref_indices.?;
         const row = self.row_buf.?;
 
+        // Fast path: simple col_ref LIKE/NOT_LIKE lit_str — bypass Value boxing entirely.
+        switch (self.predicate) {
+            .like, .not_like => |op| {
+                if (op.left == .col_ref and op.right == .lit_str) {
+                    const col_idx = op.left.col_ref.index;
+                    const pattern = op.right.lit_str;
+                    const negate = self.predicate == .not_like;
+                    const col = c.columns[col_idx];
+                    if (col.data == .string) {
+                        var write_pos: usize = 0;
+                        for (0..c.num_rows) |r| {
+                            const s = if (col.isRowNull(r)) "" else col.data.string[r];
+                            const matched = kernels.likeMatch(s, pattern);
+                            const keep = matched != negate;
+                            if (keep and write_pos == r) {
+                                write_pos += 1;
+                            } else if (keep) {
+                                copyRow(c, r, write_pos);
+                                write_pos += 1;
+                            }
+                        }
+                        c.num_rows = write_pos;
+                        for (c.columns) |*col2| col2.len = write_pos;
+                        return;
+                    }
+                }
+            },
+            else => {},
+        }
+
         var write_pos: usize = 0;
         for (0..c.num_rows) |r| {
             for (ref) |j| {
