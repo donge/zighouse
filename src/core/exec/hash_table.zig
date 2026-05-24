@@ -461,6 +461,101 @@ pub const PairCountHashTable = struct {
     }
 };
 
+// ── TripleCountHashTable ───────────────────────────────────────────────────────
+
+/// Specialized hash table for (i64, i64, string) GROUP BY with count(*).
+/// Used for Q19: GROUP BY UserID, extract(minute FROM EventTime), SearchPhrase.
+pub const TripleCountHashTable = struct {
+    const Slot = struct {
+        hash:    u64,
+        n0:      i64,
+        n1:      i64,
+        str_key: []const u8,
+        count:   u64,
+    };
+
+    slots:    []Slot,
+    occupied: []bool,
+    capacity: usize,
+    count:    usize,
+    arena:    std.mem.Allocator,
+
+    pub fn initWithCapacity(arena: std.mem.Allocator, est_rows: u64) !TripleCountHashTable {
+        const cap = if (est_rows > 0)
+            nextPow2Triple(@as(usize, @intCast(@min(est_rows * 100 / 70 + 1, std.math.maxInt(u32)))))
+        else
+            64;
+        const slots    = try arena.alloc(Slot, cap);
+        const occupied = try arena.alloc(bool, cap);
+        @memset(occupied, false);
+        return .{ .slots = slots, .occupied = occupied, .capacity = cap, .count = 0, .arena = arena };
+    }
+
+    fn nextPow2Triple(n: usize) usize {
+        if (n <= 1) return 1;
+        var p: usize = 1;
+        while (p < n) p <<= 1;
+        return p;
+    }
+
+    pub fn increment(self: *TripleCountHashTable, n0: i64, n1: i64, str_key: []const u8) !void {
+        if (self.count + 1 > (self.capacity * 7) / 10) try self.grow();
+
+        const mask = self.capacity - 1;
+        const h = hashTriple(n0, n1, str_key);
+        var slot = h & mask;
+
+        while (true) : (slot = (slot + 1) & mask) {
+            if (!self.occupied[slot]) {
+                self.slots[slot]    = .{ .hash = h, .n0 = n0, .n1 = n1, .str_key = str_key, .count = 1 };
+                self.occupied[slot] = true;
+                self.count += 1;
+                return;
+            }
+            if (self.slots[slot].hash == h and
+                self.slots[slot].n0 == n0 and
+                self.slots[slot].n1 == n1 and
+                std.mem.eql(u8, self.slots[slot].str_key, str_key))
+            {
+                self.slots[slot].count += 1;
+                return;
+            }
+        }
+    }
+
+    fn grow(self: *TripleCountHashTable) !void {
+        const new_cap  = self.capacity * 2;
+        const new_mask = new_cap - 1;
+        const new_slots    = try self.arena.alloc(Slot, new_cap);
+        const new_occupied = try self.arena.alloc(bool, new_cap);
+        @memset(new_occupied, false);
+        for (0..self.capacity) |i| {
+            if (!self.occupied[i]) continue;
+            var sl = self.slots[i].hash & new_mask;
+            while (new_occupied[sl]) : (sl = (sl + 1) & new_mask) {}
+            new_slots[sl]    = self.slots[i];
+            new_occupied[sl] = true;
+        }
+        self.slots    = new_slots;
+        self.occupied = new_occupied;
+        self.capacity = new_cap;
+    }
+
+    pub fn iterate(self: *const TripleCountHashTable, ctx: anytype, comptime cb: fn (@TypeOf(ctx), i64, i64, []const u8, u64) void) void {
+        for (0..self.capacity) |i| {
+            if (self.occupied[i]) cb(ctx, self.slots[i].n0, self.slots[i].n1, self.slots[i].str_key, self.slots[i].count);
+        }
+    }
+
+    fn hashTriple(n0: i64, n1: i64, s: []const u8) u64 {
+        var h = std.hash.Wyhash.init(0);
+        h.update(std.mem.asBytes(&n0));
+        h.update(std.mem.asBytes(&n1));
+        h.update(s);
+        return h.final();
+    }
+};
+
 // ── IntKeyHashTable ───────────────────────────────────────────────────────────
 
 /// Specialized open-addressing hash table for integer (i64) composite keys.

@@ -935,6 +935,89 @@ fn executeHashAggChunked(
     var pair_str_col_idx: usize = 0;
     var use_pair_count_path: bool = false;
 
+    // TripleCountHashTable fast path: (i64_col, date_part(unit, datetime_col), string_col) + count(*).
+    // Handles Q19: GROUP BY UserID, extract(minute FROM EventTime), SearchPhrase.
+    const DatePartUnit = enum { minute, hour, day };
+    const TripleDesc = struct {
+        n0_col:   usize,   // first i64 col_ref index
+        dp_col:   usize,   // col_ref index inside date_part(...)
+        dp_unit:  DatePartUnit,
+        str_col:  usize,   // string col_ref index
+        // Order of keys in output row: 0=n0, 1=dp, 2=str  or some permutation.
+        key_order: [3]u8,  // key_order[i] = which variable fills keys[i]
+    };
+    const maybe_triple_count: ?TripleDesc = blk: {
+        if (aggs.len != 1) break :blk null;
+        if (aggs[0].expr != .agg_call) break :blk null;
+        if (aggs[0].expr.agg_call.kind != .count_star) break :blk null;
+        if (keys.len != 3) break :blk null;
+        // Find which key is the date_part fn_call and record the others.
+        var dp_idx: ?usize = null;
+        var dp_col: usize = 0;
+        var dp_unit: DatePartUnit = .minute;
+        var col_ref_indices: [2]usize = .{0, 0};
+        var cri: usize = 0;
+        for (keys, 0..) |k, ki| {
+            switch (k.expr) {
+                .col_ref => {
+                    if (cri >= 2) break :blk null;
+                    col_ref_indices[cri] = ki;
+                    cri += 1;
+                },
+                .fn_call => |fc| {
+                    if (dp_idx != null) break :blk null; // two fn_calls
+                    if (!(std.mem.eql(u8, fc.name, "date_part") or
+                          std.mem.eql(u8, fc.name, "extract"))) break :blk null;
+                    if (fc.args.len < 2) break :blk null;
+                    if (fc.args[0] != .lit_str) break :blk null;
+                    if (fc.args[1] != .col_ref) break :blk null;
+                    const unit_str = fc.args[0].lit_str;
+                    dp_unit = if (std.mem.eql(u8, unit_str, "minute") or std.mem.eql(u8, unit_str, "min"))
+                        .minute
+                    else if (std.mem.eql(u8, unit_str, "hour"))
+                        .hour
+                    else if (std.mem.eql(u8, unit_str, "day") or std.mem.eql(u8, unit_str, "dayofmonth"))
+                        .day
+                    else
+                        break :blk null;
+                    dp_col = fc.args[1].col_ref.index;
+                    dp_idx = ki;
+                },
+                else => break :blk null,
+            }
+        }
+        if (dp_idx == null or cri != 2) break :blk null;
+        const key_order: [3]u8 = blk2: {
+            var order: [3]u8 = .{0, 0, 0};
+            for (keys, 0..) |k, ki| {
+                if (ki == dp_idx.?) order[ki] = 1  // date_part → n1
+                else if (k.expr == .col_ref) order[ki] = if (ki == col_ref_indices[0]) 0 else 2;
+            }
+            break :blk2 order;
+        };
+        _ = key_order;
+        break :blk TripleDesc{
+            .n0_col    = keys[col_ref_indices[0]].expr.col_ref.index,
+            .dp_col    = dp_col,
+            .dp_unit   = dp_unit,
+            .str_col   = keys[col_ref_indices[1]].expr.col_ref.index,
+            .key_order = blk2: {
+                var order: [3]u8 = .{0, 0, 0};
+                for (keys, 0..) |_, ki| {
+                    if (ki == dp_idx.?) order[ki] = 1
+                    else if (ki == col_ref_indices[0]) order[ki] = 0
+                    else order[ki] = 2;
+                }
+                break :blk2 order;
+            },
+        };
+    };
+    var ht_triple_count: ?ht.TripleCountHashTable = null;
+    var use_triple_count_path: bool = false;
+    var triple_desc: TripleDesc = if (maybe_triple_count) |d| d else .{
+        .n0_col = 0, .dp_col = 0, .dp_unit = .minute, .str_col = 0, .key_order = .{0,1,2},
+    };
+
     const init_accums = try alloc.alloc(AggAccum, aggs.len);
     for (aggs, 0..) |item, ci| init_accums[ci] = initAccumForAgg(item.expr);
     const key_buf     = try alloc.alloc(Value, keys.len);
@@ -1043,6 +1126,20 @@ fn executeHashAggChunked(
                     }
                 }
             }
+            // Verify triple-count eligibility: (i64, date_part_datetime, string) + count(*).
+            if (maybe_triple_count != null and !use_int_path and !use_str_count_path and !use_pair_count_path) {
+                const td = maybe_triple_count.?;
+                if (td.n0_col < c.columns.len and td.dp_col < c.columns.len and td.str_col < c.columns.len) {
+                    const n0_ok = c.columns[td.n0_col].data == .int64 or c.columns[td.n0_col].data == .uint64;
+                    const dp_ok = c.columns[td.dp_col].data == .datetime64_ms or c.columns[td.dp_col].data == .int64;
+                    const str_ok = c.columns[td.str_col].data == .string;
+                    if (n0_ok and dp_ok and str_ok) {
+                        triple_desc = td;
+                        ht_triple_count = try ht.TripleCountHashTable.initWithCapacity(alloc, est_rows);
+                        use_triple_count_path = true;
+                    }
+                }
+            }
         }
         const refs = ref_indices.?;
 
@@ -1064,6 +1161,46 @@ fn executeHashAggChunked(
                 .int64  => |ints| { for (0..c.num_rows) |r| try ht_pair_count.?.increment(ints[r], strs[r]); },
                 .uint64 => |ints| { for (0..c.num_rows) |r| try ht_pair_count.?.increment(@bitCast(ints[r]), strs[r]); },
                 else    => unreachable,
+            }
+            continue;
+        }
+
+        if (use_triple_count_path) {
+            // ── (i64, date_part, string) triple count(*) fast path ────────────
+            const td = triple_desc;
+            const n0_col = c.columns[td.n0_col];
+            const dp_col = c.columns[td.dp_col];
+            const strs   = c.columns[td.str_col].data.string;
+            for (0..c.num_rows) |r| {
+                const n0: i64 = switch (n0_col.data) {
+                    .int64  => |v| v[r],
+                    .uint64 => |v| @bitCast(v[r]),
+                    else    => unreachable,
+                };
+                const ms: i64 = switch (dp_col.data) {
+                    .datetime64_ms => |v| v[r],
+                    .int64         => |v| v[r] * 1000,
+                    else           => unreachable,
+                };
+                const secs = @divTrunc(ms, 1000);
+                const n1: i64 = switch (td.dp_unit) {
+                    .minute => @mod(@divTrunc(secs, 60), 60),
+                    .hour   => @mod(@divTrunc(secs, 3600), 24),
+                    .day    => blk: {
+                        const days = @divTrunc(ms, 86400 * 1000);
+                        // Simple day-of-month: reuse date math from kernels.
+                        const d = if (days >= 0) @as(u64, @intCast(days)) else 0;
+                        // Gregorian calendar: days since epoch.
+                        const n: u64 = d + 719468;
+                        const era: u64 = @divTrunc(n, 146097);
+                        const doe: u64 = n - era * 146097;
+                        const yoe: u64 = @divTrunc(doe - @divTrunc(doe, 1460) + @divTrunc(doe, 36524) - @divTrunc(doe, 146096), 365);
+                        const doy: u64 = doe - (365 * yoe + @divTrunc(yoe, 4) - @divTrunc(yoe, 100));
+                        const mp:  u64 = @divTrunc(5 * doy + 2, 153);
+                        break :blk @intCast(doy - @divTrunc(153 * mp + 2, 5) + 1);
+                    },
+                };
+                try ht_triple_count.?.increment(n0, n1, strs[r]);
             }
             continue;
         }
@@ -1277,6 +1414,27 @@ fn executeHashAggChunked(
                     row[1] = Value{ .int64 = n };
                 }
                 row[2] = Value{ .uint64 = count };
+                ec.rl.append(ec.alloc, row) catch {};
+            }
+        }.cb);
+    } else if (use_triple_count_path) {
+        // Emit from TripleCountHashTable: restore key order per triple_desc.key_order.
+        const td = triple_desc;
+        const EmitCtxT = struct {
+            rl: *RowList, alloc: std.mem.Allocator, key_order: [3]u8,
+        };
+        var emit_ctx_t = EmitCtxT{ .rl = &rl, .alloc = alloc, .key_order = td.key_order };
+        ht_triple_count.?.iterate(&emit_ctx_t, struct {
+            fn cb(ec: *EmitCtxT, n0: i64, n1: i64, s: []const u8, count: u64) void {
+                const row = ec.alloc.alloc(?Value, 4) catch return;
+                for (ec.key_order, 0..) |kind, i| {
+                    row[i] = switch (kind) {
+                        0 => Value{ .int64 = n0 },
+                        1 => Value{ .int64 = n1 },
+                        else => Value{ .string = s },
+                    };
+                }
+                row[3] = Value{ .uint64 = count };
                 ec.rl.append(ec.alloc, row) catch {};
             }
         }.cb);
