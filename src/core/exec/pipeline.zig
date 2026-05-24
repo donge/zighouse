@@ -493,15 +493,20 @@ fn executeNode(node: *const plan.PhysicalNode, ctx: *QueryContext) !RowList {
             return executeOrderBy(inner, ob.keys, alloc);
         },
 
-        // ── TopK ──────────────────────────────────────────────────────────────
-        .top_k => |tk| {
-            const inner = try executeNode(tk.input, ctx);
-            const sorted = try executeOrderBy(inner, tk.keys, alloc);
-            const take = @min(sorted.rows.items.len, @as(usize, @intCast(tk.k)));
-            var rl = RowList.init(sorted.metas);
-            for (sorted.rows.items[0..take]) |row| try rl.append(alloc, row);
-            return rl;
-        },
+         // ── TopK ──────────────────────────────────────────────────────────────
+         .top_k => |tk| {
+             const inner = try executeNode(tk.input, ctx);
+             const k = @as(usize, @intCast(tk.k));
+             // For small K, use a partial selection (heap-based) instead of full sort.
+             if (k <= 1024 and inner.rows.items.len > k * 4) {
+                 return executeTopK(inner, tk.keys, k, alloc);
+             }
+             const sorted = try executeOrderBy(inner, tk.keys, alloc);
+             const take = @min(sorted.rows.items.len, k);
+             var rl = RowList.init(sorted.metas);
+             for (sorted.rows.items[0..take]) |row| try rl.append(alloc, row);
+             return rl;
+         },
 
         // ── HashJoin ──────────────────────────────────────────────────────────
         .hash_join => |hj| {
@@ -1234,6 +1239,87 @@ fn executeHashAgg(
 }
 
 // ── OrderBy helper ────────────────────────────────────────────────────────────
+
+/// Heap-based top-K selection: O(n log k) time, O(k) extra memory.
+/// Returns exactly min(k, n) rows in sorted order.
+fn executeTopK(inner: RowList, keys: []const plan.SortKey, k: usize, alloc: std.mem.Allocator) !RowList {
+    const rows = inner.rows.items;
+    if (rows.len == 0 or k == 0) return RowList.init(inner.metas);
+
+    // SortCtx: lessThan(a, b) = true means a should appear before b in the output.
+    const SortCtx = struct {
+        keys: []const plan.SortKey,
+        fn lessThan(self: @This(), a: []?Value, b: []?Value) bool {
+            for (self.keys) |key| {
+                const av: ?Value = if (key.col_idx < a.len) a[key.col_idx] else null;
+                const bv: ?Value = if (key.col_idx < b.len) b[key.col_idx] else null;
+                const ord: std.math.Order = if (av != null and bv != null)
+                    Value.order(av.?, bv.?)
+                else if (av == null and bv == null)
+                    .eq
+                else if (av == null)
+                    .lt
+                else
+                    .gt;
+                if (ord == .eq) continue;
+                return if (key.desc) ord == .gt else ord == .lt;
+            }
+            return false;
+        }
+        // heapLess(a,b): for a min-heap of the BEST k rows, the "min" is the
+        // worst element (the one we'd evict). So heapLess = !lessThan.
+        fn heapLess(self: @This(), a: []?Value, b: []?Value) std.math.Order {
+            if (self.lessThan(a, b)) return .lt;
+            if (self.lessThan(b, a)) return .gt;
+            return .eq;
+        }
+    };
+    const ctx = SortCtx{ .keys = keys };
+
+    // Build a min-heap (worst-of-best k) to track the top-k rows.
+    const heap_buf = try alloc.alloc([]?Value, k);
+    var heap_len: usize = 0;
+
+    for (rows) |row| {
+        if (heap_len < k) {
+            heap_buf[heap_len] = row;
+            heap_len += 1;
+            // Sift up.
+            var i = heap_len - 1;
+            while (i > 0) {
+                const parent = (i - 1) / 2;
+                if (ctx.lessThan(heap_buf[i], heap_buf[parent])) {
+                    const tmp = heap_buf[i]; heap_buf[i] = heap_buf[parent]; heap_buf[parent] = tmp;
+                    i = parent;
+                } else break;
+            }
+        } else {
+            // If this row is better than the heap root (worst of current best), replace root.
+            if (ctx.lessThan(row, heap_buf[0])) {
+                heap_buf[0] = row;
+                // Sift down.
+                var i: usize = 0;
+                while (true) {
+                    const l = 2 * i + 1;
+                    const r = 2 * i + 2;
+                    var smallest = i;
+                    if (l < heap_len and ctx.lessThan(heap_buf[l], heap_buf[smallest])) smallest = l;
+                    if (r < heap_len and ctx.lessThan(heap_buf[r], heap_buf[smallest])) smallest = r;
+                    if (smallest == i) break;
+                    const tmp = heap_buf[i]; heap_buf[i] = heap_buf[smallest]; heap_buf[smallest] = tmp;
+                    i = smallest;
+                }
+            }
+        }
+    }
+
+    // Sort the heap to get the final ordered result.
+    std.sort.pdq([]?Value, heap_buf[0..heap_len], ctx, SortCtx.lessThan);
+
+    var rl = RowList.init(inner.metas);
+    for (heap_buf[0..heap_len]) |row| try rl.append(alloc, row);
+    return rl;
+}
 
 fn executeOrderBy(inner: RowList, keys: []const plan.SortKey, alloc: std.mem.Allocator) !RowList {
     const rows_copy = try alloc.dupe([]?Value, inner.rows.items);
