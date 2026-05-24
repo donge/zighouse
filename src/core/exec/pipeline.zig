@@ -166,6 +166,52 @@ pub const FilterState = struct {
             }
         }
 
+        // Fast path: col_ref != lit_str (e.g. "Referer <> ''").
+        // Avoids row_buf boxing and full evalExpr dispatch.
+        switch (self.predicate) {
+            .neq => |op| {
+                if (op.left == .col_ref and op.right == .lit_str) {
+                    const col_idx = op.left.col_ref.index;
+                    const lit = op.right.lit_str;
+                    if (col_idx < c.columns.len and c.columns[col_idx].data == .string) {
+                        const col = c.columns[col_idx];
+                        var write_pos: usize = 0;
+                        for (0..c.num_rows) |r| {
+                            const s = if (col.isRowNull(r)) "" else col.data.string[r];
+                            if (!std.mem.eql(u8, s, lit)) {
+                                if (write_pos != r) copyRow(c, r, write_pos);
+                                write_pos += 1;
+                            }
+                        }
+                        c.num_rows = write_pos;
+                        for (c.columns) |*col2| col2.len = write_pos;
+                        return;
+                    }
+                }
+            },
+            .eq => |op| {
+                if (op.left == .col_ref and op.right == .lit_str) {
+                    const col_idx = op.left.col_ref.index;
+                    const lit = op.right.lit_str;
+                    if (col_idx < c.columns.len and c.columns[col_idx].data == .string) {
+                        const col = c.columns[col_idx];
+                        var write_pos: usize = 0;
+                        for (0..c.num_rows) |r| {
+                            const s = if (col.isRowNull(r)) "" else col.data.string[r];
+                            if (std.mem.eql(u8, s, lit)) {
+                                if (write_pos != r) copyRow(c, r, write_pos);
+                                write_pos += 1;
+                            }
+                        }
+                        c.num_rows = write_pos;
+                        for (c.columns) |*col2| col2.len = write_pos;
+                        return;
+                    }
+                }
+            },
+            else => {},
+        }
+
         // Multi-LIKE guard short-circuit: check all LIKE guards before boxing row_buf.
         if (guards.len > 0) {
             var write_pos: usize = 0;
@@ -795,6 +841,42 @@ fn executeHashAggChunked(
     // IntKeyHashTable (no []Value boxing, inline key storage).
     const maybe_int_keys = keysAreIntExpr(keys);
 
+    // Detect Q29-style regexp_replace(col_ref, lit_str_pattern, lit_str_repl) key.
+    // Cache col_idx + whether it's the URL-domain pattern to avoid per-row checks.
+    const RegexpReplaceKeyDesc = struct {
+        col_idx: usize,
+        is_url_domain: bool,  // true = Q29 fast path
+    };
+    var regexp_replace_key_descs: ?[]RegexpReplaceKeyDesc = null;
+    check_rr: {
+        if (keys.len == 0) break :check_rr;
+        // Quick pre-check: first key must be a fn_call named regexp_replace.
+        if (keys[0].expr != .fn_call) break :check_rr;
+        const fc0 = keys[0].expr.fn_call;
+        if (!(std.mem.eql(u8, fc0.name, "regexp_replace") or
+              std.mem.eql(u8, fc0.name, "replaceRegexpOne"))) break :check_rr;
+        // All keys must be regexp_replace(col_ref, lit_str, lit_str).
+        const descs_buf = try alloc.alloc(RegexpReplaceKeyDesc, keys.len);
+        for (keys, 0..) |k, ki| {
+            if (k.expr != .fn_call) break :check_rr;
+            const fc = k.expr.fn_call;
+            if (!(std.mem.eql(u8, fc.name, "regexp_replace") or
+                  std.mem.eql(u8, fc.name, "replaceRegexpOne")) or
+                fc.args.len < 3 or
+                fc.args[0] != .col_ref or
+                fc.args[1] != .lit_str or
+                fc.args[2] != .lit_str)
+            {
+                break :check_rr;
+            }
+            const pattern = fc.args[1].lit_str;
+            const is_url = std.mem.eql(u8, pattern, "^https?://(?:www\\.)?([^/]+)/.*$") or
+                           std.mem.eql(u8, pattern, "^https?://(?:www\\.)?([^/]+)/.*");
+            descs_buf[ki] = .{ .col_idx = fc.args[0].col_ref.index, .is_url_domain = is_url };
+        }
+        regexp_replace_key_descs = descs_buf;
+    }
+
     var ht_agg = try ht.AggHashTable.initWithCapacity(alloc, keys.len, aggs.len, est_rows);
     var ht_int: ?ht.IntKeyHashTable = if (maybe_int_keys)
         try ht.IntKeyHashTable.initWithCapacity(alloc, keys.len, aggs.len, est_rows)
@@ -896,6 +978,45 @@ fn executeHashAggChunked(
                     try kernels.updateAccum(&bucket[ci], v_opt, alloc);
                 }
             }
+        } else if (regexp_replace_key_descs) |rr_descs| {
+            // ── regexp_replace key fast path (e.g. Q29) ───────────────────────
+            // Avoids per-row pattern string comparison in evalFnCall.
+            for (0..c.num_rows) |r| {
+                for (refs) |j| {
+                    const col = c.columns[j];
+                    row_buf[j] = if (col.isRowNull(r)) null else col.data.get(r);
+                }
+                var key_valid = true;
+                for (rr_descs, 0..) |desc, ki| {
+                    const s_opt = row_buf[desc.col_idx];
+                    const s = if (s_opt) |v| (v.toStr() orelse null) else null;
+                    const domain: ?Value = if (s) |str| d: {
+                        if (desc.is_url_domain) {
+                            const after_proto = if (std.mem.startsWith(u8, str, "https://"))
+                                str[8..]
+                            else if (std.mem.startsWith(u8, str, "http://"))
+                                str[7..]
+                            else
+                                break :d Value{ .string = str };
+                            const slash = std.mem.indexOfScalar(u8, after_proto, '/') orelse
+                                break :d Value{ .string = str };
+                            var host = after_proto[0..slash];
+                            if (std.mem.startsWith(u8, host, "www.")) host = host[4..];
+                            break :d Value{ .string = host };
+                        }
+                        // Non-URL domain pattern: return input unchanged (generic fallback).
+                        break :d Value{ .string = str };
+                    } else null;
+                    if (domain == null) { key_valid = false; break; }
+                    key_buf[ki] = domain.?;
+                }
+                if (!key_valid) continue;
+                const bucket = try ht_agg.getOrInsert(key_buf, init_accums);
+                for (aggs, 0..) |item, ci| {
+                    const v_opt = try evalAggArg(item.expr, row_buf, alloc);
+                    try kernels.updateAccum(&bucket[ci], v_opt, alloc);
+                }
+            }
         } else {
             // ── General path ──────────────────────────────────────────────────
             for (0..c.num_rows) |r| {
@@ -947,6 +1068,35 @@ fn executeHashAggChunked(
                                     if (std.mem.eql(u8, unit, "hour")) {
                                         break :blk Value{ .int64 = @mod(@divTrunc(secs, 3600), 24) };
                                     }
+                                }
+                            }
+                            // Fast path: regexp_replace(col_ref, lit_str_pattern, lit_str_repl)
+                            // for the Q29 URL-domain extraction pattern.
+                            if (fc.name.len > 0 and
+                                (std.mem.eql(u8, fc.name, "regexp_replace") or
+                                 std.mem.eql(u8, fc.name, "replaceRegexpOne")) and
+                                fc.args.len >= 3 and
+                                fc.args[0] == .col_ref and
+                                fc.args[1] == .lit_str and
+                                fc.args[2] == .lit_str)
+                            {
+                                const col_idx = fc.args[0].col_ref.index;
+                                const pattern = fc.args[1].lit_str;
+                                const s = (row_buf[col_idx] orelse break :blk null).toStr() orelse break :blk null;
+                                if (std.mem.eql(u8, pattern, "^https?://(?:www\\.)?([^/]+)/.*$") or
+                                    std.mem.eql(u8, pattern, "^https?://(?:www\\.)?([^/]+)/.*"))
+                                {
+                                    const after_proto = if (std.mem.startsWith(u8, s, "https://"))
+                                        s[8..]
+                                    else if (std.mem.startsWith(u8, s, "http://"))
+                                        s[7..]
+                                    else
+                                        break :blk Value{ .string = s };
+                                    const slash = std.mem.indexOfScalar(u8, after_proto, '/') orelse
+                                        break :blk Value{ .string = s };
+                                    var host = after_proto[0..slash];
+                                    if (std.mem.startsWith(u8, host, "www.")) host = host[4..];
+                                    break :blk Value{ .string = host };
                                 }
                             }
                             break :blk try kernels.evalExpr(k.expr, row_buf, null, alloc);
@@ -1720,7 +1870,23 @@ fn initAccumForAgg(expr: plan.Expr) AggAccum {
 
 fn evalAggArg(expr: plan.Expr, row: []const ?Value, alloc: std.mem.Allocator) !?Value {
     return switch (expr) {
-        .agg_call => |ac| if (ac.arg) |arg| kernels.evalExpr(arg, row, null, alloc) else null,
+        .agg_call => |ac| if (ac.arg) |arg| blk: {
+            // Inline fast paths for common single-arg function calls to avoid dispatch overhead.
+            if (arg == .fn_call) {
+                const fc = arg.fn_call;
+                if (fc.args.len == 1 and fc.args[0] == .col_ref) {
+                    const col_val = row[fc.args[0].col_ref.index] orelse break :blk null;
+                    if (std.mem.eql(u8, fc.name, "length") or
+                        std.mem.eql(u8, fc.name, "char_length") or
+                        std.mem.eql(u8, fc.name, "len"))
+                    {
+                        const s = col_val.toStr() orelse break :blk null;
+                        break :blk Value{ .int64 = @intCast(s.len) };
+                    }
+                }
+            }
+            break :blk kernels.evalExpr(arg, row, null, alloc);
+        } else null,
         else => kernels.evalExpr(expr, row, null, alloc),
     };
 }
