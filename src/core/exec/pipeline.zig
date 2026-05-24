@@ -92,16 +92,24 @@ pub const SourceIface = struct {
 
 /// Filter: evaluates predicate on each row, zeroes out non-matching rows.
 /// Non-matching rows are compacted out — chunk.num_rows shrinks.
+pub const LikeGuard = struct { col_idx: usize, pattern: []const u8, negate: bool };
+
 pub const FilterState = struct {
     predicate: plan.Expr,
     /// Column indices referenced by the predicate; populated lazily on first apply().
     ref_indices: ?[]usize = null,
     /// Row buffer reused across chunk calls (allocated on first apply).
     row_buf: ?[]?Value = null,
+    /// LIKE guards: col_ref LIKE/NOT_LIKE lit_str checks extracted from the predicate.
+    /// Checked cheaply before full evalExpr to short-circuit expensive rows early.
+    /// null = not yet initialized; empty slice = no LIKE guards in predicate.
+    like_guards: ?[]LikeGuard = null,
+    /// Set to true after first chunk if all guard columns are .string type.
+    guards_verified: bool = false,
 
     pub fn apply(self: *FilterState, c: *DataChunk, ctx: *QueryContext) !void {
         const alloc = ctx.allocator();
-        // Build ref_indices and row_buf on first call (once per query).
+        // Build ref_indices, row_buf, and like_guards on first call (once per query).
         if (self.ref_indices == null) {
             const mask = try alloc.alloc(bool, c.columns.len);
             @memset(mask, false);
@@ -115,83 +123,75 @@ pub const FilterState = struct {
             const row = try alloc.alloc(?Value, c.columns.len);
             @memset(row, null);
             self.row_buf = row;
+            // Collect LIKE/NOT_LIKE guards; only keep if all guard columns are string type.
+            var guards_list = std.ArrayListUnmanaged(LikeGuard){ .items = &.{}, .capacity = 0 };
+            collectLikeGuards(self.predicate, &guards_list, alloc);
+            const raw_guards = try guards_list.toOwnedSlice(alloc);
+            var guards_ok = true;
+            for (raw_guards) |lg| {
+                if (lg.col_idx >= c.columns.len or c.columns[lg.col_idx].data != .string) {
+                    guards_ok = false;
+                    break;
+                }
+            }
+            self.like_guards = if (guards_ok) raw_guards else &.{};
+            self.guards_verified = true;
         }
         const ref = self.ref_indices.?;
         const row = self.row_buf.?;
+        const guards = self.like_guards.?;
 
-        // Fast path: simple col_ref LIKE/NOT_LIKE lit_str — bypass Value boxing entirely.
-        switch (self.predicate) {
-            .like, .not_like => |op| {
-                if (op.left == .col_ref and op.right == .lit_str) {
-                    const col_idx = op.left.col_ref.index;
-                    const pattern = op.right.lit_str;
-                    const negate = self.predicate == .not_like;
-                    const col = c.columns[col_idx];
-                    if (col.data == .string) {
-                        var write_pos: usize = 0;
-                        for (0..c.num_rows) |r| {
-                            const s = if (col.isRowNull(r)) "" else col.data.string[r];
-                            const matched = kernels.likeMatch(s, pattern);
-                            const keep = matched != negate;
-                            if (keep and write_pos == r) {
-                                write_pos += 1;
-                            } else if (keep) {
-                                copyRow(c, r, write_pos);
-                                write_pos += 1;
-                            }
+        // Pure-LIKE fast path: predicate is exactly col_ref LIKE/NOT_LIKE lit_str.
+        if (guards.len == 1) {
+            switch (self.predicate) {
+                .like, .not_like => {
+                    const lg = guards[0];
+                    const col = c.columns[lg.col_idx];
+                    var write_pos: usize = 0;
+                    for (0..c.num_rows) |r| {
+                        const s = if (col.isRowNull(r)) "" else col.data.string[r];
+                        const keep = kernels.likeMatch(s, lg.pattern) != lg.negate;
+                        if (keep and write_pos == r) {
+                            write_pos += 1;
+                        } else if (keep) {
+                            copyRow(c, r, write_pos);
+                            write_pos += 1;
                         }
-                        c.num_rows = write_pos;
-                        for (c.columns) |*col2| col2.len = write_pos;
-                        return;
                     }
+                    c.num_rows = write_pos;
+                    for (c.columns) |*col2| col2.len = write_pos;
+                    return;
+                },
+                else => {},
+            }
+        }
+
+        // Multi-LIKE guard short-circuit: check all LIKE guards before boxing row_buf.
+        if (guards.len > 0) {
+            var write_pos: usize = 0;
+            row_loop: for (0..c.num_rows) |r| {
+                for (guards) |lg| {
+                    const col = c.columns[lg.col_idx];
+                    const s = if (col.isRowNull(r)) "" else col.data.string[r];
+                    if (kernels.likeMatch(s, lg.pattern) == lg.negate) continue :row_loop;
                 }
-            },
-            // Fast path: AND where left side is col_ref LIKE/NOT_LIKE lit_str.
-            // Evaluate LIKE first (without boxing row_buf), then only fill row_buf for matches.
-            .@"and" => |op| {
-                const like_side: ?struct { col_idx: usize, pattern: []const u8, negate: bool } = blk: {
-                    if (op.left == .like or op.left == .not_like) {
-                        const lop = if (op.left == .like) op.left.like else op.left.not_like;
-                        if (lop.left == .col_ref and lop.right == .lit_str) {
-                            break :blk .{
-                                .col_idx = lop.left.col_ref.index,
-                                .pattern = lop.right.lit_str,
-                                .negate = op.left == .not_like,
-                            };
-                        }
-                    }
-                    break :blk null;
-                };
-                if (like_side) |ls| {
-                    const like_col = c.columns[ls.col_idx];
-                    if (like_col.data == .string) {
-                        var write_pos: usize = 0;
-                        for (0..c.num_rows) |r| {
-                            // Check LIKE first (no boxing).
-                            const s = if (like_col.isRowNull(r)) "" else like_col.data.string[r];
-                            const like_ok = kernels.likeMatch(s, ls.pattern) != ls.negate;
-                            if (!like_ok) continue;
-                            // LIKE matched — now fill row_buf and evaluate full predicate.
-                            for (ref) |j| {
-                                const col = c.columns[j];
-                                row[j] = if (col.isRowNull(r)) null else col.data.get(r);
-                            }
-                            const v = try kernels.evalExpr(self.predicate, row, null, alloc);
-                            const keep = if (v) |val| val.bool_u8 != 0 else false;
-                            if (keep and write_pos == r) {
-                                write_pos += 1;
-                            } else if (keep) {
-                                copyRow(c, r, write_pos);
-                                write_pos += 1;
-                            }
-                        }
-                        c.num_rows = write_pos;
-                        for (c.columns) |*col2| col2.len = write_pos;
-                        return;
-                    }
+                // All LIKE guards passed — fill row_buf and evaluate full predicate.
+                for (ref) |j| {
+                    const col = c.columns[j];
+                    row[j] = if (col.isRowNull(r)) null else col.data.get(r);
                 }
-            },
-            else => {},
+                const v = try kernels.evalExpr(self.predicate, row, null, alloc);
+                const keep = if (v) |val| val.bool_u8 != 0 else false;
+                if (keep and write_pos == r) {
+                    write_pos += 1;
+                } else if (keep) {
+                    copyRow(c, r, write_pos);
+                    write_pos += 1;
+                }
+            }
+            c.num_rows = write_pos;
+            for (c.columns) |*col| col.len = write_pos;
+            return;
         }
 
         var write_pos: usize = 0;
@@ -213,6 +213,27 @@ pub const FilterState = struct {
         for (c.columns) |*col| col.len = write_pos;
     }
 };
+
+/// Recursively collect all col_ref LIKE/NOT_LIKE lit_str guards from an AND-chained predicate.
+/// These guards can be evaluated cheaply before full expression eval to short-circuit rows.
+fn collectLikeGuards(expr: plan.Expr, guards: *std.ArrayListUnmanaged(LikeGuard), alloc: std.mem.Allocator) void {
+    switch (expr) {
+        .like, .not_like => |op| {
+            if (op.left == .col_ref and op.right == .lit_str) {
+                guards.append(alloc, .{
+                    .col_idx = op.left.col_ref.index,
+                    .pattern = op.right.lit_str,
+                    .negate  = expr == .not_like,
+                }) catch {};
+            }
+        },
+        .@"and" => |op| {
+            collectLikeGuards(op.left, guards, alloc);
+            collectLikeGuards(op.right, guards, alloc);
+        },
+        else => {},
+    }
+}
 
 /// Recursively collect column reference indices from an expression into a mask.
 fn collectColRefs(expr: plan.Expr, mask: []bool) void {
