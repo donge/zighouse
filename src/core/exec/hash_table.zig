@@ -369,6 +369,98 @@ pub const StrCountHashTable = struct {
     }
 };
 
+// ── PairCountHashTable ────────────────────────────────────────────────────────
+
+/// Specialized hash table for (i64, string) composite GROUP BY with count(*).
+/// Flat layout, no per-slot arena alloc.  Used by Q17/Q18.
+pub const PairCountHashTable = struct {
+    const Slot = struct {
+        hash:  u64,
+        i64_key: i64,
+        str_key: []const u8,
+        count:   u64,
+    };
+
+    slots:    []Slot,
+    occupied: []bool,
+    capacity: usize,
+    count:    usize,
+    arena:    std.mem.Allocator,
+
+    pub fn initWithCapacity(arena: std.mem.Allocator, est_rows: u64) !PairCountHashTable {
+        const cap = if (est_rows > 0)
+            nextPow2Pair(@as(usize, @intCast(@min(est_rows * 100 / 70 + 1, std.math.maxInt(u32)))))
+        else
+            64;
+        const slots    = try arena.alloc(Slot, cap);
+        const occupied = try arena.alloc(bool, cap);
+        @memset(occupied, false);
+        return .{ .slots = slots, .occupied = occupied, .capacity = cap, .count = 0, .arena = arena };
+    }
+
+    fn nextPow2Pair(n: usize) usize {
+        if (n <= 1) return 1;
+        var p: usize = 1;
+        while (p < n) p <<= 1;
+        return p;
+    }
+
+    pub fn increment(self: *PairCountHashTable, i64_key: i64, str_key: []const u8) !void {
+        if (self.count + 1 > (self.capacity * 7) / 10) try self.grow();
+
+        const mask = self.capacity - 1;
+        const h = hashPair(i64_key, str_key);
+        var slot = h & mask;
+
+        while (true) : (slot = (slot + 1) & mask) {
+            if (!self.occupied[slot]) {
+                self.slots[slot]    = .{ .hash = h, .i64_key = i64_key, .str_key = str_key, .count = 1 };
+                self.occupied[slot] = true;
+                self.count += 1;
+                return;
+            }
+            if (self.slots[slot].hash == h and
+                self.slots[slot].i64_key == i64_key and
+                std.mem.eql(u8, self.slots[slot].str_key, str_key))
+            {
+                self.slots[slot].count += 1;
+                return;
+            }
+        }
+    }
+
+    fn grow(self: *PairCountHashTable) !void {
+        const new_cap  = self.capacity * 2;
+        const new_mask = new_cap - 1;
+        const new_slots    = try self.arena.alloc(Slot, new_cap);
+        const new_occupied = try self.arena.alloc(bool, new_cap);
+        @memset(new_occupied, false);
+        for (0..self.capacity) |i| {
+            if (!self.occupied[i]) continue;
+            var sl = self.slots[i].hash & new_mask;
+            while (new_occupied[sl]) : (sl = (sl + 1) & new_mask) {}
+            new_slots[sl]    = self.slots[i];
+            new_occupied[sl] = true;
+        }
+        self.slots    = new_slots;
+        self.occupied = new_occupied;
+        self.capacity = new_cap;
+    }
+
+    pub fn iterate(self: *const PairCountHashTable, ctx: anytype, comptime cb: fn (@TypeOf(ctx), i64, []const u8, u64) void) void {
+        for (0..self.capacity) |i| {
+            if (self.occupied[i]) cb(ctx, self.slots[i].i64_key, self.slots[i].str_key, self.slots[i].count);
+        }
+    }
+
+    fn hashPair(n: i64, s: []const u8) u64 {
+        var h = std.hash.Wyhash.init(0);
+        h.update(std.mem.asBytes(&n));
+        h.update(s);
+        return h.final();
+    }
+};
+
 // ── IntKeyHashTable ───────────────────────────────────────────────────────────
 
 /// Specialized open-addressing hash table for integer (i64) composite keys.

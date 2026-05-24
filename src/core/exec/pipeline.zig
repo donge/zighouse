@@ -917,6 +917,24 @@ fn executeHashAggChunked(
     var str_count_col_idx: usize = 0;
     var use_str_count_path: bool = false;
 
+    // PairCountHashTable fast path: exactly two col_ref keys (one i64, one string) + count(*).
+    // Handles Q17/Q18 (GROUP BY UserID, SearchPhrase) and Q19 (3 keys — not handled here).
+    const maybe_pair_count = blk: {
+        if (aggs.len != 1) break :blk false;
+        if (aggs[0].expr != .agg_call) break :blk false;
+        if (aggs[0].expr.agg_call.kind != .count_star) break :blk false;
+        var col_ref_count: usize = 0;
+        for (keys) |k| {
+            if (k.expr == .col_ref) col_ref_count += 1
+            else break :blk false;
+        }
+        break :blk col_ref_count == 2;
+    };
+    var ht_pair_count: ?ht.PairCountHashTable = null;
+    var pair_i64_col_idx: usize = 0;
+    var pair_str_col_idx: usize = 0;
+    var use_pair_count_path: bool = false;
+
     const init_accums = try alloc.alloc(AggAccum, aggs.len);
     for (aggs, 0..) |item, ci| init_accums[ci] = initAccumForAgg(item.expr);
     const key_buf     = try alloc.alloc(Value, keys.len);
@@ -1003,6 +1021,28 @@ fn executeHashAggChunked(
                     }
                 }
             }
+            // Verify pair-count eligibility: exactly two col_refs, one i64 and one string.
+            if (maybe_pair_count and !use_int_path and !use_str_count_path) {
+                const c0 = keys[0].expr.col_ref.index;
+                const c1 = keys[1].expr.col_ref.index;
+                if (c0 < c.columns.len and c1 < c.columns.len) {
+                    const d0 = c.columns[c0].data;
+                    const d1 = c.columns[c1].data;
+                    const ok0_i = (d0 == .int64 or d0 == .uint64) and d1 == .string;
+                    const ok1_i = (d1 == .int64 or d1 == .uint64) and d0 == .string;
+                    if (ok0_i) {
+                        pair_i64_col_idx = c0;
+                        pair_str_col_idx = c1;
+                        ht_pair_count = try ht.PairCountHashTable.initWithCapacity(alloc, est_rows);
+                        use_pair_count_path = true;
+                    } else if (ok1_i) {
+                        pair_i64_col_idx = c1;
+                        pair_str_col_idx = c0;
+                        ht_pair_count = try ht.PairCountHashTable.initWithCapacity(alloc, est_rows);
+                        use_pair_count_path = true;
+                    }
+                }
+            }
         }
         const refs = ref_indices.?;
 
@@ -1012,6 +1052,18 @@ fn executeHashAggChunked(
             const strs = col.data.string;
             for (0..c.num_rows) |r| {
                 try ht_str_count.?.increment(strs[r]);
+            }
+            continue;
+        }
+
+        if (use_pair_count_path) {
+            // ── (i64, string) pair count(*) fast path ─────────────────────────
+            const strs = c.columns[pair_str_col_idx].data.string;
+            // Handle both int64 and uint64 key columns.
+            switch (c.columns[pair_i64_col_idx].data) {
+                .int64  => |ints| { for (0..c.num_rows) |r| try ht_pair_count.?.increment(ints[r], strs[r]); },
+                .uint64 => |ints| { for (0..c.num_rows) |r| try ht_pair_count.?.increment(@bitCast(ints[r]), strs[r]); },
+                else    => unreachable,
             }
             continue;
         }
@@ -1204,6 +1256,27 @@ fn executeHashAggChunked(
                     };
                 }
                 row[ec.keys.len] = Value{ .uint64 = count };
+                ec.rl.append(ec.alloc, row) catch {};
+            }
+        }.cb);
+    } else if (use_pair_count_path) {
+        // Emit from PairCountHashTable: restore key order (i64, str or str, i64).
+        const k0_is_i64 = keys[0].expr.col_ref.index == pair_i64_col_idx;
+        const EmitCtxP = struct {
+            rl: *RowList, alloc: std.mem.Allocator, k0_is_i64: bool,
+        };
+        var emit_ctx_p = EmitCtxP{ .rl = &rl, .alloc = alloc, .k0_is_i64 = k0_is_i64 };
+        ht_pair_count.?.iterate(&emit_ctx_p, struct {
+            fn cb(ec: *EmitCtxP, n: i64, s: []const u8, count: u64) void {
+                const row = ec.alloc.alloc(?Value, 3) catch return;
+                if (ec.k0_is_i64) {
+                    row[0] = Value{ .int64 = n };
+                    row[1] = Value{ .string = s };
+                } else {
+                    row[0] = Value{ .string = s };
+                    row[1] = Value{ .int64 = n };
+                }
+                row[2] = Value{ .uint64 = count };
                 ec.rl.append(ec.alloc, row) catch {};
             }
         }.cb);
