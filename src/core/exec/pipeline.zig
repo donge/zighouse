@@ -547,11 +547,94 @@ pub fn executePlan(
     ctx: *QueryContext,
 ) !ResultSet {
     const alloc = ctx.allocator();
+
+    // ── Scannable path: stream chunks directly into ResultSink ─────────────
+    if (isScannable(node)) {
+        var sink = ResultSink.init(alloc);
+        try executeScannableToSink(node, ctx, &sink);
+        return sink.finish();
+    }
+
+    // ── Breaker path: existing RowList → ResultSet (single copy) ───────────
     var rl = try executeNode(node, ctx);
     return rl.toResultSet(alloc);
 }
 
-fn executeNode(node: *const plan.PhysicalNode, ctx: *QueryContext) !RowList {
+/// Stream a scannable node (scan/filter/project/limit) directly to a ResultSink.
+/// Avoids building a RowList by operating on DataChunks throughout.
+fn executeScannableToSink(
+    node: *const plan.PhysicalNode,
+    ctx:  *QueryContext,
+    sink: *ResultSink,
+) !void {
+    const alloc = ctx.allocator();
+    var filter_state: ?FilterState = null;
+    var project_items: ?[]const plan.ProjectItem = null;
+    var lim_state: ?LimitState = null;
+
+    var cur = node;
+    while (true) {
+        switch (cur.*) {
+            .limit   => |lim| { if (lim_state == null) lim_state = .{ .limit = lim.limit, .offset = lim.offset }; cur = lim.input; },
+            .filter  => |f|   { if (filter_state == null) filter_state = .{ .predicate = f.predicate }; cur = f.input; },
+            .project => |p|   {
+                if (project_items == null) {
+                    project_items = p.items;
+                }
+                cur = p.input;
+            },
+            else => break,
+        }
+    }
+
+    ctx.source.reset();
+    var c: DataChunk = undefined;
+    // Row buffer for projection; allocated once on first non-empty chunk.
+    var row_buf: ?[]?Value = null;
+    while (try ctx.source.nextChunk(&c, ctx)) {
+        if (filter_state)  |*fs| try fs.apply(&c, ctx);
+        if (lim_state)     |*ls| ls.apply(&c);
+        if (c.num_rows == 0) {
+            if (lim_state) |ls| if (ls.done()) break;
+            continue;
+        }
+        if (project_items) |items| {
+            // Lazy-init row_buf once on first non-empty chunk.
+            if (row_buf == null) {
+                const rb = try alloc.alloc(?Value, c.columns.len);
+                @memset(rb, null);
+                row_buf = rb;
+            }
+            const rb = row_buf.?;
+            const n = c.num_rows;
+            const out_cols = try alloc.alloc(chunk.Column, items.len);
+            for (items, 0..) |item, ci| {
+                const nw        = chunk.nullMaskWords(n);
+                const null_mask = try alloc.alloc(u64, nw);
+                @memset(null_mask, 0);
+                const data = try allocColumnData(item.out_type, n, alloc);
+                out_cols[ci] = .{ .name = item.alias, .data = data, .null_mask = null_mask, .len = n };
+            }
+            for (0..n) |r| {
+                for (c.columns, 0..) |col, j| {
+                    rb[j] = if (col.isRowNull(r)) null else col.data.get(r);
+                }
+                for (items, 0..) |item, ci| {
+                    const v_opt = try kernels.evalExpr(item.expr, rb, null, alloc);
+                    if (v_opt) |v| {
+                        setColumnValue(&out_cols[ci].data, r, v);
+                    } else {
+                        chunk.setNull(out_cols[ci].null_mask, r);
+                        setColumnZero(&out_cols[ci].data, r);
+                    }
+                }
+            }
+            c.columns = out_cols;
+        }
+        try sink.consume(c);
+        if (lim_state) |ls| if (ls.done()) break;
+    }
+}fn executeNode(node: *const plan.PhysicalNode, ctx: *QueryContext) !RowList {
     const alloc = ctx.allocator();
     switch (node.*) {
         // ── Sources ───────────────────────────────────────────────────────────
