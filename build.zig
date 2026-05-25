@@ -17,6 +17,9 @@ pub fn build(b: *std.Build) void {
     ) orelse .ReleaseFast;
     const enable_duckdb = b.option(bool, "duckdb", "Link DuckDB and enable DuckDB-backed commands") orelse true;
     const duckdb_prefix = b.option([]const u8, "duckdb-prefix", "DuckDB installation prefix") orelse "/opt/homebrew/opt/duckdb";
+    const zstd_prefix_early = b.option([]const u8, "zstd-prefix", "ZSTD installation prefix") orelse "/opt/homebrew/opt/zstd";
+    const zstd_include_early = b.fmt("{s}/include", .{zstd_prefix_early});
+    const zstd_lib_early = b.fmt("{s}/lib", .{zstd_prefix_early});
     const install_bench_tools = b.option(bool, "bench-tools", "Install benchmark helper executables") orelse true;
     const options = b.addOptions();
     options.addOption(bool, "duckdb", enable_duckdb);
@@ -82,6 +85,10 @@ pub fn build(b: *std.Build) void {
     });
     unit_tests.root_module.addImport("build_options", options_mod);
     unit_tests.root_module.link_libc = true;
+    unit_tests.root_module.addIncludePath(.{ .cwd_relative = zstd_include_early });
+    unit_tests.root_module.addLibraryPath(.{ .cwd_relative = zstd_lib_early });
+    unit_tests.root_module.addRPath(.{ .cwd_relative = zstd_lib_early });
+    unit_tests.root_module.linkSystemLibrary("zstd", .{});
     if (enable_duckdb) {
         const duckdb_include = b.fmt("{s}/include", .{duckdb_prefix});
         const duckdb_lib = b.fmt("{s}/lib", .{duckdb_prefix});
@@ -146,6 +153,10 @@ pub fn build(b: *std.Build) void {
     });
     generic_sql_tests.root_module.addImport("build_options", options_mod);
     generic_sql_tests.root_module.link_libc = true;
+    generic_sql_tests.root_module.addIncludePath(.{ .cwd_relative = zstd_include_early });
+    generic_sql_tests.root_module.addLibraryPath(.{ .cwd_relative = zstd_lib_early });
+    generic_sql_tests.root_module.addRPath(.{ .cwd_relative = zstd_lib_early });
+    generic_sql_tests.root_module.linkSystemLibrary("zstd", .{});
     if (enable_duckdb) {
         const duckdb_include = b.fmt("{s}/include", .{duckdb_prefix});
         const duckdb_lib = b.fmt("{s}/lib", .{duckdb_prefix});
@@ -251,6 +262,9 @@ pub fn build(b: *std.Build) void {
     const lz4_prefix = b.option([]const u8, "lz4-prefix", "LZ4 installation prefix") orelse "/opt/homebrew/opt/lz4";
     const lz4_include = b.fmt("{s}/include", .{lz4_prefix});
     const lz4_lib = b.fmt("{s}/lib", .{lz4_prefix});
+    // zstd paths already declared above as zstd_prefix_early / zstd_include_early / zstd_lib_early
+    const zstd_include = zstd_include_early;
+    const zstd_lib = zstd_lib_early;
     const ch_block_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/clickhouse_format/block.zig"),
@@ -263,6 +277,10 @@ pub fn build(b: *std.Build) void {
     ch_block_tests.root_module.addLibraryPath(.{ .cwd_relative = lz4_lib });
     ch_block_tests.root_module.addRPath(.{ .cwd_relative = lz4_lib });
     ch_block_tests.root_module.linkSystemLibrary("lz4", .{});
+    ch_block_tests.root_module.addIncludePath(.{ .cwd_relative = zstd_include });
+    ch_block_tests.root_module.addLibraryPath(.{ .cwd_relative = zstd_lib });
+    ch_block_tests.root_module.addRPath(.{ .cwd_relative = zstd_lib });
+    ch_block_tests.root_module.linkSystemLibrary("zstd", .{});
     const ch_block_test_cmd = b.addRunArtifact(ch_block_tests);
 
     // types.zig — no lz4 dependency
@@ -323,7 +341,7 @@ pub fn build(b: *std.Build) void {
     });
     const ch_primary_idx_test_cmd = b.addRunArtifact(ch_primary_idx_tests);
 
-    // checksums.zig — needs lz4
+    // checksums.zig — needs lz4 + zstd (transitively via block.zig)
     const ch_checksums_mod = b.createModule(.{
         .root_source_file = b.path("src/clickhouse_format/checksums.zig"),
         .target = target,
@@ -334,6 +352,10 @@ pub fn build(b: *std.Build) void {
     ch_checksums_mod.addLibraryPath(.{ .cwd_relative = lz4_lib });
     ch_checksums_mod.addRPath(.{ .cwd_relative = lz4_lib });
     ch_checksums_mod.linkSystemLibrary("lz4", .{});
+    ch_checksums_mod.addIncludePath(.{ .cwd_relative = zstd_include });
+    ch_checksums_mod.addLibraryPath(.{ .cwd_relative = zstd_lib });
+    ch_checksums_mod.addRPath(.{ .cwd_relative = zstd_lib });
+    ch_checksums_mod.linkSystemLibrary("zstd", .{});
     const ch_checksums_tests = b.addTest(.{
         .root_module = ch_checksums_mod,
     });
@@ -349,7 +371,7 @@ pub fn build(b: *std.Build) void {
     });
     const ch_string_codec_test_cmd = b.addRunArtifact(ch_string_codec_tests);
 
-    // part.zig — needs lz4 + schema + all sub-modules
+    // part.zig — needs lz4 + zstd + schema + all sub-modules
     const ch_part_mod = b.createModule(.{
         .root_source_file = b.path("src/clickhouse_format/part.zig"),
         .target = target,
@@ -360,6 +382,10 @@ pub fn build(b: *std.Build) void {
     ch_part_mod.addLibraryPath(.{ .cwd_relative = lz4_lib });
     ch_part_mod.addRPath(.{ .cwd_relative = lz4_lib });
     ch_part_mod.linkSystemLibrary("lz4", .{});
+    ch_part_mod.addIncludePath(.{ .cwd_relative = zstd_include });
+    ch_part_mod.addLibraryPath(.{ .cwd_relative = zstd_lib });
+    ch_part_mod.addRPath(.{ .cwd_relative = zstd_lib });
+    ch_part_mod.linkSystemLibrary("zstd", .{});
     ch_part_mod.addImport("schema", schema_mod);
     ch_part_mod.addImport("types", ch_types_mod);
     const ch_part_tests = b.addTest(.{
@@ -379,7 +405,7 @@ pub fn build(b: *std.Build) void {
     loader_tests.root_module.addImport("parquet", parquet_mod);
     const loader_test_cmd = b.addRunArtifact(loader_tests);
 
-    // ── Wire schema_mod + ch_part_mod + lz4 into exe and all test targets ──────
+    // ── Wire schema_mod + ch_part_mod + lz4 + zstd into exe and all test targets ──
     // All src/ files now use @import("schema") named module. Inject schema_mod
     // into every target whose root (or transitive imports) uses @import("schema").
     const lz4_targets = [_]*std.Build.Module{
@@ -394,6 +420,10 @@ pub fn build(b: *std.Build) void {
         mod.addLibraryPath(.{ .cwd_relative = lz4_lib });
         mod.addRPath(.{ .cwd_relative = lz4_lib });
         mod.linkSystemLibrary("lz4", .{});
+        mod.addIncludePath(.{ .cwd_relative = zstd_include });
+        mod.addLibraryPath(.{ .cwd_relative = zstd_lib });
+        mod.addRPath(.{ .cwd_relative = zstd_lib });
+        mod.linkSystemLibrary("zstd", .{});
     }
     // Other test targets that use @import("schema") but not ch_part/lz4:
     generic_executor_tests.root_module.addImport("schema", schema_mod);
@@ -405,6 +435,10 @@ pub fn build(b: *std.Build) void {
     generic_executor_tests.root_module.addLibraryPath(.{ .cwd_relative = lz4_lib });
     generic_executor_tests.root_module.addRPath(.{ .cwd_relative = lz4_lib });
     generic_executor_tests.root_module.linkSystemLibrary("lz4", .{});
+    generic_executor_tests.root_module.addIncludePath(.{ .cwd_relative = zstd_include });
+    generic_executor_tests.root_module.addLibraryPath(.{ .cwd_relative = zstd_lib });
+    generic_executor_tests.root_module.addRPath(.{ .cwd_relative = zstd_lib });
+    generic_executor_tests.root_module.linkSystemLibrary("zstd", .{});
     schema_infer_tests.root_module.addImport("schema", schema_mod);
     schema_infer_tests.root_module.addImport("parquet", parquet_mod);
     generic_store_tests.root_module.addImport("schema", schema_mod);

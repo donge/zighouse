@@ -4,10 +4,10 @@
 ///
 ///   [16 bytes] CityHash128 checksum of (header + compressed_data), LE u128
 ///              stored as [low64 u64 LE][high64 u64 LE]
-///   [1 byte]   method byte: 0x82=LZ4, 0x02=NONE
+///   [1 byte]   method byte: 0x82=LZ4, 0x02=NONE, 0x90=ZSTD
 ///   [4 bytes]  size_compressed_with_header (LE u32): = 9 + compressed_data_len
 ///   [4 bytes]  size_decompressed (LE u32)
-///   [N bytes]  compressed_data (LZ4 raw block)
+///   [N bytes]  compressed_data
 ///
 /// The checksum covers bytes [method..method+header+compressed-1] (9+N bytes).
 ///
@@ -23,12 +23,23 @@ pub const BLOCK_HEADER_TOTAL: usize = CHECKSUM_SIZE + HEADER_SIZE;
 
 pub const METHOD_LZ4: u8 = 0x82;
 pub const METHOD_NONE: u8 = 0x02;
+pub const METHOD_ZSTD: u8 = 0x90;
+
+// ── ZSTD C bindings ──────────────────────────────────────────────────────────
+pub const zstd = struct {
+    pub extern fn ZSTD_decompress(dst: [*]u8, dst_capacity: usize, src: [*]const u8, compressed_size: usize) usize;
+    pub extern fn ZSTD_isError(code: usize) c_int;
+    pub extern fn ZSTD_getErrorName(code: usize) [*:0]const u8;
+    pub extern fn ZSTD_compress(dst: [*]u8, dst_capacity: usize, src: [*]const u8, src_size: usize, compression_level: c_int) usize;
+    pub extern fn ZSTD_compressBound(src_size: usize) usize;
+};
 
 pub const Error = error{
     ChecksumMismatch,
     UnsupportedCompressionMethod,
     TruncatedBlock,
     DecompressedSizeMismatch,
+    ZstdDecompressFailed,
 };
 
 /// Write a single compressed block to `writer`.
@@ -140,6 +151,20 @@ pub fn readBlock(allocator: std.mem.Allocator, reader: *std.Io.Reader) ![]u8 {
         return decompressed;
     }
 
+    if (method == METHOD_ZSTD) {
+        const result = zstd.ZSTD_decompress(
+            decompressed.ptr,
+            decompressed.len,
+            compressed.ptr,
+            compressed.len,
+        );
+        allocator.free(compressed);
+        if (zstd.ZSTD_isError(result) != 0) return error.ZstdDecompressFailed;
+        if (result != size_decompressed) return error.DecompressedSizeMismatch;
+        return decompressed;
+    }
+
+    // Default: LZ4
     const n = try lz4.decompress(compressed, decompressed);
     allocator.free(compressed);
     if (n != size_decompressed) return error.DecompressedSizeMismatch;

@@ -1,16 +1,25 @@
-/// ClickHouse MergeTree `.mrk2` mark file writer.
+/// ClickHouse MergeTree `.mrk2` / `.cmrk2` / `.cmrk4` mark file support.
 ///
-/// Each mark entry = 24 bytes (3 × u64 LE):
-///   offset_in_compressed_file  u64 LE  — byte offset of the LZ4 block in .bin
-///   offset_in_decompressed_block u64 LE — byte offset within the decompressed block
-///   granularity                u64 LE  — number of rows in this granule (= 8192 default)
+/// Wide-part marks (`.mrk2` / `.cmrk2`):
+///   Each mark entry = 24 bytes (3 × u64 LE):
+///     offset_in_compressed_file  u64 LE  — byte offset of the LZ4 block in .bin
+///     offset_in_decompressed_block u64 LE — byte offset within the decompressed block
+///     granularity                u64 LE  — number of rows in this granule (= 8192 default)
+///   `.cmrk2` wraps mark bytes in a single CH compressed block (LZ4).
 ///
-/// The `.mrk2` format is used when `index_granularity_bytes > 0` (adaptive
-/// granularity is OFF for our writer — we always write fixed 8192-row granules).
+/// Compact-part marks (`.cmrk4`):
+///   The entire mark file is a single CH compressed block (ZSTD or LZ4).
+///   After decompression, the layout is:
+///     For each substream s in [0 .. n_substreams):
+///       offset_in_data_bin        u64 LE  — byte offset in data.bin where this substream's block starts
+///       offset_in_decompressed    u64 LE  — offset within that decompressed block (0 for start of granule)
+///   There are n_substreams entries per granule × n_granules entries total.
+///   The column/substream order matches `columns_substreams.txt`.
 ///
-/// Reference: MergeTreeIndexGranularityInfo.cpp, MarkRange.h
+/// Reference: MergeTreeIndexGranularityInfo.cpp, MarkRange.h, MergeTreeDataPartCompact.cpp
 
 const std = @import("std");
+const block = @import("block.zig");
 
 pub const MARK_SIZE: usize = 24; // 3 × u64
 pub const DEFAULT_GRANULE: u64 = 8192;
@@ -100,6 +109,59 @@ pub fn marksForFixedColumn(
         };
     }
     return marks;
+}
+
+// ── Compact part mark (.cmrk4) support ────────────────────────────────────────
+
+/// A single substream mark entry from a `.cmrk4` file.
+/// Identifies where in `data.bin` this substream's compressed block lives.
+pub const CompactMark = struct {
+    /// Byte offset in `data.bin` where this substream's compressed block starts.
+    offset_in_file: u64,
+    /// Byte offset within the decompressed block (0 for granule start).
+    offset_in_block: u64,
+};
+
+pub const COMPACT_MARK_SIZE: usize = 16; // 2 × u64
+
+/// Read all compact marks from a decompressed `.cmrk4` payload.
+/// Returns allocator-owned slice of `n_substreams` entries per granule.
+/// Total entries = n_granules × n_substreams, stored in granule-major order.
+pub fn readCompactMarks(allocator: std.mem.Allocator, data: []const u8) ![]CompactMark {
+    if (data.len % COMPACT_MARK_SIZE != 0) return error.TruncatedMark;
+    const n = data.len / COMPACT_MARK_SIZE;
+    const result = try allocator.alloc(CompactMark, n);
+    for (result, 0..) |*m, i| {
+        const off = i * COMPACT_MARK_SIZE;
+        m.* = .{
+            .offset_in_file = std.mem.readInt(u64, data[off..][0..8], .little),
+            .offset_in_block = std.mem.readInt(u64, data[off + 8 ..][0..8], .little),
+        };
+    }
+    return result;
+}
+
+/// Read a `.cmrk4` file: decompress the outer CH block, then parse marks.
+/// The caller must provide the raw file bytes.
+/// Returns allocator-owned slice of CompactMark (length = n_granules × n_substreams).
+pub fn readCmrk4(allocator: std.mem.Allocator, file_bytes: []const u8) ![]CompactMark {
+    var reader = std.Io.Reader.fixed(file_bytes);
+    const decompressed = try block.readBlock(allocator, &reader);
+    defer allocator.free(decompressed);
+    return readCompactMarks(allocator, decompressed);
+}
+
+/// Encode compact marks and write as a single LZ4-compressed CH block.
+/// `marks` is in granule-major order (n_granules × n_substreams entries).
+pub fn writeCmrk4(writer: *std.Io.Writer, compact_marks: []const CompactMark) !void {
+    const raw = try std.heap.page_allocator.alloc(u8, compact_marks.len * COMPACT_MARK_SIZE);
+    defer std.heap.page_allocator.free(raw);
+    for (compact_marks, 0..) |m, i| {
+        const off = i * COMPACT_MARK_SIZE;
+        std.mem.writeInt(u64, raw[off..][0..8], m.offset_in_file, .little);
+        std.mem.writeInt(u64, raw[off + 8 ..][0..8], m.offset_in_block, .little);
+    }
+    try block.writeBlock(writer, raw);
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

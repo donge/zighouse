@@ -855,7 +855,8 @@ pub const ColumnReader = struct {
             out[i] = switch (self.col.ty) {
                 .int8 => @as(i64, @as(i8, @bitCast(slice[0]))),
                 .int16 => @as(i64, std.mem.readInt(i16, slice[0..2], .little)),
-                .int32, .date => @as(i64, std.mem.readInt(i32, slice[0..4], .little)),
+                .date => @as(i64, std.mem.readInt(u16, slice[0..2], .little)),
+                .int32 => @as(i64, std.mem.readInt(i32, slice[0..4], .little)),
                 .int64, .timestamp => std.mem.readInt(i64, slice[0..8], .little),
                 // float32: raw 4-byte bits stored as i64 (upper 32 bits zero)
                 .float32 => @as(i64, std.mem.readInt(u32, slice[0..4], .little)),
@@ -986,6 +987,616 @@ fn readVarUIntLocal(buf: []const u8) ?struct { usize, usize } {
         shift += 7;
     }
     return null;
+}
+
+// ── Compact part read/write ────────────────────────────────────────────────────
+//
+// Compact part layout (CH 22+ default for small parts):
+//   data.bin        — all columns concatenated; each column/granule = one CH block
+//   data.cmrk4      — single CH block (ZSTD or LZ4); decompressed = n_substreams × 16B marks
+//   primary.cidx    — single CH block (ZSTD or LZ4); same payload as primary.idx
+//   columns.txt     — same format as wide part
+//   columns_substreams.txt — substream listing per column
+//   count.txt       — row count
+//   checksums.txt   — file checksums (binary, CH format v4)
+//   serialization.json — per-column serialization info
+//   metadata_version.txt / default_compression_codec.txt / format_version.txt
+//
+// Substream ordering in data.bin and cmrk4:
+//   For each column (in columns.txt declaration order):
+//     - Fixed-width columns: 1 substream = the column data
+//     - String columns: 2 substreams: <col>.size then <col> (raw bytes)
+
+/// Open a compact-format MergeTree part for reading.
+///
+/// Handles parts written by ClickHouse server (ZSTD-compressed cmrk4/cidx)
+/// or by ZigHouse (LZ4-compressed).
+pub const CompactOpenedPart = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    part_dir: []const u8,
+    table: schema.Table,
+    row_count: u64,
+    /// Per-substream: fully decompressed block bytes, one entry per block
+    /// (one block per substream per granule).
+    /// Index: substream_idx * n_granules + granule_idx
+    substream_data: [][]u8,
+    /// Number of substreams total.
+    n_substreams: usize,
+    /// n_granules (derived from row_count and GRANULE_SIZE).
+    n_granules: usize,
+    /// Substream index for each column's first substream.
+    col_substream_start: []usize,
+
+    pub fn open(
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        part_dir: []const u8,
+        table: schema.Table,
+    ) !CompactOpenedPart {
+        // Read count.txt
+        const count_path = try std.fmt.allocPrint(allocator, "{s}/count.txt", .{part_dir});
+        defer allocator.free(count_path);
+        const row_count = try count_txt.readPath(allocator, io, count_path);
+
+        const n_gran: usize = if (row_count == 0) 0 else (row_count + GRANULE_SIZE - 1) / GRANULE_SIZE;
+
+        // In CH Compact format: data.bin has one physical block per column per granule.
+        // For String columns, the single block contains: sizes (n_rows*8 bytes) + raw bytes.
+        // So total physical blocks = n_gran * n_columns.
+        const n_cols = table.columns.len;
+
+        // col_substream_start[ci] = ci (one block per column per granule).
+        const col_ss = try allocator.alloc(usize, n_cols);
+        errdefer allocator.free(col_ss);
+        for (0..n_cols) |ci| col_ss[ci] = ci;
+
+        // Read and decompress all blocks from data.bin.
+        const total_blocks = n_gran * n_cols;
+        const substream_data = try allocator.alloc([]u8, total_blocks);
+        errdefer {
+            for (substream_data) |sd| allocator.free(sd);
+            allocator.free(substream_data);
+        }
+        for (substream_data) |*sd| sd.* = &.{};
+
+        if (total_blocks > 0) {
+            const bin_path = try std.fmt.allocPrint(allocator, "{s}/data.bin", .{part_dir});
+            defer allocator.free(bin_path);
+            const bin_raw = try std.Io.Dir.cwd().readFileAlloc(io, bin_path, allocator, .limited(std.math.maxInt(usize)));
+            defer allocator.free(bin_raw);
+
+            var bin_r = std.Io.Reader.fixed(bin_raw);
+            for (substream_data) |*sd| {
+                const chunk = block.readBlock(allocator, &bin_r) catch |e| switch (e) {
+                    error.TruncatedBlock => break,
+                    else => return e,
+                };
+                sd.* = chunk;
+            }
+        }
+
+        return .{
+            .allocator = allocator,
+            .io = io,
+            .part_dir = part_dir,
+            .table = table,
+            .row_count = row_count,
+            .substream_data = substream_data,
+            .n_substreams = n_cols,
+            .n_granules = n_gran,
+            .col_substream_start = col_ss,
+        };
+    }
+
+    pub fn deinit(self: *CompactOpenedPart) void {
+        for (self.substream_data) |sd| self.allocator.free(sd);
+        self.allocator.free(self.substream_data);
+        self.allocator.free(self.col_substream_start);
+    }
+
+    /// Return a ColumnReader for column at `col_idx`.
+    /// Collects and concatenates all granule blocks for this column's substreams.
+    pub fn columnReader(self: *CompactOpenedPart, col_idx: usize) !ColumnReader {
+        const col = self.table.columns[col_idx];
+        const ss_start = self.col_substream_start[col_idx];
+
+        if (self.row_count == 0) {
+            return ColumnReader{
+                .allocator = self.allocator,
+                .col = col,
+                .row_count = 0,
+                .data = try self.allocator.alloc(u8, 0),
+                .size_data = null,
+                .cursor = 0,
+                .size_cursor = 0,
+                .rows_read = 0,
+            };
+        }
+
+        // Concatenate all granule blocks for this column's data (and size if String)
+        var data_buf: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer data_buf.deinit(self.allocator);
+        var size_buf: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer size_buf.deinit(self.allocator);
+
+        for (0..self.n_granules) |g| {
+            // In CH Compact format: one physical block per column per granule.
+            // For String columns: block = sizes_bytes(n_rows*8) + raw_bytes.
+            const block_idx = g * self.n_substreams + ss_start;
+            switch (col.ty) {
+                .text, .char => {
+                    const combined = self.substream_data[block_idx];
+                    // Compute rows in this granule
+                    const gs = g * GRANULE_SIZE;
+                    const ge = @min(gs + GRANULE_SIZE, self.row_count);
+                    const n_rows_in_gran = ge - gs;
+                    const sizes_bytes = n_rows_in_gran * 8;
+                    if (sizes_bytes > combined.len) return error.UnexpectedEndOfData;
+                    try size_buf.appendSlice(self.allocator, combined[0..sizes_bytes]);
+                    try data_buf.appendSlice(self.allocator, combined[sizes_bytes..]);
+                },
+                else => {
+                    try data_buf.appendSlice(self.allocator, self.substream_data[block_idx]);
+                },
+            }
+        }
+
+        const size_data: ?[]u8 = switch (col.ty) {
+            .text, .char => try size_buf.toOwnedSlice(self.allocator),
+            else => blk: {
+                size_buf.deinit(self.allocator);
+                break :blk null;
+            },
+        };
+
+        return ColumnReader{
+            .allocator = self.allocator,
+            .col = col,
+            .row_count = self.row_count,
+            .data = try data_buf.toOwnedSlice(self.allocator),
+            .size_data = size_data,
+            .cursor = 0,
+            .size_cursor = 0,
+            .rows_read = 0,
+        };
+    }
+};
+
+// ── Compact part writer ────────────────────────────────────────────────────────
+
+/// Write a ClickHouse-compatible compact MergeTree part directory.
+///
+/// Layout written:
+///   data.bin                     — all substreams as sequential CH blocks (LZ4)
+///   data.cmrk4                   — compressed marks (LZ4 block of 16-byte entries)
+///   primary.cidx                 — compressed primary index (LZ4 block)
+///   columns.txt                  — column declarations
+///   columns_substreams.txt       — substream listing
+///   count.txt                    — row count
+///   checksums.txt                — checksums (CH format v4)
+///   serialization.json           — minimal default serialization
+///   metadata_version.txt         — "1"
+///   default_compression_codec.txt — "CODEC(LZ4)"
+///   format_version.txt           — "1"
+pub const CompactPart = struct {
+    const ManagedList = std.array_list.Managed(u8);
+    const ManagedMarkList = std.array_list.Managed(marks.CompactMark);
+    const ManagedCsList = std.array_list.Managed(checksums.FileChecksum);
+
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    part_dir: []u8,
+    table: schema.Table,
+    /// Per-column buffered row data (uncompressed).
+    col_bufs: []ManagedList,
+    /// For String columns: per-column size stream buffer (one u64 LE per row = string byte length).
+    size_bufs: []?ManagedList,
+    row_count: u64,
+
+    pub fn open(
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        part_dir: []const u8,
+        table: schema.Table,
+    ) !CompactPart {
+        const dir = try allocator.dupe(u8, part_dir);
+        errdefer allocator.free(dir);
+
+        try std.Io.Dir.cwd().createDirPath(io, part_dir);
+
+        const col_bufs = try allocator.alloc(ManagedList, table.columns.len);
+        for (col_bufs) |*b| b.* = ManagedList.init(allocator);
+
+        const size_bufs = try allocator.alloc(?ManagedList, table.columns.len);
+        for (size_bufs, table.columns) |*sb, col| {
+            sb.* = switch (col.ty) {
+                .text, .char => ManagedList.init(allocator),
+                else => null,
+            };
+        }
+
+        return .{
+            .allocator = allocator,
+            .io = io,
+            .part_dir = dir,
+            .table = table,
+            .col_bufs = col_bufs,
+            .size_bufs = size_bufs,
+            .row_count = 0,
+        };
+    }
+
+    pub fn deinit(self: *CompactPart) void {
+        for (self.col_bufs) |*b| b.deinit();
+        for (self.size_bufs) |*sb| if (sb.*) |*b| b.deinit();
+        self.allocator.free(self.col_bufs);
+        self.allocator.free(self.size_bufs);
+        self.allocator.free(self.part_dir);
+    }
+
+    /// Append a batch of fixed-width values for column `col_idx`.
+    /// Also increments row_count if col_idx == 0.
+    pub fn appendFixedBatch(self: *CompactPart, col_idx: usize, values: []const i64) !void {
+        const col = self.table.columns[col_idx];
+        const width: usize = types.chFixedWidth(col.ty) orelse return error.NotAFixedColumn;
+        const buf = &self.col_bufs[col_idx];
+        for (values) |v| {
+            const old_len = buf.items.len;
+            try buf.resize(old_len + width);
+            const dest = buf.items[old_len..][0..width];
+            switch (col.ty) {
+                .int8 => dest[0] = @bitCast(@as(i8, @intCast(v))),
+                .int16 => std.mem.writeInt(i16, dest[0..2], @intCast(v), .little),
+                .date => std.mem.writeInt(u16, dest[0..2], @intCast(v), .little),
+                .int32 => std.mem.writeInt(i32, dest[0..4], @intCast(v), .little),
+                .int64, .timestamp => std.mem.writeInt(i64, dest[0..8], v, .little),
+                .float32 => std.mem.writeInt(u32, dest[0..4], @truncate(@as(u64, @bitCast(v))), .little),
+                .float64 => std.mem.writeInt(u64, dest[0..8], @bitCast(v), .little),
+                else => return error.NotAFixedColumn,
+            }
+        }
+        if (col_idx == 0) self.row_count += values.len;
+    }
+
+    /// Append a single string value for column `col_idx`.
+    pub fn appendString(self: *CompactPart, col_idx: usize, s: []const u8) !void {
+        const sb = &(self.size_bufs[col_idx] orelse return error.NotAStringColumn);
+        var len_buf: [8]u8 = undefined;
+        std.mem.writeInt(u64, &len_buf, s.len, .little);
+        try sb.appendSlice(&len_buf);
+        try self.col_bufs[col_idx].appendSlice(s);
+    }
+
+    /// Finalize: write all compact part files to disk.
+    pub fn finish(self: *CompactPart) !void {
+        // n_substreams
+        var n_sub: usize = 0;
+        for (self.table.columns) |col| {
+            n_sub += switch (col.ty) { .text, .char => 2, else => 1 };
+        }
+
+        const n_gran: usize = if (self.row_count == 0) 0 else (self.row_count + GRANULE_SIZE - 1) / GRANULE_SIZE;
+
+        // ── data.bin + cmrk4 marks ────────────────────────────────────────────
+        var bin_aw = std.Io.Writer.Allocating.init(self.allocator);
+        defer bin_aw.deinit();
+
+        var cm_list = ManagedMarkList.init(self.allocator);
+        defer cm_list.deinit();
+
+        for (0..n_gran) |g| {
+            const gs = g * GRANULE_SIZE;
+            const ge = @min(gs + GRANULE_SIZE, self.row_count);
+
+            for (self.table.columns, 0..) |col, ci| {
+                switch (col.ty) {
+                    .text, .char => {
+                        // CH Compact format: String = 1 physical block per granule.
+                        // Block contents: sizes (n_rows*8 bytes of u64 LE lengths) + raw bytes.
+                        // 2 marks: first at (block_offset, 0) for .size substream,
+                        //          second at (block_offset, n_rows*8) for data substream.
+                        const sb = self.size_bufs[ci].?.items;
+                        const sz_slice = sb[gs * 8 .. ge * 8]; // size stream bytes
+
+                        // Compute data byte range
+                        var byte_start: u64 = 0;
+                        for (0..gs) |ri| {
+                            byte_start += std.mem.readInt(u64, sb[ri * 8 ..][0..8], .little);
+                        }
+                        var byte_end = byte_start;
+                        for (gs..ge) |ri| {
+                            byte_end += std.mem.readInt(u64, sb[ri * 8 ..][0..8], .little);
+                        }
+                        const data_slice = self.col_bufs[ci].items[byte_start..byte_end];
+
+                        // Combined block = sizes + data
+                        const combined = try self.allocator.alloc(u8, sz_slice.len + data_slice.len);
+                        defer self.allocator.free(combined);
+                        @memcpy(combined[0..sz_slice.len], sz_slice);
+                        @memcpy(combined[sz_slice.len..], data_slice);
+
+                        const block_offset: u64 = @intCast(bin_aw.writer.end);
+                        const n_rows_in_gran = ge - gs;
+                        try cm_list.append(.{ .offset_in_file = block_offset, .offset_in_block = 0 });
+                        try cm_list.append(.{ .offset_in_file = block_offset, .offset_in_block = @intCast(n_rows_in_gran * 8) });
+                        try block.writeBlock(&bin_aw.writer, combined);
+                    },
+                    else => {
+                        const width = types.chFixedWidth(col.ty) orelse continue;
+                        const bs = gs * width;
+                        const be = ge * width;
+                        try cm_list.append(.{ .offset_in_file = @intCast(bin_aw.writer.end), .offset_in_block = 0 });
+                        try block.writeBlock(&bin_aw.writer, self.col_bufs[ci].items[bs..be]);
+                    },
+                }
+            }
+        }
+
+        var bin_al = bin_aw.toArrayList();
+        defer bin_al.deinit(self.allocator);
+        try compactWriteFile(self.io, self.part_dir, "data.bin", bin_al.items);
+
+        // cmrk4
+        {
+            var cmrk_aw = std.Io.Writer.Allocating.init(self.allocator);
+            defer cmrk_aw.deinit();
+            try marks.writeCmrk4(&cmrk_aw.writer, cm_list.items);
+            var cmrk_al = cmrk_aw.toArrayList();
+            defer cmrk_al.deinit(self.allocator);
+            try compactWriteFile(self.io, self.part_dir, "data.cmrk4", cmrk_al.items);
+        }
+
+        // ── primary.cidx ──────────────────────────────────────────────────────
+        {
+            var pk_aw = std.Io.Writer.Allocating.init(self.allocator);
+            defer pk_aw.deinit();
+            const pk_col = self.table.columns[0];
+            const width = types.chFixedWidth(pk_col.ty) orelse 0;
+            var pk_raw = std.ArrayList(u8).empty;
+            defer pk_raw.deinit(self.allocator);
+            if (width > 0) {
+                const cd = self.col_bufs[0].items;
+                for (0..n_gran) |g| {
+                    const off = g * GRANULE_SIZE * width;
+                    if (off + width <= cd.len)
+                        try pk_raw.appendSlice(self.allocator, cd[off .. off + width]);
+                }
+            }
+            var cidx_aw = std.Io.Writer.Allocating.init(self.allocator);
+            defer cidx_aw.deinit();
+            try block.writeBlock(&cidx_aw.writer, pk_raw.items);
+            var cidx_al = cidx_aw.toArrayList();
+            defer cidx_al.deinit(self.allocator);
+            try compactWriteFile(self.io, self.part_dir, "primary.cidx", cidx_al.items);
+        }
+
+        // ── count.txt ─────────────────────────────────────────────────────────
+        {
+            var buf: [32]u8 = undefined;
+            const s = std.fmt.bufPrint(&buf, "{d}\n", .{self.row_count}) catch unreachable;
+            try compactWriteFile(self.io, self.part_dir, "count.txt", s);
+        }
+
+        // ── columns.txt ───────────────────────────────────────────────────────
+        {
+            const ch_cols = try columns_txt.fromTable(self.allocator, self.table);
+            defer columns_txt.freeChColumns(self.allocator, ch_cols);
+            var caw = std.Io.Writer.Allocating.init(self.allocator);
+            defer caw.deinit();
+            try columns_txt.write(&caw.writer, ch_cols);
+            var cal = caw.toArrayList();
+            defer cal.deinit(self.allocator);
+            try compactWriteFile(self.io, self.part_dir, "columns.txt", cal.items);
+        }
+
+        // ── columns_substreams.txt ─────────────────────────────────────────────
+        {
+            var ssw = std.Io.Writer.Allocating.init(self.allocator);
+            defer ssw.deinit();
+            try ssw.writer.print("columns substreams version: 1\n{d} columns:\n", .{self.table.columns.len});
+            for (self.table.columns) |col| {
+                switch (col.ty) {
+                    .text, .char => try ssw.writer.print("2 substreams for column `{s}`:\n\t{s}.size\n\t{s}\n", .{ col.name, col.name, col.name }),
+                    else => try ssw.writer.print("1 substreams for column `{s}`:\n\t{s}\n", .{ col.name, col.name }),
+                }
+            }
+            var ssal = ssw.toArrayList();
+            defer ssal.deinit(self.allocator);
+            try compactWriteFile(self.io, self.part_dir, "columns_substreams.txt", ssal.items);
+        }
+
+        // ── serialization.json ────────────────────────────────────────────────
+        {
+            var sjw = std.Io.Writer.Allocating.init(self.allocator);
+            defer sjw.deinit();
+            try sjw.writer.print("{{\"columns\":[", .{});
+            for (self.table.columns, 0..) |col, i| {
+                if (i > 0) try sjw.writer.print(",", .{});
+                try sjw.writer.print("{{\"kind\":\"Default\",\"name\":\"{s}\",\"num_defaults\":0,\"num_rows\":{d}}}", .{ col.name, self.row_count });
+            }
+            try sjw.writer.print("]}}\n", .{});
+            var sjal = sjw.toArrayList();
+            defer sjal.deinit(self.allocator);
+            try compactWriteFile(self.io, self.part_dir, "serialization.json", sjal.items);
+        }
+
+        // ── static metadata files ─────────────────────────────────────────────
+        try compactWriteFile(self.io, self.part_dir, "metadata_version.txt", "1\n");
+        try compactWriteFile(self.io, self.part_dir, "default_compression_codec.txt", "CODEC(LZ4)\n");
+        try compactWriteFile(self.io, self.part_dir, "format_version.txt", "1\n");
+
+        // ── checksums.txt ─────────────────────────────────────────────────────
+        {
+            const file_names = [_][]const u8{
+                "count.txt",
+                "columns.txt",
+                "columns_substreams.txt",
+                "data.bin",
+                "data.cmrk4",
+                "default_compression_codec.txt",
+                "format_version.txt",
+                "metadata_version.txt",
+                "primary.cidx",
+                "serialization.json",
+            };
+            var cs_entries = ManagedCsList.init(self.allocator);
+            defer cs_entries.deinit();
+            const cwd = std.Io.Dir.cwd();
+            for (file_names) |fname| {
+                const fpath = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ self.part_dir, fname });
+                defer self.allocator.free(fpath);
+                const fdata = cwd.readFileAlloc(self.io, fpath, self.allocator, .limited(std.math.maxInt(usize))) catch continue;
+                defer self.allocator.free(fdata);
+                const fhash = checksums.hashFile(fdata);
+                try cs_entries.append(.{
+                    .name = fname,
+                    .file_size = @intCast(fdata.len),
+                    .file_hash = fhash,
+                    .is_compressed = false,
+                });
+            }
+            // Sort by name (already sorted above, but be safe)
+            std.mem.sort(checksums.FileChecksum, cs_entries.items, {}, checksumLessThan);
+            var csaw = std.Io.Writer.Allocating.init(self.allocator);
+            defer csaw.deinit();
+            try checksums.write(self.allocator, &csaw.writer, cs_entries.items);
+            var csal = csaw.toArrayList();
+            defer csal.deinit(self.allocator);
+            try compactWriteFile(self.io, self.part_dir, "checksums.txt", csal.items);
+        }
+    }
+};
+
+fn compactWriteFile(io: std.Io, dir: []const u8, name: []const u8, data: []const u8) !void {
+    // Build path on stack where possible
+    var path_buf: [4096]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ dir, name }) catch return error.PathTooLong;
+    var f = try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = true });
+    defer f.close(io);
+    try f.writeStreamingAll(io, data);
+}
+
+test "CompactPart write + read round-trip" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const part_dir = "/tmp/zig_test_compact_part";
+
+    const cols = [_]schema.Column{
+        .{ .name = "event_date", .ty = .date },
+        .{ .name = "user_id", .ty = .int32 },
+        .{ .name = "duration", .ty = .int64 },
+        .{ .name = "url", .ty = .text },
+    };
+    const table = schema.Table{ .name = "test_compact", .columns = &cols };
+
+    // Write
+    {
+        var cp = try CompactPart.open(io, allocator, part_dir, table);
+        defer cp.deinit();
+
+        const dates   = [_]i64{ 19723, 19723, 19724 };
+        const users   = [_]i64{ 1, 2, 3 };
+        const durs    = [_]i64{ 3500, 1200, 4200 };
+
+        try cp.appendFixedBatch(0, &dates);
+        try cp.appendFixedBatch(1, &users);
+        try cp.appendFixedBatch(2, &durs);
+        try cp.appendString(3, "https://example.com/home");
+        try cp.appendString(3, "https://example.com/about");
+        try cp.appendString(3, "https://example.com/contact");
+
+        try cp.finish();
+    }
+
+    // Read back
+    {
+        var cop = try CompactOpenedPart.open(io, allocator, part_dir, table);
+        defer cop.deinit();
+
+        try std.testing.expectEqual(@as(u64, 3), cop.row_count);
+
+        // Read fixed column: event_date
+        var cr0 = try cop.columnReader(0);
+        defer cr0.deinit();
+        var date_vals: [3]i64 = undefined;
+        const n0 = try cr0.readFixed(&date_vals);
+        try std.testing.expectEqual(@as(usize, 3), n0);
+        try std.testing.expectEqual(@as(i64, 19723), date_vals[0]);
+        try std.testing.expectEqual(@as(i64, 19724), date_vals[2]);
+
+        // Read string column: url
+        var cr3 = try cop.columnReader(3);
+        defer cr3.deinit();
+        var url_count3: usize = 0;
+        const n3 = try cr3.readStrings(3, &url_count3, struct {
+            fn cb(ctx: *usize, _: []const u8) !void {
+                ctx.* += 1;
+            }
+        }.cb);
+        try std.testing.expectEqual(@as(usize, 3), n3);
+        try std.testing.expectEqual(@as(usize, 3), url_count3);
+    }
+}
+
+test "CompactOpenedPart reads CH-written compact part" {
+    // This test reads the part created by the CH server in the integration setup.
+    // It is skipped if the part directory doesn't exist.
+    const ch_part_dir = "/tmp/ch-srv/data/store/4d0/4d02ac62-2539-4cf7-97dc-28415c3acc30/all_1_1_0";
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    // Check if part exists by trying to open count.txt
+    {
+        const check_path = ch_part_dir ++ "/count.txt";
+        const f = std.Io.Dir.cwd().openFile(io, check_path, .{}) catch return; // skip if not present
+        f.close(io);
+    }
+
+    const cols = [_]schema.Column{
+        .{ .name = "event_date",  .ty = .date },
+        .{ .name = "event_time",  .ty = .int32 },
+        .{ .name = "user_id",     .ty = .int32 },
+        .{ .name = "page_id",     .ty = .int32 },
+        .{ .name = "duration",    .ty = .int64 },
+        .{ .name = "url",         .ty = .text },
+    };
+    const table = schema.Table{ .name = "events", .columns = &cols };
+
+    var cop = try CompactOpenedPart.open(io, allocator, ch_part_dir, table);
+    defer cop.deinit();
+
+    try std.testing.expectEqual(@as(u64, 5), cop.row_count);
+
+    // Read event_date (u16 Date → stored as i16 → should be 19723 or 19724)
+    var cr0 = try cop.columnReader(0);
+    defer cr0.deinit();
+    var dates: [5]i64 = undefined;
+    const n = try cr0.readFixed(&dates);
+    try std.testing.expectEqual(@as(usize, 5), n);
+    try std.testing.expectEqual(@as(i64, 19723), dates[0]);
+
+    // Read user_id
+    var cr2 = try cop.columnReader(2);
+    defer cr2.deinit();
+    var users: [5]i64 = undefined;
+    const nu = try cr2.readFixed(&users);
+    try std.testing.expectEqual(@as(usize, 5), nu);
+    try std.testing.expectEqual(@as(i64, 1), users[0]);
+
+    // Read url (String) — just count rows and check first
+    var cr5 = try cop.columnReader(5);
+    defer cr5.deinit();
+    var url_count: usize = 0;
+    const ns = try cr5.readStrings(5, &url_count, struct {
+        fn cb(ctx: *usize, _s: []const u8) !void {
+            _ = _s;
+            ctx.* += 1;
+        }
+    }.cb);
+    try std.testing.expectEqual(@as(usize, 5), ns);
+    try std.testing.expectEqual(@as(usize, 5), url_count);
 }
 
 test "part write and verify files exist" {
