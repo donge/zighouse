@@ -109,6 +109,25 @@ pub const RowBinaryDecoder = struct {
 
         while (pos < data.len) {
             for (self.table.columns, self.columns) |col, *buf| {
+                // Nullable(T): RowBinary prepends a 1-byte null flag (1 = NULL, 0 = value).
+                // Simple handling: skip the value bytes and store zero/empty for NULLs.
+                const ch_ty = col.ch_type orelse "";
+                const is_nullable = chTypeStartsWith(ch_ty, "Nullable(");
+                if (is_nullable) {
+                    if (pos + 1 > data.len) return error.UnexpectedEndOfData;
+                    const null_flag = data[pos];
+                    pos += 1;
+                    if (null_flag == 1) {
+                        // NULL — consume value bytes and append zero/empty placeholder.
+                        pos = try skipRowBinaryValue(col, ch_ty, data, pos);
+                        switch (col.ty) {
+                            .text, .char => try buf.str_vals.append(self.allocator, ""),
+                            else => try buf.fixed_vals.append(self.allocator, 0),
+                        }
+                        continue;
+                    }
+                    // null_flag == 0: fall through to normal decode below.
+                }
                 switch (col.ty) {
                     .int8 => {
                         if (pos + 1 > data.len) return error.UnexpectedEndOfData;
@@ -150,7 +169,7 @@ pub const RowBinaryDecoder = struct {
                     },
                     .text, .char => {
                         // Dispatch based on ch_type for special encodings.
-                        const ch_ty = col.ch_type orelse "";
+                        // Note: ch_ty already declared in outer scope; reuse it here.
                         if (chTypeEql(ch_ty, "IPv6")) {
                             // IPv6: fixed 16 bytes raw
                             if (pos + 16 > data.len) return error.UnexpectedEndOfData;
@@ -192,6 +211,40 @@ pub const RowBinaryDecoder = struct {
         return rows;
     }
 };
+
+/// Skip a single RowBinary value of the given column type without storing it.
+/// Used when a Nullable(T) null flag indicates the value is NULL.
+/// `ch_ty` may still be the Nullable-wrapped type; inner type is extracted if needed.
+/// Returns the updated position.
+fn skipRowBinaryValue(col: schema.Column, ch_ty: []const u8, data: []const u8, pos_in: usize) !usize {
+    var pos = pos_in;
+    // Unwrap Nullable(...) to get the inner ch_type for string dispatch.
+    const inner_ch_ty = if (chTypeStartsWith(ch_ty, "Nullable(")) extractInner(ch_ty) else ch_ty;
+    switch (col.ty) {
+        .int8  => pos += 1,
+        .int16 => pos += 2,
+        .int32, .date => pos += 4,
+        .int64, .timestamp => pos += 8,
+        .float32 => pos += 4,
+        .float64 => pos += 8,
+        .text, .char => {
+            if (chTypeEql(inner_ch_ty, "IPv6")) {
+                pos += 16;
+            } else if (chTypeEql(inner_ch_ty, "IPv4")) {
+                pos += 4;
+            } else {
+                // Variable-length string: read and skip the varint length + bytes.
+                const len, const var_bytes = readVarUInt(data[pos..]) orelse
+                    return error.UnexpectedEndOfData;
+                pos += var_bytes;
+                if (len > MAX_STRING_LEN) return error.StringTooLong;
+                if (pos + len > data.len) return error.UnexpectedEndOfData;
+                pos += len;
+            }
+        },
+    }
+    return pos;
+}
 
 /// Read a ClickHouse varUInt from `buf`.
 /// Returns .{value, bytes_consumed} or null if buffer is too short.
@@ -566,7 +619,9 @@ fn parseChType(s: []const u8) ?schema.ColumnType {
     if (chTypeEql(s, "UInt64")) return .int64;
     if (chTypeEql(s, "Date")) return .date;
     if (chTypeEql(s, "Date32")) return .date;
-    if (chTypeEql(s, "DateTime")) return .timestamp;
+    // DateTime is 4-byte UInt32 (seconds since epoch) on the wire — map to int32.
+    // DateTime64(*) is 8-byte Int64 — map to timestamp (handled below via startsWith).
+    if (chTypeEql(s, "DateTime")) return .int32;
     if (chTypeEql(s, "String")) return .text;
     if (chTypeEql(s, "FixedString")) return .text;
     if (chTypeEql(s, "IPv4")) return .text;
@@ -1081,7 +1136,7 @@ test "decodeWithHeader: all Phase-1 types" {
     std.mem.writeInt(i32, buf[pos..][0..4], 2, .little); pos += 4;
     std.mem.writeInt(i64, buf[pos..][0..8], 3, .little); pos += 8;
     std.mem.writeInt(i32, buf[pos..][0..4], 4, .little); pos += 4; // Date stored as i32 in RowBinary
-    std.mem.writeInt(i64, buf[pos..][0..8], 5, .little); pos += 8; // DateTime stored as i64
+    std.mem.writeInt(u32, buf[pos..][0..4], 5, .little); pos += 4; // DateTime is 4-byte UInt32 on wire
 
     var result = try decodeWithHeader(allocator, buf[0..pos]);
     defer result.deinit(allocator);
@@ -1091,5 +1146,5 @@ test "decodeWithHeader: all Phase-1 types" {
     try std.testing.expectEqual(schema.ColumnType.int32,     result.table.columns[1].ty);
     try std.testing.expectEqual(schema.ColumnType.int64,     result.table.columns[2].ty);
     try std.testing.expectEqual(schema.ColumnType.date,      result.table.columns[3].ty);
-    try std.testing.expectEqual(schema.ColumnType.timestamp, result.table.columns[4].ty);
+    try std.testing.expectEqual(schema.ColumnType.int32,     result.table.columns[4].ty); // DateTime → int32 (4-byte)
 }

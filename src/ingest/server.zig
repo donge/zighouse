@@ -91,7 +91,7 @@ pub const Server = struct {
             .io = io,
             .config = config,
             .schemas = schemas,
-            .seq = 1,
+            .seq = scanMaxPartSeq(io, config.data_dir) + 1,
             .views = std.StringHashMap([]const u8).init(allocator),
             .functions = std.StringHashMap([]const u8).init(allocator),
         };
@@ -1259,6 +1259,46 @@ pub const Server = struct {
 };
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Scan all existing part directories under data_dir to find the highest seq number.
+/// Part directories are named "all_{seq}_{seq}_0". Returns the max seq found, or 0
+/// if none exist. Used at startup so new parts never overwrite existing ones after restart.
+fn scanMaxPartSeq(io: std.Io, data_dir: []const u8) u64 {
+    var max_seq: u64 = 0;
+    const cwd = std.Io.Dir.cwd();
+    var dir = cwd.openDir(io, data_dir, .{ .iterate = true }) catch return 0;
+    defer dir.close(io);
+    var db_it = dir.iterate();
+    while (db_it.next(io) catch null) |db_entry| {
+        if (db_entry.kind != .directory) continue;
+        var db_dir = dir.openDir(io, db_entry.name, .{ .iterate = true }) catch continue;
+        defer db_dir.close(io);
+        var tbl_it = db_dir.iterate();
+        while (tbl_it.next(io) catch null) |tbl_entry| {
+            if (tbl_entry.kind != .directory) continue;
+            var tbl_dir = db_dir.openDir(io, tbl_entry.name, .{ .iterate = true }) catch continue;
+            defer tbl_dir.close(io);
+            var parts_dir = tbl_dir.openDir(io, "parts", .{ .iterate = true }) catch continue;
+            defer parts_dir.close(io);
+            var part_it = parts_dir.iterate();
+            while (part_it.next(io) catch null) |part_entry| {
+                if (part_entry.kind != .directory) continue;
+                const seq = parsePartSeq(part_entry.name) orelse continue;
+                if (seq > max_seq) max_seq = seq;
+            }
+        }
+    }
+    return max_seq;
+}
+
+/// Parse the seq number from a part directory name "all_{seq}_{seq}_0".
+fn parsePartSeq(name: []const u8) ?u64 {
+    // Expected format: "all_N_N_0"
+    if (!std.mem.startsWith(u8, name, "all_")) return null;
+    const after_all = name[4..];
+    const underscore = std.mem.indexOfScalar(u8, after_all, '_') orelse return null;
+    return std.fmt.parseInt(u64, after_all[0..underscore], 10) catch null;
+}
 
 fn sendResponse(request: *std.http.Server.Request, out: *std.Io.Writer, status: std.http.Status, body: []const u8) !void {
     try request.respond(body, .{
