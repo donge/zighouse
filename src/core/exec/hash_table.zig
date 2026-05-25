@@ -722,6 +722,176 @@ pub const IntKeyHashTable = struct {
     }
 };
 
+// ── CompactIntKeyHashTable ────────────────────────────────────────────────────
+
+/// Agg kind for compact (8-byte) accumulator storage.
+/// Covers all numeric aggregates; string/array aggs are excluded.
+pub const CompactAggKind = enum {
+    count,    // u64 ++
+    i64_sum,  // i64 +=
+    u64_sum,  // u64 +=
+    f64_sum,  // f64 += (also used for AVG)
+    i64_min,  // i64 = min(cur, arg)
+    i64_max,  // i64 = max(cur, arg)
+    u64_min,  // u64 = min(cur, arg)
+    u64_max,  // u64 = max(cur, arg)
+    f64_min,  // f64 = min(cur, arg)
+    f64_max,  // f64 = max(cur, arg)
+};
+
+/// Like IntKeyHashTable but stores accumulators as raw u64 (8B) instead of
+/// AggAccum (32B union), reducing the accum slab size by 4×.
+///
+/// This matters for high-cardinality GROUP BY with numeric aggs (e.g. Q33:
+/// 10M unique (WatchID, ClientIP) pairs × 3 aggs = 32B×3=96B vs 8B×3=24B per slot;
+/// working set drops from ~1.7 GB to ~0.5 GB, reducing L3 miss rate).
+///
+/// Only applicable when all aggs are pure numeric (no str_min, uniq_strs, any_val).
+/// The caller must provide a `kinds` slice describing each agg's update semantics
+/// and matching `init_vals` (u64-pun of the initial value).
+pub const CompactIntKeyHashTable = struct {
+    const EMPTY_TAG: u64 = 0;
+    const INITIAL_CAP = 64;
+
+    keys_flat:  []i64,   // slot i → keys_flat[i*num_keys .. (i+1)*num_keys]
+    vals_flat:  []u64,   // slot i → vals_flat[i*num_aggs .. (i+1)*num_aggs]
+    tags:       []u64,   // 0=empty, else hash|bit63
+    capacity:   usize,
+    count:      usize,
+    num_keys:   usize,
+    num_aggs:   usize,
+    arena:      std.mem.Allocator,
+
+    pub fn initWithCapacity(
+        arena:    std.mem.Allocator,
+        num_keys: usize,
+        num_aggs: usize,
+        est_rows: u64,
+    ) !CompactIntKeyHashTable {
+        const cap = if (est_rows > 0)
+            nextPow2I(@as(usize, @intCast(@min(est_rows * 100 / 70 + 1, std.math.maxInt(u32)))))
+        else INITIAL_CAP;
+        const keys_flat = try arena.alloc(i64, cap * num_keys);
+        const vals_flat = try arena.alloc(u64, cap * num_aggs);
+        const tags      = try arena.alloc(u64, cap);
+        @memset(tags, EMPTY_TAG);
+        return .{
+            .keys_flat = keys_flat,
+            .vals_flat = vals_flat,
+            .tags      = tags,
+            .capacity  = cap,
+            .count     = 0,
+            .num_keys  = num_keys,
+            .num_aggs  = num_aggs,
+            .arena     = arena,
+        };
+    }
+
+    fn nextPow2I(n: usize) usize {
+        if (n <= 1) return 1;
+        var p: usize = 1;
+        while (p < n) p <<= 1;
+        return p;
+    }
+
+    fn hashI64s(keys: []const i64) u64 {
+        if (keys.len == 1) {
+            var h: u64 = @bitCast(keys[0]);
+            h ^= h >> 33; h *%= 0xff51afd7ed558ccd;
+            h ^= h >> 33; h *%= 0xc4ceb9fe1a85ec53;
+            h ^= h >> 33;
+            return h | (1 << 63);
+        }
+        if (keys.len == 2) {
+            const k0: u64 = @bitCast(keys[0]);
+            const k1: u64 = @bitCast(keys[1]);
+            var h: u64 = k0 *% 0x9e3779b97f4a7c15 ^ k1 *% 0x6c62272e07bb0142;
+            h ^= h >> 30; h *%= 0xbf58476d1ce4e5b9;
+            h ^= h >> 27; h *%= 0x94d049bb133111eb;
+            h ^= h >> 31;
+            return h | (1 << 63);
+        }
+        var h = std.hash.Wyhash.init(0);
+        h.update(std.mem.sliceAsBytes(keys));
+        return h.final() | (1 << 63);
+    }
+
+    /// Returns a pointer to the vals_flat slice for the given key's slot,
+    /// inserting with `init_vals` if not present.
+    pub fn getOrInsert(
+        self: *CompactIntKeyHashTable,
+        key:       []const i64,
+        init_vals: []const u64,
+    ) ![]u64 {
+        if (self.count + 1 > (self.capacity * 7) / 10) try self.grow();
+        const mask = self.capacity - 1;
+        const h    = hashI64s(key);
+        var   slot = h & mask;
+        while (true) : (slot = (slot + 1) & mask) {
+            const tag = self.tags[slot];
+            if (tag == EMPTY_TAG) {
+                const kb = slot * self.num_keys;
+                @memcpy(self.keys_flat[kb .. kb + self.num_keys], key);
+                const vb = slot * self.num_aggs;
+                @memcpy(self.vals_flat[vb .. vb + self.num_aggs], init_vals);
+                self.tags[slot] = h;
+                self.count += 1;
+                return self.vals_flat[vb .. vb + self.num_aggs];
+            }
+            if (tag == h) {
+                const kb = slot * self.num_keys;
+                if (std.mem.eql(i64, self.keys_flat[kb .. kb + self.num_keys], key)) {
+                    const vb = slot * self.num_aggs;
+                    return self.vals_flat[vb .. vb + self.num_aggs];
+                }
+            }
+        }
+    }
+
+    fn grow(self: *CompactIntKeyHashTable) !void {
+        const new_cap  = self.capacity * 2;
+        const new_mask = new_cap - 1;
+        const new_keys = try self.arena.alloc(i64, new_cap * self.num_keys);
+        const new_vals = try self.arena.alloc(u64, new_cap * self.num_aggs);
+        const new_tags = try self.arena.alloc(u64, new_cap);
+        @memset(new_tags, EMPTY_TAG);
+        for (0..self.capacity) |i| {
+            if (self.tags[i] == EMPTY_TAG) continue;
+            const h    = self.tags[i];
+            var   slot = h & new_mask;
+            while (new_tags[slot] != EMPTY_TAG) : (slot = (slot + 1) & new_mask) {}
+            const src_kb = i * self.num_keys;
+            const dst_kb = slot * self.num_keys;
+            @memcpy(new_keys[dst_kb .. dst_kb + self.num_keys],
+                    self.keys_flat[src_kb .. src_kb + self.num_keys]);
+            const src_vb = i * self.num_aggs;
+            const dst_vb = slot * self.num_aggs;
+            @memcpy(new_vals[dst_vb .. dst_vb + self.num_aggs],
+                    self.vals_flat[src_vb .. src_vb + self.num_aggs]);
+            new_tags[slot] = h;
+        }
+        self.keys_flat = new_keys;
+        self.vals_flat = new_vals;
+        self.tags      = new_tags;
+        self.capacity  = new_cap;
+    }
+
+    pub fn iterate(
+        self: *const CompactIntKeyHashTable,
+        ctx:  anytype,
+        comptime cb: fn (@TypeOf(ctx), []const i64, []const u64) void,
+    ) void {
+        for (0..self.capacity) |i| {
+            if (self.tags[i] != EMPTY_TAG) {
+                const kb = i * self.num_keys;
+                const vb = i * self.num_aggs;
+                cb(ctx, self.keys_flat[kb .. kb + self.num_keys],
+                        self.vals_flat[vb .. vb + self.num_aggs]);
+            }
+        }
+    }
+};
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 test "AggHashTable insert and lookup" {
