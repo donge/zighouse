@@ -53,6 +53,19 @@ pub const ColumnBuffer = struct {
         return init(col);
     }
 
+    /// Allocate a slice of ColumnBuffers for all columns in a table.
+    pub fn initAll(allocator: std.mem.Allocator, table: schema.Table) ![]ColumnBuffer {
+        const bufs = try allocator.alloc(ColumnBuffer, table.columns.len);
+        for (table.columns, bufs) |col, *buf| buf.* = initEmpty(col);
+        return bufs;
+    }
+
+    /// Deinit and free a slice previously created by initAll.
+    pub fn deinitAll(allocator: std.mem.Allocator, bufs: []ColumnBuffer) void {
+        for (bufs) |*buf| buf.deinit(allocator);
+        allocator.free(bufs);
+    }
+
     pub fn deinit(self: *ColumnBuffer, allocator: std.mem.Allocator) void {
         self.fixed_vals.deinit(allocator);
         self.str_vals.deinit(allocator);
@@ -131,26 +144,41 @@ pub const RowBinaryDecoder = struct {
                 switch (col.ty) {
                     .int8 => {
                         if (pos + 1 > data.len) return error.UnexpectedEndOfData;
-                        const v = @as(i8, @bitCast(data[pos]));
-                        try buf.fixed_vals.append(self.allocator, @as(i64, v));
+                        // UInt8: zero-extend; Int8: sign-extend.
+                        const raw = data[pos];
+                        const v: i64 = if (chTypeStartsWith(ch_ty, "UInt"))
+                            @as(i64, raw)
+                        else
+                            @as(i64, @as(i8, @bitCast(raw)));
+                        try buf.fixed_vals.append(self.allocator, v);
                         pos += 1;
                     },
                     .int16 => {
                         if (pos + 2 > data.len) return error.UnexpectedEndOfData;
-                        const v = std.mem.readInt(i16, data[pos..][0..2], .little);
-                        try buf.fixed_vals.append(self.allocator, @as(i64, v));
+                        // UInt16: zero-extend; Int16: sign-extend.
+                        const v: i64 = if (chTypeStartsWith(ch_ty, "UInt"))
+                            @as(i64, std.mem.readInt(u16, data[pos..][0..2], .little))
+                        else
+                            @as(i64, std.mem.readInt(i16, data[pos..][0..2], .little));
+                        try buf.fixed_vals.append(self.allocator, v);
                         pos += 2;
                     },
                     .int32, .date => {
                         if (pos + 4 > data.len) return error.UnexpectedEndOfData;
-                        const v = std.mem.readInt(i32, data[pos..][0..4], .little);
-                        try buf.fixed_vals.append(self.allocator, @as(i64, v));
+                        // UInt32: zero-extend to i64; Int32/Date: sign-extend.
+                        const v: i64 = if (chTypeStartsWith(ch_ty, "UInt"))
+                            @as(i64, std.mem.readInt(u32, data[pos..][0..4], .little))
+                        else
+                            @as(i64, std.mem.readInt(i32, data[pos..][0..4], .little));
+                        try buf.fixed_vals.append(self.allocator, v);
                         pos += 4;
                     },
                     .int64, .timestamp => {
                         if (pos + 8 > data.len) return error.UnexpectedEndOfData;
-                        const v = std.mem.readInt(i64, data[pos..][0..8], .little);
-                        try buf.fixed_vals.append(self.allocator, v);
+                        // UInt64 / Int64: both stored as raw i64 bits (bitCast).
+                        // The query layer uses Value.uint64 for UInt columns.
+                        const v = std.mem.readInt(u64, data[pos..][0..8], .little);
+                        try buf.fixed_vals.append(self.allocator, @bitCast(v));
                         pos += 8;
                     },
                     // Float32: 4 bytes IEEE 754. Store raw bits sign-extended to i64.
@@ -184,6 +212,14 @@ pub const RowBinaryDecoder = struct {
                             try buf.str_bytes.appendSlice(self.allocator, data[pos..][0..4]);
                             try buf.str_vals.append(self.allocator, buf.str_bytes.items[start..]);
                             pos += 4;
+                        } else if (chTypeStartsWith(ch_ty, "Decimal128") or chTypeStartsWith(ch_ty, "Decimal256")) {
+                            // Decimal128: fixed 16 bytes; Decimal256: fixed 32 bytes.
+                            const width: usize = if (chTypeStartsWith(ch_ty, "Decimal256")) 32 else 16;
+                            if (pos + width > data.len) return error.UnexpectedEndOfData;
+                            const start = buf.str_bytes.items.len;
+                            try buf.str_bytes.appendSlice(self.allocator, data[pos..][0..width]);
+                            try buf.str_vals.append(self.allocator, buf.str_bytes.items[start..]);
+                            pos += width;
                         } else if (chTypeStartsWith(ch_ty, "Array(")) {
                             // Array(T) RowBinary: varint count + count * T values
                             pos = try decodeRowBinaryArrayOrMap(self.allocator, ch_ty, data, pos, buf);
@@ -232,6 +268,8 @@ fn skipRowBinaryValue(col: schema.Column, ch_ty: []const u8, data: []const u8, p
                 pos += 16;
             } else if (chTypeEql(inner_ch_ty, "IPv4")) {
                 pos += 4;
+            } else if (chTypeStartsWith(inner_ch_ty, "Decimal128") or chTypeStartsWith(inner_ch_ty, "Decimal256")) {
+                pos += if (chTypeStartsWith(inner_ch_ty, "Decimal256")) @as(usize, 32) else @as(usize, 16);
             } else {
                 // Variable-length string: read and skip the varint length + bytes.
                 const len, const var_bytes = readVarUInt(data[pos..]) orelse
@@ -639,6 +677,26 @@ fn parseChType(s: []const u8) ?schema.ColumnType {
     if (chTypeStartsWith(s, "DateTime64")) return .timestamp;
     // FixedString(N)
     if (chTypeStartsWith(s, "FixedString(")) return .text;
+    // Decimal(P, S) — map based on precision to match CH wire size.
+    // Decimal32 (P≤9): 4 bytes → float32; Decimal64 (P≤18): 8 bytes → float64;
+    // Decimal128/256: 16/32 bytes — fall through to text (raw bytes).
+    if (chTypeStartsWith(s, "Decimal")) {
+        // Explicit aliases
+        if (chTypeStartsWith(s, "Decimal32")) return .float32;
+        if (chTypeStartsWith(s, "Decimal64")) return .float64;
+        if (chTypeStartsWith(s, "Decimal128") or chTypeStartsWith(s, "Decimal256")) return .text;
+        // Decimal(P, S) — extract precision
+        const inner = extractInner(s);
+        const comma = std.mem.indexOfScalar(u8, inner, ',') orelse inner.len;
+        const p_str = std.mem.trim(u8, inner[0..comma], " ");
+        const p = std.fmt.parseInt(u32, p_str, 10) catch 19;
+        if (p <= 9) return .float32;
+        if (p <= 18) return .float64;
+        return .text; // Decimal128/256: store raw bytes as text
+    }
+    // Enum8 / Enum16 — store as the underlying integer type.
+    if (chTypeStartsWith(s, "Enum8(") or chTypeEql(s, "Enum8")) return .int8;
+    if (chTypeStartsWith(s, "Enum16(") or chTypeEql(s, "Enum16")) return .int16;
     return null;
 }
 
@@ -1094,13 +1152,13 @@ test "decodeWithHeader: partial name triggers errdefer (no leak)" {
 }
 
 test "decodeWithHeader: unsupported type triggers errdefer (no leak)" {
-    // num_cols=1, name="x", type="Decimal(10,2)" (unsupported)
+    // Tuple is still unsupported and should return UnsupportedColumnType.
     const allocator = std.testing.allocator;
     var buf: [64]u8 = undefined;
     var pos: usize = 0;
     buf[pos] = 1; pos += 1;           // num_cols=1
     buf[pos] = 1; pos += 1; buf[pos] = 'x'; pos += 1; // name="x"
-    const unsupported = "Decimal(10,2)";
+    const unsupported = "Tuple(Int32, String)";
     buf[pos] = unsupported.len; pos += 1;
     @memcpy(buf[pos..][0..unsupported.len], unsupported); pos += unsupported.len;
     try std.testing.expectError(error.UnsupportedColumnType, decodeWithHeader(allocator, buf[0..pos]));

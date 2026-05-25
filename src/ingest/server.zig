@@ -234,7 +234,7 @@ pub const Server = struct {
         } else if (asciiStartsWith(trimmed, "CREATE")) {
             try self.handleCreate(request, out, trimmed);
         } else if (asciiStartsWith(trimmed, "TRUNCATE")) {
-            // TRUNCATE TABLE <name> — no-op
+            try self.handleTruncate(request, out, trimmed);
             try sendResponse(request, out, .ok, "");
         } else if (asciiStartsWith(trimmed, "DROP") or
                    asciiStartsWith(trimmed, "SYSTEM") or
@@ -259,7 +259,7 @@ pub const Server = struct {
         } else if (asciiStartsWith(trimmed, "DESCRIBE")) {
             try self.handleDescribeSimple(request, out, trimmed);
         } else if (asciiStartsWith(trimmed, "TRUNCATE")) {
-            // TRUNCATE TABLE <name> — no-op (ZigHouse uses append-only parts)
+            try self.handleTruncate(request, out, trimmed);
             const empty = try native_block.encodeEmpty(self.allocator);
             defer self.allocator.free(empty);
             try sendNativeBlock(self.allocator, request, out, empty);
@@ -430,6 +430,10 @@ pub const Server = struct {
             try self.handleInsertNative(request, out, insert_info.db_table, body);
         } else if (insert_info.with_names_and_types) {
             try self.handleInsertWithHeader(request, out, insert_info.db_table, body);
+        } else if (insert_info.csv_fmt) {
+            try self.handleInsertCSV(request, out, insert_info.db_table, body);
+        } else if (insert_info.json_each_row_fmt) {
+            try self.handleInsertJSONEachRow(request, out, insert_info.db_table, body);
         } else {
             try self.handleInsertRowBinary(request, out, insert_info.db_table, body);
         }
@@ -563,6 +567,67 @@ pub const Server = struct {
         try sendResponse(request, out, .ok, "");
     }
 
+    /// INSERT FORMAT CSV — comma-separated values, one row per line.
+    /// Requires table schema to be pre-registered (no auto-inference).
+    fn handleInsertCSV(
+        self: *Server,
+        request: *std.http.Server.Request,
+        out: *std.Io.Writer,
+        db_table: DbTable,
+        body: []const u8,
+    ) !void {
+        const entry = self.schemas.find(db_table.db, db_table.table) orelse {
+            try sendResponse(request, out, .bad_request,
+                "Unknown table; use CREATE TABLE or RowBinaryWithNamesAndTypes first\n");
+            return;
+        };
+        const cols = try row_binary_decoder.ColumnBuffer.initAll(self.allocator, entry.table);
+        defer row_binary_decoder.ColumnBuffer.deinitAll(self.allocator, cols);
+
+
+        var line_it = std.mem.splitScalar(u8, body, '\n');
+        while (line_it.next()) |line| {
+            const trimmed = std.mem.trim(u8, line, " \t\r");
+            if (trimmed.len == 0 or trimmed[0] != '{') continue;
+            // For each column in schema order, extract the value from the JSON object.
+            for (entry.table.columns, cols) |col, *buf| {
+                const val = extractJsonField(trimmed, col.name) orelse "";
+                try appendParsedField(self.allocator, col, val, buf);
+            }
+        }
+        try self.writePart(db_table, entry, cols);
+        try sendResponse(request, out, .ok, "");
+    }
+
+    /// INSERT FORMAT JSONEachRow — one JSON object per line.
+    fn handleInsertJSONEachRow(
+        self: *Server,
+        request: *std.http.Server.Request,
+        out: *std.Io.Writer,
+        db_table: DbTable,
+        body: []const u8,
+    ) !void {
+        const entry = self.schemas.find(db_table.db, db_table.table) orelse {
+            try sendResponse(request, out, .bad_request,
+                "Unknown table; use CREATE TABLE first\n");
+            return;
+        };
+        const cols = try row_binary_decoder.ColumnBuffer.initAll(self.allocator, entry.table);
+        defer row_binary_decoder.ColumnBuffer.deinitAll(self.allocator, cols);
+
+        var line_it = std.mem.splitScalar(u8, body, '\n');
+        while (line_it.next()) |line| {
+            const trimmed = std.mem.trim(u8, line, " \t\r");
+            if (trimmed.len == 0 or trimmed[0] != '{') continue;
+            for (entry.table.columns, cols) |col, *buf| {
+                const val = extractJsonField(trimmed, col.name) orelse "";
+                try appendParsedField(self.allocator, col, val, buf);
+            }
+        }
+        try self.writePart(db_table, entry, cols);
+        try sendResponse(request, out, .ok, "");
+    }
+
     /// Write one part to disk and increment seq.
     fn writePart(
         self: *Server,
@@ -605,6 +670,50 @@ pub const Server = struct {
 
         try sess.writeColumns(reordered);
         try sess.finish();
+    }
+
+    /// Parse "TRUNCATE TABLE [db.]table" and delete all parts under that table.
+    /// Silently succeeds if the table or its parts directory does not exist.
+    fn handleTruncate(self: *Server, request: *std.http.Server.Request, out: *std.Io.Writer, sql: []const u8) !void {
+        _ = request;
+        _ = out;
+        // Parse: TRUNCATE [TABLE] [db.]table
+        var it = std.mem.tokenizeAny(u8, sql, " \t\r\n;");
+        _ = it.next(); // "TRUNCATE"
+        const maybe_table_kw = it.next() orelse return;
+        const tbl_token = if (asciiEql(maybe_table_kw, "TABLE")) (it.next() orelse return) else maybe_table_kw;
+        // Strip trailing semicolons
+        const tbl_name = std.mem.trimEnd(u8, tbl_token, ";");
+        const dbt = splitDbTable(tbl_name);
+
+        const parts_path = try std.fmt.allocPrint(
+            self.allocator,
+            "{s}/{s}/{s}/parts",
+            .{ self.config.data_dir, dbt.db, dbt.table },
+        );
+        defer self.allocator.free(parts_path);
+
+        const cwd = std.Io.Dir.cwd();
+        var parts_dir = cwd.openDir(self.io, parts_path, .{ .iterate = true }) catch return; // not found → ok
+        defer parts_dir.close(self.io);
+
+        // Collect part directory names to delete (can't delete while iterating).
+        var to_delete: std.ArrayListUnmanaged([]u8) = .empty;
+        defer {
+            for (to_delete.items) |p| self.allocator.free(p);
+            to_delete.deinit(self.allocator);
+        }
+
+        var it2 = parts_dir.iterate();
+        while (try it2.next(self.io)) |entry| {
+            if (entry.kind != .directory) continue;
+            const full = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ parts_path, entry.name });
+            try to_delete.append(self.allocator, full);
+        }
+
+        for (to_delete.items) |part_path| {
+            cwd.deleteTree(self.io, part_path) catch {}; // best-effort
+        }
     }
 
     /// Walk a PhysicalNode tree to find the first part_scan and return its columns.
@@ -1291,6 +1400,88 @@ fn scanMaxPartSeq(io: std.Io, data_dir: []const u8) u64 {
     return max_seq;
 }
 
+/// Parse a text field value and append to a ColumnBuffer according to the column type.
+/// Used by CSV and JSONEachRow handlers.
+fn appendParsedField(
+    allocator: std.mem.Allocator,
+    col: schema.Column,
+    field: []const u8,
+    buf: *row_binary_decoder.ColumnBuffer,
+) !void {
+    switch (col.ty) {
+        .text, .char => {
+            const duped = try allocator.dupe(u8, field);
+            try buf.str_bytes.appendSlice(allocator, duped);
+            allocator.free(duped);
+            // str_vals slice points into str_bytes; re-establish pointer after potential resize.
+            const end = buf.str_bytes.items.len;
+            const start = end - field.len;
+            try buf.str_vals.append(allocator, buf.str_bytes.items[start..end]);
+        },
+        .float32, .float64 => {
+            const v = std.fmt.parseFloat(f64, field) catch 0.0;
+            const bits: u64 = @bitCast(v);
+            try buf.fixed_vals.append(allocator, @bitCast(bits));
+        },
+        else => {
+            const v = std.fmt.parseInt(i64, field, 10) catch 0;
+            try buf.fixed_vals.append(allocator, v);
+        },
+    }
+}
+
+/// Extract the string value of a named field from a JSON object literal.
+/// Returns raw value (unquoted for strings, as-is for numbers/booleans), or null if not found.
+/// This is a minimal extractor — handles simple flat JSON objects only.
+fn extractJsonField(json: []const u8, key: []const u8) ?[]const u8 {
+    // Search for `"key":` pattern
+    var pos: usize = 0;
+    while (pos < json.len) {
+        const quote = std.mem.indexOfScalarPos(u8, json, pos, '"') orelse break;
+        const end_key = std.mem.indexOfScalarPos(u8, json, quote + 1, '"') orelse break;
+        const found_key = json[quote + 1 .. end_key];
+        pos = end_key + 1;
+        // Skip whitespace and colon
+        while (pos < json.len and (json[pos] == ' ' or json[pos] == '\t')) pos += 1;
+        if (pos >= json.len or json[pos] != ':') continue;
+        pos += 1;
+        while (pos < json.len and (json[pos] == ' ' or json[pos] == '\t')) pos += 1;
+        if (pos >= json.len) break;
+        if (!std.mem.eql(u8, found_key, key)) {
+            // Skip this value to advance pos
+            if (json[pos] == '"') {
+                pos += 1;
+                while (pos < json.len and json[pos] != '"') {
+                    if (json[pos] == '\\') pos += 1;
+                    pos += 1;
+                }
+                pos += 1; // closing quote
+            } else {
+                while (pos < json.len and json[pos] != ',' and json[pos] != '}') pos += 1;
+            }
+            continue;
+        }
+        // Found the key — extract value
+        if (json[pos] == '"') {
+            // String value — return contents without quotes
+            const vstart = pos + 1;
+            var vend = vstart;
+            while (vend < json.len and json[vend] != '"') {
+                if (json[vend] == '\\') vend += 1;
+                vend += 1;
+            }
+            return json[vstart..vend];
+        } else {
+            // Number / bool / null — return raw token
+            const vstart = pos;
+            var vend = pos;
+            while (vend < json.len and json[vend] != ',' and json[vend] != '}' and json[vend] != ' ') vend += 1;
+            return json[vstart..vend];
+        }
+    }
+    return null;
+}
+
 /// Parse the seq number from a part directory name "all_{seq}_{seq}_0".
 fn parsePartSeq(name: []const u8) ?u64 {
     // Expected format: "all_N_N_0"
@@ -1543,7 +1734,14 @@ fn hexDigit(c: u8) ?u8 {
 }
 
 const DbTable = struct { db: []const u8, table: []const u8 };
-const InsertInfo = struct { db_table: DbTable, with_names_and_types: bool, native_fmt: bool = false, values_fmt: bool = false };
+const InsertInfo = struct {
+    db_table: DbTable,
+    with_names_and_types: bool,
+    native_fmt: bool = false,
+    values_fmt: bool = false,
+    csv_fmt: bool = false,
+    json_each_row_fmt: bool = false,
+};
 
 /// Split "db.table" → {db, table}.  If no dot, db = "default".
 fn splitDbTable(name: []const u8) DbTable {
@@ -1588,11 +1786,15 @@ fn parseInsertTarget(q: []const u8) ?InsertInfo {
     }
     const with_header = asciiEql(fmt, "RowBinaryWithNamesAndTypes");
     const native_fmt = asciiEql(fmt, "Native");
-    if (!with_header and !asciiEql(fmt, "RowBinary") and !native_fmt) return null;
+    const csv_fmt = asciiEql(fmt, "CSV") or asciiEql(fmt, "CSVWithNames");
+    const json_fmt = asciiEql(fmt, "JSONEachRow") or asciiEql(fmt, "NDJSON");
+    if (!with_header and !asciiEql(fmt, "RowBinary") and !native_fmt and !csv_fmt and !json_fmt) return null;
     return .{
         .db_table = db_table,
         .with_names_and_types = with_header,
         .native_fmt = native_fmt,
+        .csv_fmt = csv_fmt,
+        .json_each_row_fmt = json_fmt,
     };
 }
 
@@ -1753,7 +1955,9 @@ test "parseInsertTarget: bare table defaults to default db" {
 
 test "parseInsertTarget: wrong format returns null" {
     try std.testing.expect(parseInsertTarget("SELECT 1") == null);
-    try std.testing.expect(parseInsertTarget("INSERT INTO t FORMAT CSV") == null);
+    // CSV and JSONEachRow are now supported; truly unsupported formats still return null.
+    try std.testing.expect(parseInsertTarget("INSERT INTO t FORMAT Parquet") == null);
+    try std.testing.expect(parseInsertTarget("INSERT INTO t FORMAT Arrow") == null);
 }
 
 test "splitDbTable: db.table" {
