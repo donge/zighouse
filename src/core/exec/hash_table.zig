@@ -565,16 +565,21 @@ pub const TripleCountHashTable = struct {
 /// Accumulators are stored inline (flat array, no pointer per slot) to eliminate
 /// per-insert arena allocation and pointer indirection on every update.
 /// Layout: slot i → keys_flat[i*num_keys..(i+1)*num_keys], accums_flat[i*num_aggs..(i+1)*num_aggs].
+///
+/// `tags` merges occupied+hash into one u64 (0 = empty, else = hash value with bit 63 forced to 1).
+/// This eliminates a separate `occupied[]` array access on every probe, reducing L3 misses.
 pub const IntKeyHashTable = struct {
     const LOAD_FACTOR = 0.70;
     const INITIAL_CAP = 64;
+    /// Tag sentinel: 0 = empty.  Stored hash = raw_hash | (1 << 63) to avoid 0 collision.
+    const EMPTY_TAG: u64 = 0;
 
     /// Flat key storage: slot i's key is keys_flat[i*num_keys .. (i+1)*num_keys].
     keys_flat:  []i64,
     /// Flat accum storage: slot i's accums are accums_flat[i*num_aggs .. (i+1)*num_aggs].
     accums_flat: []AggAccum,
-    occupied:   []bool,
-    hashes:     []u64,
+    /// tags[i] = 0 (empty) or (hash | TAG_SET_BIT).  Replaces separate occupied+hashes arrays.
+    tags:       []u64,
     capacity:   usize,
     count:      usize,
     num_keys:   usize,
@@ -590,16 +595,14 @@ pub const IntKeyHashTable = struct {
         const cap = if (est_rows > 0)
             nextPow2I(@as(usize, @intCast(@min(est_rows * 100 / 70 + 1, std.math.maxInt(u32)))))
         else INITIAL_CAP;
-        const keys_flat   = try arena.alloc(i64,     cap * num_keys);
-        const accums_flat = try arena.alloc(AggAccum, cap * num_aggs);
-        const occupied    = try arena.alloc(bool,     cap);
-        const hashes      = try arena.alloc(u64,      cap);
-        @memset(occupied, false);
+        const keys_flat   = try arena.alloc(i64,      cap * num_keys);
+        const accums_flat = try arena.alloc(AggAccum,  cap * num_aggs);
+        const tags        = try arena.alloc(u64,       cap);
+        @memset(tags, EMPTY_TAG);
         return .{
             .keys_flat   = keys_flat,
             .accums_flat = accums_flat,
-            .occupied    = occupied,
-            .hashes      = hashes,
+            .tags        = tags,
             .capacity    = cap,
             .count       = 0,
             .num_keys    = num_keys,
@@ -624,7 +627,7 @@ pub const IntKeyHashTable = struct {
             h ^= h >> 33;
             h *%= 0xc4ceb9fe1a85ec53;
             h ^= h >> 33;
-            return h;
+            return h | (1 << 63); // ensure non-zero
         }
         if (keys.len == 2) {
             const k0: u64 = @bitCast(keys[0]);
@@ -635,11 +638,11 @@ pub const IntKeyHashTable = struct {
             h ^= h >> 27;
             h *%= 0x94d049bb133111eb;
             h ^= h >> 31;
-            return h;
+            return h | (1 << 63);
         }
         var h = std.hash.Wyhash.init(0);
         h.update(std.mem.sliceAsBytes(keys));
-        return h.final();
+        return h.final() | (1 << 63);
     }
 
     /// Returns a slice into accums_flat for slot. On new insert, copies init_accums.
@@ -655,17 +658,18 @@ pub const IntKeyHashTable = struct {
         const h    = hashI64s(key);
         var   slot = h & mask;
         while (true) : (slot = (slot + 1) & mask) {
-            if (!self.occupied[slot]) {
+            const tag = self.tags[slot];
+            if (tag == EMPTY_TAG) {
+                // Empty slot: insert here.
                 const kbase = slot * self.num_keys;
                 @memcpy(self.keys_flat[kbase .. kbase + self.num_keys], key);
                 const abase = slot * self.num_aggs;
                 @memcpy(self.accums_flat[abase .. abase + self.num_aggs], init_accums);
-                self.hashes[slot]   = h;
-                self.occupied[slot] = true;
+                self.tags[slot] = h;
                 self.count += 1;
                 return self.accums_flat[abase .. abase + self.num_aggs];
             }
-            if (self.hashes[slot] == h) {
+            if (tag == h) {
                 const kbase = slot * self.num_keys;
                 if (std.mem.eql(i64, self.keys_flat[kbase .. kbase + self.num_keys], key)) {
                     const abase = slot * self.num_aggs;
@@ -676,19 +680,18 @@ pub const IntKeyHashTable = struct {
     }
 
     fn grow(self: *IntKeyHashTable) !void {
-        const new_cap      = self.capacity * 2;
-        const new_mask     = new_cap - 1;
-        const new_keys     = try self.arena.alloc(i64,     new_cap * self.num_keys);
-        const new_accums   = try self.arena.alloc(AggAccum, new_cap * self.num_aggs);
-        const new_occupied = try self.arena.alloc(bool,    new_cap);
-        const new_hashes   = try self.arena.alloc(u64,     new_cap);
-        @memset(new_occupied, false);
+        const new_cap  = self.capacity * 2;
+        const new_mask = new_cap - 1;
+        const new_keys   = try self.arena.alloc(i64,      new_cap * self.num_keys);
+        const new_accums = try self.arena.alloc(AggAccum,  new_cap * self.num_aggs);
+        const new_tags   = try self.arena.alloc(u64,       new_cap);
+        @memset(new_tags, EMPTY_TAG);
 
         for (0..self.capacity) |i| {
-            if (!self.occupied[i]) continue;
-            const h    = self.hashes[i];
+            if (self.tags[i] == EMPTY_TAG) continue;
+            const h    = self.tags[i];
             var   slot = h & new_mask;
-            while (new_occupied[slot]) : (slot = (slot + 1) & new_mask) {}
+            while (new_tags[slot] != EMPTY_TAG) : (slot = (slot + 1) & new_mask) {}
             const src_kbase = i * self.num_keys;
             const dst_kbase = slot * self.num_keys;
             @memcpy(new_keys[dst_kbase .. dst_kbase + self.num_keys],
@@ -697,21 +700,19 @@ pub const IntKeyHashTable = struct {
             const dst_abase = slot * self.num_aggs;
             @memcpy(new_accums[dst_abase .. dst_abase + self.num_aggs],
                     self.accums_flat[src_abase .. src_abase + self.num_aggs]);
-            new_hashes[slot]   = h;
-            new_occupied[slot] = true;
+            new_tags[slot] = h;
         }
 
         self.keys_flat   = new_keys;
         self.accums_flat = new_accums;
-        self.occupied    = new_occupied;
-        self.hashes      = new_hashes;
+        self.tags        = new_tags;
         self.capacity    = new_cap;
     }
 
     /// Iterate over all occupied entries, calling cb with (key_slice, accums_slice).
     pub fn iterate(self: *const IntKeyHashTable, ctx: anytype, comptime cb: fn (@TypeOf(ctx), []const i64, []const AggAccum) void) void {
         for (0..self.capacity) |i| {
-            if (self.occupied[i]) {
+            if (self.tags[i] != EMPTY_TAG) {
                 const kbase = i * self.num_keys;
                 const abase = i * self.num_aggs;
                 cb(ctx, self.keys_flat[kbase .. kbase + self.num_keys],

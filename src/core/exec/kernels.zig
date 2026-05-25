@@ -1409,12 +1409,15 @@ pub fn updateAccum(accum: *AggAccum, v: ?Value, arena: std.mem.Allocator) !void 
         .f64_min   => if (v) |val| { if (val.toF64()) |f| { if (f < accum.f64_min) accum.f64_min = f; } },
         .f64_max   => if (v) |val| { if (val.toF64()) |f| { if (f > accum.f64_max) accum.f64_max = f; } },
         .str_min   => if (v) |val| { if (val.toStr()) |s| {
-            if (accum.str_min) |cur| { if (std.mem.lessThan(u8, s, cur)) accum.str_min = try arena.dupe(u8, s); }
-            else accum.str_min = try arena.dupe(u8, s);
+            // Borrow the pointer directly — string slices from DataChunk columns
+            // point into store memory (mmapped) or chunk arenas that are not freed
+            // during hash_agg / scalar_agg processing.  No dupe needed.
+            if (accum.str_min) |cur| { if (std.mem.lessThan(u8, s, cur)) accum.str_min = s; }
+            else accum.str_min = s;
         }},
         .str_max   => if (v) |val| { if (val.toStr()) |s| {
-            if (accum.str_max) |cur| { if (std.mem.lessThan(u8, cur, s)) accum.str_max = try arena.dupe(u8, s); }
-            else accum.str_max = try arena.dupe(u8, s);
+            if (accum.str_max) |cur| { if (std.mem.lessThan(u8, cur, s)) accum.str_max = s; }
+            else accum.str_max = s;
         }},
         .uniq_strs => if (v) |val| { if (val.toStr()) |s| {
             const owned = try arena.dupe(u8, s);
