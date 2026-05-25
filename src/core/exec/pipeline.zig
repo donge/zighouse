@@ -113,6 +113,10 @@ pub const FilterState = struct {
     /// Set to true after first chunk if all guard columns are .string type.
     guards_verified: bool = false,
 
+    /// When true, the pure-LIKE fast path skips copyRow and just counts matching rows.
+    /// Safe only when downstream only reads c.num_rows (e.g. COUNT(*) aggregation).
+    count_only_mode: bool = false,
+
     pub fn apply(self: *FilterState, c: *DataChunk, ctx: *QueryContext) !void {
         const alloc = ctx.allocator();
         // Build ref_indices, row_buf, and like_guards on first call (once per query).
@@ -153,6 +157,17 @@ pub const FilterState = struct {
                 .like, .not_like => {
                     const lg = guards[0];
                     const col = c.columns[lg.col_idx];
+                    if (self.count_only_mode) {
+                        // Count-only: skip copyRow entirely — caller only needs c.num_rows.
+                        var count: usize = 0;
+                        for (0..c.num_rows) |r| {
+                            const s = if (col.isRowNull(r)) "" else col.data.string[r];
+                            if (lg.matcher.match(s) != lg.negate) count += 1;
+                        }
+                        c.num_rows = count;
+                        for (c.columns) |*col2| col2.len = count;
+                        return;
+                    }
                     var write_pos: usize = 0;
                     for (0..c.num_rows) |r| {
                         const s = if (col.isRowNull(r)) "" else col.data.string[r];
@@ -886,6 +901,16 @@ fn executeScalarAggChunked(
 
     var filter_state: ?FilterState = extractFilter(input);
     var lim_state:    ?LimitState  = extractLimit(input);
+
+    // Count-only mode: if all aggs are COUNT(*), skip copyRow in pure-LIKE filter.
+    // Downstream only reads c.num_rows for count accumulation.
+    if (filter_state != null) {
+        const all_count_star = for (aggs) |item| {
+            const ok = item.expr == .agg_call and item.expr.agg_call.kind == .count_star;
+            if (!ok) break false;
+        } else true;
+        if (all_count_star) filter_state.?.count_only_mode = true;
+    }
 
     var c: DataChunk = undefined;
     ctx.source.reset();
