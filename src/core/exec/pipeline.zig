@@ -1706,8 +1706,12 @@ fn updateAccumsFromChunk(
                                         switch (col.data) {
                                             .int64 => |vals| {
                                                 if (acc_ptr.* == .i64_sum) {
-                                                    for (0..c.num_rows) |r| {
-                                                        if (!chunk.isNull(col.null_mask, r)) acc_ptr.i64_sum +%= vals[r] + k;
+                                                    if (chunk.allNonNull(col.null_mask)) {
+                                                        acc_ptr.i64_sum +%= simd.sumI64(vals[0..c.num_rows]) +% (@as(i64, @intCast(c.num_rows)) *% k);
+                                                    } else {
+                                                        for (0..c.num_rows) |r| {
+                                                            if (!chunk.isNull(col.null_mask, r)) acc_ptr.i64_sum +%= vals[r] + k;
+                                                        }
                                                     }
                                                     handled = true;
                                                 }
@@ -1728,18 +1732,27 @@ fn updateAccumsFromChunk(
                                 switch (col.data) {
                                     .int64 => |vals| {
                                         if (acc_ptr.* == .f64_sum) {
-                                            for (0..c.num_rows) |r| {
-                                                if (!chunk.isNull(col.null_mask, r))
-                                                    acc_ptr.f64_sum += @floatFromInt(vals[r]);
+                                            if (chunk.allNonNull(col.null_mask)) {
+                                                // Fast path: no nulls — sum as i64 then cast once.
+                                                acc_ptr.f64_sum += @floatFromInt(simd.sumI64(vals[0..c.num_rows]));
+                                            } else {
+                                                for (0..c.num_rows) |r| {
+                                                    if (!chunk.isNull(col.null_mask, r))
+                                                        acc_ptr.f64_sum += @floatFromInt(vals[r]);
+                                                }
                                             }
                                             handled = true;
                                         }
                                     },
                                     .uint64 => |vals| {
                                         if (acc_ptr.* == .f64_sum) {
-                                            for (0..c.num_rows) |r| {
-                                                if (!chunk.isNull(col.null_mask, r))
-                                                    acc_ptr.f64_sum += @floatFromInt(vals[r]);
+                                            if (chunk.allNonNull(col.null_mask)) {
+                                                acc_ptr.f64_sum += @floatFromInt(@as(u64, @bitCast(simd.sumU64(vals[0..c.num_rows]))));
+                                            } else {
+                                                for (0..c.num_rows) |r| {
+                                                    if (!chunk.isNull(col.null_mask, r))
+                                                        acc_ptr.f64_sum += @floatFromInt(vals[r]);
+                                                }
                                             }
                                             handled = true;
                                         }
@@ -1762,9 +1775,14 @@ fn updateAccumsFromChunk(
                                 switch (col.data) {
                                     .int64 => |vals| {
                                         if (acc_ptr.* == .i64_min) {
-                                            for (0..c.num_rows) |r| {
-                                                if (!chunk.isNull(col.null_mask, r) and vals[r] < acc_ptr.i64_min)
-                                                    acc_ptr.i64_min = vals[r];
+                                            if (chunk.allNonNull(col.null_mask)) {
+                                                const v = simd.minI64(vals[0..c.num_rows]);
+                                                if (v < acc_ptr.i64_min) acc_ptr.i64_min = v;
+                                            } else {
+                                                for (0..c.num_rows) |r| {
+                                                    if (!chunk.isNull(col.null_mask, r) and vals[r] < acc_ptr.i64_min)
+                                                        acc_ptr.i64_min = vals[r];
+                                                }
                                             }
                                             handled = true;
                                         }
@@ -1780,9 +1798,14 @@ fn updateAccumsFromChunk(
                                     },
                                     .float64 => |vals| {
                                         if (acc_ptr.* == .f64_min) {
-                                            for (0..c.num_rows) |r| {
-                                                if (!chunk.isNull(col.null_mask, r) and vals[r] < acc_ptr.f64_min)
-                                                    acc_ptr.f64_min = vals[r];
+                                            if (chunk.allNonNull(col.null_mask)) {
+                                                const v = simd.minF64(vals[0..c.num_rows]);
+                                                if (v < acc_ptr.f64_min) acc_ptr.f64_min = v;
+                                            } else {
+                                                for (0..c.num_rows) |r| {
+                                                    if (!chunk.isNull(col.null_mask, r) and vals[r] < acc_ptr.f64_min)
+                                                        acc_ptr.f64_min = vals[r];
+                                                }
                                             }
                                             handled = true;
                                         }
@@ -1810,9 +1833,14 @@ fn updateAccumsFromChunk(
                                 switch (col.data) {
                                     .int64 => |vals| {
                                         if (acc_ptr.* == .i64_max) {
-                                            for (0..c.num_rows) |r| {
-                                                if (!chunk.isNull(col.null_mask, r) and vals[r] > acc_ptr.i64_max)
-                                                    acc_ptr.i64_max = vals[r];
+                                            if (chunk.allNonNull(col.null_mask)) {
+                                                const v = simd.maxI64(vals[0..c.num_rows]);
+                                                if (v > acc_ptr.i64_max) acc_ptr.i64_max = v;
+                                            } else {
+                                                for (0..c.num_rows) |r| {
+                                                    if (!chunk.isNull(col.null_mask, r) and vals[r] > acc_ptr.i64_max)
+                                                        acc_ptr.i64_max = vals[r];
+                                                }
                                             }
                                             handled = true;
                                         }
@@ -1828,9 +1856,14 @@ fn updateAccumsFromChunk(
                                     },
                                     .float64 => |vals| {
                                         if (acc_ptr.* == .f64_max) {
-                                            for (0..c.num_rows) |r| {
-                                                if (!chunk.isNull(col.null_mask, r) and vals[r] > acc_ptr.f64_max)
-                                                    acc_ptr.f64_max = vals[r];
+                                            if (chunk.allNonNull(col.null_mask)) {
+                                                const v = simd.maxF64(vals[0..c.num_rows]);
+                                                if (v > acc_ptr.f64_max) acc_ptr.f64_max = v;
+                                            } else {
+                                                for (0..c.num_rows) |r| {
+                                                    if (!chunk.isNull(col.null_mask, r) and vals[r] > acc_ptr.f64_max)
+                                                        acc_ptr.f64_max = vals[r];
+                                                }
                                             }
                                             handled = true;
                                         }
