@@ -679,6 +679,15 @@ fn executeScannableToSink(
             if (isScannable(p.input)) {
                 return executeLimitChunked(node, ctx);
             }
+            // Detect: project → top_k → scannable  (e.g. SELECT * … ORDER BY col LIMIT k)
+            // Stream scannable input directly into heap to avoid materialising all rows.
+            if (p.input.* == .top_k) {
+                const tk = p.input.top_k;
+                if (isScannable(tk.input)) {
+                    var proj_over_scan = plan.PhysicalNode{ .project = .{ .input = tk.input, .items = p.items } };
+                    return executeTopKFromScannable(&proj_over_scan, tk.keys, @intCast(tk.k), ctx);
+                }
+            }
             const inner = try executeNode(p.input, ctx);
             return projectRowList(inner, p.items, alloc);
         },
@@ -727,8 +736,13 @@ fn executeScannableToSink(
 
          // ── TopK ──────────────────────────────────────────────────────────────
          .top_k => |tk| {
-             const inner = try executeNode(tk.input, ctx);
              const k = @as(usize, @intCast(tk.k));
+             // Fast path: stream scannable input directly into heap — avoids
+             // materialising all rows into a RowList before sorting.
+             if (isScannable(tk.input)) {
+                 return executeTopKFromScannable(tk.input, tk.keys, k, ctx);
+             }
+             const inner = try executeNode(tk.input, ctx);
              // For small K, use a partial selection (heap-based) instead of full sort.
              if (k <= 1024 and inner.rows.items.len > k * 4) {
                  return executeTopK(inner, tk.keys, k, alloc);
@@ -2177,6 +2191,153 @@ fn executeTopK(inner: RowList, keys: []const plan.SortKey, k: usize, alloc: std.
     for (heap_buf[0..heap_len]) |row| try rl.append(alloc, row);
     return rl;
 }
+
+/// Stream a scannable node (scan/filter/project/limit) directly into a min-heap
+/// of at most K rows, avoiding materialisation of all rows into a RowList.
+/// Only rows that actually enter the heap (≤ K rows) are fully materialised via readRow.
+/// Read a single row from a slice of columns (without a DataChunk wrapper).
+fn readRowFromCols(cols: []const chunk.Column, row: usize, a: std.mem.Allocator) ![]?Value {
+    const vals = try a.alloc(?Value, cols.len);
+    for (cols, 0..) |col, ci| vals[ci] = if (col.isRowNull(row)) null else col.data.get(row);
+    return vals;
+}
+
+fn executeTopKFromScannable(
+    node: *const plan.PhysicalNode,
+    keys: []const plan.SortKey,
+    k:    usize,
+    ctx:  *QueryContext,
+) !RowList {
+    const alloc = ctx.allocator();
+
+    // Traverse to extract filter / project / limit wrappers.
+    var filter_state:  ?FilterState               = null;
+    var project_items: ?[]const plan.ProjectItem  = null;
+    var lim_state:     ?LimitState                = null;
+    var cur = node;
+    while (true) {
+        switch (cur.*) {
+            .limit   => |lim| { if (lim_state == null) lim_state = .{ .limit = lim.limit, .offset = lim.offset }; cur = lim.input; },
+            .filter  => |f|   { if (filter_state == null) filter_state = .{ .predicate = f.predicate }; cur = f.input; },
+            .project => |p|   { if (project_items == null) project_items = p.items; cur = p.input; },
+            else => break,
+        }
+    }
+
+    const schema_metas = ctx.source.schema();
+    const out_metas: []result.ColMeta = if (project_items) |items| blk: {
+        const m = try alloc.alloc(result.ColMeta, items.len);
+        for (items, 0..) |item, i| m[i] = .{ .name = item.alias, .col_type = item.out_type };
+        break :blk m;
+    } else try alloc.dupe(result.ColMeta, schema_metas);
+
+    if (k == 0) return RowList.init(out_metas);
+
+    const SortCtx = struct {
+        keys: []const plan.SortKey,
+        fn lessThan(self: @This(), a: []?Value, b: []?Value) bool {
+            for (self.keys) |key| {
+                const av: ?Value = if (key.col_idx < a.len) a[key.col_idx] else null;
+                const bv: ?Value = if (key.col_idx < b.len) b[key.col_idx] else null;
+                const ord: std.math.Order = if (av != null and bv != null)
+                    Value.order(av.?, bv.?)
+                else if (av == null and bv == null) .eq
+                else if (av == null) .lt
+                else .gt;
+                if (ord == .eq) continue;
+                return if (key.desc) ord == .gt else ord == .lt;
+            }
+            return false;
+        }
+    };
+    const sctx = SortCtx{ .keys = keys };
+
+    // Strategy: accumulate up to K raw (pre-projection) schema rows in the heap.
+    // Project only the final K winners — avoids projecting all 300K+ matching rows.
+    // sort key col_idx = schema column index (same in pre- and post-projection).
+    const heap_buf = try alloc.alloc([]?Value, k);
+    var heap_len: usize = 0;
+
+    // Scratch: only key columns need to be read for heap-root comparison.
+    const num_schema_cols = schema_metas.len;
+    const key_scratch = try alloc.alloc(?Value, num_schema_cols);
+    @memset(key_scratch, null);
+
+    ctx.source.reset();
+    var c: DataChunk = undefined;
+    while (try ctx.source.nextChunk(&c, ctx)) {
+        if (filter_state) |*fs| try fs.apply(&c, ctx);
+        if (lim_state)    |*ls| ls.apply(&c);
+        if (c.num_rows == 0) {
+            if (lim_state) |ls| if (ls.done()) break;
+            continue;
+        }
+
+        for (0..c.num_rows) |r| {
+            if (heap_len < k) {
+                // Heap not full: read full raw row and insert.
+                const row = try c.readRow(r, alloc);
+                heap_buf[heap_len] = row;
+                heap_len += 1;
+                // Sift up.
+                var i = heap_len - 1;
+                while (i > 0) {
+                    const parent = (i - 1) / 2;
+                    if (sctx.lessThan(heap_buf[i], heap_buf[parent])) {
+                        const tmp = heap_buf[i]; heap_buf[i] = heap_buf[parent]; heap_buf[parent] = tmp;
+                        i = parent;
+                    } else break;
+                }
+            } else {
+                // Heap full: read only sort-key columns to compare against heap root.
+                for (keys) |key| {
+                    if (key.col_idx < c.columns.len) {
+                        const col = &c.columns[key.col_idx];
+                        key_scratch[key.col_idx] = if (col.isRowNull(r)) null else col.data.get(r);
+                    }
+                }
+                if (sctx.lessThan(key_scratch, heap_buf[0])) {
+                    // Winner: materialise full raw row and replace heap root.
+                    const row = try c.readRow(r, alloc);
+                    heap_buf[0] = row;
+                    // Sift down.
+                    var i: usize = 0;
+                    while (true) {
+                        const l = 2 * i + 1;
+                        const r2 = 2 * i + 2;
+                        var smallest = i;
+                        if (l < heap_len and sctx.lessThan(heap_buf[l], heap_buf[smallest])) smallest = l;
+                        if (r2 < heap_len and sctx.lessThan(heap_buf[r2], heap_buf[smallest])) smallest = r2;
+                        if (smallest == i) break;
+                        const tmp = heap_buf[i]; heap_buf[i] = heap_buf[smallest]; heap_buf[smallest] = tmp;
+                        i = smallest;
+                    }
+                }
+            }
+        }
+        if (lim_state) |ls| if (ls.done()) break;
+    }
+
+    std.sort.pdq([]?Value, heap_buf[0..heap_len], sctx, SortCtx.lessThan);
+
+    // Project the K winners (only K rows — negligible cost).
+    var rl = RowList.init(out_metas);
+    if (project_items) |items| {
+        const row_buf = try alloc.alloc(?Value, schema_metas.len);
+        for (heap_buf[0..heap_len]) |raw_row| {
+            const proj_row = try alloc.alloc(?Value, items.len);
+            @memcpy(row_buf[0..raw_row.len], raw_row);
+            for (items, 0..) |item, ci| {
+                proj_row[ci] = try kernels.evalExpr(item.expr, row_buf, null, alloc);
+            }
+            try rl.append(alloc, proj_row);
+        }
+    } else {
+        for (heap_buf[0..heap_len]) |row| try rl.append(alloc, row);
+    }
+    return rl;
+}
+
 
 fn executeOrderBy(inner: RowList, keys: []const plan.SortKey, alloc: std.mem.Allocator) !RowList {
     const rows_copy = try alloc.dupe([]?Value, inner.rows.items);
