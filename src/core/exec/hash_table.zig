@@ -733,6 +733,9 @@ pub const IntKeyHashTable = struct {
 ///   key_slots[slot] = { hash: u64, str: []const u8 }  — 24B per slot
 ///   vals_flat[slot*num_aggs .. (slot+1)*num_aggs]      — 8B per agg per slot
 ///   tags[slot] = 0 (empty) | (hash | bit63)
+///
+/// String sidecar (for str_min / str_max aggs):
+///   str_sidecar[slot*num_str_aggs + str_idx]  — nullable []const u8 per slot
 pub const StrAggHashTable = struct {
     const EMPTY_TAG: u64 = 0;
     const INITIAL_CAP = 64;
@@ -741,34 +744,46 @@ pub const StrAggHashTable = struct {
         str: []const u8,
     };
 
-    key_slots:  []KeySlot,
-    vals_flat:  []u64,
-    tags:       []u64,
-    capacity:   usize,
-    count:      usize,
-    num_aggs:   usize,
-    arena:      std.mem.Allocator,
+    key_slots:    []KeySlot,
+    vals_flat:    []u64,
+    tags:         []u64,
+    /// Sidecar for string-valued aggs (str_min / str_max).
+    /// Indexed as [slot * num_str_aggs + sidecar_idx].  null = unset (initial state).
+    str_sidecar:  []?[]const u8,
+    capacity:     usize,
+    count:        usize,
+    num_aggs:     usize,
+    num_str_aggs: usize,
+    arena:        std.mem.Allocator,
 
     pub fn initWithCapacity(
-        arena:    std.mem.Allocator,
-        num_aggs: usize,
-        est_rows: u64,
+        arena:        std.mem.Allocator,
+        num_aggs:     usize,
+        num_str_aggs: usize,
+        est_rows:     u64,
     ) !StrAggHashTable {
         const cap = if (est_rows > 0)
             nextPow2(@as(usize, @intCast(@min(est_rows * 100 / 70 + 1, std.math.maxInt(u32)))))
         else INITIAL_CAP;
-        const key_slots = try arena.alloc(KeySlot, cap);
-        const vals_flat = try arena.alloc(u64, cap * num_aggs);
-        const tags      = try arena.alloc(u64, cap);
+        const key_slots   = try arena.alloc(KeySlot, cap);
+        const vals_flat   = try arena.alloc(u64, cap * num_aggs);
+        const tags        = try arena.alloc(u64, cap);
+        const str_sidecar = if (num_str_aggs > 0)
+            try arena.alloc(?[]const u8, cap * num_str_aggs)
+        else
+            try arena.alloc(?[]const u8, 0);
         @memset(tags, EMPTY_TAG);
+        if (num_str_aggs > 0) @memset(str_sidecar, null);
         return .{
-            .key_slots = key_slots,
-            .vals_flat = vals_flat,
-            .tags      = tags,
-            .capacity  = cap,
-            .count     = 0,
-            .num_aggs  = num_aggs,
-            .arena     = arena,
+            .key_slots    = key_slots,
+            .vals_flat    = vals_flat,
+            .tags         = tags,
+            .str_sidecar  = str_sidecar,
+            .capacity     = cap,
+            .count        = 0,
+            .num_aggs     = num_aggs,
+            .num_str_aggs = num_str_aggs,
+            .arena        = arena,
         };
     }
 
@@ -783,13 +798,18 @@ pub const StrAggHashTable = struct {
         return std.hash.Wyhash.hash(0, s) | (1 << 63);
     }
 
-    /// Returns a slice into vals_flat for the given string key's slot,
+    pub const InsertResult = struct {
+        vals: []u64,
+        slot: usize,
+    };
+
+    /// Returns a slice into vals_flat and the slot index for the given string key,
     /// inserting with init_vals if new. The str pointer is borrowed (not duped).
     pub fn getOrInsert(
         self:      *StrAggHashTable,
         s:         []const u8,
         init_vals: []const u64,
-    ) ![]u64 {
+    ) !InsertResult {
         if (self.count + 1 > (self.capacity * 7) / 10) try self.grow();
         const mask = self.capacity - 1;
         const h    = hashStr(s);
@@ -802,13 +822,46 @@ pub const StrAggHashTable = struct {
                 @memcpy(self.vals_flat[vb .. vb + self.num_aggs], init_vals);
                 self.tags[slot] = h;
                 self.count += 1;
-                return self.vals_flat[vb .. vb + self.num_aggs];
+                // Zero-init sidecar entries for this slot.
+                if (self.num_str_aggs > 0) {
+                    const sb = slot * self.num_str_aggs;
+                    @memset(self.str_sidecar[sb .. sb + self.num_str_aggs], null);
+                }
+                return .{ .vals = self.vals_flat[vb .. vb + self.num_aggs], .slot = slot };
             }
             if (tag == h and std.mem.eql(u8, self.key_slots[slot].str, s)) {
                 const vb = slot * self.num_aggs;
-                return self.vals_flat[vb .. vb + self.num_aggs];
+                return .{ .vals = self.vals_flat[vb .. vb + self.num_aggs], .slot = slot };
             }
         }
+    }
+
+    /// Update a string sidecar entry (str_min or str_max) at the given slot.
+    /// For str_min: replaces if new value is lexicographically smaller.
+    /// For str_max: replaces if new value is lexicographically larger.
+    /// kind must be .str_min or .str_max.
+    pub fn updateStrSidecar(
+        self:      *StrAggHashTable,
+        slot:      usize,
+        sidecar_i: usize,
+        s:         []const u8,
+        comptime is_min: bool,
+    ) void {
+        const idx = slot * self.num_str_aggs + sidecar_i;
+        if (self.str_sidecar[idx]) |cur| {
+            if (is_min) {
+                if (std.mem.lessThan(u8, s, cur)) self.str_sidecar[idx] = s;
+            } else {
+                if (std.mem.lessThan(u8, cur, s)) self.str_sidecar[idx] = s;
+            }
+        } else {
+            self.str_sidecar[idx] = s;
+        }
+    }
+
+    /// Return the string sidecar value for a given slot and sidecar index (null = unset).
+    pub fn getStrSidecar(self: *const StrAggHashTable, slot: usize, sidecar_i: usize) ?[]const u8 {
+        return self.str_sidecar[slot * self.num_str_aggs + sidecar_i];
     }
 
     fn grow(self: *StrAggHashTable) !void {
@@ -817,7 +870,12 @@ pub const StrAggHashTable = struct {
         const new_keys = try self.arena.alloc(KeySlot, new_cap);
         const new_vals = try self.arena.alloc(u64, new_cap * self.num_aggs);
         const new_tags = try self.arena.alloc(u64, new_cap);
+        const new_sc   = if (self.num_str_aggs > 0)
+            try self.arena.alloc(?[]const u8, new_cap * self.num_str_aggs)
+        else
+            try self.arena.alloc(?[]const u8, 0);
         @memset(new_tags, EMPTY_TAG);
+        if (self.num_str_aggs > 0) @memset(new_sc, null);
         for (0..self.capacity) |i| {
             if (self.tags[i] == EMPTY_TAG) continue;
             const h    = self.tags[i];
@@ -829,11 +887,18 @@ pub const StrAggHashTable = struct {
             @memcpy(new_vals[dst_vb .. dst_vb + self.num_aggs],
                     self.vals_flat[src_vb .. src_vb + self.num_aggs]);
             new_tags[slot] = h;
+            if (self.num_str_aggs > 0) {
+                const src_sb = i * self.num_str_aggs;
+                const dst_sb = slot * self.num_str_aggs;
+                @memcpy(new_sc[dst_sb .. dst_sb + self.num_str_aggs],
+                        self.str_sidecar[src_sb .. src_sb + self.num_str_aggs]);
+            }
         }
-        self.key_slots = new_keys;
-        self.vals_flat = new_vals;
-        self.tags      = new_tags;
-        self.capacity  = new_cap;
+        self.key_slots   = new_keys;
+        self.vals_flat   = new_vals;
+        self.tags        = new_tags;
+        self.str_sidecar = new_sc;
+        self.capacity    = new_cap;
     }
 
     pub fn iterate(
@@ -849,12 +914,27 @@ pub const StrAggHashTable = struct {
             }
         }
     }
+
+    /// Like iterate but also provides the slot index for sidecar access.
+    pub fn iterateWithSlot(
+        self: *const StrAggHashTable,
+        ctx:  anytype,
+        comptime cb: fn (@TypeOf(ctx), []const u8, []const u64, usize) void,
+    ) void {
+        for (0..self.capacity) |i| {
+            if (self.tags[i] != EMPTY_TAG) {
+                const vb = i * self.num_aggs;
+                cb(ctx, self.key_slots[i].str,
+                        self.vals_flat[vb .. vb + self.num_aggs], i);
+            }
+        }
+    }
 };
 
 // ── CompactIntKeyHashTable ────────────────────────────────────────────────────
 
 /// Agg kind for compact (8-byte) accumulator storage.
-/// Covers all numeric aggregates; string/array aggs are excluded.
+/// Covers all numeric aggregates and string min/max (via StrAggHashTable sidecar).
 pub const CompactAggKind = enum {
     count,    // u64 ++
     i64_sum,  // i64 +=
@@ -866,6 +946,11 @@ pub const CompactAggKind = enum {
     u64_max,  // u64 = max(cur, arg)
     f64_min,  // f64 = min(cur, arg)
     f64_max,  // f64 = max(cur, arg)
+    /// String min: stored in StrAggHashTable.str_sidecar, not in vals_flat.
+    /// vals_flat slot is unused (set to 0).
+    str_min,
+    /// String max: same as str_min but uses max comparison.
+    str_max,
 };
 
 /// Like IntKeyHashTable but stores accumulators as raw u64 (8B) instead of

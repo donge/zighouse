@@ -984,6 +984,42 @@ fn emitCompactVals(
                 break :blk Value{ .float64 = sum };
             },
             .f64_min, .f64_max => Value{ .float64 = @bitCast(v) },
+            // str_min/str_max: emitted via sidecar; return empty string as sentinel.
+            .str_min, .str_max => Value{ .string = "" },
+        };
+    }
+}
+
+/// Like emitCompactVals but reads str_min/str_max from StrAggHashTable sidecar.
+fn emitCompactValsWithSidecar(
+    vals:         []const u64,
+    kinds:        []const ht.CompactAggKind,
+    aggs:         []const plan.ProjectItem,
+    out:          []?Value,
+    str_ht:       *const ht.StrAggHashTable,
+    slot:         usize,
+    sidecar_idx:  []const usize,
+) void {
+    for (vals, kinds, aggs, 0..) |v, kind, item, i| {
+        out[i] = switch (kind) {
+            .count, .u64_sum, .u64_min, .u64_max => Value{ .uint64 = v },
+            .i64_sum, .i64_min, .i64_max => Value{ .int64 = @bitCast(v) },
+            .f64_sum => blk: {
+                const sum: f64 = @bitCast(v);
+                if (item.expr == .agg_call and item.expr.agg_call.kind == .avg) {
+                    var cnt: u64 = 0;
+                    for (vals, kinds) |cv, ck| {
+                        if (ck == .count) { cnt = cv; break; }
+                    }
+                    if (cnt > 0) break :blk Value{ .float64 = sum / @as(f64, @floatFromInt(cnt)) };
+                }
+                break :blk Value{ .float64 = sum };
+            },
+            .f64_min, .f64_max => Value{ .float64 = @bitCast(v) },
+            .str_min, .str_max => blk: {
+                const s = str_ht.getStrSidecar(slot, sidecar_idx[i]) orelse "";
+                break :blk Value{ .string = s };
+            },
         };
     }
 }
@@ -991,11 +1027,14 @@ fn emitCompactVals(
 /// Update compact u64 accumulator slots for a single row.
 /// Shared between int-key and str-agg paths to avoid code duplication.
 inline fn updateCompactVals(
-    slot_vals: []u64,
-    ck:        []const ht.CompactAggKind,
-    aggs:      []const plan.ProjectItem,
-    c:         *const DataChunk,
-    r:         usize,
+    slot_vals:       []u64,
+    ck:              []const ht.CompactAggKind,
+    aggs:            []const plan.ProjectItem,
+    c:               *const DataChunk,
+    r:               usize,
+    str_ht:          ?*ht.StrAggHashTable,
+    slot:            usize,
+    sidecar_indices: []const usize,
 ) !void {
     for (aggs, 0..) |item, ci| {
         if (item.expr != .agg_call) continue;
@@ -1098,6 +1137,28 @@ inline fn updateCompactVals(
                     };
                 }}
             },
+            .str_min => {
+                if (str_ht) |sht| {
+                    if (ac.arg) |arg| { if (arg == .col_ref) {
+                        const col = c.columns[arg.col_ref.index];
+                        if (!col.isRowNull(r)) switch (col.data) {
+                            .string => |v| sht.updateStrSidecar(slot, sidecar_indices[ci], v[r], true),
+                            else => {},
+                        };
+                    }}
+                }
+            },
+            .str_max => {
+                if (str_ht) |sht| {
+                    if (ac.arg) |arg| { if (arg == .col_ref) {
+                        const col = c.columns[arg.col_ref.index];
+                        if (!col.isRowNull(r)) switch (col.data) {
+                            .string => |v| sht.updateStrSidecar(slot, sidecar_indices[ci], v[r], false),
+                            else => {},
+                        };
+                    }}
+                }
+            },
         }
     }
 }
@@ -1132,9 +1193,11 @@ fn executeHashAggChunked(
                 .count_star, .count => .count,
                 .sum  => .i64_sum,   // type refined at runtime (int64/uint64/f64)
                 .avg  => .f64_sum,
-                // min/max excluded: arg may be string, which compact can't handle.
-                // They are handled correctly by the generic AggAccum path.
-                .min, .max, .group_uniq_array, .any => break :blk null,
+                // min/max: string args use str_min/str_max (StrAggHashTable sidecar);
+                // numeric args use the appropriate numeric kind (refined at runtime).
+                .min  => if (item.out_type == .string) .str_min else .i64_min,
+                .max  => if (item.out_type == .string) .str_max else .i64_max,
+                .group_uniq_array, .any => break :blk null,
             };
         }
         break :blk kinds;
@@ -1151,9 +1214,28 @@ fn executeHashAggChunked(
                 .u64_min => std.math.maxInt(u64),
                 .f64_min => @bitCast(std.math.inf(f64)),
                 .f64_max => @bitCast(-std.math.inf(f64)),
+                // str_min/str_max: vals_flat slot unused; sidecar handles the string.
+                .str_min, .str_max => 0,
             };
         }
         break :blk iv;
+    } else &.{};
+
+    // Count str_min/str_max aggs for StrAggHashTable sidecar sizing.
+    const num_str_aggs: usize = if (compact_kinds) |ck| blk: {
+        var n: usize = 0;
+        for (ck) |k| { if (k == .str_min or k == .str_max) n += 1; }
+        break :blk n;
+    } else 0;
+    // Map compact_kind index → sidecar index (only valid for str_min/str_max entries).
+    const str_agg_sidecar_idx: []usize = if (compact_kinds) |ck| blk: {
+        const m = try alloc.alloc(usize, ck.len);
+        var si: usize = 0;
+        for (ck, 0..) |k, ci| {
+            if (k == .str_min or k == .str_max) { m[ci] = si; si += 1; }
+            else m[ci] = 0;
+        }
+        break :blk m;
     } else &.{};
 
     // Detect Q29-style regexp_replace(col_ref, lit_str_pattern, lit_str_repl) key.
@@ -1201,10 +1283,10 @@ fn executeHashAggChunked(
     var ht_agg = try ht.AggHashTable.initWithCapacity(alloc, keys.len, aggs.len, est_rows);
     // Use CompactIntKeyHashTable when keys are all-int AND aggs are all pure-numeric.
     // Falls back to IntKeyHashTable when compact_kinds is null (e.g. any_val agg).
-    var ht_compact: ?ht.CompactIntKeyHashTable = if (compact_kinds != null)
+    var ht_compact: ?ht.CompactIntKeyHashTable = if (compact_kinds != null and maybe_int_keys and num_str_aggs == 0)
         try ht.CompactIntKeyHashTable.initWithCapacity(alloc, keys.len, aggs.len, est_rows)
     else null;
-    var ht_int: ?ht.IntKeyHashTable = if (maybe_int_keys and compact_kinds == null)
+    var ht_int: ?ht.IntKeyHashTable = if (maybe_int_keys and (compact_kinds == null or num_str_aggs > 0))
         try ht.IntKeyHashTable.initWithCapacity(alloc, keys.len, aggs.len, est_rows)
     else null;
 
@@ -1228,18 +1310,19 @@ fn executeHashAggChunked(
     var str_count_col_idx: usize = 0;
     var use_str_count_path: bool = false;
 
-    // StrAggHashTable fast path: single string col_ref key + all-numeric compact aggs.
+    // StrAggHashTable fast path: single string col_ref key + all-compact aggs
+    // (including str_min/str_max via sidecar).
     // Handles Q22/Q23 (GROUP BY SearchPhrase + MIN/COUNT) and the Q29 regexp_replace path.
     // Also triggered when maybe_str_count would apply but there are additional aggs beyond COUNT(*).
     const str_agg_col_idx: ?usize = blk: {
         if (maybe_int_keys) break :blk null;      // int key path takes priority
-        if (compact_kinds == null) break :blk null; // aggs not all compact-numeric
+        if (compact_kinds == null) break :blk null; // aggs not all compact
         if (keys.len != 1) break :blk null;        // single key only
         if (keys[0].expr != .col_ref) break :blk null;
         break :blk keys[0].expr.col_ref.index;
     };
     var ht_str_agg: ?ht.StrAggHashTable = if (str_agg_col_idx != null or rr_can_use_str_agg)
-        try ht.StrAggHashTable.initWithCapacity(alloc, aggs.len, est_rows)
+        try ht.StrAggHashTable.initWithCapacity(alloc, aggs.len, num_str_aggs, est_rows)
     else null;
     var use_str_agg_path: bool = false;
     // Set to true when regexp_replace key path routes to ht_str_agg (e.g. Q29).
@@ -1559,7 +1642,7 @@ fn executeHashAggChunked(
                     }
                     if (!key_valid) continue;
                     const slot_vals = try htc.getOrInsert(int_key_buf, compact_init_vals);
-                    try updateCompactVals(slot_vals, ck, aggs, &c, r);
+                    try updateCompactVals(slot_vals, ck, aggs, &c, r, null, 0, str_agg_sidecar_idx);
                 }
             } else {
             // ── Regular AggAccum sub-path ──────────────────────────────────────
@@ -1597,8 +1680,8 @@ fn executeHashAggChunked(
             for (0..c.num_rows) |r| {
                 if (c.columns[col_idx].isRowNull(r)) continue;
                 const s = strs[r];
-                const slot_vals = try ht_str_agg.?.getOrInsert(s, compact_init_vals);
-                try updateCompactVals(slot_vals, ck, aggs, &c, r);
+                const res = try ht_str_agg.?.getOrInsert(s, compact_init_vals);
+                try updateCompactVals(res.vals, ck, aggs, &c, r, &ht_str_agg.?, res.slot, str_agg_sidecar_idx);
             }
         } else if (regexp_replace_key_descs) |rr_descs| {
             // ── regexp_replace key fast path (e.g. Q29) ───────────────────────
@@ -1638,8 +1721,8 @@ fn executeHashAggChunked(
                 }
                 if (!key_valid) continue;
                 if (use_rr_str_agg) {
-                    const slot_vals = try ht_str_agg.?.getOrInsert(domain_str, compact_init_vals);
-                    try updateCompactVals(slot_vals, ck.?, aggs, &c, r);
+                    const res = try ht_str_agg.?.getOrInsert(domain_str, compact_init_vals);
+                    try updateCompactVals(res.vals, ck.?, aggs, &c, r, &ht_str_agg.?, res.slot, str_agg_sidecar_idx);
                 } else {
                     const bucket = try ht_agg.getOrInsert(key_buf, init_accums);
                     for (aggs, 0..) |item, ci| {
@@ -1816,24 +1899,29 @@ fn executeHashAggChunked(
             }
         }.cb);
     } else if (use_str_agg_path) {
-        // Emit from StrAggHashTable: string key + compact numeric aggs → Values.
+        // Emit from StrAggHashTable: string key + compact aggs → Values.
+        // Uses sidecar for str_min/str_max aggs.
         const EmitCtxSA = struct {
-            rl:    *RowList,
-            alloc: std.mem.Allocator,
-            aggs:  []const plan.ProjectItem,
-            kinds: []const ht.CompactAggKind,
+            rl:           *RowList,
+            alloc:        std.mem.Allocator,
+            aggs:         []const plan.ProjectItem,
+            kinds:        []const ht.CompactAggKind,
+            str_ht:       *ht.StrAggHashTable,
+            sidecar_idx:  []const usize,
         };
         var emit_ctx_sa = EmitCtxSA{
-            .rl    = &rl,
-            .alloc = alloc,
-            .aggs  = aggs,
-            .kinds = compact_kinds.?,
+            .rl          = &rl,
+            .alloc       = alloc,
+            .aggs        = aggs,
+            .kinds       = compact_kinds.?,
+            .str_ht      = &ht_str_agg.?,
+            .sidecar_idx = str_agg_sidecar_idx,
         };
-        ht_str_agg.?.iterate(&emit_ctx_sa, struct {
-            fn cb(ec: *EmitCtxSA, s: []const u8, vals: []const u64) void {
+        ht_str_agg.?.iterateWithSlot(&emit_ctx_sa, struct {
+            fn cb(ec: *EmitCtxSA, s: []const u8, vals: []const u64, slot: usize) void {
                 const row = ec.alloc.alloc(?Value, 1 + vals.len) catch return;
                 row[0] = Value{ .string = s };
-                emitCompactVals(vals, ec.kinds, ec.aggs, row[1..]);
+                emitCompactValsWithSidecar(vals, ec.kinds, ec.aggs, row[1..], ec.str_ht, slot, ec.sidecar_idx);
                 ec.rl.append(ec.alloc, row) catch {};
             }
         }.cb);
