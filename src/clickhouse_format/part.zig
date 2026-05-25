@@ -1270,7 +1270,7 @@ pub const CompactPart = struct {
 
     /// Finalize: write all compact part files to disk.
     pub fn finish(self: *CompactPart) !void {
-        // n_substreams
+        // n_substreams (logical: String = 2 substreams)
         var n_sub: usize = 0;
         for (self.table.columns) |col| {
             n_sub += switch (col.ty) { .text, .char => 2, else => 1 };
@@ -1285,9 +1285,14 @@ pub const CompactPart = struct {
         var cm_list = ManagedMarkList.init(self.allocator);
         defer cm_list.deinit();
 
+        // Track row count per granule for adaptive marks
+        const gran_rows = try self.allocator.alloc(u64, n_gran);
+        defer self.allocator.free(gran_rows);
+
         for (0..n_gran) |g| {
             const gs = g * GRANULE_SIZE;
             const ge = @min(gs + GRANULE_SIZE, self.row_count);
+            gran_rows[g] = ge - gs;
 
             for (self.table.columns, 0..) |col, ci| {
                 switch (col.ty) {
@@ -1337,11 +1342,12 @@ pub const CompactPart = struct {
         defer bin_al.deinit(self.allocator);
         try compactWriteFile(self.io, self.part_dir, "data.bin", bin_al.items);
 
-        // cmrk4
+        // cmrk4 — adaptive granularity format: each row = n_sub × 16B marks + 8B granularity,
+        // plus one EOF sentinel row.
         {
             var cmrk_aw = std.Io.Writer.Allocating.init(self.allocator);
             defer cmrk_aw.deinit();
-            try marks.writeCmrk4(&cmrk_aw.writer, cm_list.items);
+            try marks.writeCmrk4(&cmrk_aw.writer, cm_list.items, n_sub, gran_rows, @intCast(bin_al.items.len));
             var cmrk_al = cmrk_aw.toArrayList();
             defer cmrk_al.deinit(self.allocator);
             try compactWriteFile(self.io, self.part_dir, "data.cmrk4", cmrk_al.items);
@@ -1374,7 +1380,7 @@ pub const CompactPart = struct {
         // ── count.txt ─────────────────────────────────────────────────────────
         {
             var buf: [32]u8 = undefined;
-            const s = std.fmt.bufPrint(&buf, "{d}\n", .{self.row_count}) catch unreachable;
+            const s = std.fmt.bufPrint(&buf, "{d}", .{self.row_count}) catch unreachable;
             try compactWriteFile(self.io, self.part_dir, "count.txt", s);
         }
 
@@ -1407,15 +1413,35 @@ pub const CompactPart = struct {
         }
 
         // ── serialization.json ────────────────────────────────────────────────
+        // CH 26.5 requires: version=1, types_serialization_versions, columns sorted alphabetically.
         {
+            // Build sorted column name list
+            const sorted_cols = try self.allocator.dupe(schema.Column, self.table.columns);
+            defer self.allocator.free(sorted_cols);
+            std.mem.sort(schema.Column, sorted_cols, {}, struct {
+                fn lessThan(_: void, a: schema.Column, b: schema.Column) bool {
+                    return std.mem.order(u8, a.name, b.name) == .lt;
+                }
+            }.lessThan);
+
+            // Check if any String columns exist (need types_serialization_versions)
+            var has_string = false;
+            for (self.table.columns) |col| {
+                if (col.ty == .text or col.ty == .char) { has_string = true; break; }
+            }
+
             var sjw = std.Io.Writer.Allocating.init(self.allocator);
             defer sjw.deinit();
             try sjw.writer.print("{{\"columns\":[", .{});
-            for (self.table.columns, 0..) |col, i| {
+            for (sorted_cols, 0..) |col, i| {
                 if (i > 0) try sjw.writer.print(",", .{});
                 try sjw.writer.print("{{\"kind\":\"Default\",\"name\":\"{s}\",\"num_defaults\":0,\"num_rows\":{d}}}", .{ col.name, self.row_count });
             }
-            try sjw.writer.print("]}}\n", .{});
+            if (has_string) {
+                try sjw.writer.print("],\"propagate_types_serialization_versions_to_nested_types\":true,\"types_serialization_versions\":{{\"string\":1}},\"version\":1}}", .{});
+            } else {
+                try sjw.writer.print("],\"version\":1}}", .{});
+            }
             var sjal = sjw.toArrayList();
             defer sjal.deinit(self.allocator);
             try compactWriteFile(self.io, self.part_dir, "serialization.json", sjal.items);
@@ -1424,7 +1450,7 @@ pub const CompactPart = struct {
         // ── static metadata files ─────────────────────────────────────────────
         try compactWriteFile(self.io, self.part_dir, "metadata_version.txt", "1\n");
         try compactWriteFile(self.io, self.part_dir, "default_compression_codec.txt", "CODEC(LZ4)\n");
-        try compactWriteFile(self.io, self.part_dir, "format_version.txt", "1\n");
+        // Note: format_version.txt is NOT written — CH 26.5 compact parts don't use it
 
         // ── checksums.txt ─────────────────────────────────────────────────────
         {
@@ -1435,7 +1461,6 @@ pub const CompactPart = struct {
                 "data.bin",
                 "data.cmrk4",
                 "default_compression_codec.txt",
-                "format_version.txt",
                 "metadata_version.txt",
                 "primary.cidx",
                 "serialization.json",
@@ -1597,6 +1622,87 @@ test "CompactOpenedPart reads CH-written compact part" {
     }.cb);
     try std.testing.expectEqual(@as(usize, 5), ns);
     try std.testing.expectEqual(@as(usize, 5), url_count);
+}
+
+test "CompactPart write events schema for CH ATTACH" {
+    // Writes a compact part matching 'default.events' to /tmp/ch-srv detached dir.
+    // After the test, run:
+    //   clickhouse client --port 19000 \
+    //     --query "ALTER TABLE default.events ATTACH PART 'all_2_2_0'"
+    // to verify CH can read the zighouse-written part.
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const ch_detached = "/tmp/ch-srv/data/store/4d0/4d02ac62-2539-4cf7-97dc-28415c3acc30/detached";
+    const part_name = "all_2_2_0";
+    const part_dir = ch_detached ++ "/" ++ part_name;
+
+    // Remove existing if present
+    {
+        var detached_dir = std.Io.Dir.openDirAbsolute(io, ch_detached, .{}) catch null;
+        if (detached_dir) |*d| {
+            defer d.close(io);
+            d.deleteTree(io, part_name) catch {};
+        }
+    }
+
+    const cols = [_]schema.Column{
+        .{ .name = "event_date",  .ty = .date },
+        .{ .name = "event_time",  .ty = .int32 },
+        .{ .name = "user_id",     .ty = .int32 },
+        .{ .name = "page_id",     .ty = .int32 },
+        .{ .name = "duration",    .ty = .int64 },
+        .{ .name = "url",         .ty = .text },
+    };
+    const table = schema.Table{ .name = "events", .columns = &cols };
+
+    var cp = try CompactPart.open(io, allocator, part_dir, table);
+    defer cp.deinit();
+
+    // 5 rows ordered by (event_date, user_id)
+    // 2024-01-01 = day 19723, 2024-01-02 = day 19724
+    const dates = [_]i64{ 19723, 19723, 19723, 19724, 19724 };
+    const times = [_]i64{ 1704099600, 1704099720, 1704099660, 1704186000, 1704186300 };
+    const users = [_]i64{ 1, 1, 2, 3, 4 };
+    const pages = [_]i64{ 100, 102, 101, 100, 103 };
+    const durs  = [_]i64{ 3500, 8900, 1200, 4200, 600 };
+    const urls  = [_][]const u8{
+        "https://example.com/home",
+        "https://example.com/products",
+        "https://example.com/about",
+        "https://example.com/home",
+        "https://example.com/contact",
+    };
+
+    try cp.appendFixedBatch(0, &dates);
+    try cp.appendFixedBatch(1, &times);
+    try cp.appendFixedBatch(2, &users);
+    try cp.appendFixedBatch(3, &pages);
+    try cp.appendFixedBatch(4, &durs);
+    for (urls) |u| try cp.appendString(5, u);
+    // row_count already set by appendFixedBatch(0); url has no row_count tracking
+    try std.testing.expectEqual(@as(u64, 5), cp.row_count);
+
+    try cp.finish();
+
+    // Verify files exist
+    const cwd = std.Io.Dir.cwd();
+    inline for ([_][]const u8{
+        "data.bin", "data.cmrk4", "primary.cidx", "columns.txt",
+        "count.txt", "checksums.txt", "columns_substreams.txt",
+    }) |fname| {
+        const fpath = part_dir ++ "/" ++ fname;
+        const f = try cwd.openFile(io, fpath, .{});
+        f.close(io);
+    }
+
+    std.debug.print(
+        \\
+        \\Part written to {s}
+        \\To attach: clickhouse client --port 19000 \
+        \\  --query "ALTER TABLE default.events ATTACH PART '{s}'"
+        \\
+    , .{ part_dir, part_name });
 }
 
 test "part write and verify files exist" {

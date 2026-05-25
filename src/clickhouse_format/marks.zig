@@ -152,15 +152,51 @@ pub fn readCmrk4(allocator: std.mem.Allocator, file_bytes: []const u8) ![]Compac
 }
 
 /// Encode compact marks and write as a single LZ4-compressed CH block.
-/// `marks` is in granule-major order (n_granules × n_substreams entries).
-pub fn writeCmrk4(writer: *std.Io.Writer, compact_marks: []const CompactMark) !void {
-    const raw = try std.heap.page_allocator.alloc(u8, compact_marks.len * COMPACT_MARK_SIZE);
+///
+/// CH adaptive-granularity format (version 4):
+///   For each granule g in [0..n_granules]:  (n_granules+1 rows total, last is EOF)
+///     n_substreams × 16 bytes: {offset_in_file: u64 LE, offset_in_block: u64 LE}
+///     8 bytes: granularity (rows in this granule) as u64 LE
+///
+/// `compact_marks` must have n_granules × n_substreams entries (granule-major order).
+/// `granularities` must have n_granules entries (row count per granule).
+/// `eof_offset` is the byte size of data.bin (for the EOF sentinel granule).
+pub fn writeCmrk4(
+    writer: *std.Io.Writer,
+    compact_marks: []const CompactMark,
+    n_substreams: usize,
+    granularities: []const u64,
+    eof_offset: u64,
+) !void {
+    const n_granules = granularities.len;
+    if (n_substreams == 0 or (n_granules > 0 and compact_marks.len != n_granules * n_substreams))
+        return error.InvalidMarkCount;
+
+    // (n_granules + 1) rows: one per granule + one EOF row
+    const row_bytes = n_substreams * COMPACT_MARK_SIZE + 8; // marks + granularity
+    const total_bytes = (n_granules + 1) * row_bytes;
+    const raw = try std.heap.page_allocator.alloc(u8, total_bytes);
     defer std.heap.page_allocator.free(raw);
-    for (compact_marks, 0..) |m, i| {
-        const off = i * COMPACT_MARK_SIZE;
-        std.mem.writeInt(u64, raw[off..][0..8], m.offset_in_file, .little);
-        std.mem.writeInt(u64, raw[off + 8 ..][0..8], m.offset_in_block, .little);
+
+    var pos: usize = 0;
+    for (0..n_granules) |g| {
+        for (0..n_substreams) |s| {
+            const m = compact_marks[g * n_substreams + s];
+            std.mem.writeInt(u64, raw[pos..][0..8], m.offset_in_file, .little);
+            std.mem.writeInt(u64, raw[pos + 8 ..][0..8], m.offset_in_block, .little);
+            pos += COMPACT_MARK_SIZE;
+        }
+        std.mem.writeInt(u64, raw[pos..][0..8], granularities[g], .little);
+        pos += 8;
     }
+    // EOF sentinel granule: all marks point to eof_offset, granularity=0
+    for (0..n_substreams) |_| {
+        std.mem.writeInt(u64, raw[pos..][0..8], eof_offset, .little);
+        std.mem.writeInt(u64, raw[pos + 8 ..][0..8], 0, .little);
+        pos += COMPACT_MARK_SIZE;
+    }
+    std.mem.writeInt(u64, raw[pos..][0..8], 0, .little); // granularity=0 for EOF
+
     try block.writeBlock(writer, raw);
 }
 
