@@ -16,6 +16,7 @@ const result = @import("../result.zig");
 const plan   = @import("plan.zig");
 const kernels = @import("kernels.zig");
 const ht     = @import("hash_table.zig");
+const simd   = @import("../simd_ops.zig");
 
 pub const Value      = types.Value;
 pub const AggAccum   = types.AggAccum;
@@ -1613,10 +1614,16 @@ fn updateAccumsFromChunk(
         // Single pass: accumulate col_sum and non_null_count.
         var col_sum: i64 = 0;
         var non_null_count: i64 = 0;
-        for (0..c.num_rows) |r| {
-            if (!chunk.isNull(col.null_mask, r)) {
-                col_sum +%= vals[r];
-                non_null_count += 1;
+        if (chunk.allNonNull(col.null_mask)) {
+            // Fast path: no nulls — use SIMD sum.
+            col_sum = simd.sumI64(vals[0..c.num_rows]);
+            non_null_count = @intCast(c.num_rows);
+        } else {
+            for (0..c.num_rows) |r| {
+                if (!chunk.isNull(col.null_mask, r)) {
+                    col_sum +%= vals[r];
+                    non_null_count += 1;
+                }
             }
         }
         // Update each accumulator analytically: SUM(col+k) = SUM(col) + count*k.
@@ -1666,22 +1673,22 @@ fn updateAccumsFromChunk(
                                     switch (col.data) {
                                         .int64 => |vals| {
                                             if (acc_ptr.* == .i64_sum) {
-                                                for (vals[0..c.num_rows]) |v| acc_ptr.i64_sum +%= v;
+                                                acc_ptr.i64_sum +%= simd.sumI64(vals[0..c.num_rows]);
                                                 handled = true;
                                             }
                                         },
                                         .uint64 => |vals| {
                                             if (acc_ptr.* == .u64_sum) {
-                                                for (vals[0..c.num_rows]) |v| acc_ptr.u64_sum +%= v;
+                                                acc_ptr.u64_sum +%= @bitCast(simd.sumU64(vals[0..c.num_rows]));
                                                 handled = true;
                                             } else if (acc_ptr.* == .i64_sum) {
-                                                for (vals[0..c.num_rows]) |v| acc_ptr.i64_sum +%= @bitCast(v);
+                                                acc_ptr.i64_sum +%= simd.sumU64(vals[0..c.num_rows]);
                                                 handled = true;
                                             }
                                         },
                                         .float64 => |vals| {
                                             if (acc_ptr.* == .f64_sum) {
-                                                for (vals[0..c.num_rows]) |v| acc_ptr.f64_sum += v;
+                                                acc_ptr.f64_sum += simd.sumF64(vals[0..c.num_rows]);
                                                 handled = true;
                                             }
                                         },
@@ -1739,7 +1746,7 @@ fn updateAccumsFromChunk(
                                     },
                                     .float64 => |vals| {
                                         if (acc_ptr.* == .f64_sum) {
-                                            for (vals[0..c.num_rows]) |v| acc_ptr.f64_sum += v;
+                                            acc_ptr.f64_sum += simd.sumF64(vals[0..c.num_rows]);
                                             handled = true;
                                         }
                                     },

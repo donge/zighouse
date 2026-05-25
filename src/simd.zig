@@ -27,6 +27,53 @@ pub fn sum(comptime T: type, values: []const T) i64 {
     return total;
 }
 
+/// SIMD sum of i64 slice using 8-wide vectors (ARM NEON / AVX2).
+/// Returns i64 with wrapping arithmetic (overflow is intentional for
+/// accumulators that wrap).
+pub fn sumI64(values: []const i64) i64 {
+    const LANES = 8;
+    const V = @Vector(LANES, i64);
+    var acc: V = @splat(0);
+    var i: usize = 0;
+    while (i + LANES <= values.len) : (i += LANES) {
+        const v: V = values[i..][0..LANES].*;
+        acc +%= v;
+    }
+    var total: i64 = @reduce(.Add, acc);
+    while (i < values.len) : (i += 1) total +%= values[i];
+    return total;
+}
+
+/// SIMD sum of u64 slice, returned as i64 (reinterpret, wrapping).
+pub fn sumU64(values: []const u64) i64 {
+    const LANES = 8;
+    const V = @Vector(LANES, u64);
+    var acc: V = @splat(0);
+    var i: usize = 0;
+    while (i + LANES <= values.len) : (i += LANES) {
+        const v: V = values[i..][0..LANES].*;
+        acc +%= v;
+    }
+    var total: u64 = @reduce(.Add, acc);
+    while (i < values.len) : (i += 1) total +%= values[i];
+    return @bitCast(total);
+}
+
+/// SIMD sum of f64 slice.
+pub fn sumF64(values: []const f64) f64 {
+    const LANES = 4;
+    const V = @Vector(LANES, f64);
+    var acc: V = @splat(0.0);
+    var i: usize = 0;
+    while (i + LANES <= values.len) : (i += LANES) {
+        const v: V = values[i..][0..LANES].*;
+        acc += v;
+    }
+    var total: f64 = @reduce(.Add, acc);
+    while (i < values.len) : (i += 1) total += values[i];
+    return total;
+}
+
 pub fn countNonZero(comptime T: type, values: []const T) u64 {
     const lanes = lanesForCount(T);
     const V = @Vector(lanes, T);
