@@ -722,6 +722,135 @@ pub const IntKeyHashTable = struct {
     }
 };
 
+// ── StrAggHashTable ───────────────────────────────────────────────────────────
+
+/// Specialized hash table for single-string GROUP BY keys with numeric aggregates.
+/// Key is stored as a borrowed []const u8 pointer (no arena.dupe needed when the
+/// source string is in stable memory — store mmap or non-freed chunk arenas).
+/// Accumulators are stored as u64 (8B each, same as CompactIntKeyHashTable).
+///
+/// Layout:
+///   key_slots[slot] = { hash: u64, str: []const u8 }  — 24B per slot
+///   vals_flat[slot*num_aggs .. (slot+1)*num_aggs]      — 8B per agg per slot
+///   tags[slot] = 0 (empty) | (hash | bit63)
+pub const StrAggHashTable = struct {
+    const EMPTY_TAG: u64 = 0;
+    const INITIAL_CAP = 64;
+
+    const KeySlot = struct {
+        str: []const u8,
+    };
+
+    key_slots:  []KeySlot,
+    vals_flat:  []u64,
+    tags:       []u64,
+    capacity:   usize,
+    count:      usize,
+    num_aggs:   usize,
+    arena:      std.mem.Allocator,
+
+    pub fn initWithCapacity(
+        arena:    std.mem.Allocator,
+        num_aggs: usize,
+        est_rows: u64,
+    ) !StrAggHashTable {
+        const cap = if (est_rows > 0)
+            nextPow2(@as(usize, @intCast(@min(est_rows * 100 / 70 + 1, std.math.maxInt(u32)))))
+        else INITIAL_CAP;
+        const key_slots = try arena.alloc(KeySlot, cap);
+        const vals_flat = try arena.alloc(u64, cap * num_aggs);
+        const tags      = try arena.alloc(u64, cap);
+        @memset(tags, EMPTY_TAG);
+        return .{
+            .key_slots = key_slots,
+            .vals_flat = vals_flat,
+            .tags      = tags,
+            .capacity  = cap,
+            .count     = 0,
+            .num_aggs  = num_aggs,
+            .arena     = arena,
+        };
+    }
+
+    fn nextPow2(n: usize) usize {
+        if (n <= 1) return 1;
+        var p: usize = 1;
+        while (p < n) p <<= 1;
+        return p;
+    }
+
+    fn hashStr(s: []const u8) u64 {
+        return std.hash.Wyhash.hash(0, s) | (1 << 63);
+    }
+
+    /// Returns a slice into vals_flat for the given string key's slot,
+    /// inserting with init_vals if new. The str pointer is borrowed (not duped).
+    pub fn getOrInsert(
+        self:      *StrAggHashTable,
+        s:         []const u8,
+        init_vals: []const u64,
+    ) ![]u64 {
+        if (self.count + 1 > (self.capacity * 7) / 10) try self.grow();
+        const mask = self.capacity - 1;
+        const h    = hashStr(s);
+        var   slot = h & mask;
+        while (true) : (slot = (slot + 1) & mask) {
+            const tag = self.tags[slot];
+            if (tag == EMPTY_TAG) {
+                self.key_slots[slot] = .{ .str = s };
+                const vb = slot * self.num_aggs;
+                @memcpy(self.vals_flat[vb .. vb + self.num_aggs], init_vals);
+                self.tags[slot] = h;
+                self.count += 1;
+                return self.vals_flat[vb .. vb + self.num_aggs];
+            }
+            if (tag == h and std.mem.eql(u8, self.key_slots[slot].str, s)) {
+                const vb = slot * self.num_aggs;
+                return self.vals_flat[vb .. vb + self.num_aggs];
+            }
+        }
+    }
+
+    fn grow(self: *StrAggHashTable) !void {
+        const new_cap  = self.capacity * 2;
+        const new_mask = new_cap - 1;
+        const new_keys = try self.arena.alloc(KeySlot, new_cap);
+        const new_vals = try self.arena.alloc(u64, new_cap * self.num_aggs);
+        const new_tags = try self.arena.alloc(u64, new_cap);
+        @memset(new_tags, EMPTY_TAG);
+        for (0..self.capacity) |i| {
+            if (self.tags[i] == EMPTY_TAG) continue;
+            const h    = self.tags[i];
+            var   slot = h & new_mask;
+            while (new_tags[slot] != EMPTY_TAG) : (slot = (slot + 1) & new_mask) {}
+            new_keys[slot] = self.key_slots[i];
+            const src_vb = i * self.num_aggs;
+            const dst_vb = slot * self.num_aggs;
+            @memcpy(new_vals[dst_vb .. dst_vb + self.num_aggs],
+                    self.vals_flat[src_vb .. src_vb + self.num_aggs]);
+            new_tags[slot] = h;
+        }
+        self.key_slots = new_keys;
+        self.vals_flat = new_vals;
+        self.tags      = new_tags;
+        self.capacity  = new_cap;
+    }
+
+    pub fn iterate(
+        self: *const StrAggHashTable,
+        ctx:  anytype,
+        comptime cb: fn (@TypeOf(ctx), []const u8, []const u64) void,
+    ) void {
+        for (0..self.capacity) |i| {
+            if (self.tags[i] != EMPTY_TAG) {
+                const vb = i * self.num_aggs;
+                cb(ctx, self.key_slots[i].str,
+                        self.vals_flat[vb .. vb + self.num_aggs]);
+            }
+        }
+    }
+};
+
 // ── CompactIntKeyHashTable ────────────────────────────────────────────────────
 
 /// Agg kind for compact (8-byte) accumulator storage.

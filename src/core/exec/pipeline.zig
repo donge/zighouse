@@ -960,6 +960,148 @@ fn keysAreColRef(keys: []const plan.ProjectItem) bool {
 
 
 /// Drive the source chunk by chunk and build a hash aggregate without rows.
+/// Convert compact u64 accumulator values to output Values for emit.
+/// Shared between CompactIntKeyHashTable and StrAggHashTable emit paths.
+fn emitCompactVals(
+    vals:  []const u64,
+    kinds: []const ht.CompactAggKind,
+    aggs:  []const plan.ProjectItem,
+    out:   []?Value,
+) void {
+    for (vals, kinds, aggs, 0..) |v, kind, item, i| {
+        out[i] = switch (kind) {
+            .count, .u64_sum, .u64_min, .u64_max => Value{ .uint64 = v },
+            .i64_sum, .i64_min, .i64_max => Value{ .int64 = @bitCast(v) },
+            .f64_sum => blk: {
+                const sum: f64 = @bitCast(v);
+                if (item.expr == .agg_call and item.expr.agg_call.kind == .avg) {
+                    var cnt: u64 = 0;
+                    for (vals, kinds) |cv, ck| {
+                        if (ck == .count) { cnt = cv; break; }
+                    }
+                    if (cnt > 0) break :blk Value{ .float64 = sum / @as(f64, @floatFromInt(cnt)) };
+                }
+                break :blk Value{ .float64 = sum };
+            },
+            .f64_min, .f64_max => Value{ .float64 = @bitCast(v) },
+        };
+    }
+}
+
+/// Update compact u64 accumulator slots for a single row.
+/// Shared between int-key and str-agg paths to avoid code duplication.
+inline fn updateCompactVals(
+    slot_vals: []u64,
+    ck:        []const ht.CompactAggKind,
+    aggs:      []const plan.ProjectItem,
+    c:         *const DataChunk,
+    r:         usize,
+) !void {
+    for (aggs, 0..) |item, ci| {
+        if (item.expr != .agg_call) continue;
+        const ac = item.expr.agg_call;
+        switch (ck[ci]) {
+            .count => {
+                if (ac.kind == .count_star) {
+                    slot_vals[ci] += 1;
+                } else if (ac.kind == .count) {
+                    if (ac.arg) |arg| {
+                        if (arg == .col_ref) {
+                            if (!c.columns[arg.col_ref.index].isRowNull(r))
+                                slot_vals[ci] += 1;
+                        } else slot_vals[ci] += 1;
+                    }
+                }
+            },
+            .i64_sum => {
+                if (ac.arg) |arg| { if (arg == .col_ref) {
+                    const col = c.columns[arg.col_ref.index];
+                    if (!col.isRowNull(r)) switch (col.data) {
+                        .int64  => |v| { var s: i64 = @bitCast(slot_vals[ci]); s += v[r]; slot_vals[ci] = @bitCast(s); },
+                        .uint64 => |v| { var s: i64 = @bitCast(slot_vals[ci]); s += @as(i64, @bitCast(v[r])); slot_vals[ci] = @bitCast(s); },
+                        .bool_u8 => |v| { var s: i64 = @bitCast(slot_vals[ci]); s += v[r]; slot_vals[ci] = @bitCast(s); },
+                        else => {},
+                    };
+                }}
+            },
+            .f64_sum => {
+                if (ac.arg) |arg| { if (arg == .col_ref) {
+                    const col = c.columns[arg.col_ref.index];
+                    if (!col.isRowNull(r)) switch (col.data) {
+                        .float64 => |v| { var s: f64 = @bitCast(slot_vals[ci]); s += v[r]; slot_vals[ci] = @bitCast(s); },
+                        .int64   => |v| { var s: f64 = @bitCast(slot_vals[ci]); s += @floatFromInt(v[r]); slot_vals[ci] = @bitCast(s); },
+                        .uint64  => |v| { var s: f64 = @bitCast(slot_vals[ci]); s += @floatFromInt(v[r]); slot_vals[ci] = @bitCast(s); },
+                        else => {},
+                    };
+                }}
+            },
+            .i64_min => {
+                if (ac.arg) |arg| { if (arg == .col_ref) {
+                    const col = c.columns[arg.col_ref.index];
+                    if (!col.isRowNull(r)) switch (col.data) {
+                        .int64 => |v| { const cur: i64 = @bitCast(slot_vals[ci]); if (v[r] < cur) slot_vals[ci] = @bitCast(v[r]); },
+                        else => {},
+                    };
+                }}
+            },
+            .i64_max => {
+                if (ac.arg) |arg| { if (arg == .col_ref) {
+                    const col = c.columns[arg.col_ref.index];
+                    if (!col.isRowNull(r)) switch (col.data) {
+                        .int64 => |v| { const cur: i64 = @bitCast(slot_vals[ci]); if (v[r] > cur) slot_vals[ci] = @bitCast(v[r]); },
+                        else => {},
+                    };
+                }}
+            },
+            .u64_sum => {
+                if (ac.arg) |arg| { if (arg == .col_ref) {
+                    const col = c.columns[arg.col_ref.index];
+                    if (!col.isRowNull(r)) switch (col.data) {
+                        .uint64 => |v| slot_vals[ci] += v[r],
+                        else => {},
+                    };
+                }}
+            },
+            .u64_min => {
+                if (ac.arg) |arg| { if (arg == .col_ref) {
+                    const col = c.columns[arg.col_ref.index];
+                    if (!col.isRowNull(r)) switch (col.data) {
+                        .uint64 => |v| { if (v[r] < slot_vals[ci]) slot_vals[ci] = v[r]; },
+                        else => {},
+                    };
+                }}
+            },
+            .u64_max => {
+                if (ac.arg) |arg| { if (arg == .col_ref) {
+                    const col = c.columns[arg.col_ref.index];
+                    if (!col.isRowNull(r)) switch (col.data) {
+                        .uint64 => |v| { if (v[r] > slot_vals[ci]) slot_vals[ci] = v[r]; },
+                        else => {},
+                    };
+                }}
+            },
+            .f64_min => {
+                if (ac.arg) |arg| { if (arg == .col_ref) {
+                    const col = c.columns[arg.col_ref.index];
+                    if (!col.isRowNull(r)) switch (col.data) {
+                        .float64 => |v| { const cur: f64 = @bitCast(slot_vals[ci]); if (v[r] < cur) slot_vals[ci] = @bitCast(v[r]); },
+                        else => {},
+                    };
+                }}
+            },
+            .f64_max => {
+                if (ac.arg) |arg| { if (arg == .col_ref) {
+                    const col = c.columns[arg.col_ref.index];
+                    if (!col.isRowNull(r)) switch (col.data) {
+                        .float64 => |v| { const cur: f64 = @bitCast(slot_vals[ci]); if (v[r] > cur) slot_vals[ci] = @bitCast(v[r]); },
+                        else => {},
+                    };
+                }}
+            },
+        }
+    }
+}
+
 fn executeHashAggChunked(
     input: *const plan.PhysicalNode,
     keys:  []const plan.ProjectItem,
@@ -983,17 +1125,16 @@ fn executeHashAggChunked(
     // CompactIntKeyHashTable (8B/agg vs 32B/agg), cutting the accum slab 4×.
     // Only active when maybe_int_keys is true.
     const compact_kinds: ?[]ht.CompactAggKind = blk: {
-        if (!maybe_int_keys) break :blk null;
         const kinds = try alloc.alloc(ht.CompactAggKind, aggs.len);
         for (aggs, 0..) |item, ci| {
             if (item.expr != .agg_call) break :blk null;
             kinds[ci] = switch (item.expr.agg_call.kind) {
                 .count_star, .count => .count,
-                .sum  => .i64_sum,   // may be upgraded to u64/f64 at runtime
+                .sum  => .i64_sum,   // type refined at runtime (int64/uint64/f64)
                 .avg  => .f64_sum,
-                .min  => .i64_min,
-                .max  => .i64_max,
-                .group_uniq_array, .any => break :blk null, // not compact-safe
+                // min/max excluded: arg may be string, which compact can't handle.
+                // They are handled correctly by the generic AggAccum path.
+                .min, .max, .group_uniq_array, .any => break :blk null,
             };
         }
         break :blk kinds;
@@ -1051,6 +1192,12 @@ fn executeHashAggChunked(
         regexp_replace_key_descs = descs_buf;
     }
 
+    // StrAggHashTable for regexp_replace single-key path (e.g. Q29).
+    // Initialized here if rr_descs is single-key and aggs are compact-numeric.
+    const rr_can_use_str_agg = compact_kinds != null and
+        regexp_replace_key_descs != null and
+        regexp_replace_key_descs.?.len == 1;
+
     var ht_agg = try ht.AggHashTable.initWithCapacity(alloc, keys.len, aggs.len, est_rows);
     // Use CompactIntKeyHashTable when keys are all-int AND aggs are all pure-numeric.
     // Falls back to IntKeyHashTable when compact_kinds is null (e.g. any_val agg).
@@ -1080,6 +1227,23 @@ fn executeHashAggChunked(
     var ht_str_count: ?ht.StrCountHashTable = null;
     var str_count_col_idx: usize = 0;
     var use_str_count_path: bool = false;
+
+    // StrAggHashTable fast path: single string col_ref key + all-numeric compact aggs.
+    // Handles Q22/Q23 (GROUP BY SearchPhrase + MIN/COUNT) and the Q29 regexp_replace path.
+    // Also triggered when maybe_str_count would apply but there are additional aggs beyond COUNT(*).
+    const str_agg_col_idx: ?usize = blk: {
+        if (maybe_int_keys) break :blk null;      // int key path takes priority
+        if (compact_kinds == null) break :blk null; // aggs not all compact-numeric
+        if (keys.len != 1) break :blk null;        // single key only
+        if (keys[0].expr != .col_ref) break :blk null;
+        break :blk keys[0].expr.col_ref.index;
+    };
+    var ht_str_agg: ?ht.StrAggHashTable = if (str_agg_col_idx != null or rr_can_use_str_agg)
+        try ht.StrAggHashTable.initWithCapacity(alloc, aggs.len, est_rows)
+    else null;
+    var use_str_agg_path: bool = false;
+    // Set to true when regexp_replace key path routes to ht_str_agg (e.g. Q29).
+    var rr_used_str_agg: bool = false;
 
     // PairCountHashTable fast path: exactly two col_ref keys (one i64, one string) + count(*).
     // Handles Q17/Q18 (GROUP BY UserID, SearchPhrase) and Q19 (3 keys — not handled here).
@@ -1268,6 +1432,14 @@ fn executeHashAggChunked(
                     }
                 }
             }
+            // Verify str-agg eligibility: single string col_ref key + compact numeric aggs.
+            if (str_agg_col_idx) |col_idx| {
+                if (!use_str_count_path and col_idx < c.columns.len and
+                    c.columns[col_idx].data == .string)
+                {
+                    use_str_agg_path = true;
+                }
+            }
             // Verify pair-count eligibility: exactly two col_refs, one i64 and one string.
             if (maybe_pair_count and !use_int_path and !use_str_count_path) {
                 const c0 = keys[0].expr.col_ref.index;
@@ -1387,109 +1559,7 @@ fn executeHashAggChunked(
                     }
                     if (!key_valid) continue;
                     const slot_vals = try htc.getOrInsert(int_key_buf, compact_init_vals);
-                    for (aggs, 0..) |item, ci| {
-                        if (item.expr != .agg_call) continue;
-                        const ac = item.expr.agg_call;
-                        switch (ck[ci]) {
-                            .count => {
-                                if (ac.kind == .count_star) {
-                                    slot_vals[ci] += 1;
-                                } else if (ac.kind == .count) {
-                                    if (ac.arg) |arg| {
-                                        if (arg == .col_ref) {
-                                            if (!c.columns[arg.col_ref.index].isRowNull(r))
-                                                slot_vals[ci] += 1;
-                                        } else slot_vals[ci] += 1;
-                                    }
-                                }
-                            },
-                            .i64_sum => {
-                                if (ac.arg) |arg| { if (arg == .col_ref) {
-                                    const col = c.columns[arg.col_ref.index];
-                                    if (!col.isRowNull(r)) switch (col.data) {
-                                        .int64  => |v| { var s: i64 = @bitCast(slot_vals[ci]); s += v[r]; slot_vals[ci] = @bitCast(s); },
-                                        .uint64 => |v| { var s: i64 = @bitCast(slot_vals[ci]); s += @as(i64, @bitCast(v[r])); slot_vals[ci] = @bitCast(s); },
-                                        .bool_u8 => |v| { var s: i64 = @bitCast(slot_vals[ci]); s += v[r]; slot_vals[ci] = @bitCast(s); },
-                                        else => {},
-                                    };
-                                }}
-                            },
-                            .f64_sum => {
-                                if (ac.arg) |arg| { if (arg == .col_ref) {
-                                    const col = c.columns[arg.col_ref.index];
-                                    if (!col.isRowNull(r)) switch (col.data) {
-                                        .float64 => |v| { var s: f64 = @bitCast(slot_vals[ci]); s += v[r]; slot_vals[ci] = @bitCast(s); },
-                                        .int64   => |v| { var s: f64 = @bitCast(slot_vals[ci]); s += @floatFromInt(v[r]); slot_vals[ci] = @bitCast(s); },
-                                        .uint64  => |v| { var s: f64 = @bitCast(slot_vals[ci]); s += @floatFromInt(v[r]); slot_vals[ci] = @bitCast(s); },
-                                        else => {},
-                                    };
-                                }}
-                            },
-                            .i64_min => {
-                                if (ac.arg) |arg| { if (arg == .col_ref) {
-                                    const col = c.columns[arg.col_ref.index];
-                                    if (!col.isRowNull(r)) switch (col.data) {
-                                        .int64 => |v| { const cur: i64 = @bitCast(slot_vals[ci]); if (v[r] < cur) slot_vals[ci] = @bitCast(v[r]); },
-                                        else => {},
-                                    };
-                                }}
-                            },
-                            .i64_max => {
-                                if (ac.arg) |arg| { if (arg == .col_ref) {
-                                    const col = c.columns[arg.col_ref.index];
-                                    if (!col.isRowNull(r)) switch (col.data) {
-                                        .int64 => |v| { const cur: i64 = @bitCast(slot_vals[ci]); if (v[r] > cur) slot_vals[ci] = @bitCast(v[r]); },
-                                        else => {},
-                                    };
-                                }}
-                            },
-                            .u64_sum => {
-                                if (ac.arg) |arg| { if (arg == .col_ref) {
-                                    const col = c.columns[arg.col_ref.index];
-                                    if (!col.isRowNull(r)) switch (col.data) {
-                                        .uint64 => |v| slot_vals[ci] += v[r],
-                                        else => {},
-                                    };
-                                }}
-                            },
-                            .u64_min => {
-                                if (ac.arg) |arg| { if (arg == .col_ref) {
-                                    const col = c.columns[arg.col_ref.index];
-                                    if (!col.isRowNull(r)) switch (col.data) {
-                                        .uint64 => |v| { if (v[r] < slot_vals[ci]) slot_vals[ci] = v[r]; },
-                                        else => {},
-                                    };
-                                }}
-                            },
-                            .u64_max => {
-                                if (ac.arg) |arg| { if (arg == .col_ref) {
-                                    const col = c.columns[arg.col_ref.index];
-                                    if (!col.isRowNull(r)) switch (col.data) {
-                                        .uint64 => |v| { if (v[r] > slot_vals[ci]) slot_vals[ci] = v[r]; },
-                                        else => {},
-                                    };
-                                }}
-                            },
-                            .f64_min => {
-                                if (ac.arg) |arg| { if (arg == .col_ref) {
-                                    const col = c.columns[arg.col_ref.index];
-                                    if (!col.isRowNull(r)) switch (col.data) {
-                                        .float64 => |v| { const cur: f64 = @bitCast(slot_vals[ci]); if (v[r] < cur) slot_vals[ci] = @bitCast(v[r]); },
-                                        else => {},
-                                    };
-                                }}
-                            },
-                            .f64_max => {
-                                if (ac.arg) |arg| { if (arg == .col_ref) {
-                                    const col = c.columns[arg.col_ref.index];
-                                    if (!col.isRowNull(r)) switch (col.data) {
-                                        .float64 => |v| { const cur: f64 = @bitCast(slot_vals[ci]); if (v[r] > cur) slot_vals[ci] = @bitCast(v[r]); },
-                                        else => {},
-                                    };
-                                }}
-                            },
-                        }
-                    }
+                    try updateCompactVals(slot_vals, ck, aggs, &c, r);
                 }
             } else {
             // ── Regular AggAccum sub-path ──────────────────────────────────────
@@ -1519,15 +1589,30 @@ fn executeHashAggChunked(
                 }
             }
             } // end else (regular path)
+    } else if (use_str_agg_path or rr_used_str_agg) {
+            // ── String-key compact agg path (e.g. Q22/Q23 GROUP BY SearchPhrase) ──
+            const col_idx = str_agg_col_idx.?;
+            const ck      = compact_kinds.?;
+            const strs    = c.columns[col_idx].data.string;
+            for (0..c.num_rows) |r| {
+                if (c.columns[col_idx].isRowNull(r)) continue;
+                const s = strs[r];
+                const slot_vals = try ht_str_agg.?.getOrInsert(s, compact_init_vals);
+                try updateCompactVals(slot_vals, ck, aggs, &c, r);
+            }
         } else if (regexp_replace_key_descs) |rr_descs| {
             // ── regexp_replace key fast path (e.g. Q29) ───────────────────────
             // Avoids per-row pattern string comparison in evalFnCall.
+            const use_rr_str_agg = ht_str_agg != null and rr_descs.len == 1;
+            if (use_rr_str_agg) rr_used_str_agg = true;
+            const ck = compact_kinds;
             for (0..c.num_rows) |r| {
                 for (refs) |j| {
                     const col = c.columns[j];
                     row_buf[j] = if (col.isRowNull(r)) null else col.data.get(r);
                 }
                 var key_valid = true;
+                var domain_str: []const u8 = "";
                 for (rr_descs, 0..) |desc, ki| {
                     const s_opt = row_buf[desc.col_idx];
                     const s = if (s_opt) |v| (v.toStr() orelse null) else null;
@@ -1545,17 +1630,22 @@ fn executeHashAggChunked(
                             if (std.mem.startsWith(u8, host, "www.")) host = host[4..];
                             break :d Value{ .string = host };
                         }
-                        // Non-URL domain pattern: return input unchanged (generic fallback).
                         break :d Value{ .string = str };
                     } else null;
                     if (domain == null) { key_valid = false; break; }
                     key_buf[ki] = domain.?;
+                    if (ki == 0) domain_str = domain.?.string;
                 }
                 if (!key_valid) continue;
-                const bucket = try ht_agg.getOrInsert(key_buf, init_accums);
-                for (aggs, 0..) |item, ci| {
-                    const v_opt = try evalAggArg(item.expr, row_buf, alloc);
-                    try kernels.updateAccum(&bucket[ci], v_opt, alloc);
+                if (use_rr_str_agg) {
+                    const slot_vals = try ht_str_agg.?.getOrInsert(domain_str, compact_init_vals);
+                    try updateCompactVals(slot_vals, ck.?, aggs, &c, r);
+                } else {
+                    const bucket = try ht_agg.getOrInsert(key_buf, init_accums);
+                    for (aggs, 0..) |item, ci| {
+                        const v_opt = try evalAggArg(item.expr, row_buf, alloc);
+                        try kernels.updateAccum(&bucket[ci], v_opt, alloc);
+                    }
                 }
             }
         } else {
@@ -1725,55 +1815,58 @@ fn executeHashAggChunked(
                 ec.rl.append(ec.alloc, row) catch {};
             }
         }.cb);
+    } else if (use_str_agg_path) {
+        // Emit from StrAggHashTable: string key + compact numeric aggs → Values.
+        const EmitCtxSA = struct {
+            rl:    *RowList,
+            alloc: std.mem.Allocator,
+            aggs:  []const plan.ProjectItem,
+            kinds: []const ht.CompactAggKind,
+        };
+        var emit_ctx_sa = EmitCtxSA{
+            .rl    = &rl,
+            .alloc = alloc,
+            .aggs  = aggs,
+            .kinds = compact_kinds.?,
+        };
+        ht_str_agg.?.iterate(&emit_ctx_sa, struct {
+            fn cb(ec: *EmitCtxSA, s: []const u8, vals: []const u64) void {
+                const row = ec.alloc.alloc(?Value, 1 + vals.len) catch return;
+                row[0] = Value{ .string = s };
+                emitCompactVals(vals, ec.kinds, ec.aggs, row[1..]);
+                ec.rl.append(ec.alloc, row) catch {};
+            }
+        }.cb);
     } else if (use_int_path) {
         if (ht_compact) |*htc| {
-            // Emit from CompactIntKeyHashTable: u64 vals → Values.
-            const EmitCtxC = struct {
-                rl:    *RowList,
-                alloc: std.mem.Allocator,
-                keys:  []const plan.ProjectItem,
-                aggs:  []const plan.ProjectItem,
-                kinds: []const ht.CompactAggKind,
-                descs: []const IntKeyDesc,
-            };
-            var emit_ctx_c = EmitCtxC{
-                .rl    = &rl,
-                .alloc = alloc,
-                .keys  = keys,
-                .aggs  = aggs,
-                .kinds = compact_kinds.?,
-                .descs = int_key_descs,
-            };
-            htc.iterate(&emit_ctx_c, struct {
-                fn cb(ec: *EmitCtxC, k: []const i64, vals: []const u64) void {
-                    const row = ec.alloc.alloc(?Value, ec.keys.len + vals.len) catch return;
-                    for (k, 0..) |raw_val, i| {
-                        _ = ec.descs[i];
-                        row[i] = Value{ .int64 = raw_val };
-                    }
-                    for (vals, ec.kinds, ec.aggs, 0..) |v, kind, item, i| {
-                        row[ec.keys.len + i] = switch (kind) {
-                            .count, .u64_sum, .u64_min, .u64_max => Value{ .uint64 = v },
-                            .i64_sum, .i64_min, .i64_max => Value{ .int64 = @bitCast(v) },
-                            .f64_sum => blk: {
-                                // AVG: divide sum by count agg if present, else return sum.
-                                const sum: f64 = @bitCast(v);
-                                if (item.expr == .agg_call and item.expr.agg_call.kind == .avg) {
-                                    // Find count agg in the same row.
-                                    var cnt: u64 = 0;
-                                    for (vals, ec.kinds) |cv, ck| {
-                                        if (ck == .count) { cnt = cv; break; }
-                                    }
-                                    if (cnt > 0) break :blk Value{ .float64 = sum / @as(f64, @floatFromInt(cnt)) };
-                                }
-                                break :blk Value{ .float64 = sum };
-                            },
-                            .f64_min, .f64_max => Value{ .float64 = @bitCast(v) },
-                        };
-                    }
-                    ec.rl.append(ec.alloc, row) catch {};
-                }
-            }.cb);
+             // Emit from CompactIntKeyHashTable: u64 vals → Values.
+             const EmitCtxC = struct {
+                 rl:    *RowList,
+                 alloc: std.mem.Allocator,
+                 keys:  []const plan.ProjectItem,
+                 aggs:  []const plan.ProjectItem,
+                 kinds: []const ht.CompactAggKind,
+                 descs: []const IntKeyDesc,
+             };
+             var emit_ctx_c = EmitCtxC{
+                 .rl    = &rl,
+                 .alloc = alloc,
+                 .keys  = keys,
+                 .aggs  = aggs,
+                 .kinds = compact_kinds.?,
+                 .descs = int_key_descs,
+             };
+             htc.iterate(&emit_ctx_c, struct {
+                 fn cb(ec: *EmitCtxC, k: []const i64, vals: []const u64) void {
+                     const row = ec.alloc.alloc(?Value, ec.keys.len + vals.len) catch return;
+                     for (k, 0..) |raw_val, i| {
+                         _ = ec.descs[i];
+                         row[i] = Value{ .int64 = raw_val };
+                     }
+                     emitCompactVals(vals, ec.kinds, ec.aggs, row[ec.keys.len..]);
+                     ec.rl.append(ec.alloc, row) catch {};
+                 }
+             }.cb);
         } else {
         // Emit from IntKeyHashTable: convert i64 keys back to Values.
         const EmitCtxI = struct {
