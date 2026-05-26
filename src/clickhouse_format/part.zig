@@ -2013,3 +2013,48 @@ test "pk_col_name unknown returns PkColumnNotFound error" {
     const result = Part.open(io, allocator, "/tmp/zig_test_pk_err", table, "NonExistentColumn");
     try std.testing.expectError(error.PkColumnNotFound, result);
 }
+
+// ── OpenedPartAny — format-auto-detecting reader ──────────────────────────────
+
+/// Opens either a Wide or a Compact MergeTree part by probing for `data.cmrk4`.
+/// Both variants expose the same `row_count`, `columnReader()`, and `deinit()` API.
+pub const OpenedPartAny = union(enum) {
+    wide:    OpenedPart,
+    compact: CompactOpenedPart,
+
+    pub fn open(io: std.Io, alloc: std.mem.Allocator, dir: []const u8, table: schema.Table) !OpenedPartAny {
+        const cmrk_path = try std.fmt.allocPrint(alloc, "{s}/data.cmrk4", .{dir});
+        defer alloc.free(cmrk_path);
+        const is_compact = blk: {
+            const f = std.Io.Dir.cwd().openFile(io, cmrk_path, .{}) catch break :blk false;
+            f.close(io);
+            break :blk true;
+        };
+        if (is_compact) {
+            return .{ .compact = try CompactOpenedPart.open(io, alloc, dir, table) };
+        } else {
+            return .{ .wide = try OpenedPart.open(io, alloc, dir, table) };
+        }
+    }
+
+    pub fn deinit(self: *OpenedPartAny) void {
+        switch (self.*) {
+            .wide    => |*p| p.deinit(),
+            .compact => |*p| p.deinit(),
+        }
+    }
+
+    pub fn rowCount(self: *const OpenedPartAny) u64 {
+        return switch (self.*) {
+            .wide    => |*p| p.row_count,
+            .compact => |*p| p.row_count,
+        };
+    }
+
+    pub fn columnReader(self: *OpenedPartAny, col_idx: usize) !ColumnReader {
+        return switch (self.*) {
+            .wide    => |*p| p.columnReader(col_idx),
+            .compact => |*p| p.columnReader(col_idx),
+        };
+    }
+};

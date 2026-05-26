@@ -1129,9 +1129,9 @@ const Executor = struct {
         comptime callback: fn (@TypeOf(context), *const RowCtx) anyerror!void,
     ) anyerror!void {
         // Build a Table with only the needed columns using table metadata.
-        var opened = try ch_part.OpenedPart.open(self.io, self.allocator, part_dir, self.table.*);
+        var opened = try ch_part.OpenedPartAny.open(self.io, self.allocator, part_dir, self.table.*);
         defer opened.deinit();
-        const row_count: usize = @intCast(opened.row_count);
+        const row_count: usize = @intCast(opened.rowCount());
 
         // Classify columns
         var fixed_descs: std.ArrayList(ColDesc) = .empty;

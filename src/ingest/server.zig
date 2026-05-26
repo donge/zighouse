@@ -638,14 +638,13 @@ pub const Server = struct {
         const seq = self.seq;
         self.seq += 1;
 
-        var sess = try part_writer_session.PartWriterSession.open(
+        var sess = try part_writer_session.CompactPartWriterSession.open(
             self.allocator,
             self.io,
             self.config.data_dir,
             db_table.db,
             db_table.table,
             entry.table,
-            entry.pk,
             seq,
         );
         defer sess.deinit();

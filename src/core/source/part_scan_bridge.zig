@@ -61,11 +61,11 @@ const ScanState = struct {
     io:          std.Io,
     table:       schema.Table,
     part_dirs:   []const []const u8,
-    part_idx:    usize,                      // which part we're on
-    opened:      ?part_mod.OpenedPart,       // currently-open part
-    rows_read:   u64,                        // rows read from current part
-    col_readers: []?part_mod.ColumnReader,   // one per table column; null if unopened
-    metas:       []ColMeta,                  // schema metas (allocated once)
+    part_idx:    usize,                          // which part we're on
+    opened:      ?part_mod.OpenedPartAny,        // currently-open part (wide or compact)
+    rows_read:   u64,                            // rows read from current part
+    col_readers: []?part_mod.ColumnReader,       // one per table column; null if unopened
+    metas:       []ColMeta,                      // schema metas (allocated once)
     /// If non-null, only columns marked `true` are read from disk.
     /// Length == table.columns.len.  null means read all.
     needed_cols: ?[]const bool,
@@ -135,7 +135,7 @@ const ScanState = struct {
         if (self.part_idx >= self.part_dirs.len) return false;
         const dir = self.part_dirs[self.part_idx];
         self.part_idx += 1;
-        self.opened = try part_mod.OpenedPart.open(self.io, self.alloc, dir, self.table);
+        self.opened = try part_mod.OpenedPartAny.open(self.io, self.alloc, dir, self.table);
         for (self.table.columns, 0..) |_, i| {
             // Skip columns not in the needed set (column pruning).
             if (self.needed_cols) |nc| {
@@ -151,13 +151,13 @@ const ScanState = struct {
         // Advance to a part with remaining rows.
         while (true) {
             if (self.opened) |*op| {
-                if (self.rows_read < op.row_count) break;
+                if (self.rows_read < op.rowCount()) break;
             }
             const ok = try self.openNextPart();
             if (!ok) return false;
         }
         const op = &self.opened.?;
-        const remaining = op.row_count - self.rows_read;
+        const remaining = op.rowCount() - self.rows_read;
         const n = @min(remaining, chunk.CHUNK_SIZE);
 
         const arena_alloc = ctx.allocator();
