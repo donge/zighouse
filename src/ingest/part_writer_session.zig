@@ -91,3 +91,76 @@ pub const PartWriterSession = struct {
         try self.part.finish();
     }
 };
+
+/// Like PartWriterSession but writes a ClickHouse Compact MergeTree part.
+///
+/// Compact parts store all columns in a single data.bin file (interleaved by granule),
+/// which is the format CH uses for freshly-inserted small parts before merging.
+/// The resulting part is directly ATTACH-able to CH and readable via CompactOpenedPart.
+pub const CompactPartWriterSession = struct {
+    allocator: std.mem.Allocator,
+    io:        std.Io,
+    part:      ch_part.CompactPart,
+    part_dir:  []u8,
+    row_count: u64,
+
+    /// Open a new compact part for writing.
+    pub fn open(
+        allocator:  std.mem.Allocator,
+        io:         std.Io,
+        data_dir:   []const u8,
+        db:         []const u8,
+        table_name: []const u8,
+        table:      schema.Table,
+        seq:        u64,
+    ) !CompactPartWriterSession {
+        const part_dir = try std.fmt.allocPrint(
+            allocator,
+            "{s}/{s}/{s}/parts/all_{d}_{d}_0",
+            .{ data_dir, db, table_name, seq, seq },
+        );
+        errdefer allocator.free(part_dir);
+
+        const part = try ch_part.CompactPart.open(io, allocator, part_dir, table);
+        return .{
+            .allocator = allocator,
+            .io        = io,
+            .part      = part,
+            .part_dir  = part_dir,
+            .row_count = 0,
+        };
+    }
+
+    pub fn deinit(self: *CompactPartWriterSession) void {
+        self.part.deinit();
+        self.allocator.free(self.part_dir);
+    }
+
+    /// Write all column buffers from a decoded RowBinary batch.
+    pub fn writeColumns(self: *CompactPartWriterSession, columns: []const row_binary_decoder.ColumnBuffer) !void {
+        if (columns.len == 0) return;
+        const n_rows = columns[0].rowCount();
+        if (n_rows == 0) return;
+
+        for (columns, 0..) |*col_buf, col_idx| {
+            switch (col_buf.col.ty) {
+                .text, .char => {
+                    for (col_buf.str_vals.items) |s| {
+                        try self.part.appendString(col_idx, s);
+                    }
+                },
+                else => {
+                    try self.part.appendFixedBatch(col_idx, col_buf.fixed_vals.items);
+                },
+            }
+        }
+
+        self.row_count += n_rows;
+    }
+
+    /// Finalise and flush the compact part to disk.
+    pub fn finish(self: *CompactPartWriterSession) !void {
+        self.part.setRowCount(self.row_count);
+        try self.part.finish();
+    }
+};

@@ -362,6 +362,97 @@ fn chAllStrValue(ctx: CHAllColsCtx, slot: usize, value: []const u8) anyerror!voi
     try ctx.part.appendStrOne(ctx.str_col_map[slot], value);
 }
 
+// ── CompactPart import ────────────────────────────────────────────────────────
+
+/// Import a Parquet file into a ClickHouse-compatible Compact MergeTree part.
+///
+/// Writes all files required by CH 26.5 compact parts:
+///   data.bin, data.cmrk4, primary.cidx, serialization.json,
+///   columns.txt, columns_substreams.txt, count.txt,
+///   checksums.txt, default_compression_codec.txt, metadata_version.txt
+///
+/// The resulting part can be ATTACHed directly to a CH table or read back via
+/// CompactOpenedPart / PartScanBridge.
+pub fn importParquetCompact(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    parquet_path: []const u8,
+    store_dir: []const u8,
+    table: schema.Table,
+) !u64 {
+    const total_rows: u64 = try parquet.rowCountPath(allocator, io, parquet_path);
+
+    const part_dir = try std.fmt.allocPrint(
+        allocator,
+        "{s}/{s}/parts/all_1_1_0",
+        .{ store_dir, table.name },
+    );
+    defer allocator.free(part_dir);
+
+    var part = try ch_part.CompactPart.open(io, allocator, part_dir, table);
+    defer part.deinit();
+
+    // Build separate index lists for fixed vs string columns.
+    var fixed_indices: std.ArrayListUnmanaged(usize) = .empty;
+    defer fixed_indices.deinit(allocator);
+    var str_indices: std.ArrayListUnmanaged(usize) = .empty;
+    defer str_indices.deinit(allocator);
+    var str_col_map: std.ArrayListUnmanaged(usize) = .empty;
+    defer str_col_map.deinit(allocator);
+    var fixed_col_map: std.ArrayListUnmanaged(usize) = .empty;
+    defer fixed_col_map.deinit(allocator);
+
+    for (table.columns, 0..) |col, col_idx| {
+        switch (col.ty) {
+            .text, .char => {
+                try str_indices.append(allocator, col_idx);
+                try str_col_map.append(allocator, col_idx);
+            },
+            else => {
+                try fixed_indices.append(allocator, col_idx);
+                try fixed_col_map.append(allocator, col_idx);
+            },
+        }
+    }
+
+    const ctx = CompactAllColsCtx{
+        .part         = &part,
+        .fixed_col_map = fixed_col_map.items,
+        .str_col_map   = str_col_map.items,
+    };
+
+    _ = try parquet.streamAllColumnsPath(
+        allocator,
+        io,
+        parquet_path,
+        fixed_indices.items,
+        str_indices.items,
+        ctx,
+        compactAllFixedBatch,
+        compactAllStrValue,
+    );
+
+    part.setRowCount(total_rows);
+    try part.finish();
+    return total_rows;
+}
+
+const CompactAllColsCtx = struct {
+    part:          *ch_part.CompactPart,
+    fixed_col_map: []const usize,
+    str_col_map:   []const usize,
+};
+
+fn compactAllFixedBatch(ctx: CompactAllColsCtx, slot_start: usize, batches: []const []const i64) anyerror!void {
+    for (ctx.fixed_col_map[slot_start..][0..batches.len], batches) |col_idx, batch| {
+        try ctx.part.appendFixedBatch(col_idx, batch);
+    }
+}
+
+fn compactAllStrValue(ctx: CompactAllColsCtx, slot: usize, value: []const u8) anyerror!void {
+    try ctx.part.appendString(ctx.str_col_map[slot], value);
+}
+
 /// Scan a Parquet file using the CH import path (streamAllColumnsPath),
 /// but discard all data — only count rows and verify all columns decode OK.
 /// Prints progress every 1M rows.
@@ -621,4 +712,12 @@ test "importParquet round-trips a tiny synthetic parquet" {
     // Integration tests live in tests/import_roundtrip_test.zig (future).
     // Smoke: just make sure the module compiles and the helpers link.
     _ = importParquet;
+}
+
+test "importParquetCompact compiles and links" {
+    // Smoke test — just verify the function and its helpers compile.
+    _ = importParquetCompact;
+    _ = CompactAllColsCtx;
+    _ = compactAllFixedBatch;
+    _ = compactAllStrValue;
 }

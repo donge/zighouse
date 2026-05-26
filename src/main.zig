@@ -17,7 +17,7 @@ const usage =
     \\  zighouse schema
     \\  zighouse queries
     \\  zighouse init <data_dir>
-    \\  zighouse import-parquet [--format=generic|ch|ch-http] [--pk=<col>] <parquet_path> <store_dir> <table_name>
+    \\  zighouse import-parquet [--format=generic|ch|ch-compact|ch-http] [--pk=<col>] <parquet_path> <store_dir> <table_name>
     \\  zighouse serve --data-dir=<dir> [--schemas=<schemas.json>] [--port=<port>]
     \\  zighouse generic-query <store_dir> <table_name> <sql>
     \\  zighouse import-clickbench-parquet-hot <hits.parquet> <data_dir> [limit_rows]
@@ -85,8 +85,8 @@ fn runCommand(init: std.process.Init, allocator: std.mem.Allocator, args: *std.p
         try printOut(init.io, "initialized {s}\n", .{data_dir});
     } else if (std.mem.eql(u8, command, "import-parquet")) {
         // Generic Parquet import: infer schema, write generic_part store, write catalog manifest.
-        // Usage: zighouse import-parquet [--format=<generic|ch>] [--pk=<col>] <parquet_path> <store_dir> <table_name>
-        var format: enum { generic, ch, ch_http } = .generic;
+        // Usage: zighouse import-parquet [--format=<generic|ch|ch-compact|ch-http>] [--pk=<col>] <parquet_path> <store_dir> <table_name>
+        var format: enum { generic, ch, ch_compact, ch_http } = .generic;
         var pk_col_name: ?[]const u8 = null;
         const parquet_path = blk: {
             var first = args.next() orelse return error.MissingParquetPath;
@@ -95,6 +95,7 @@ fn runCommand(init: std.process.Init, allocator: std.mem.Allocator, args: *std.p
                 if (std.mem.startsWith(u8, first, "--format=")) {
                     const fmt = first["--format=".len..];
                     if (std.mem.eql(u8, fmt, "ch")) format = .ch
+                    else if (std.mem.eql(u8, fmt, "ch-compact")) format = .ch_compact
                     else if (std.mem.eql(u8, fmt, "ch-http")) format = .ch_http;
                     first = args.next() orelse return error.MissingParquetPath;
                 } else if (std.mem.startsWith(u8, first, "--pk=")) {
@@ -111,8 +112,9 @@ fn runCommand(init: std.process.Init, allocator: std.mem.Allocator, args: *std.p
         var inferred = try schema_infer.inferSchema(allocator, init.io, parquet_path, table_name);
         defer inferred.deinit();
         const row_count = switch (format) {
-            .generic => try loader.importParquet(allocator, init.io, parquet_path, store_dir, inferred.table),
-            .ch => try loader.importParquetCH(allocator, init.io, parquet_path, store_dir, inferred.table, pk_col_name),
+            .generic    => try loader.importParquet(allocator, init.io, parquet_path, store_dir, inferred.table),
+            .ch         => try loader.importParquetCH(allocator, init.io, parquet_path, store_dir, inferred.table, pk_col_name),
+            .ch_compact => try loader.importParquetCompact(allocator, init.io, parquet_path, store_dir, inferred.table),
             .ch_http => blk: {
                 // Parse optional CH HTTP params from env / args (already consumed above)
                 const ch_host = std.c.getenv("ZIGHOUSE_CH_HOST") orelse "127.0.0.1";
@@ -132,9 +134,10 @@ fn runCommand(init: std.process.Init, allocator: std.mem.Allocator, args: *std.p
             },
         };
         const part_fmt: catalog.PartFormat = switch (format) {
-            .generic => .generic,
-            .ch => .ch_mergetree,
-            .ch_http => .ch_mergetree, // no local part, but record it
+            .generic    => .generic,
+            .ch         => .ch_mergetree,
+            .ch_compact => .ch_mergetree,  // compact parts are also CH MergeTree
+            .ch_http    => .ch_mergetree,  // no local part, but record it
         };
         // For ch-http, don't write a local catalog manifest (data is in CH directly)
         if (format != .ch_http) {

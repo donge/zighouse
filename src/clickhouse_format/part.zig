@@ -1268,6 +1268,17 @@ pub const CompactPart = struct {
         try self.col_bufs[col_idx].appendSlice(s);
     }
 
+    /// Append a batch of strings to a string column.
+    pub fn appendStrBatch(self: *CompactPart, col_idx: usize, strings: []const []const u8) !void {
+        for (strings) |s| try self.appendString(col_idx, s);
+    }
+
+    /// Set total row count explicitly — required when using appendFixedBatch/appendStrBatch
+    /// (since those don't update row_count), before calling finish().
+    pub fn setRowCount(self: *CompactPart, n: u64) void {
+        self.row_count = n;
+    }
+
     /// Finalize: write all compact part files to disk.
     pub fn finish(self: *CompactPart) !void {
         // n_substreams (logical: String = 2 substreams)
