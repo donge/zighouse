@@ -1609,6 +1609,34 @@ fn csvToTsv(allocator: std.mem.Allocator, csv: []const u8, skip_header: bool) ![
                     i += 1;
                 }
             }
+        } else if (i < src.len and src[i] == 0x01) {
+            // Array sentinel field: \x01 + elements joined by \x0c → [elem1,elem2,...]
+            i += 1; // skip sentinel
+            const field_start = i;
+            while (i < src.len and src[i] != ',' and src[i] != '\n' and src[i] != '\r') i += 1;
+            const field = src[field_start..i];
+            try out.append(allocator, '[');
+            var first_elem = true;
+            var elem_it = std.mem.splitScalar(u8, field, '\x0c');
+            while (elem_it.next()) |elem| {
+                if (!first_elem) try out.append(allocator, ',');
+                first_elem = false;
+                // Numeric elements: emit as-is; string elements: single-quoted
+                const is_numeric = for (elem) |c| {
+                    if (c != '-' and (c < '0' or c > '9') and c != '.') break false;
+                } else true;
+                if (is_numeric or elem.len == 0) {
+                    try out.appendSlice(allocator, elem);
+                } else {
+                    try out.append(allocator, '\'');
+                    for (elem) |c| {
+                        if (c == '\'') try out.append(allocator, '\\');
+                        try out.append(allocator, c);
+                    }
+                    try out.append(allocator, '\'');
+                }
+            }
+            try out.append(allocator, ']');
         } else {
             // Unquoted field: read until comma or newline.
             while (i < src.len and src[i] != ',' and src[i] != '\n' and src[i] != '\r') {

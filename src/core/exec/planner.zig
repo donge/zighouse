@@ -869,7 +869,7 @@ fn isAggregate(func: generic_sql.AggregateFn) bool {
         .sum, .avg, .min, .max,
         .uniq_exact, .uniq_exact_if,
         .group_uniq_array, .any_val => true,
-        .column_ref, .int_literal, .float_literal, .case_when => false,
+        .column_ref, .int_literal, .float_literal, .case_when, .cmp_expr => false,
     };
 }
 
@@ -977,6 +977,7 @@ fn scalarExprToProjectItem(ctx: *PlannerCtx, p: generic_sql.Expr) !?ProjectItem 
                 .out_type = .string, // CASE WHEN output is typically string
             };
         },
+        .cmp_expr => null, // handled by generic_executor path; planner doesn't process this
         else => null, // aggregate in scalar context — caller handles
     };
 }

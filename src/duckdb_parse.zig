@@ -453,6 +453,17 @@ fn translateSelectNode(allocator: std.mem.Allocator, node_obj: std.json.ObjectMa
         .limit = limit,
         .offset = offset,
         .subquery_source = subquery_source,
+        // Detect numbers(N) / system.numbers virtual table.
+        .numbers_count = blk: {
+            if (std.ascii.eqlIgnoreCase(table_name, "system.numbers") or
+                std.ascii.eqlIgnoreCase(table_name, "numbers"))
+                break :blk limit orelse std.math.maxInt(u64);
+            if (std.mem.startsWith(u8, table_name, "numbers:")) {
+                const n = std.fmt.parseInt(u64, table_name[8..], 10) catch break :blk null;
+                break :blk n;
+            }
+            break :blk null;
+        },
         .owned = true,
     };
 }
@@ -836,7 +847,25 @@ fn extractTableNameOrSubquery(allocator: std.mem.Allocator, from: std.json.Value
             return try allocator.dupe(u8, alias_raw.string);
         return try allocator.dupe(u8, "__subquery__");
     }
-    if (!std.mem.eql(u8, t, "BASE_TABLE")) return null;
+    if (!std.mem.eql(u8, t, "BASE_TABLE")) {
+        // Handle numbers(N) table function: DuckDB parses this as TABLE_FUNCTION.
+        if (std.mem.eql(u8, t, "TABLE_FUNCTION")) {
+            const fn_node = obj.get("function") orelse return null;
+            const fn_name = (fn_node.object.get("function_name") orelse return null).string;
+            if (std.ascii.eqlIgnoreCase(fn_name, "numbers") or
+                std.ascii.eqlIgnoreCase(fn_name, "generate_series"))
+            {
+                // Encode N into the table name: "numbers:N"
+                const children = fn_node.object.get("children").?.array.items;
+                const n: u64 = if (children.len > 0) blk: {
+                    const nv = extractIntLiteral(children[0]) orelse break :blk 0;
+                    break :blk @intCast(@max(0, nv));
+                } else 0;
+                return try std.fmt.allocPrint(allocator, "numbers:{d}", .{n});
+            }
+        }
+        return null;
+    }
     const name = (obj.get("table_name") orelse return null).string;
     // If schema_name is set and non-empty and not "main", reconstruct "schema.table".
     if (obj.get("schema_name")) |schema_val| {
@@ -937,6 +966,14 @@ fn translateExpr(allocator: std.mem.Allocator, val: std.json.Value) !?generic_sq
             errdefer allocator.free(col_text);
             const alias_owned = alias;
             return .{ .func = .column_ref, .column = col_text, .alias = alias_owned };
+        }
+        // IN / NOT IN used as value expression: "1 IN (1,2)" → cmp_expr
+        if (std.mem.eql(u8, op_type, "OPERATOR_IN") or std.mem.eql(u8, op_type, "OPERATOR_NOT_IN") or
+            std.mem.eql(u8, op_type, "COMPARE_IN") or std.mem.eql(u8, op_type, "COMPARE_NOT_IN") or
+            std.mem.eql(u8, op_type, "OPERATOR_NOT"))
+        {
+            const text = try exprToText(allocator, val) orelse return null;
+            return .{ .func = .cmp_expr, .column = text, .alias = alias };
         }
         return null;
     }
@@ -1395,6 +1432,15 @@ fn translateExpr(allocator: std.mem.Allocator, val: std.json.Value) !?generic_sq
         const cwd = try allocator.create(generic_sql.CaseWhenData);
         cwd.* = .{ .when_texts = when_texts, .then_texts = then_texts, .else_text = else_text };
         return generic_sql.Expr{ .func = .case_when, .alias = alias, .case_when_data = cwd };
+    }
+
+    // ── COMPARISON / CONJUNCTION used as a value expression ────────────────────
+    // e.g. SELECT 1 = 1, a AND b — evaluate as boolean → uint8 0/1
+    if (std.mem.eql(u8, class, "COMPARISON") or
+        std.mem.eql(u8, class, "CONJUNCTION"))
+    {
+        const text = try exprToText(allocator, val) orelse return null;
+        return .{ .func = .cmp_expr, .column = text, .alias = alias };
     }
 
     const text = try exprToText(allocator, val) orelse return null;

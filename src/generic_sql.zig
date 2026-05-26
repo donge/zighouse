@@ -11,6 +11,7 @@ pub const AggregateFn = enum {
     group_uniq_array, // groupUniqArray(col) — array of distinct values (joined as string)
     any_val,          // any(col) — first non-null value
     case_when,        // CASE WHEN … THEN … ELSE … END — data in case_when_data field
+    cmp_expr,         // comparison/boolean as value: "1 = 1" → uint8 0 or 1
 };
 
 /// Optional inline condition for countIf / uniqExactIf:
@@ -134,6 +135,9 @@ pub const Plan = struct {
     /// UNION ALL right-hand side plan. When set, executor runs both plans and concatenates rows.
     /// Free with deinit(allocator, union_other.*) then destroy.
     union_other: ?*Plan = null,
+    /// When non-null, the FROM clause is a numbers(N) / system.numbers virtual table.
+    /// The executor generates N rows with a single column `number` = 0..N-1.
+    numbers_count: ?u64 = null,
     /// When true, all string fields (table, where_text, group_by, having_text,
     /// order_by_alias, order_by_text) were heap-allocated by the DuckDB parser
     /// and must be freed by deinit().  Legacy parser uses SQL slices (no free).

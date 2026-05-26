@@ -1,0 +1,3 @@
+CREATE TABLE t26 (id UInt64, a UInt64) ENGINE = MergeTree ORDER BY id;
+INSERT INTO t26 VALUES (1,10),(2,7),(3,3),(4,15);
+SELECT id, a % 3 AS r FROM t26 ORDER BY id;

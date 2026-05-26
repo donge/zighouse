@@ -57,6 +57,8 @@ const rules = [_]RewriteRule{
     // arrayStringConcat(arr, sep) → array_to_string(arr, sep)
     // DuckDB's parser rejects arrayStringConcat when the first arg is an array literal.
     .{ .name = "arrayStringConcat",    .kind = .rename,     .param = "array_to_string("  },
+    // materialize(x) is a CH no-op that forces materialization; treat as identity.
+    .{ .name = "materialize",          .kind = .rename,     .param = "("                 },
 };
 
 // ── Public entry point ────────────────────────────────────────────────────────
