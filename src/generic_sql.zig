@@ -608,3 +608,12 @@ test "if() parsed as case_when" {
     try std.testing.expectEqualStrings("'pos'", cwd.then_texts[0]);
     try std.testing.expectEqualStrings("'non-pos'", cwd.else_text orelse return error.NoElse);
 }
+
+test "IS NOT NULL parsed correctly" {
+    const alloc = std.testing.allocator;
+    const plan = try parse(alloc, "SELECT id FROM t WHERE val IS NOT NULL ORDER BY id") orelse return error.ParseFail;
+    defer deinit(alloc, plan);
+    const we = plan.where_expr orelse return error.NoWhereExpr;
+    try std.testing.expectEqual(std.meta.Tag(WhereNode).is_not_null, std.meta.activeTag(we.*));
+    try std.testing.expectEqualStrings("val", we.*.is_not_null);
+}

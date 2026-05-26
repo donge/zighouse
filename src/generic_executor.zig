@@ -3577,12 +3577,24 @@ fn evalFunc(kind: EvalKind, name: []const u8, inner: []const u8, row: *const Row
             if (std.ascii.eqlIgnoreCase(type_part, "VARCHAR") or
                 std.ascii.eqlIgnoreCase(type_part, "STRING"))
             {
-                const s = v.toStr() orelse return Value{ .str = "" };
-                // If this looks like a 16-byte IPv6 raw blob, format it
-                if (s.len == 16) {
-                    if (ipv6BytesToStr(s)) |ip_str| return Value{ .str_owned = ip_str };
+                switch (v) {
+                    .str, .str_owned => {
+                        const s = v.toStr().?;
+                        if (s.len == 16) {
+                            if (ipv6BytesToStr(s)) |ip_str| return Value{ .str_owned = ip_str };
+                        }
+                        return v;
+                    },
+                    .i64 => |n| return Value{ .str_owned = std.fmt.allocPrint(std.heap.page_allocator, "{d}", .{n}) catch return null },
+                    .f64 => |f| return Value{ .str_owned = std.fmt.allocPrint(std.heap.page_allocator, "{d}", .{f}) catch return null },
+                    .uint8 => |u| return Value{ .str_owned = std.fmt.allocPrint(std.heap.page_allocator, "{d}", .{u}) catch return null },
+                    .date => |d| {
+                        const ymd = epochDaysToYmd(d);
+                        const y: u32 = @intCast(@max(0, ymd.year));
+                        return Value{ .str_owned = std.fmt.allocPrint(std.heap.page_allocator, "{d:0>4}-{d:0>2}-{d:0>2}", .{ y, ymd.month, ymd.day }) catch return null };
+                    },
+                    else => return Value{ .str = "" },
                 }
-                return Value{ .str = s };
             }
             if (std.ascii.eqlIgnoreCase(type_part, "DATE")) {
                 // Handle both string timestamps and integer Unix timestamps
@@ -3979,6 +3991,18 @@ fn evalCaseWhen(trimmed: []const u8, row: *const RowCtx) ?Value {
 /// Evaluate a text-encoded boolean condition (for if() conditions and WHERE).
 fn evalTextBoolExpr(expr: []const u8, row: *const RowCtx) bool {
     const trimmed = std.mem.trim(u8, expr, " \t\r\n");
+
+    // IS NOT NULL / IS NULL
+    if (std.ascii.indexOfIgnoreCase(trimmed, " IS NOT NULL")) |pos| {
+        const col = std.mem.trim(u8, trimmed[0..pos], " \t\r\n");
+        const v = row.get(col) orelse return false; // missing → null
+        return v != .null_val;
+    }
+    if (std.ascii.indexOfIgnoreCase(trimmed, " IS NULL")) |pos| {
+        const col = std.mem.trim(u8, trimmed[0..pos], " \t\r\n");
+        const v = row.get(col) orelse return true;
+        return v == .null_val;
+    }
 
     // AND: split on top-level AND
     if (findTopLevelKeyword(trimmed, "AND")) |pos| {

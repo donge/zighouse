@@ -623,6 +623,19 @@ fn translateWhere(allocator: std.mem.Allocator, val: std.json.Value) !*generic_s
     if (std.mem.eql(u8, class, "OPERATOR")) {
         const op_type = obj.get("type").?.string;
         const children = obj.get("children").?.array.items;
+        if ((std.mem.eql(u8, op_type, "OPERATOR_IS_NULL") or
+             std.mem.eql(u8, op_type, "OPERATOR_IS_NOT_NULL")) and children.len == 1)
+        {
+            const col_name = columnName(children[0]) orelse return error.UnsupportedWhereNode;
+            const col = try allocator.dupe(u8, col_name);
+            const node = try allocator.create(generic_sql.WhereNode);
+            if (std.mem.eql(u8, op_type, "OPERATOR_IS_NULL")) {
+                node.* = .{ .is_null = col };
+            } else {
+                node.* = .{ .is_not_null = col };
+            }
+            return node;
+        }
         if ((std.mem.eql(u8, op_type, "OPERATOR_IN") or std.mem.eql(u8, op_type, "OPERATOR_NOT_IN") or
              std.mem.eql(u8, op_type, "COMPARE_IN") or std.mem.eql(u8, op_type, "COMPARE_NOT_IN")) and
             children.len >= 2)
