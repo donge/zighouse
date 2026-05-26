@@ -230,7 +230,7 @@ pub const Server = struct {
         if (asciiStartsWith(trimmed, "INSERT")) {
             try self.handleInsert(request, out, trimmed);
         } else if (asciiStartsWith(trimmed, "SELECT") or asciiStartsWith(trimmed, "WITH")) {
-            try self.handleSelectNoDrain(request, out, trimmed);
+            try self.handleSelectNoDrain(request, out, trimmed, true);
         } else if (asciiStartsWith(trimmed, "CREATE")) {
             try self.handleCreate(request, out, trimmed);
         } else if (asciiStartsWith(trimmed, "TRUNCATE")) {
@@ -253,7 +253,7 @@ pub const Server = struct {
         if (asciiStartsWith(trimmed, "INSERT")) {
             try self.handleInsertBodyData(request, out, trimmed, data_part);
         } else if (asciiStartsWith(trimmed, "SELECT") or asciiStartsWith(trimmed, "WITH")) {
-            try self.handleSelectSimple(request, out, trimmed);
+            try self.handleSelectSimple(request, out, trimmed, false);
         } else if (asciiStartsWith(trimmed, "CREATE")) {
             try self.handleCreateSimple(request, out, trimmed);
         } else if (asciiStartsWith(trimmed, "DESCRIBE")) {
@@ -817,10 +817,10 @@ pub const Server = struct {
 
     /// SELECT handler for body-SQL mode.
     /// Handles clickhouse-go handshake and generic SELECTs.
-     fn handleSelectSimple(self: *Server, request: *std.http.Server.Request, out: *std.Io.Writer, sql: []const u8) !void {
-         // Debug: log incoming SQL
-         std.debug.print("[SQL] {s}\n", .{sql[0..@min(3000, sql.len)]});
-         // clickhouse-go handshake: SELECT displayName(), version(), revision(), timezone()
+    fn handleSelectSimple(self: *Server, request: *std.http.Server.Request, out: *std.Io.Writer, sql: []const u8, want_tsv: bool) !void {
+        // Debug: log incoming SQL
+        std.debug.print("[SQL] {s}\n", .{sql[0..@min(3000, sql.len)]});
+        // clickhouse-go handshake: SELECT displayName(), version(), revision(), timezone()
         // Must return a Native Block (clickhouse-go uses default_format=Native).
         if (std.mem.indexOf(u8, sql, "displayName()") != null or
             std.mem.indexOf(u8, sql, "version()") != null)
@@ -836,8 +836,12 @@ pub const Server = struct {
             try sendNativeBlock(self.allocator, request, out, bytes);
             return;
         }
-        // SELECT 1 → return a single-row Native Block with column "1" Int64 value 1.
+        // SELECT 1 → return 1 (TSV) or native block.
         if (std.mem.eql(u8, sql, "SELECT 1") or std.mem.eql(u8, sql, "select 1")) {
+            if (want_tsv) {
+                try sendResponse(request, out, .ok, "1\n");
+                return;
+            }
             const cols = [_]native_block.Col{
                 .{ .name = "1", .kind = .int64, .i64_val = 1 },
             };
@@ -847,13 +851,28 @@ pub const Server = struct {
             return;
         }
         // Generic SELECT: route through normal path (body already consumed).
-        try self.handleSelectNoDrain(request, out, sql);
+        try self.handleSelectNoDrain(request, out, sql, want_tsv);
     }
 
     /// SELECT that doesn't drain the body (already consumed by handleRequest).
-    fn handleSelectNoDrain(self: *Server, request: *std.http.Server.Request, out: *std.Io.Writer, sql: []const u8) !void {
+    fn handleSelectNoDrain(self: *Server, request: *std.http.Server.Request, out: *std.Io.Writer, sql: []const u8, want_tsv: bool) !void {
         // Make user-defined functions available to the executor.
         generic_executor.udf_registry = &self.functions;
+
+        // Fast path: SELECT 1
+        if (std.mem.eql(u8, sql, "SELECT 1") or std.mem.eql(u8, sql, "select 1")) {
+            if (want_tsv) {
+                try sendResponse(request, out, .ok, "1\n");
+            } else {
+                const cols = [_]native_block.Col{
+                    .{ .name = "1", .kind = .int64, .i64_val = 1 },
+                };
+                const bytes = try native_block.encodeOneRow(self.allocator, &cols);
+                defer self.allocator.free(bytes);
+                try sendNativeBlock(self.allocator, request, out, bytes);
+            }
+            return;
+        }
 
         // Strip FINAL modifier.
         const sql_needs_free = std.ascii.indexOfIgnoreCase(sql, "FINAL") != null;
@@ -876,10 +895,11 @@ pub const Server = struct {
         };
         defer generic_sql.deinit(self.allocator, plan);
 
-        // Subquery: materialize inner, run outer, return Native block.
+        // Subquery: materialize inner, run outer, return result.
         if (plan.subquery_source) |inner_plan| {
             const inner_db_table = splitDbTable(inner_plan.table);
             const inner_entry = self.schemas.find(inner_db_table.db, inner_db_table.table) orelse {
+                if (want_tsv) { try sendResponse(request, out, .ok, ""); return; }
                 const nb = try native_block.encodeEmpty(self.allocator);
                 defer self.allocator.free(nb);
                 try sendNativeBlock(self.allocator, request, out, nb);
@@ -891,6 +911,12 @@ pub const Server = struct {
             defer self.allocator.free(inner_csv);
             const result = try generic_executor.runOverCsv(self.allocator, plan, inner_csv, &inner_entry.table);
             defer self.allocator.free(result);
+            if (want_tsv) {
+                const tsv = try csvToTsv(self.allocator, result, true);
+                defer self.allocator.free(tsv);
+                try sendResponse(request, out, .ok, tsv);
+                return;
+            }
             var rs = try serializer.csvToResultSet(self.allocator, result, &inner_entry.table);
             defer rs.deinit();
             const nb = try serializer.toNativeBlock(self.allocator, rs);
@@ -911,15 +937,25 @@ pub const Server = struct {
                 &fake_table,
             )) |fake_result| {
                 defer self.allocator.free(fake_result);
-                var rs = try serializer.csvToResultSet(self.allocator, fake_result, null);
-                defer rs.deinit();
-                const nb = try serializer.toNativeBlock(self.allocator, rs);
-                defer self.allocator.free(nb);
-                try sendNativeBlock(self.allocator, request, out, nb);
+                if (want_tsv) {
+                    const tsv = try csvToTsv(self.allocator, fake_result, true);
+                    defer self.allocator.free(tsv);
+                    try sendResponse(request, out, .ok, tsv);
+                } else {
+                    var rs = try serializer.csvToResultSet(self.allocator, fake_result, null);
+                    defer rs.deinit();
+                    const nb = try serializer.toNativeBlock(self.allocator, rs);
+                    defer self.allocator.free(nb);
+                    try sendNativeBlock(self.allocator, request, out, nb);
+                }
             } else |_| {
-                const nb = try native_block.encodeEmpty(self.allocator);
-                defer self.allocator.free(nb);
-                try sendNativeBlock(self.allocator, request, out, nb);
+                if (want_tsv) {
+                    try sendResponse(request, out, .ok, "");
+                } else {
+                    const nb = try native_block.encodeEmpty(self.allocator);
+                    defer self.allocator.free(nb);
+                    try sendNativeBlock(self.allocator, request, out, nb);
+                }
             }
             return;
         };
@@ -938,27 +974,41 @@ pub const Server = struct {
                 &entry.table,
             )) |empty_result| {
                 defer self.allocator.free(empty_result);
-                var rs = try serializer.csvToResultSet(self.allocator, empty_result, &entry.table);
-                defer rs.deinit();
-                const nb = try serializer.toNativeBlock(self.allocator, rs);
-                defer self.allocator.free(nb);
-                try sendNativeBlock(self.allocator, request, out, nb);
+                if (want_tsv) {
+                    const tsv = try csvToTsv(self.allocator, empty_result, true);
+                    defer self.allocator.free(tsv);
+                    try sendResponse(request, out, .ok, tsv);
+                } else {
+                    var rs = try serializer.csvToResultSet(self.allocator, empty_result, &entry.table);
+                    defer rs.deinit();
+                    const nb = try serializer.toNativeBlock(self.allocator, rs);
+                    defer self.allocator.free(nb);
+                    try sendNativeBlock(self.allocator, request, out, nb);
+                }
             } else |_| {
-                const nb = try native_block.encodeEmpty(self.allocator);
-                defer self.allocator.free(nb);
-                try sendNativeBlock(self.allocator, request, out, nb);
+                if (want_tsv) {
+                    try sendResponse(request, out, .ok, "");
+                } else {
+                    const nb = try native_block.encodeEmpty(self.allocator);
+                    defer self.allocator.free(nb);
+                    try sendNativeBlock(self.allocator, request, out, nb);
+                }
             }
             return;
         }
 
-        // ── IR execution path (native binary, no CSV intermediate) ────────────
-        if (try self.tryIrExecute(plan, &entry.table, parts.dirs(), sql_clean)) |nb| {
-            defer self.allocator.free(nb);
-            try sendNativeBlock(self.allocator, request, out, nb);
-            return;
+        // ── IR execution path ─────────────────────────────────────────────────
+        // Skip IR path for TSV output — fall through to generic_executor which
+        // produces CSV we can easily convert to TSV.
+        if (!want_tsv) {
+            if (try self.tryIrExecute(plan, &entry.table, parts.dirs(), sql_clean)) |nb| {
+                defer self.allocator.free(nb);
+                try sendNativeBlock(self.allocator, request, out, nb);
+                return;
+            }
         }
 
-        // ── Fallback: generic_executor → CSV → native block ────────────────
+        // ── Fallback: generic_executor → CSV → output ─────────────────────────
         const result = try generic_executor.runWithSource(
             self.allocator, self.io,
             plan,
@@ -967,11 +1017,17 @@ pub const Server = struct {
         );
         defer self.allocator.free(result);
 
-        var rs = try serializer.csvToResultSet(self.allocator, result, &entry.table);
-        defer rs.deinit();
-        const nb = try serializer.toNativeBlock(self.allocator, rs);
-        defer self.allocator.free(nb);
-        try sendNativeBlock(self.allocator, request, out, nb);
+        if (want_tsv) {
+            const tsv = try csvToTsv(self.allocator, result, true);
+            defer self.allocator.free(tsv);
+            try sendResponse(request, out, .ok, tsv);
+        } else {
+            var rs = try serializer.csvToResultSet(self.allocator, result, &entry.table);
+            defer rs.deinit();
+            const nb = try serializer.toNativeBlock(self.allocator, rs);
+            defer self.allocator.free(nb);
+            try sendNativeBlock(self.allocator, request, out, nb);
+        }
     }
 
     fn handleCreateSimple(self: *Server, request: *std.http.Server.Request, out: *std.Io.Writer, sql: []const u8) !void {
@@ -1055,6 +1111,12 @@ pub const Server = struct {
             return;
         };
 
+        // VALUES INSERT is entirely in the SQL string — data part is empty; handle first.
+        if (insert_info.values_fmt) {
+            try self.handleInsertValues(request, out, sql);
+            return;
+        }
+
         if (data.len == 0) {
             const empty = try native_block.encodeEmpty(self.allocator);
             defer self.allocator.free(empty);
@@ -1066,9 +1128,6 @@ pub const Server = struct {
             try self.handleInsertNativeData(request, out, insert_info.db_table, data);
         } else if (insert_info.with_names_and_types) {
             try self.handleInsertWithHeaderData(request, out, insert_info.db_table, data);
-        } else if (insert_info.values_fmt) {
-            // SQL VALUES INSERT — entire sql string contains the full statement.
-            try self.handleInsertValues(request, out, sql);
         } else {
             try self.handleInsertRowBinaryData(request, out, insert_info.db_table, data);
         }
@@ -1158,7 +1217,19 @@ pub const Server = struct {
         };
         const n_cols = if (col_indices) |ci| ci.len else entry.table.columns.len;
 
-        // Parse and write each row
+        // Allocate one ColumnBuffer per schema column; accumulate ALL rows before writePart.
+        const col_bufs = try self.allocator.alloc(row_binary_decoder.ColumnBuffer, entry.table.columns.len);
+        for (col_bufs, entry.table.columns) |*buf, col| {
+            buf.* = .{ .col = col, .fixed_vals = .empty, .str_vals = .empty, .str_bytes = .empty };
+        }
+        defer {
+            for (col_bufs) |*buf| buf.deinit(self.allocator);
+            self.allocator.free(col_bufs);
+        }
+
+        var row_count: usize = 0;
+
+        // Parse all (v1, v2, ...) tuples into col_bufs.
         while (true) {
             it.skipWs();
             if (it.pos >= it.src.len) break;
@@ -1167,20 +1238,10 @@ pub const Server = struct {
             if (it.peekChar() != '(') break;
             it.pos += 1; // consume '('
 
-            // Build ColumnBuffers for this row
-            const col_bufs = try self.allocator.alloc(row_binary_decoder.ColumnBuffer, entry.table.columns.len);
-            for (col_bufs, entry.table.columns) |*buf, col| {
-                buf.* = row_binary_decoder.ColumnBuffer{
-                    .col = col,
-                    .fixed_vals = .empty,
-                    .str_vals = .empty,
-                    .str_bytes = .empty,
-                };
-            }
-            defer {
-                for (col_bufs) |*buf| buf.deinit(self.allocator);
-                self.allocator.free(col_bufs);
-            }
+            // Track which schema columns were set in this row.
+            const set_flags = try self.allocator.alloc(bool, entry.table.columns.len);
+            defer self.allocator.free(set_flags);
+            @memset(set_flags, false);
 
             var val_count: usize = 0;
             while (val_count < n_cols) {
@@ -1192,43 +1253,26 @@ pub const Server = struct {
 
                 const col_idx = if (col_indices) |ci| ci[val_count] else val_count;
                 if (col_idx < col_bufs.len) {
-                    const col_ty = entry.table.columns[col_idx].ty;
-                    var buf = &col_bufs[col_idx];
-                    switch (col_ty) {
-                        .text, .char => {
-                            const start = buf.str_bytes.items.len;
-                            try buf.str_bytes.appendSlice(self.allocator, val_str);
-                            const end = buf.str_bytes.items.len;
-                            try buf.str_vals.append(self.allocator, buf.str_bytes.items[start..end]);
-                        },
-                        else => {
-                            const iv: i64 = if (val_str.len == 0) 0 else
-                                std.fmt.parseInt(i64, val_str, 10) catch
-                                @as(i64, @intFromFloat(std.fmt.parseFloat(f64, val_str) catch 0.0));
-                            try buf.fixed_vals.append(self.allocator, iv);
-                        },
-                    }
+                    try appendParsedField(self.allocator, entry.table.columns[col_idx], val_str, &col_bufs[col_idx]);
+                    set_flags[col_idx] = true;
                 }
                 val_count += 1;
             }
             it.skipWs();
             if (it.peekChar() == ')') it.pos += 1;
 
-            // Fill any columns with 0 empty values not set
-            for (col_bufs) |*buf| {
-                if (buf.rowCount() == 0) {
-                    switch (buf.col.ty) {
-                        .text, .char => {
-                            const start = buf.str_bytes.items.len;
-                            _ = start;
-                            try buf.str_vals.append(self.allocator, buf.str_bytes.items[0..0]);
-                        },
-                        else => try buf.fixed_vals.append(self.allocator, 0),
-                    }
+            // Fill any unset columns with zero/empty for this row.
+            for (col_bufs, set_flags) |*buf, was_set| {
+                if (was_set) continue;
+                switch (buf.col.ty) {
+                    .text, .char => try buf.str_vals.append(self.allocator, buf.str_bytes.items[0..0]),
+                    else         => try buf.fixed_vals.append(self.allocator, 0),
                 }
             }
+            row_count += 1;
+        }
 
-            // Write the part
+        if (row_count > 0) {
             const db_table = DbTable{ .db = db_name, .table = table_name };
             try self.writePart(db_table, entry, col_bufs);
         }
@@ -1400,7 +1444,7 @@ fn scanMaxPartSeq(io: std.Io, data_dir: []const u8) u64 {
 }
 
 /// Parse a text field value and append to a ColumnBuffer according to the column type.
-/// Used by CSV and JSONEachRow handlers.
+/// Used by CSV, JSONEachRow, and VALUES handlers.
 fn appendParsedField(
     allocator: std.mem.Allocator,
     col: schema.Column,
@@ -1409,12 +1453,9 @@ fn appendParsedField(
 ) !void {
     switch (col.ty) {
         .text, .char => {
-            const duped = try allocator.dupe(u8, field);
-            try buf.str_bytes.appendSlice(allocator, duped);
-            allocator.free(duped);
-            // str_vals slice points into str_bytes; re-establish pointer after potential resize.
+            const start = buf.str_bytes.items.len;
+            try buf.str_bytes.appendSlice(allocator, field);
             const end = buf.str_bytes.items.len;
-            const start = end - field.len;
             try buf.str_vals.append(allocator, buf.str_bytes.items[start..end]);
         },
         .float32, .float64 => {
@@ -1422,11 +1463,65 @@ fn appendParsedField(
             const bits: u64 = @bitCast(v);
             try buf.fixed_vals.append(allocator, @bitCast(bits));
         },
+        .date => {
+            // Accept 'YYYY-MM-DD' or integer days.
+            const v: i64 = parseDateLiteral(field) orelse
+                std.fmt.parseInt(i64, field, 10) catch 0;
+            try buf.fixed_vals.append(allocator, v);
+        },
+        .timestamp => {
+            // Accept 'YYYY-MM-DD HH:MM:SS' or integer unix seconds.
+            const v: i64 = parseDateTimeLiteral(field) orelse
+                std.fmt.parseInt(i64, field, 10) catch 0;
+            try buf.fixed_vals.append(allocator, v);
+        },
         else => {
             const v = std.fmt.parseInt(i64, field, 10) catch 0;
             try buf.fixed_vals.append(allocator, v);
         },
     }
+}
+
+/// Parse 'YYYY-MM-DD' → days since 1970-01-01 (UInt16 stored as i64).
+/// Returns null if the string is not in the expected format.
+fn parseDateLiteral(s: []const u8) ?i64 {
+    const str = std.mem.trim(u8, s, " \t'\"");
+    if (str.len < 10) return null;
+    const year  = std.fmt.parseInt(u32, str[0..4], 10) catch return null;
+    if (str[4] != '-') return null;
+    const month = std.fmt.parseInt(u32, str[5..7], 10) catch return null;
+    if (str[7] != '-') return null;
+    const day   = std.fmt.parseInt(u32, str[8..10], 10) catch return null;
+    return @intCast(ymdToEpochDays(year, month, day));
+}
+
+/// Parse 'YYYY-MM-DD HH:MM:SS' or 'YYYY-MM-DD' → unix seconds.
+fn parseDateTimeLiteral(s: []const u8) ?i64 {
+    const str = std.mem.trim(u8, s, " \t'\"");
+    if (str.len < 10) return null;
+    const days = parseDateLiteral(str) orelse return null;
+    var secs: i64 = days * 86400;
+    if (str.len >= 19 and (str[10] == ' ' or str[10] == 'T')) {
+        const hh = std.fmt.parseInt(i64, str[11..13], 10) catch 0;
+        const mm = std.fmt.parseInt(i64, str[14..16], 10) catch 0;
+        const ss = std.fmt.parseInt(i64, str[17..19], 10) catch 0;
+        secs += hh * 3600 + mm * 60 + ss;
+    }
+    return secs;
+}
+
+/// Gregorian calendar: year/month/day → days since 1970-01-01.
+fn ymdToEpochDays(year: u32, month: u32, day: u32) i32 {
+    // Algorithm from http://howardhinnant.github.io/date_algorithms.html
+    var y: i32 = @intCast(year);
+    const m: i32 = @intCast(month);
+    const d: i32 = @intCast(day);
+    if (m <= 2) y -= 1;
+    const era: i32 = @divFloor(y, 400);
+    const yoe: i32 = y - era * 400;
+    const doy: i32 = @divFloor(153 * (m + (if (m > 2) @as(i32, -3) else 9)) + 2, 5) + d - 1;
+    const doe: i32 = yoe * 365 + @divFloor(yoe, 4) - @divFloor(yoe, 100) + doy;
+    return era * 146097 + doe - 719468;
 }
 
 /// Extract the string value of a named field from a JSON object literal.
@@ -1479,6 +1574,64 @@ fn extractJsonField(json: []const u8, key: []const u8) ?[]const u8 {
         }
     }
     return null;
+}
+
+/// Convert a CSV string (comma-separated, first row = header) to TabSeparated.
+/// Handles quoted fields; strips surrounding quotes. Output has no quoting.
+/// If skip_header is true, the first (header) line of the CSV is omitted.
+fn csvToTsv(allocator: std.mem.Allocator, csv: []const u8, skip_header: bool) ![]u8 {
+    // If skip_header, advance past the first CSV line.
+    var src = csv;
+    if (skip_header) {
+        if (std.mem.indexOfScalar(u8, src, '\n')) |nl| {
+            src = src[nl + 1 ..];
+        } else {
+            return allocator.dupe(u8, "");
+        }
+    }
+    var out = std.ArrayListUnmanaged(u8){ .items = &.{}, .capacity = 0 };
+    errdefer out.deinit(allocator);
+    var i: usize = 0;
+    while (i < src.len) {
+        // Parse one field.
+        if (i < src.len and src[i] == '"') {
+            // Quoted field.
+            i += 1;
+            while (i < src.len) {
+                if (src[i] == '"') {
+                    i += 1;
+                    if (i < src.len and src[i] == '"') {
+                        try out.append(allocator, '"');
+                        i += 1;
+                    } else break;
+                } else {
+                    try out.append(allocator, src[i]);
+                    i += 1;
+                }
+            }
+        } else {
+            // Unquoted field: read until comma or newline.
+            while (i < src.len and src[i] != ',' and src[i] != '\n' and src[i] != '\r') {
+                try out.append(allocator, src[i]);
+                i += 1;
+            }
+        }
+        // After field: decide separator.
+        if (i >= src.len) {
+            // EOF — done.
+        } else if (src[i] == ',') {
+            try out.append(allocator, '\t');
+            i += 1;
+        } else if (src[i] == '\r') {
+            i += 1;
+            if (i < src.len and src[i] == '\n') i += 1;
+            try out.append(allocator, '\n');
+        } else if (src[i] == '\n') {
+            i += 1;
+            try out.append(allocator, '\n');
+        }
+    }
+    return out.toOwnedSlice(allocator);
 }
 
 /// Parse the seq number from a part directory name "all_{seq}_{seq}_0".
