@@ -595,3 +595,16 @@ test "parses filtered column projection" {
     try std.testing.expectEqualStrings("UserID", plan.projections[0].column.?);
     try std.testing.expect(plan.filter != null);
 }
+
+test "if() parsed as case_when" {
+    const alloc = std.testing.allocator;
+    const plan = try parse(alloc, "SELECT id, if(val > 0, 'pos', 'non-pos') FROM t ORDER BY id") orelse return error.ParseFail;
+    defer deinit(alloc, plan);
+    try std.testing.expectEqual(@as(usize, 2), plan.projections.len);
+    const proj = plan.projections[1];
+    try std.testing.expectEqual(AggregateFn.case_when, proj.func);
+    const cwd = proj.case_when_data orelse return error.NoCWD;
+    try std.testing.expectEqualStrings("val > 0", cwd.when_texts[0]);
+    try std.testing.expectEqualStrings("'pos'", cwd.then_texts[0]);
+    try std.testing.expectEqualStrings("'non-pos'", cwd.else_text orelse return error.NoElse);
+}

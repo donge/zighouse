@@ -289,13 +289,34 @@ const Value = union(enum) {
                 }
             },
             .null_val => {},
-            // Date: emit days as integer — header sentinel \x02D: tells native-block to encode as Date
-            .date => |d| try out.print(allocator, "{d}", .{d}),
+            // Date: format as YYYY-MM-DD (ClickHouse TabSeparated format).
+            // Header sentinel \x02D: is still added by writeExprHeader for native-block encoding.
+            .date => |d| {
+                const ymd = epochDaysToYmd(d);
+                // year is i32 but always positive for dates after 1970; cast to u32 avoids '+' prefix.
+                const y: u32 = @intCast(@max(0, ymd.year));
+                try out.print(allocator, "{d:0>4}-{d:0>2}-{d:0>2}", .{ y, ymd.month, ymd.day });
+            },
             // UInt8 bool: emit as plain integer — header sentinel \x03U8: tells native-block to encode as UInt8
             .uint8 => |v| try out.print(allocator, "{d}", .{v}),
         }
     }
 };
+
+/// Convert days-since-1970-01-01 to a Gregorian (year, month, day) triple.
+/// Algorithm: http://howardhinnant.github.io/date_algorithms.html  civil_from_days
+fn epochDaysToYmd(days: i32) struct { year: i32, month: u32, day: u32 } {
+    const z: i32 = days + 719468;
+    const era: i32 = @divFloor(z, 146097);
+    const doe: u32 = @intCast(z - era * 146097);
+    const yoe: u32 = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    const y: i32   = @as(i32, @intCast(yoe)) + era * 400;
+    const doy: u32 = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    const mp: u32  = (5 * doy + 2) / 153;
+    const d: u32   = doy - (153 * mp + 2) / 5 + 1;
+    const m: u32   = if (mp < 10) mp + 3 else mp - 9;
+    return .{ .year = y + @as(i32, if (m <= 2) 1 else 0), .month = m, .day = d };
+}
 
 // ── Predicate evaluation ──────────────────────────────────────────────────────
 
@@ -922,7 +943,13 @@ const Executor = struct {
         var ctx = ScanCtx.init(self.allocator, self.plan);
         ctx.table = self.table;
         defer ctx.deinit(self.allocator);
-        try self.streamRows(&needed, &ctx, ScanCtx.observe);
+        if (self.plan.table.len == 0 or std.mem.eql(u8, self.plan.table, "system.one")) {
+            // No FROM clause: evaluate projections against a synthetic empty row.
+            const empty_row = RowCtx{ .names = &.{}, .values = &.{}, .table = null, .parent = null };
+            try ScanCtx.observe(&ctx, &empty_row);
+        } else {
+            try self.streamRows(&needed, &ctx, ScanCtx.observe);
+        }
         return ctx.format(self.allocator, self.plan);
     }
 
@@ -1195,8 +1222,9 @@ const Executor = struct {
                         const bits: u32 = @intCast(buf[row_idx] & 0xFFFF_FFFF);
                         break :blk Value{ .f64 = @as(f64, @floatCast(@as(f32, @bitCast(bits)))) };
                     },
-                    .fixed_f64 => Value{ .f64 = @bitCast(buf[row_idx]) },
-                    else => Value{ .i64 = buf[row_idx] },
+                    .fixed_f64   => Value{ .f64  = @bitCast(buf[row_idx]) },
+                    .fixed_date  => Value{ .date = @intCast(buf[row_idx]) },
+                    else         => Value{ .i64  = buf[row_idx] },
                 };
             }
             for (str_data, 0..) |col_data, si| {
@@ -1392,10 +1420,26 @@ const AggState = struct {
                 if (v.toF64()) |fv| self.sum += fv;
             },
             .min => {
-                if (self.min == null or Value.order(v, self.min.?) == .lt) self.min = v;
+                if (self.min == null or Value.order(v, self.min.?) == .lt) {
+                    // Deep-copy string values — scan buffers are reused per row.
+                    if (v == .str) {
+                        if (self.min) |old| if (old == .str_owned) alloc.free(old.str_owned);
+                        self.min = Value{ .str_owned = try alloc.dupe(u8, v.str) };
+                    } else {
+                        self.min = v;
+                    }
+                }
             },
             .max => {
-                if (self.max == null or Value.order(v, self.max.?) == .gt) self.max = v;
+                if (self.max == null or Value.order(v, self.max.?) == .gt) {
+                    // Deep-copy string values — scan buffers are reused per row.
+                    if (v == .str) {
+                        if (self.max) |old| if (old == .str_owned) alloc.free(old.str_owned);
+                        self.max = Value{ .str_owned = try alloc.dupe(u8, v.str) };
+                    } else {
+                        self.max = v;
+                    }
+                }
             },
             .column_ref, .int_literal, .float_literal, .case_when => {},
         }
@@ -1603,7 +1647,6 @@ const ScalarAggCtx = struct {
         // assembled RowCtx so they can reference sibling aggregate aliases.
         var emit_first = true;
         for (plan.projections, self.states) |proj, *state2| {
-            _ = state2;
             if (isHiddenArrayJoinProj(proj)) continue;
             if (!emit_first) try out.append(allocator, ',');
             emit_first = false;
@@ -1611,20 +1654,11 @@ const ScalarAggCtx = struct {
                 const expr_text = proj.column orelse break :blk Value{ .null_val = {} };
                 break :blk evalTextExpr(expr_text, &agg_row) orelse Value{ .null_val = {} };
             } else if (proj.func == .float_literal) Value{ .f64 = proj.float_val } else blk: {
-                // Try alias then column then header-expression text as key.
-                if (proj.alias) |a| {
-                    if (agg_row.get(a)) |val| break :blk val;
-                }
-                if (proj.column) |col| {
-                    if (agg_row.get(col)) |val| break :blk val;
-                }
-                // Fall back to the header expression text (e.g. "count_star()")
-                var hdr_buf2: std.ArrayList(u8) = .empty;
-                defer hdr_buf2.deinit(allocator);
-                if (writeExprHeader(&hdr_buf2, allocator, proj)) |_| {
-                    if (agg_row.get(hdr_buf2.items)) |val| break :blk val;
-                } else |_| {}
-                break :blk Value{ .null_val = {} };
+                // Use the state directly for aggregate projections — avoids column name
+                // collisions when two aggregates reference the same column (e.g. min(val), max(val)).
+                var sv = state2.result(proj, self.allocator);
+                if (proj.post_fn) |pf| sv = applyPostFn(pf, sv, allocator);
+                break :blk sv;
             };
             try v.writeCsv(&out, allocator);
         }
@@ -2525,6 +2559,18 @@ fn collectNeededColumns(
                 try add(allocator, &seen, needed, col, table);
             }
         }
+        // Also collect columns from CASE WHEN expressions
+        if (proj.case_when_data) |cwd| {
+            for (cwd.when_texts) |wt| {
+                try addFuncColumns(allocator, &seen, needed, wt, table, &add);
+            }
+            for (cwd.then_texts) |tt| {
+                try addFuncColumns(allocator, &seen, needed, tt, table, &add);
+            }
+            if (cwd.else_text) |et| {
+                try addFuncColumns(allocator, &seen, needed, et, table, &add);
+            }
+        }
         // Also collect columns from cond expressions (countIf/uniqExactIf)
         if (proj.cond) |cond| {
             if (cond.cond_text != null) {
@@ -2776,7 +2822,19 @@ fn evalProjectionExpr(proj: generic_sql.Expr, row: *const RowCtx) Value {
             if (row.get(col)) |v| return v;
             return evalTextExpr(col, row) orelse Value{ .null_val = {} };
         },
-        .case_when => return Value{ .null_val = {} }, // handled by IR planner path only
+        .case_when => {
+            // Evaluate CASE WHEN … THEN … ELSE … END using text evaluators.
+            const cwd = proj.case_when_data orelse return Value{ .null_val = {} };
+            for (cwd.when_texts, cwd.then_texts) |when_t, then_t| {
+                if (evalTextBoolExpr(when_t, row)) {
+                    return evalTextExpr(then_t, row) orelse Value{ .null_val = {} };
+                }
+            }
+            if (cwd.else_text) |et| {
+                return evalTextExpr(et, row) orelse Value{ .null_val = {} };
+            }
+            return Value{ .null_val = {} };
+        },
     }
 }
 
