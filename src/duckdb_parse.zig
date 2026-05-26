@@ -1570,7 +1570,7 @@ fn exprToText(allocator: std.mem.Allocator, val: std.json.Value) !?[]const u8 {
             defer allocator.free(r);
             return try std.fmt.allocPrint(allocator, "{s} NOT LIKE {s}", .{ l, r });
         }
-        // Arithmetic binary operators: subtract, add, multiply, divide
+        // Arithmetic binary operators: subtract, add, multiply, divide, modulo
         if (children.len == 2) {
             const op_sym: ?[]const u8 = if (std.mem.eql(u8, fn_name, "subtract") or std.mem.eql(u8, fn_name, "-"))
                 "-"
@@ -1580,6 +1580,8 @@ fn exprToText(allocator: std.mem.Allocator, val: std.json.Value) !?[]const u8 {
                 "*"
             else if (std.mem.eql(u8, fn_name, "divide") or std.mem.eql(u8, fn_name, "/"))
                 "/"
+            else if (std.mem.eql(u8, fn_name, "modulo") or std.mem.eql(u8, fn_name, "%"))
+                "%"
             else
                 null;
             if (op_sym) |sym| {
@@ -1590,8 +1592,8 @@ fn exprToText(allocator: std.mem.Allocator, val: std.json.Value) !?[]const u8 {
                 // Wrap sub-expressions that contain arithmetic operators to preserve evaluation
                 // order. DuckDB strips parens in the AST, so we must re-add them for our
                 // text-based evaluator which parses right-to-left.
-                const l_needs = std.mem.indexOfAny(u8, l, "+-*/") != null;
-                const r_needs = std.mem.indexOfAny(u8, r, "+-*/") != null;
+                const l_needs = std.mem.indexOfAny(u8, l, "+-*/%") != null;
+                const r_needs = std.mem.indexOfAny(u8, r, "+-*/%") != null;
                 const lp: []const u8 = if (l_needs) "(" else "";
                 const lq: []const u8 = if (l_needs) ")" else "";
                 const rp: []const u8 = if (r_needs) "(" else "";

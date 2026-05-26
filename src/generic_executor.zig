@@ -2869,6 +2869,12 @@ const EvalKind = enum {
     // Date
     date_yyyymmdd,     // toYYYYMMDD(x) → integer
     date_trunc,        // date_trunc('unit', col) → truncated timestamp string
+    date_year,         // toYear(x) / year(x) → integer year
+    date_month,        // toMonth(x) / month(x) → integer month (1-12)
+    date_day,          // toDayOfMonth(x) / day(x) → integer day (1-31)
+    date_hour,         // toHour(x) → integer hour (0-23)
+    date_minute,       // toMinute(x) → integer minute (0-59)
+    date_second,       // toSecond(x) → integer second (0-59)
     // IP
     ip_bool,           // isIPv4String / isIPv6String → 0 or 1
     ip_to_num,         // IPv4StringToNumOrDefault(s) → uint32
@@ -2934,6 +2940,18 @@ const func_evals = [_]FuncEval{
     .{ .name = "least",                       .kind = .num_least        },
     .{ .name = "toyyyymmdd",                  .kind = .date_yyyymmdd    },
     .{ .name = "date_trunc",                  .kind = .date_trunc       },
+    .{ .name = "toyear",                      .kind = .date_year        },
+    .{ .name = "year",                        .kind = .date_year        },
+    .{ .name = "tomonth",                     .kind = .date_month       },
+    .{ .name = "month",                       .kind = .date_month       },
+    .{ .name = "todayofmonth",                .kind = .date_day         },
+    .{ .name = "day",                         .kind = .date_day         },
+    .{ .name = "tohour",                      .kind = .date_hour        },
+    .{ .name = "hour",                        .kind = .date_hour        },
+    .{ .name = "tominute",                    .kind = .date_minute      },
+    .{ .name = "minute",                      .kind = .date_minute      },
+    .{ .name = "tosecond",                    .kind = .date_second      },
+    .{ .name = "second",                      .kind = .date_second      },
     .{ .name = "isipv4string",                .kind = .ip_bool          },
     .{ .name = "isipv6string",                .kind = .ip_bool          },
     .{ .name = "ipv4stringtonumordefault",     .kind = .ip_to_num        },
@@ -3230,7 +3248,7 @@ fn evalTextExpr(expr: []const u8, row: *const RowCtx) ?Value {
                 const ch = trimmed[i];
                 if (ch == ')' or ch == ']') depth += 1;
                 if (ch == '(' or ch == '[') { if (depth > 0) depth -= 1; }
-                if (depth == 0 and (ch == '*' or ch == '/') and i > 0) {
+                if (depth == 0 and (ch == '*' or ch == '/' or ch == '%') and i > 0) {
                     found_op = ch;
                     found_pos = i;
                     break;
@@ -3250,6 +3268,7 @@ fn evalTextExpr(expr: []const u8, row: *const RowCtx) ?Value {
                             '-' => la - ra,
                             '*' => la * ra,
                             '/' => if (ra == 0.0) 0.0 else la / ra,
+                            '%' => if (ra == 0.0) 0.0 else @mod(la, ra),
                             else => unreachable,
                         };
                         // Return as i64 if result is whole number
@@ -3435,7 +3454,7 @@ fn evalFunc(kind: EvalKind, name: []const u8, inner: []const u8, row: *const Row
                     const yad = epoch_day.calculateYearDay();
                     const mad = yad.calculateMonthDay();
                     return Value{ .i64 = @as(i64, yad.year) * 10000 +
-                        @as(i64, @intFromEnum(mad.month) + 1) * 100 +
+                        @as(i64, @intFromEnum(mad.month)) * 100 +
                         @as(i64, mad.day_index + 1) };
                 },
                 else => {
@@ -3523,7 +3542,50 @@ fn evalFunc(kind: EvalKind, name: []const u8, inner: []const u8, row: *const Row
             // Return epoch milliseconds (so native block encoder treats as DateTime64(3))
             return Value{ .i64 = truncated_s * 1000 };
         },
-        // ── IP functions ───────────────────────────────────────────
+        // ── date extraction ────────────────────────────────────────
+        .date_year, .date_month, .date_day, .date_hour, .date_minute, .date_second => {
+            const v = evalTextExpr(inner, row) orelse return null;
+            // Parse to epoch seconds
+            const ts_s: i64 = switch (v) {
+                .i64 => |ts| if (ts > 1_000_000_000_000) @divFloor(ts, 1000) else ts,
+                .f64 => |ts| @intFromFloat(if (ts > 1_000_000_000_000.0) ts / 1000.0 else ts),
+                .str, .str_owned => blk: {
+                    const sv = v.toStr() orelse break :blk 0;
+                    if (std.fmt.parseInt(i64, sv, 10) catch null) |iv|
+                        break :blk if (iv > 1_000_000_000_000) @divFloor(iv, 1000) else iv;
+                    if (sv.len >= 10) {
+                        const yr = std.fmt.parseInt(i64, sv[0..4], 10) catch break :blk 0;
+                        const mo = std.fmt.parseInt(i64, sv[5..7], 10) catch break :blk 0;
+                        const dy = std.fmt.parseInt(i64, sv[8..10], 10) catch break :blk 0;
+                        var hh: i64 = 0; var mm: i64 = 0; var ss: i64 = 0;
+                        if (sv.len >= 13) hh = std.fmt.parseInt(i64, sv[11..13], 10) catch 0;
+                        if (sv.len >= 16) mm = std.fmt.parseInt(i64, sv[14..16], 10) catch 0;
+                        if (sv.len >= 19) ss = std.fmt.parseInt(i64, sv[17..19], 10) catch 0;
+                        const dpm = [_]i64{31,28,31,30,31,30,31,31,30,31,30,31};
+                        var days: i64 = (yr - 1970) * 365 + @divFloor(yr - 1969, 4);
+                        for (dpm[0..@intCast(mo - 1)]) |d| days += d;
+                        days += dy - 1;
+                        break :blk days * 86400 + hh * 3600 + mm * 60 + ss;
+                    }
+                    break :blk 0;
+                },
+                else => 0,
+            };
+            const ts_u: u64 = @intCast(@max(ts_s, 0));
+            const epoch_s4 = std.time.epoch.EpochSeconds{ .secs = ts_u };
+            const epoch_day4 = epoch_s4.getEpochDay();
+            const yad4 = epoch_day4.calculateYearDay();
+            const mad4 = yad4.calculateMonthDay();
+            return switch (kind) {
+                .date_year   => Value{ .i64 = @as(i64, yad4.year) },
+                .date_month  => Value{ .i64 = @as(i64, @intFromEnum(mad4.month)) },
+                .date_day    => Value{ .i64 = @as(i64, mad4.day_index) + 1 },
+                .date_hour   => Value{ .i64 = @mod(@divFloor(ts_s, 3600), 24) },
+                .date_minute => Value{ .i64 = @mod(@divFloor(ts_s, 60), 60) },
+                .date_second => Value{ .i64 = @mod(ts_s, 60) },
+                else => unreachable,
+            };
+        },
         .ip_bool => {
             const v = evalTextExpr(inner, row) orelse return Value{ .i64 = 0 };
             const sv = v.toStr() orelse return Value{ .i64 = 0 };
