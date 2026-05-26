@@ -1716,6 +1716,69 @@ test "CompactPart write events schema for CH ATTACH" {
     , .{ part_dir, part_name });
 }
 
+test "CompactPart write all_3_3_0 for CH ATTACH E2E" {
+    // Writes a NEW compact part all_3_3_0 to the CH detached dir.
+    // After the test, verify with:
+    //   curl 'http://localhost:19001/?query=SELECT+count(*)+FROM+default.events'
+    //   -> should be 13 (10 existing + 3 new)
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const ch_detached = "/tmp/ch-srv/data/store/4d0/4d02ac62-2539-4cf7-97dc-28415c3acc30/detached";
+    const part_name = "all_3_3_0";
+    const part_dir = ch_detached ++ "/" ++ part_name;
+
+    // Remove existing if present
+    {
+        var detached_dir = std.Io.Dir.openDirAbsolute(io, ch_detached, .{}) catch null;
+        if (detached_dir) |*d| {
+            defer d.close(io);
+            d.deleteTree(io, part_name) catch {};
+        }
+    }
+
+    const cols = [_]schema.Column{
+        .{ .name = "event_date", .ty = .date },
+        .{ .name = "event_time", .ty = .int32 },
+        .{ .name = "user_id",    .ty = .int32 },
+        .{ .name = "page_id",    .ty = .int32 },
+        .{ .name = "duration",   .ty = .int64 },
+        .{ .name = "url",        .ty = .text },
+    };
+    const table = schema.Table{ .name = "events", .columns = &cols };
+
+    var cp = try CompactPart.open(io, allocator, part_dir, table);
+    defer cp.deinit();
+
+    // 3 new rows (user_id 5,6,7) — not overlapping with existing 1..4
+    const dates = [_]i64{ 19723, 19724, 19724 };
+    const times = [_]i64{ 1704099900, 1704186600, 1704186900 };
+    const users = [_]i64{ 5, 6, 7 };
+    const pages = [_]i64{ 200, 201, 202 };
+    const durs  = [_]i64{ 500, 750, 1100 };
+    const urls  = [_][]const u8{
+        "https://example.com/new1",
+        "https://example.com/new2",
+        "https://example.com/new3",
+    };
+
+    try cp.appendFixedBatch(0, &dates);
+    try cp.appendFixedBatch(1, &times);
+    try cp.appendFixedBatch(2, &users);
+    try cp.appendFixedBatch(3, &pages);
+    try cp.appendFixedBatch(4, &durs);
+    for (urls) |u| try cp.appendString(5, u);
+    try std.testing.expectEqual(@as(u64, 3), cp.row_count);
+    try cp.finish();
+
+    std.debug.print(
+        \\
+        \\[E2E] Part written: {s}
+        \\[E2E] Run: curl 'http://localhost:19001/?query=ALTER+TABLE+default.events+ATTACH+PART+%27{s}%27'
+        \\
+    , .{ part_dir, part_name });
+}
+
 test "part write and verify files exist" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

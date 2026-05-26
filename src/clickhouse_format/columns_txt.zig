@@ -43,14 +43,14 @@ pub fn fromTable(allocator: std.mem.Allocator, table: schema.Table) ![]ChColumn 
             .int8, .int16, .int32, .int64, .date, .timestamp, .text, .float32, .float64 => {
                 try list.append(allocator, .{
                     .name = col.name,
-                    .ch_type = types.chTypeName(col.ty),
+                    .ch_type = col.ch_type orelse types.chTypeName(col.ty),
                 });
             },
             .char => {
                 // char maps to String in CH
                 try list.append(allocator, .{
                     .name = col.name,
-                    .ch_type = "String",
+                    .ch_type = col.ch_type orelse "String",
                 });
             },
         }
