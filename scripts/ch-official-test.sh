@@ -34,6 +34,7 @@ for sql_file in "$TEST_DIR"/*.sql; do
   [[ "$first_line" == "404: Not Found" ]] && { ((skip++)); continue; }
 
   actual=""
+  stmt_buf=""
   while IFS= read -r line; do
     # Skip blank and pure comment lines
     [[ -z "$line" ]] && continue
@@ -44,14 +45,28 @@ for sql_file in "$TEST_DIR"/*.sql; do
     # Skip lines with serverError annotation (they are expected to error)
     [[ "$line" == *"-- { serverError"* ]] && continue
 
-    # Strip trailing semicolon
-    sql="${trimmed%;}"
-    [[ -z "$sql" ]] && continue
+    # Accumulate into stmt_buf
+    if [[ -n "$stmt_buf" ]]; then
+      stmt_buf="${stmt_buf} ${trimmed}"
+    else
+      stmt_buf="$trimmed"
+    fi
 
-    res="$(run_sql "$sql" 2>/dev/null || true)"
-    # Only append if non-empty to avoid spurious newlines
-    [[ -n "$res" ]] && actual="${actual}${res}"$'\n'
+    # Check if stmt_buf ends with a semicolon (end of statement)
+    if [[ "$stmt_buf" == *\; ]]; then
+      sql="${stmt_buf%;}"
+      stmt_buf=""
+      [[ -z "$sql" ]] && continue
+      res="$(run_sql "$sql" 2>/dev/null || true)"
+      [[ -n "$res" ]] && actual="${actual}${res}"$'\n'
+    fi
   done < "$sql_file"
+  # Flush any remaining buffer (no trailing semicolon)
+  if [[ -n "$stmt_buf" ]]; then
+    sql="$stmt_buf"
+    res="$(run_sql "$sql" 2>/dev/null || true)"
+    [[ -n "$res" ]] && actual="${actual}${res}"$'\n'
+  fi
 
   ref="$(cat "$ref_file")"
   # Normalize: strip trailing newline from both
