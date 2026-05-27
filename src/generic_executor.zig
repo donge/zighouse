@@ -71,10 +71,26 @@ pub fn runWithSource(
     source: Source,
     table: *const schema.Table,
 ) anyerror![]u8 {
+    // Expand SELECT * (STAR projection with column==null) to all schema columns.
+    var expanded_projs: ?[]generic_sql.Expr = null;
+    defer if (expanded_projs) |ep| allocator.free(ep);
+    var effective_plan = plan;
+    for (plan.projections) |p| {
+        if (p.func == .column_ref and p.column == null and table.columns.len > 0) {
+            // Replace the single STAR with all columns
+            const new_projs = try allocator.alloc(generic_sql.Expr, table.columns.len);
+            for (table.columns, 0..) |col, ci| {
+                new_projs[ci] = .{ .func = .column_ref, .column = col.name };
+            }
+            expanded_projs = new_projs;
+            effective_plan.projections = new_projs;
+            break;
+        }
+    }
     const exec = Executor{
         .allocator = allocator,
         .io = io,
-        .plan = plan,
+        .plan = effective_plan,
         .source = source,
         .table = table,
     };
@@ -1882,13 +1898,10 @@ const GroupByCtx = struct {
             // Evaluate all arrayJoin inner expressions, zip by index.
             const primary2 = aj_items2.items[0];
             const arr_val2 = evalTextExpr(primary2.inner, row) orelse return;
-            const elems2: []const Value = switch (arr_val2) {
-                .array => |a| a,
-                else => blk: {
-                    const s = self.allocator.create(Value) catch return;
-                    s.* = arr_val2;
-                    break :blk @as([]const Value, @as(*[1]Value, s));
-                },
+            const elems2: []const Value = valueToArray(arr_val2) orelse blk: {
+                const s = self.allocator.create(Value) catch return;
+                s.* = arr_val2;
+                break :blk @as([]const Value, @as(*[1]Value, s));
             };
             var secondary_arrays2: std.ArrayListUnmanaged([]const Value) = .empty;
             defer secondary_arrays2.deinit(self.allocator);
@@ -1897,16 +1910,13 @@ const GroupByCtx = struct {
                     try secondary_arrays2.append(self.allocator, &.{});
                     continue;
                 };
-                const sa: []const Value = switch (sv) {
-                    .array => |a| a,
-                    else => blk: {
-                        const s = self.allocator.create(Value) catch {
-                            try secondary_arrays2.append(self.allocator, &.{});
-                            break :blk &.{};
-                        };
-                        s.* = sv;
-                        break :blk @as([]const Value, @as(*[1]Value, s));
-                    },
+                const sa: []const Value = valueToArray(sv) orelse blk: {
+                    const s = self.allocator.create(Value) catch {
+                        try secondary_arrays2.append(self.allocator, &.{});
+                        break :blk &.{};
+                    };
+                    s.* = sv;
+                    break :blk @as([]const Value, @as(*[1]Value, s));
                 };
                 try secondary_arrays2.append(self.allocator, sa);
             }
@@ -2253,13 +2263,10 @@ const ScanCtx = struct {
             // Evaluate all arrayJoin inner expressions; zip by index.
             const primary = aj_items.items[0];
             const arr_val = evalTextExpr(primary.inner, row) orelse return;
-            const elems: []const Value = switch (arr_val) {
-                .array => |a| a,
-                else => blk: {
-                    const s = self.arena.allocator().create(Value) catch return;
-                    s.* = arr_val;
-                    break :blk @as([]const Value, @as(*[1]Value, s));
-                },
+            const elems: []const Value = valueToArray(arr_val) orelse blk: {
+                const s = self.arena.allocator().create(Value) catch return;
+                s.* = arr_val;
+                break :blk @as([]const Value, @as(*[1]Value, s));
             };
             // Evaluate secondary arrays (may be shorter; pad with null_val).
             var secondary_arrays: std.ArrayListUnmanaged([]const Value) = .empty;
@@ -2269,16 +2276,13 @@ const ScanCtx = struct {
                     try secondary_arrays.append(self.allocator, &.{});
                     continue;
                 };
-                const sa: []const Value = switch (sv) {
-                    .array => |a| a,
-                    else => blk: {
-                        const s = self.arena.allocator().create(Value) catch {
-                            try secondary_arrays.append(self.allocator, &.{});
-                            break :blk &.{};
-                        };
-                        s.* = sv;
-                        break :blk @as([]const Value, @as(*[1]Value, s));
-                    },
+                const sa: []const Value = valueToArray(sv) orelse blk: {
+                    const s = self.arena.allocator().create(Value) catch {
+                        try secondary_arrays.append(self.allocator, &.{});
+                        break :blk &.{};
+                    };
+                    s.* = sv;
+                    break :blk @as([]const Value, @as(*[1]Value, s));
                 };
                 try secondary_arrays.append(self.allocator, sa);
             }
@@ -2490,18 +2494,12 @@ const ScanCtx = struct {
                         // If value was already decoded to .array by decodeArrayBlob, render directly.
                         if (v == .array) {
                             const arr = v.array;
-                            try out.append(allocator, '[');
+                            // Use \x01-sentinel format so csvToTsv handles it correctly.
+                            try out.append(allocator, 0x01);
                             for (arr, 0..) |elem, ei| {
-                                if (ei > 0) try out.append(allocator, ',');
-                                const s = elem.toStr() orelse "";
-                                try out.append(allocator, '\'');
-                                for (s) |c| {
-                                    if (c == '\'') try out.append(allocator, '\\');
-                                    try out.append(allocator, c);
-                                }
-                                try out.append(allocator, '\'');
+                                if (ei > 0) try out.append(allocator, '\x0c');
+                                try elem.writeCsv(&out, allocator);
                             }
-                            try out.append(allocator, ']');
                             continue;
                         }
                         // For .str values with \x01 sentinel (serialized array), write as-is.
@@ -3052,6 +3050,8 @@ const EvalKind = enum {
     arr_min,           // arrayMin(arr)
     arr_slice,         // arraySlice(arr, off, len)
     arr_str_join,      // arrayStringConcat(arr [, sep])
+    arr_enumerate,     // arrayEnumerate(arr) → [1,2,...,len]
+    arr_enumerate_uniq, // arrayEnumerateUniq(arr) → [1,1,...] within equal-value runs
     // Map
     map_keys,          // mapKeys(m) → array of keys
     map_values,        // mapValues(m) → array of values
@@ -3189,6 +3189,8 @@ const func_evals = [_]FuncEval{
     .{ .name = "arrayslice",                  .kind = .arr_slice        },
      .{ .name = "arraystringconcat",           .kind = .arr_str_join     },
      .{ .name = "array_to_string",            .kind = .arr_str_join     },
+    .{ .name = "arrayenumerate",              .kind = .arr_enumerate    },
+    .{ .name = "arrayenumerateuniq",          .kind = .arr_enumerate_uniq },
     .{ .name = "mapkeys",                     .kind = .map_keys         },
     .{ .name = "map_keys",                    .kind = .map_keys         },
     .{ .name = "mapvalues",                   .kind = .map_values       },
@@ -3249,14 +3251,57 @@ const func_evals = [_]FuncEval{
 /// Parse a \x0c-separated string into a []Value (page_allocator-owned).
 /// Handles both "a\x0cb" and "\x0ca\x0cb" (leading \x0c = element prefix) formats.
 fn parseArrayValue(s: []const u8) ?[]Value {
-    var list: std.ArrayListUnmanaged(Value) = .empty;
-    var it = std.mem.splitScalar(u8, s, '\x0c');
-    while (it.next()) |elem| {
-        // Skip the leading empty segment produced by a leading \x0c
-        if (elem.len == 0 and list.items.len == 0) continue;
-        list.append(std.heap.page_allocator, Value{ .str = elem }) catch return null;
+    // Handle \x0c-separated format (from sentinel serialization: \x01 elem \x0c elem ...)
+    if (std.mem.indexOfScalar(u8, s, '\x0c') != null) {
+        // strip optional leading \x01 sentinel byte
+        const data = if (s.len > 0 and s[0] == '\x01') s[1..] else s;
+        var list: std.ArrayListUnmanaged(Value) = .empty;
+        var it = std.mem.splitScalar(u8, data, '\x0c');
+        while (it.next()) |elem| {
+            if (elem.len == 0 and list.items.len == 0) continue;
+            list.append(std.heap.page_allocator, Value{ .str = elem }) catch return null;
+        }
+        return list.toOwnedSlice(std.heap.page_allocator) catch null;
     }
-    return list.toOwnedSlice(std.heap.page_allocator) catch null;
+    // Handle ClickHouse text format: [elem1,elem2,...] or ['str1','str2']
+    const trimmed = std.mem.trim(u8, s, " \t");
+    if (trimmed.len >= 2 and trimmed[0] == '[' and trimmed[trimmed.len - 1] == ']') {
+        const content = trimmed[1 .. trimmed.len - 1];
+        if (content.len == 0) return &.{}; // empty array
+        var list: std.ArrayListUnmanaged(Value) = .empty;
+        var p: usize = 0;
+        while (p < content.len) {
+            // skip whitespace and commas
+            while (p < content.len and (content[p] == ' ' or content[p] == ',' or content[p] == '\t')) p += 1;
+            if (p >= content.len) break;
+            if (content[p] == '\'') {
+                // quoted string
+                p += 1;
+                const start = p;
+                while (p < content.len and content[p] != '\'') p += 1;
+                const elem = content[start..p];
+                if (p < content.len) p += 1; // skip closing '
+                list.append(std.heap.page_allocator, Value{ .str = elem }) catch return null;
+            } else {
+                // number or bare token
+                const start = p;
+                while (p < content.len and content[p] != ',' and content[p] != ']' and content[p] != ' ') p += 1;
+                const elem_str = content[start..p];
+                if (elem_str.len == 0) continue;
+                if (std.fmt.parseInt(i64, elem_str, 10)) |iv| {
+                    list.append(std.heap.page_allocator, Value{ .i64 = iv }) catch return null;
+                } else |_| {
+                    if (std.fmt.parseFloat(f64, elem_str)) |fv| {
+                        list.append(std.heap.page_allocator, Value{ .f64 = fv }) catch return null;
+                    } else |_| {
+                        list.append(std.heap.page_allocator, Value{ .str = elem_str }) catch return null;
+                    }
+                }
+            }
+        }
+        return list.toOwnedSlice(std.heap.page_allocator) catch null;
+    }
+    return null;
 }
 
 /// Get the array elements from a Value (either .array or parse from .str/.str_owned).
@@ -4391,7 +4436,7 @@ fn evalFunc(kind: EvalKind, name: []const u8, inner: []const u8, row: *const Row
             }
             return Value{ .array = rest };
         },
-        .arr_str_join => {
+         .arr_str_join => {
             // arrayStringConcat(arr [, sep])
             const args = splitTopLevelArgs(inner) catch return Value{ .str = "" };
             if (args.len < 1) return Value{ .str = "" };
@@ -4407,6 +4452,40 @@ fn evalFunc(kind: EvalKind, name: []const u8, inner: []const u8, row: *const Row
                 buf.appendSlice(std.heap.page_allocator, elem.toStr() orelse "") catch {};
             }
             return Value{ .str_owned = buf.toOwnedSlice(std.heap.page_allocator) catch return Value{ .str = "" } };
+        },
+        .arr_enumerate => {
+            // arrayEnumerate(arr) → [1, 2, ..., len(arr)]
+            const arr_v = evalTextExpr(inner, row) orelse return Value{ .array = &.{} };
+            const arr = valueToArray(arr_v) orelse return Value{ .array = &.{} };
+            const out = std.heap.page_allocator.alloc(Value, arr.len) catch return Value{ .array = &.{} };
+            for (0..arr.len) |i| out[i] = Value{ .i64 = @intCast(i + 1) };
+            return Value{ .array = out };
+        },
+        .arr_enumerate_uniq => {
+            // arrayEnumerateUniq(arr) → for each element, position within run of equal values
+            const args = splitTopLevelArgs(inner) catch return Value{ .array = &.{} };
+            if (args.len == 0) return Value{ .array = &.{} };
+            const arr_v = evalTextExpr(std.mem.trim(u8, args.items[0], " \t\r\n"), row) orelse return Value{ .array = &.{} };
+            const arr = valueToArray(arr_v) orelse return Value{ .array = &.{} };
+            const out = std.heap.page_allocator.alloc(Value, arr.len) catch return Value{ .array = &.{} };
+            // For single array: count per unique value
+            var counts = std.ArrayListUnmanaged(struct { v: Value, c: i64 }).empty;
+            for (arr) |elem| {
+                var found = false;
+                for (counts.items) |*entry| {
+                    if (Value.eql(entry.v, elem)) { entry.c += 1; found = true; break; }
+                }
+                if (!found) counts.append(std.heap.page_allocator, .{ .v = elem, .c = 1 }) catch {};
+            }
+            // Reset and recount for output
+            for (counts.items) |*entry| entry.c = 0;
+            for (arr, 0..) |elem, i| {
+                for (counts.items) |*entry| {
+                    if (Value.eql(entry.v, elem)) { entry.c += 1; out[i] = Value{ .i64 = entry.c }; break; }
+                }
+            }
+            counts.deinit(std.heap.page_allocator);
+            return Value{ .array = out };
         },
         // ── Map functions ─────────────────────────────────────────
         .map_keys => {

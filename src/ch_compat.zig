@@ -278,10 +278,15 @@ fn rewriteArrayJoin(allocator: std.mem.Allocator, sql: []const u8) !?[]u8 {
     defer alias_map.deinit(allocator);
 
     for (items.items) |item| {
-        const as_pos = std.ascii.indexOfIgnoreCase(item, " AS ") orelse continue;
-        const expr = std.mem.trim(u8, item[0..as_pos], " \t\r\n");
-        const alias = std.mem.trim(u8, item[as_pos + 4..], " \t\r\n");
-        try alias_map.append(allocator, .{ .alias = alias, .expr = expr });
+        if (std.ascii.indexOfIgnoreCase(item, " AS ")) |as_pos| {
+            const expr = std.mem.trim(u8, item[0..as_pos], " \t\r\n");
+            const alias = std.mem.trim(u8, item[as_pos + 4..], " \t\r\n");
+            try alias_map.append(allocator, .{ .alias = alias, .expr = expr });
+        } else {
+            // No AS: the alias is the same as the expression (e.g. "ARRAY JOIN arr" means arr AS arr)
+            const expr = std.mem.trim(u8, item, " \t\r\n");
+            if (expr.len > 0) try alias_map.append(allocator, .{ .alias = expr, .expr = expr });
+        }
     }
 
     // Parse original SELECT list: "SELECT col1, col2" → ["col1", "col2"]

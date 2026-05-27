@@ -718,6 +718,11 @@ fn extractInner(s: []const u8) []const u8 {
 
 /// Return the fixed byte width for a CH type that maps to .text, or null if variable-length.
 /// Used by consumeNativeTextRows to decide how to consume each row.
+/// Public alias used by server.zig for VALUES INSERT array encoding.
+pub fn chTypeFixedWidth(type_str: []const u8) ?usize {
+    return nativeTextFixedWidth(type_str);
+}
+
 fn nativeTextFixedWidth(type_str: []const u8) ?usize {
     if (chTypeEql(type_str, "IPv4")) return 4;
     if (chTypeEql(type_str, "IPv6")) return 16;

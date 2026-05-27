@@ -1403,9 +1403,9 @@ pub const Server = struct {
             try self.writePart(db_table, entry, col_bufs);
         }
 
-        const empty = try native_block.encodeEmpty(self.allocator);
-        defer self.allocator.free(empty);
-        try sendNativeBlock(self.allocator, request, out, empty);
+        // Return empty text response (not native block) for HTTP VALUES INSERT.
+        // This keeps the response non-binary so test harnesses work correctly.
+        try sendResponse(request, out, .ok, "");
     }
 
     /// Native Block INSERT for body-SQL mode (data already split from SQL line).
@@ -1571,12 +1571,98 @@ fn scanMaxPartSeq(io: std.Io, data_dir: []const u8) u64 {
 
 /// Parse a text field value and append to a ColumnBuffer according to the column type.
 /// Used by CSV, JSONEachRow, and VALUES handlers.
+/// Parse an array literal string like "[1,2,3]" or "['a','b']" into element strings.
+/// Returns owned slice of owned element strings (caller frees all).
+fn parseArrayLiteralElements(allocator: std.mem.Allocator, lit: []const u8) ![][]const u8 {
+    const s = std.mem.trim(u8, lit, " \t");
+    var elems: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer {
+        for (elems.items) |e| allocator.free(e);
+        elems.deinit(allocator);
+    }
+    if (s.len < 2 or s[0] != '[') return elems.toOwnedSlice(allocator);
+    var p: usize = 1; // skip '['
+    while (p < s.len and s[p] != ']') {
+        // skip whitespace and commas
+        while (p < s.len and (s[p] == ' ' or s[p] == '\t' or s[p] == ',')) p += 1;
+        if (p >= s.len or s[p] == ']') break;
+        if (s[p] == '\'') {
+            // quoted string element
+            p += 1;
+            var ebuf: std.ArrayListUnmanaged(u8) = .empty;
+            while (p < s.len) {
+                if (s[p] == '\'') {
+                    p += 1;
+                    if (p < s.len and s[p] == '\'') { try ebuf.append(allocator, '\''); p += 1; }
+                    else break;
+                } else { try ebuf.append(allocator, s[p]); p += 1; }
+            }
+            try elems.append(allocator, try ebuf.toOwnedSlice(allocator));
+        } else if (s[p] == '[') {
+            // nested array: capture balanced brackets
+            const start = p;
+            var depth: usize = 0;
+            while (p < s.len) {
+                if (s[p] == '[') depth += 1
+                else if (s[p] == ']') { depth -= 1; if (depth == 0) { p += 1; break; } }
+                p += 1;
+            }
+            try elems.append(allocator, try allocator.dupe(u8, s[start..p]));
+        } else {
+            // number or bare token
+            const start = p;
+            while (p < s.len and s[p] != ',' and s[p] != ']' and s[p] != ' ' and s[p] != '\t') p += 1;
+            try elems.append(allocator, try allocator.dupe(u8, s[start..p]));
+        }
+    }
+    return elems.toOwnedSlice(allocator);
+}
+
 fn appendParsedField(
     allocator: std.mem.Allocator,
     col: schema.Column,
     field: []const u8,
     buf: *row_binary_decoder.ColumnBuffer,
 ) !void {
+    // Array(*) columns: parse [elem,...] literal into binary blob
+    if (col.ch_type) |ct| {
+        if (std.mem.startsWith(u8, ct, "Array(")) {
+            const elem_type = ct[6 .. ct.len - 1]; // strip "Array(" and ")"
+            const elems = try parseArrayLiteralElements(allocator, field);
+            defer { for (elems) |e| allocator.free(e); allocator.free(elems); }
+            // Encode elements into binary blob
+            var blob: std.ArrayListUnmanaged(u8) = .empty;
+            defer blob.deinit(allocator);
+            const fix_w = row_binary_decoder.chTypeFixedWidth(elem_type);
+            for (elems) |e| {
+                if (fix_w) |w| {
+                    const v = std.fmt.parseInt(i64, std.mem.trim(u8, e, " \t"), 10) catch 0;
+                    var tmp = [_]u8{0} ** 8;
+                    std.mem.writeInt(i64, &tmp, v, .little);
+                    try blob.appendSlice(allocator, tmp[0..w]);
+                } else {
+                    // variable-length string: varint(len) + content
+                    const slen = e.len;
+                    var vbuf: [10]u8 = undefined;
+                    var vi: usize = 0;
+                    var rem = slen;
+                    while (true) {
+                        vbuf[vi] = @intCast(rem & 0x7F);
+                        rem >>= 7;
+                        if (rem == 0) { vi += 1; break; }
+                        vbuf[vi] |= 0x80;
+                        vi += 1;
+                    }
+                    try blob.appendSlice(allocator, vbuf[0..vi]);
+                    try blob.appendSlice(allocator, e);
+                }
+            }
+            const start = buf.str_bytes.items.len;
+            try buf.str_bytes.appendSlice(allocator, blob.items);
+            try buf.str_vals.append(allocator, buf.str_bytes.items[start..]);
+            return;
+        }
+    }
     switch (col.ty) {
         .text, .char => {
             const start = buf.str_bytes.items.len;
@@ -2198,6 +2284,21 @@ const SqlValuesParser = struct {
         if (self.pos + 4 <= self.src.len and std.ascii.eqlIgnoreCase(self.src[self.pos..self.pos + 4], "NULL")) {
             self.pos += 4;
             return try allocator.dupe(u8, "");
+        }
+        // Array literal: [elem, elem, ...]
+        if (c == '[') {
+            const start = self.pos;
+            var depth: usize = 0;
+            while (self.pos < self.src.len) {
+                const ch = self.src[self.pos];
+                if (ch == '[') depth += 1
+                else if (ch == ']') {
+                    depth -= 1;
+                    if (depth == 0) { self.pos += 1; break; }
+                }
+                self.pos += 1;
+            }
+            return try allocator.dupe(u8, self.src[start..self.pos]);
         }
         // Number or bare token
         const start = self.pos;
