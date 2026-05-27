@@ -2324,8 +2324,13 @@ const ScanCtx = struct {
         }
 
         const vals = try self.arena.allocator().alloc(Value, self.plan.projections.len);
+        // Build a mutable alias row so later projections can reference earlier aliases.
+        var alias_names = std.ArrayListUnmanaged([]const u8).empty;
+        var alias_vals  = std.ArrayListUnmanaged(Value).empty;
+        defer { alias_names.deinit(self.allocator); alias_vals.deinit(self.allocator); }
+        var alias_row: RowCtx = .{ .names = &.{}, .values = &.{}, .parent = row };
         for (self.plan.projections, vals) |proj, *v| {
-            const raw = evalProjectionExpr(proj, row);
+            const raw = evalProjectionExpr(proj, &alias_row);
             v.* = switch (raw) {
                 .str      => |s| Value{ .str = try self.arena.allocator().dupe(u8, s) },
                 .str_owned => |s| Value{ .str = try self.arena.allocator().dupe(u8, s) },
@@ -2343,6 +2348,12 @@ const ScanCtx = struct {
                  },
                 else => raw,
             };
+            // Make this alias available to subsequent projections
+            if (proj.alias) |a| {
+                try alias_names.append(self.allocator, a);
+                try alias_vals.append(self.allocator, v.*);
+                alias_row = .{ .names = alias_names.items, .values = alias_vals.items, .parent = row };
+            }
         }
         try self.rows.append(self.allocator, vals);
     }
