@@ -911,7 +911,10 @@ pub const Server = struct {
                 break :blk try generic_executor.runWithSource(self.allocator, self.io, inner_plan.*, .{ .ch_parts = inner_dirs }, inner_table);
             };
             defer self.allocator.free(inner_csv);
-            const result = try generic_executor.runOverCsv(self.allocator, plan, inner_csv, inner_table);
+            // Expand SELECT * by reading the CSV header and rewriting projections.
+            const outer_plan = try expandStarPlan(self.allocator, plan, inner_csv);
+            defer if (outer_plan.projections.ptr != plan.projections.ptr) self.allocator.free(outer_plan.projections);
+            const result = try generic_executor.runOverCsv(self.allocator, outer_plan, inner_csv, inner_table);
             defer self.allocator.free(result);
             if (want_tsv) {
                 const tsv = try csvToTsv(self.allocator, result, true);
@@ -1048,6 +1051,59 @@ pub const Server = struct {
             defer self.allocator.free(nb);
             try sendNativeBlock(self.allocator, request, out, nb);
         }
+    }
+
+    /// If `plan` has a single star projection (SELECT *), expand it to explicit
+    /// column_ref projections derived from the CSV header of `csv`.
+    /// Returns a modified Plan whose `projections` slice is heap-allocated (caller
+    /// must free) only when expansion actually occurred; otherwise returns `plan` unchanged.
+    fn expandStarPlan(
+        allocator: std.mem.Allocator,
+        plan: generic_sql.Plan,
+        csv: []const u8,
+    ) !generic_sql.Plan {
+        // Check if this is a pure SELECT * (single projection with column = null)
+        const is_star = plan.projections.len == 1 and plan.projections[0].column == null and
+            plan.projections[0].func == .column_ref;
+        if (!is_star) return plan;
+
+        // Parse CSV header to get column names
+        const header_end = std.mem.indexOfScalar(u8, csv, '\n') orelse return plan;
+        const header_line = csv[0..header_end];
+
+        var col_names: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer col_names.deinit(allocator);
+        var pos: usize = 0;
+        while (pos <= header_line.len) {
+            const was = pos;
+            // Simple CSV split (no quoted headers expected here)
+            const end = std.mem.indexOfScalarPos(u8, header_line, pos, ',') orelse header_line.len;
+            const name = std.mem.trim(u8, header_line[pos..end], " \t\r");
+            // Strip type sentinels
+            const stripped: []const u8 = if (name.len > 4 and name[0] == 0x03 and name[1] == 'U' and name[2] == '8' and name[3] == ':')
+                name[4..]
+            else if (name.len > 3 and name[0] == 0x02 and name[1] == 'D' and name[2] == ':')
+                name[3..]
+            else
+                name;
+            if (stripped.len > 0) try col_names.append(allocator, stripped);
+            pos = if (end < header_line.len) end + 1 else header_line.len + 1;
+            if (pos == was + 1 and was >= header_line.len) break;
+        }
+
+        if (col_names.items.len == 0) return plan;
+
+        // Build new projections
+        const new_projs = try allocator.alloc(generic_sql.Expr, col_names.items.len);
+        for (col_names.items, 0..) |name, i| {
+            new_projs[i] = .{
+                .func = .column_ref,
+                .column = name,
+            };
+        }
+        var new_plan = plan;
+        new_plan.projections = new_projs;
+        return new_plan;
     }
 
     /// Run a UNION ALL plan chain and return concatenated CSV (no header row).
