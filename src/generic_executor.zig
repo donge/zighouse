@@ -3006,6 +3006,16 @@ const EvalKind = enum {
     math_is_nan, // isNaN(x)
     math_is_inf, // isInfinite(x) / isInf(x)
     math_is_finite, // isFinite(x)
+    math_pi,        // pi()
+    math_e,         // e()
+    // Hyperbolic
+    math_sinh,  math_cosh,  math_tanh,
+    math_asinh, math_acosh, math_atanh,
+    // Other math
+    math_log1p, // log1p(x)
+    math_hypot, // hypot(x,y)
+    // Range/sequence function
+    fn_range,   // range(n) or range(start, end) → array [0..n-1]
 };
 
 const FuncEval = struct {
@@ -3111,6 +3121,18 @@ const func_evals = [_]FuncEval{
     .{ .name = "isinfinite", .kind = .math_is_inf },
     .{ .name = "isinf",   .kind = .math_is_inf },
     .{ .name = "isfinite", .kind = .math_is_finite },
+    .{ .name = "pi",       .kind = .math_pi      },
+    .{ .name = "e",        .kind = .math_e       },
+    .{ .name = "sinh",     .kind = .math_sinh    },
+    .{ .name = "cosh",     .kind = .math_cosh    },
+    .{ .name = "tanh",     .kind = .math_tanh    },
+    .{ .name = "asinh",    .kind = .math_asinh   },
+    .{ .name = "acosh",    .kind = .math_acosh   },
+    .{ .name = "atanh",    .kind = .math_atanh   },
+    .{ .name = "log1p",    .kind = .math_log1p   },
+    .{ .name = "hypot",    .kind = .math_hypot   },
+    .{ .name = "range",    .kind = .fn_range     },
+    .{ .name = "generate_series", .kind = .fn_range },
 };
 
 // ── Helper: resolve a Value from an array stored as \f-separated string ───────
@@ -4219,6 +4241,44 @@ fn evalFunc(kind: EvalKind, name: []const u8, inner: []const u8, row: *const Row
         .math_is_finite => {
             const x = (evalTextExpr(std.mem.trim(u8, inner, " \t\r\n"), row) orelse return null).toF64() orelse return null;
             return Value{ .i64 = if (std.math.isFinite(x)) 1 else 0 };
+        },
+        .math_pi => return Value{ .f64 = std.math.pi },
+        .math_e  => return Value{ .f64 = std.math.e  },
+        .math_sinh, .math_cosh, .math_tanh, .math_asinh, .math_acosh, .math_atanh, .math_log1p => {
+            const x = (evalTextExpr(std.mem.trim(u8, inner, " \t\r\n"), row) orelse return null).toF64() orelse return null;
+            const result: f64 = switch (kind) {
+                .math_sinh  => std.math.sinh(x),
+                .math_cosh  => std.math.cosh(x),
+                .math_tanh  => std.math.tanh(x),
+                .math_asinh => std.math.asinh(x),
+                .math_acosh => std.math.acosh(x),
+                .math_atanh => std.math.atanh(x),
+                .math_log1p => std.math.log1p(x),
+                else        => unreachable,
+            };
+            return Value{ .f64 = result };
+        },
+        .math_hypot => {
+            const args = splitTopLevelArgs(inner) catch return null;
+            if (args.len != 2) return null;
+            const a = (evalTextExpr(std.mem.trim(u8, args.items[0], " \t\r\n"), row) orelse return null).toF64() orelse return null;
+            const b = (evalTextExpr(std.mem.trim(u8, args.items[1], " \t\r\n"), row) orelse return null).toF64() orelse return null;
+            return Value{ .f64 = std.math.hypot(a, b) };
+        },
+        .fn_range => {
+            // range(n): [0, 1, ..., n-1]  or  range(start, end): [start, ..., end-1]
+            const args = splitTopLevelArgs(inner) catch return null;
+            if (args.len == 0) return Value{ .array = &.{} };
+            const start: i64 = if (args.len >= 2)
+                (evalTextExpr(std.mem.trim(u8, args.items[0], " \t\r\n"), row) orelse return null).toI64() orelse return null
+            else 0;
+            const end_idx: usize = if (args.len >= 2) 1 else 0;
+            const n_val = evalTextExpr(std.mem.trim(u8, args.items[end_idx], " \t\r\n"), row) orelse return null;
+            const end_val = n_val.toI64() orelse return null;
+            const count: usize = @intCast(@max(0, end_val - start));
+            const elems = std.heap.page_allocator.alloc(Value, count) catch return null;
+            for (elems, 0..) |*e, i| e.* = Value{ .i64 = start + @as(i64, @intCast(i)) };
+            return Value{ .array = elems };
         },
     }
 }
