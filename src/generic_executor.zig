@@ -3077,6 +3077,7 @@ const func_evals = [_]FuncEval{
      .{ .name = "risk_score",                  .kind = .stub_float_zero  },
     .{ .name = "cast",                        .kind = .cast_expr        },
     .{ .name = "tostring",                    .kind = .str_tostring     },
+    .{ .name = "ch_tostring",                 .kind = .str_tostring     },
     .{ .name = "now",                         .kind = .fn_now           },
     .{ .name = "today",                       .kind = .fn_now           },
     .{ .name = "list_value",                  .kind = .arr_make         },

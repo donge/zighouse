@@ -1491,7 +1491,15 @@ fn exprToText(allocator: std.mem.Allocator, val: std.json.Value) !?[]const u8 {
             std.mem.eql(u8, type_id, "DATE") or
             std.mem.eql(u8, type_id, "TIMESTAMP"))
         {
-            return try std.fmt.allocPrint(allocator, "'{s}'", .{raw_val.string});
+            switch (raw_val) {
+                .string => |s| return try std.fmt.allocPrint(allocator, "'{s}'", .{s}),
+                .integer => |us| {
+                    // DuckDB stores TIMESTAMP as microseconds since epoch; render as CAST for eval.
+                    const ts_s: i64 = @divFloor(us, 1_000_000);
+                    return try std.fmt.allocPrint(allocator, "CAST({d} AS TIMESTAMP)", .{ts_s});
+                },
+                else => return null,
+            }
         }
         // DECIMAL: stored as integer scaled by 10^scale — reconstruct the decimal string
         if (std.mem.eql(u8, type_id, "DECIMAL")) {

@@ -26,7 +26,8 @@ const rules = [_]RewriteRule{
 
     // CH type-cast functions → CAST(x AS T)
     // DuckDB does not recognise these names at the parser level.
-    .{ .name = "toString",         .kind = .cast,       .param = "AS VARCHAR"   },
+    // toString(x) — renamed to ch_tostring to avoid DuckDB binding CAST(x AS VARCHAR) when x is TIMESTAMP
+    // .{ .name = "toString",         .kind = .cast,       .param = "AS VARCHAR"   },
     .{ .name = "toDate",           .kind = .cast,       .param = "AS DATE"      },
     .{ .name = "toDateTime",       .kind = .cast,       .param = "AS TIMESTAMP" },
     .{ .name = "toUInt8",          .kind = .cast,       .param = "AS UTINYINT"  },
@@ -62,6 +63,8 @@ const rules = [_]RewriteRule{
     .{ .name = "arrayStringConcat",    .kind = .rename,     .param = "array_to_string("  },
     // materialize(x) is a CH no-op that forces materialization; treat as identity.
     .{ .name = "materialize",          .kind = .rename,     .param = "("                 },
+    // toString(x) — rename to avoid DuckDB's built-in toString binding TIMESTAMP args
+    .{ .name = "toString",             .kind = .rename,     .param = "ch_tostring("      },
 };
 
 // ── Public entry point ────────────────────────────────────────────────────────
