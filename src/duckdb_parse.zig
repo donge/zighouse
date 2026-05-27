@@ -437,7 +437,7 @@ fn translateSelectNode(allocator: std.mem.Allocator, node_obj: std.json.ObjectMa
         }
     }
 
-    return generic_sql.Plan{
+    const plan = generic_sql.Plan{
         .table = table_name,
         .projections = try projections.toOwnedSlice(allocator),
         .filter = filter,
@@ -457,7 +457,14 @@ fn translateSelectNode(allocator: std.mem.Allocator, node_obj: std.json.ObjectMa
         .numbers_count = blk: {
             if (std.ascii.eqlIgnoreCase(table_name, "system.numbers") or
                 std.ascii.eqlIgnoreCase(table_name, "numbers"))
-                break :blk limit orelse std.math.maxInt(u64);
+            {
+                // Generate enough rows to satisfy LIMIT+WHERE. Use a generous
+                // multiple of the LIMIT as the scan cap to avoid infinite loops
+                // when the WHERE filter never matches unknown functions.
+                const lim = limit orelse 0;
+                const scan_cap: u64 = if (lim > 0) @min(lim * 10_000, 10_000_000) else 10_000_000;
+                break :blk scan_cap;
+            }
             if (std.mem.startsWith(u8, table_name, "numbers:")) {
                 const n = std.fmt.parseInt(u64, table_name[8..], 10) catch break :blk null;
                 break :blk n;
@@ -466,6 +473,16 @@ fn translateSelectNode(allocator: std.mem.Allocator, node_obj: std.json.ObjectMa
         },
         .owned = true,
     };
+    // Replace wildcard projections with `number` for numbers virtual table.
+    if (plan.numbers_count != null) {
+        const mutable_projs: []generic_sql.Expr = @constCast(plan.projections);
+        for (mutable_projs) |*proj| {
+            if (proj.func == .column_ref and proj.column == null) {
+                proj.column = try allocator.dupe(u8, "number");
+            }
+        }
+    }
+    return plan;
 }
 
 // ── WHERE AST → WhereNode tree ───────────────────────────────────────────────

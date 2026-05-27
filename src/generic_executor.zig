@@ -476,14 +476,16 @@ const RowCtx = struct {
     table: ?*const schema.Table = null,
 
     fn get(self: *const RowCtx, name: []const u8) ?Value {
+        // Strip table-alias qualifier (e.g. "sys_num.number" → "number")
+        const bare_name = if (std.mem.lastIndexOfScalar(u8, name, '.')) |dot| name[dot + 1 ..] else name;
         // Fast path: direct column name match in this scope
         for (self.names, self.values) |n, v| {
-            if (std.ascii.eqlIgnoreCase(n, name)) {
+            if (std.ascii.eqlIgnoreCase(n, bare_name)) {
                 // If this is a raw Array blob (stored as .str), decode it to .array
                 // so that array functions (has, arrayFilter, etc.) can operate on it.
                 if (v == .str or v == .str_owned) {
                     if (self.table) |tbl| {
-                        if (tbl.findColumn(name)) |ci| {
+                        if (tbl.findColumn(bare_name)) |ci| {
                             if (tbl.columns[ci].ch_type) |ct| {
                                 if (std.mem.startsWith(u8, ct, "Array(")) {
                                     return decodeArrayBlob(ct, v.toStr().?);
@@ -949,12 +951,16 @@ const Executor = struct {
             try ScanCtx.observe(&ctx, &empty_row);
         } else if (self.plan.numbers_count) |count| {
             // numbers(N) / system.numbers: generate rows number=0..N-1
+            const has_order = self.plan.order_by_text != null or self.plan.order_by_count_desc or self.plan.order_by_alias != null;
+            const row_limit = if (!has_order) (self.plan.limit orelse std.math.maxInt(usize)) + (self.plan.offset orelse 0) else std.math.maxInt(usize);
             var number_val: Value = undefined;
             var number_name: [6]u8 = "number".*;
             const names: []const []const u8 = &[_][]const u8{number_name[0..]};
             var vals: [1]Value = undefined;
             var i: u64 = 0;
             while (i < count) : (i += 1) {
+                // Short-circuit when we have enough collected rows (no ORDER BY).
+                if (!has_order and ctx.rows.items.len >= row_limit) break;
                 number_val = Value{ .i64 = @intCast(i) };
                 vals[0] = number_val;
                 const row = RowCtx{ .names = names, .values = vals[0..], .table = null, .parent = null };
@@ -2940,6 +2946,8 @@ const EvalKind = enum {
     int_div_or_zero,   // intDivOrZero(a, b) → trunc(a/b) or 0 if b=0
     // String helpers
     append_trailing_char, // appendTrailingCharIfAbsent(s, c) → s with c appended if not already last
+    // FixedString
+    fixed_string,         // toFixedString(s, n) → s padded/truncated to n bytes (null-pad)
 };
 
 const FuncEval = struct {
@@ -3017,6 +3025,7 @@ const func_evals = [_]FuncEval{
     .{ .name = "totypename",                  .kind = .type_name        },
     .{ .name = "intdivorzero",                .kind = .int_div_or_zero  },
     .{ .name = "appendtrailingcharifabsent",  .kind = .append_trailing_char },
+    .{ .name = "tofixedstring",               .kind = .fixed_string         },
 };
 
 // ── Helper: resolve a Value from an array stored as \f-separated string ───────
@@ -4057,6 +4066,21 @@ fn evalFunc(kind: EvalKind, name: []const u8, inner: []const u8, row: *const Row
             const result = std.heap.page_allocator.alloc(u8, sv.len + 1) catch return null;
             @memcpy(result[0..sv.len], sv);
             result[sv.len] = c;
+            return Value{ .str_owned = result };
+        },
+        .fixed_string => {
+            // toFixedString(s, n): pad/truncate s to exactly n bytes with \x00 padding
+            const args = splitTopLevelArgs(inner) catch return null;
+            if (args.len < 1) return null;
+            const sv = (evalTextExpr(std.mem.trim(u8, args.items[0], " \t\r\n"), row) orelse return null).toStr() orelse return null;
+            if (args.len < 2) return Value{ .str = sv };
+            const n_val = evalTextExpr(std.mem.trim(u8, args.items[1], " \t\r\n"), row) orelse return Value{ .str = sv };
+            const n: usize = @intCast(@max(0, n_val.toI64() orelse return Value{ .str = sv }));
+            if (sv.len == n) return Value{ .str = sv };
+            const result = std.heap.page_allocator.alloc(u8, n) catch return null;
+            const copy_len = @min(sv.len, n);
+            @memcpy(result[0..copy_len], sv[0..copy_len]);
+            if (n > sv.len) @memset(result[sv.len..], 0);
             return Value{ .str_owned = result };
         },
     }
