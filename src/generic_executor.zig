@@ -2331,6 +2331,35 @@ const ScanCtx = struct {
             @memcpy(self.rows.items, sorted);
         }
 
+        // SELECT DISTINCT: remove duplicate rows using string-key dedup
+        if (plan.distinct and self.rows.items.len > 1) {
+            var seen = std.StringHashMap(void).init(allocator);
+            defer {
+                var it = seen.keyIterator();
+                while (it.next()) |k| allocator.free(k.*);
+                seen.deinit();
+            }
+            var deduped = std.ArrayListUnmanaged([]Value).empty;
+            defer deduped.deinit(allocator);
+            for (self.rows.items) |row_vals| {
+                // Build a key from all column values
+                var key_buf: std.ArrayList(u8) = .empty;
+                for (row_vals, 0..) |v, ci| {
+                    if (ci > 0) key_buf.append(allocator, '\x01') catch {};
+                    v.writeCsv(&key_buf, allocator) catch {};
+                }
+                const key = try key_buf.toOwnedSlice(allocator);
+                const gop = try seen.getOrPut(key);
+                if (gop.found_existing) {
+                    allocator.free(key);
+                } else {
+                    try deduped.append(allocator, row_vals);
+                }
+            }
+            self.rows.clearRetainingCapacity();
+            try self.rows.appendSlice(allocator, deduped.items);
+        }
+
         const offset = plan.offset orelse 0;
         const limit = plan.limit orelse std.math.maxInt(usize);
         const start = @min(offset, self.rows.items.len);

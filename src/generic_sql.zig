@@ -138,6 +138,8 @@ pub const Plan = struct {
     /// When non-null, the FROM clause is a numbers(N) / system.numbers virtual table.
     /// The executor generates N rows with a single column `number` = 0..N-1.
     numbers_count: ?u64 = null,
+    /// SELECT DISTINCT deduplication
+    distinct: bool = false,
     /// When true, all string fields (table, where_text, group_by, having_text,
     /// order_by_alias, order_by_text) were heap-allocated by the DuckDB parser
     /// and must be freed by deinit().  Legacy parser uses SQL slices (no free).

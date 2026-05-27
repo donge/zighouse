@@ -425,6 +425,7 @@ fn translateSelectNode(allocator: std.mem.Allocator, node_obj: std.json.ObjectMa
     // ── LIMIT / OFFSET ───────────────────────────────────────────────────────
     var limit: ?usize = null;
     var offset: ?usize = null;
+    var distinct = false;
     for (node_obj.get("modifiers").?.array.items) |mod| {
         const mt = mod.object.get("type").?.string;
         if (std.mem.eql(u8, mt, "LIMIT_MODIFIER")) {
@@ -435,6 +436,7 @@ fn translateSelectNode(allocator: std.mem.Allocator, node_obj: std.json.ObjectMa
                 if (ov != .null) offset = extractIntLiteral(ov);
             }
         }
+        if (std.mem.eql(u8, mt, "DISTINCT_MODIFIER")) distinct = true;
     }
 
     const plan = generic_sql.Plan{
@@ -452,6 +454,7 @@ fn translateSelectNode(allocator: std.mem.Allocator, node_obj: std.json.ObjectMa
         .order_by_text = order_by_text,
         .limit = limit,
         .offset = offset,
+        .distinct = distinct,
         .subquery_source = subquery_source,
         // Detect numbers(N) / system.numbers virtual table.
         .numbers_count = blk: {

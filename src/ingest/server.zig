@@ -898,18 +898,16 @@ pub const Server = struct {
         // Subquery: materialize inner, run outer, return result.
         if (plan.subquery_source) |inner_plan| {
             const inner_db_table = splitDbTable(inner_plan.table);
-            const inner_entry = self.schemas.find(inner_db_table.db, inner_db_table.table) orelse {
-                if (want_tsv) { try sendResponse(request, out, .ok, ""); return; }
-                const nb = try native_block.encodeEmpty(self.allocator);
-                defer self.allocator.free(nb);
-                try sendNativeBlock(self.allocator, request, out, nb);
-                return;
-            };
+            const inner_entry_opt = self.schemas.find(inner_db_table.db, inner_db_table.table);
+            // Create a fake table descriptor when the inner table is unknown (e.g. system.one, numbers(N)).
+            const fake_inner_table = schema.Table{ .name = "", .columns = &.{} };
+            const inner_table: *const schema.Table = if (inner_entry_opt) |e| &e.table else &fake_inner_table;
             var inner_parts = try part_scanner.scan(self.allocator, self.io, self.config.data_dir, inner_db_table.db, inner_db_table.table);
             defer inner_parts.deinit();
-            const inner_csv = try generic_executor.runWithSource(self.allocator, self.io, inner_plan.*, .{ .ch_parts = inner_parts.dirs() }, &inner_entry.table);
+            const inner_dirs: []const []const u8 = if (inner_entry_opt != null) inner_parts.dirs() else &.{};
+            const inner_csv = try generic_executor.runWithSource(self.allocator, self.io, inner_plan.*, .{ .ch_parts = inner_dirs }, inner_table);
             defer self.allocator.free(inner_csv);
-            const result = try generic_executor.runOverCsv(self.allocator, plan, inner_csv, &inner_entry.table);
+            const result = try generic_executor.runOverCsv(self.allocator, plan, inner_csv, inner_table);
             defer self.allocator.free(result);
             if (want_tsv) {
                 const tsv = try csvToTsv(self.allocator, result, true);
@@ -917,7 +915,7 @@ pub const Server = struct {
                 try sendResponse(request, out, .ok, tsv);
                 return;
             }
-            var rs = try serializer.csvToResultSet(self.allocator, result, &inner_entry.table);
+            var rs = try serializer.csvToResultSet(self.allocator, result, if (inner_entry_opt) |e| &e.table else null);
             defer rs.deinit();
             const nb = try serializer.toNativeBlock(self.allocator, rs);
             defer self.allocator.free(nb);
