@@ -946,7 +946,24 @@ const Executor = struct {
 
         var ctx = GroupByCtx.init(self.allocator, self.plan);
         defer ctx.deinit(self.allocator);
-        try self.streamRows(&needed, &ctx, GroupByCtx.observe);
+        if (self.plan.table.len == 0 or std.mem.eql(u8, self.plan.table, "system.one")) {
+            const dummy_names: []const []const u8 = &.{"dummy"};
+            var dummy_vals: [1]Value = .{Value{ .uint8 = 0 }};
+            const empty_row = RowCtx{ .names = dummy_names, .values = dummy_vals[0..], .table = null, .parent = null };
+            try GroupByCtx.observe(&ctx, &empty_row);
+        } else if (self.plan.numbers_count) |count| {
+            var number_name: [6]u8 = "number".*;
+            const names: []const []const u8 = &[_][]const u8{number_name[0..]};
+            var vals: [1]Value = undefined;
+            var i: u64 = 0;
+            while (i < count) : (i += 1) {
+                vals[0] = Value{ .i64 = @intCast(i) };
+                const row = RowCtx{ .names = names, .values = vals[0..], .table = null, .parent = null };
+                try GroupByCtx.observe(&ctx, &row);
+            }
+        } else {
+            try self.streamRows(&needed, &ctx, GroupByCtx.observe);
+        }
         return ctx.format(self.allocator, self.plan);
     }
 
@@ -1824,13 +1841,22 @@ const GroupByCtx = struct {
             const alias = proj.alias orelse proj.column orelse continue;
             if (std.ascii.eqlIgnoreCase(alias, expr.base_col)) {
                 const col_expr = proj.column orelse expr.base_col;
-                const v = evalTextExpr(col_expr, row) orelse return Value{ .null_val = {} };
+                const v = evalTextExpr(col_expr, row) orelse blk: {
+                    // evalTextExpr doesn't handle boolean expressions (IN, comparisons).
+                    // Fall back to evalFilter which does.
+                    const b = evalTextBoolExpr(col_expr, row);
+                    break :blk Value{ .uint8 = if (b) 1 else 0 };
+                };
                 if (expr.offset == 0) return v;
                 const iv = v.toI64() orelse return v;
                 return Value{ .i64 = iv + expr.offset };
             }
         }
-        return Value{ .null_val = {} };
+        // Not a column or alias — try evaluating base_col as a text expression directly.
+        if (evalTextExpr(expr.base_col, row)) |v| return v;
+        // Last resort: treat as a boolean expression (handles IN, comparisons, etc.).
+        const b = evalTextBoolExpr(expr.base_col, row);
+        return Value{ .uint8 = if (b) 1 else 0 };
     }
 
     fn observe(self: *GroupByCtx, row: *const RowCtx) anyerror!void {
@@ -2147,9 +2173,23 @@ const GroupByCtx = struct {
                         try out.print(allocator, "{d}", .{fv});
                     }
                 } else {
-                    var v = state.result(proj, self.allocator);
-                    if (proj.post_fn) |pf| v = applyPostFn(pf, v, allocator);
-                    try v.writeCsv(&out, allocator);
+                    // For non-column_ref projections (e.g. cmp_expr), check if it's a GROUP BY key.
+                    const proj_alias = proj.alias orelse proj.column;
+                    var wrote_key = false;
+                    if (proj_alias) |pa| {
+                        for (self.group_exprs, entry.key_values) |ge, kv| {
+                            if (std.ascii.eqlIgnoreCase(ge.base_col, pa) and ge.offset == proj.int_offset) {
+                                try kv.writeCsv(&out, allocator);
+                                wrote_key = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (!wrote_key) {
+                        var v = state.result(proj, self.allocator);
+                        if (proj.post_fn) |pf| v = applyPostFn(pf, v, allocator);
+                        try v.writeCsv(&out, allocator);
+                    }
                 }
                 col_written += 1;
             }

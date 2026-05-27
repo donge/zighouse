@@ -958,7 +958,7 @@ pub const Server = struct {
                 plan,
                 .{ .ch_parts = &.{} },
                 &fake_table,
-            )) |fake_result| {
+            )            ) |fake_result| {
                 defer self.allocator.free(fake_result);
                 if (want_tsv) {
                     const tsv = try csvToTsv(self.allocator, fake_result, true);

@@ -693,7 +693,42 @@ pub fn rewrite(allocator: std.mem.Allocator, sql: []const u8) !?[]u8 {
     // Normalize whitespace: collapse runs of \t\r\n and multiple spaces into a
     // single space so that keyword searches like " ARRAY JOIN " work regardless
     // of indentation or newlines in the incoming SQL.
-    const norm = try normalizeWhitespace(allocator, sql);
+    const norm_raw = try normalizeWhitespace(allocator, sql);
+    defer allocator.free(norm_raw);
+
+    // Strip trailing ClickHouse SETTINGS clause: "SETTINGS key = val, ..."
+    // This clause is not valid SQL and DuckDB cannot parse it.
+    const norm = blk: {
+        const settings_kw = " SETTINGS ";
+        if (std.ascii.indexOfIgnoreCase(norm_raw, settings_kw)) |pos| {
+            // Only strip if SETTINGS is not inside parentheses (i.e. top-level).
+            var depth: usize = 0;
+            var in_str: bool = false;
+            var top_pos: ?usize = null;
+            var j: usize = 0;
+            while (j < norm_raw.len) : (j += 1) {
+                const c = norm_raw[j];
+                if (in_str) {
+                    if (c == '\'') in_str = false;
+                    continue;
+                }
+                if (c == '\'') { in_str = true; continue; }
+                if (c == '(') { depth += 1; continue; }
+                if (c == ')') { if (depth > 0) depth -= 1; continue; }
+                if (depth == 0 and j >= pos and
+                    std.ascii.startsWithIgnoreCase(norm_raw[j..], settings_kw[1..]))
+                {
+                    top_pos = j;
+                    break;
+                }
+            }
+            if (top_pos) |tp| {
+                const trimmed = std.mem.trimEnd(u8, norm_raw[0..tp], " \t");
+                break :blk try allocator.dupe(u8, trimmed);
+            }
+        }
+        break :blk try allocator.dupe(u8, norm_raw);
+    };
     defer allocator.free(norm);
 
     // Rewrite count() → count(*): ClickHouse allows bare count() but DuckDB requires count(*).
