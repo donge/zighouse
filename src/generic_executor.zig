@@ -227,7 +227,17 @@ const Value = union(enum) {
                     else => return .gt,
                 }
             },
-            .array    => return .lt,
+            .array => |av| switch (b) {
+                .array => |bv| {
+                    const len = @min(av.len, bv.len);
+                    for (0..len) |i| {
+                        const o = Value.order(av[i], bv[i]);
+                        if (o != .eq) return o;
+                    }
+                    return std.math.order(av.len, bv.len);
+                },
+                else => return .gt,
+            },
             .null_val => return if (b == .null_val) .eq else .lt,
         }
     }
