@@ -70,6 +70,58 @@ const rules = [_]RewriteRule{
 ///
 /// Aliases that appear in the SELECT list are left as-is (they refer to the ARRAY JOIN result).
 /// Only the first ARRAY JOIN item is used for row expansion; others are kept as columns.
+/// Check if a string is exactly "system.one" (case-insensitive).
+fn isSystemOne(s: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(std.mem.trim(u8, s, " \t\r\n"), "system.one");
+}
+
+/// Try to extract count and start from "range(N)", "range(0, N)", or "range(start, N)" expressions.
+/// Returns .{count_expr, start_expr} where count_expr is the number of elements and start_expr is the start value.
+/// For range(N): count="N", start=null
+/// For range(start, end): count is computed as integer string if both are integer literals.
+fn extractRangeArgs(allocator: std.mem.Allocator, expr: []const u8) !?struct { count: []const u8, start: ?[]const u8 } {
+    const e = std.mem.trim(u8, expr, " \t\r\n");
+    if (!std.ascii.startsWithIgnoreCase(e, "range(")) return null;
+    if (e[e.len - 1] != ')') return null;
+    const inner = std.mem.trim(u8, e[6 .. e.len - 1], " \t\r\n");
+    if (std.mem.indexOf(u8, inner, ",")) |ci| {
+        const start_s = std.mem.trim(u8, inner[0..ci], " \t\r\n");
+        const end_s = std.mem.trim(u8, inner[ci + 1 ..], " \t\r\n");
+        // range(start, end): count = end - start
+        if (std.mem.eql(u8, start_s, "0")) {
+            return .{ .count = try allocator.dupe(u8, end_s), .start = null };
+        }
+        // Require both to be integer literals so we can emit "numbers(count)"
+        const start_int = std.fmt.parseInt(i64, start_s, 10) catch return null;
+        const end_int = std.fmt.parseInt(i64, end_s, 10) catch return null;
+        if (end_int <= start_int) return null;
+        const count_text = try std.fmt.allocPrint(allocator, "{d}", .{end_int - start_int});
+        return .{ .count = count_text, .start = try allocator.dupe(u8, start_s) };
+    }
+    return .{ .count = try allocator.dupe(u8, inner), .start = null };
+}
+
+/// Replace all word-boundary occurrences of `old` with `new` in `src`.
+fn replaceTokenAll(allocator: std.mem.Allocator, src: []const u8, old: []const u8, new: []const u8) ![]u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    var i: usize = 0;
+    while (i < src.len) {
+        if (i + old.len <= src.len and std.ascii.eqlIgnoreCase(src[i .. i + old.len], old)) {
+            const before_ok = i == 0 or !isIdent(src[i - 1]);
+            const after_ok = i + old.len >= src.len or !isIdent(src[i + old.len]);
+            if (before_ok and after_ok) {
+                try buf.appendSlice(allocator, new);
+                i += old.len;
+                continue;
+            }
+        }
+        try buf.append(allocator, src[i]);
+        i += 1;
+    }
+    return buf.toOwnedSlice(allocator);
+}
+
 fn rewriteArrayJoin(allocator: std.mem.Allocator, sql: []const u8) !?[]u8 {
     // Find " ARRAY JOIN " position
     const aj_pos = std.ascii.indexOfIgnoreCase(sql, " ARRAY JOIN ") orelse return null;
@@ -85,6 +137,106 @@ fn rewriteArrayJoin(allocator: std.mem.Allocator, sql: []const u8) !?[]u8 {
     const after_from = sql[from_pos..aj_pos]; // includes " FROM tablename"
     const aj_clause_start = aj_pos + 12; // len(" ARRAY JOIN ") == 12
     const aj_rest = sql[aj_clause_start..];
+
+    // ── Fast path ──────────────────────────────────────────────────────────────
+    // Pattern: SELECT ... FROM system.one ARRAY JOIN range(N) AS alias [suffix]
+    // Rewrite to: SELECT ...(alias→number)... FROM numbers(N) [suffix]
+    // This allows DuckDB to handle aggregation natively over N rows.
+    {
+        const from_table = std.mem.trim(u8, after_from[6..], " \t\r\n"); // strip " FROM "
+        if (isSystemOne(from_table)) {
+            // Find suffix (WHERE/ORDER/GROUP/LIMIT/HAVING)
+            var aj_end2: usize = aj_rest.len;
+            for ([_][]const u8{ " WHERE ", " ORDER ", " GROUP ", " LIMIT ", " HAVING " }) |kw| {
+                if (std.ascii.indexOfIgnoreCase(aj_rest, kw)) |p| {
+                    if (p < aj_end2) aj_end2 = p;
+                }
+            }
+            const aj_clause2 = aj_rest[0..aj_end2];
+            const suffix2 = aj_rest[aj_end2..];
+
+            // Parse ARRAY JOIN items — require all are range(N) AS alias
+            var items2: std.ArrayListUnmanaged(struct { alias: []const u8, count: []const u8, offset: ?[]const u8 }) = .empty;
+            defer items2.deinit(allocator);
+            var valid = true;
+            {
+                var depth: usize = 0;
+                var start: usize = 0;
+                for (aj_clause2, 0..) |ch, ci| {
+                    if (ch == '(' or ch == '[') depth += 1;
+                    if (ch == ')' or ch == ']') { if (depth > 0) depth -= 1; }
+                    if (ch == ',' and depth == 0) {
+                        const item = std.mem.trim(u8, aj_clause2[start..ci], " \t\r\n");
+                        const as_p = std.ascii.indexOfIgnoreCase(item, " AS ") orelse { valid = false; break; };
+                        const expr = std.mem.trim(u8, item[0..as_p], " \t\r\n");
+                        const alias = std.mem.trim(u8, item[as_p + 4..], " \t\r\n");
+                        const rargs = (try extractRangeArgs(allocator, expr)) orelse { valid = false; break; };
+                        try items2.append(allocator, .{ .alias = alias, .count = rargs.count, .offset = rargs.start });
+                        start = ci + 1;
+                    }
+                }
+                if (valid) {
+                    const last_item = std.mem.trim(u8, aj_clause2[if (items2.items.len == 0) 0 else blk: {
+                        // find last comma pos
+                        var d2: usize = 0;
+                        var lc: usize = 0;
+                        for (aj_clause2, 0..) |ch, ci| {
+                            if (ch == '(' or ch == '[') d2 += 1;
+                            if (ch == ')' or ch == ']') { if (d2 > 0) d2 -= 1; }
+                            if (ch == ',' and d2 == 0) lc = ci + 1;
+                        }
+                        break :blk lc;
+                    }..], " \t\r\n");
+                    const as_p2 = std.ascii.indexOfIgnoreCase(last_item, " AS ");
+                    if (as_p2 == null) {
+                        valid = false;
+                    } else {
+                        const expr2 = std.mem.trim(u8, last_item[0..as_p2.?], " \t\r\n");
+                        const alias2 = std.mem.trim(u8, last_item[as_p2.? + 4..], " \t\r\n");
+                        const rargs2 = try extractRangeArgs(allocator, expr2);
+                        if (rargs2 == null) valid = false
+                        else try items2.append(allocator, .{ .alias = alias2, .count = rargs2.?.count, .offset = rargs2.?.start });
+                    }
+                }
+            }
+
+            if (valid and items2.items.len == 1) {
+                // Single range alias — rewrite to numbers(count)
+                // with alias replaced by (number + offset) if offset != null, else just "number"
+                const alias = items2.items[0].alias;
+                const count_tok = items2.items[0].count;
+                const offset_tok = items2.items[0].offset;
+
+                // Replace alias → "number" (or "(number + offset)") in the SELECT list
+                const pre_select_trimmed = std.mem.trim(u8, pre_select, " \t\r\n");
+                const replacement: []const u8 = if (offset_tok) |off|
+                    try std.fmt.allocPrint(allocator, "(number + {s})", .{off})
+                else
+                    try allocator.dupe(u8, "number");
+                defer allocator.free(replacement);
+                const replaced_select = try replaceTokenAll(allocator, pre_select_trimmed, alias, replacement);
+                defer allocator.free(replaced_select);
+
+                var out2: std.ArrayListUnmanaged(u8) = .empty;
+                errdefer out2.deinit(allocator);
+                try out2.appendSlice(allocator, replaced_select);
+                try out2.appendSlice(allocator, " FROM numbers(");
+                try out2.appendSlice(allocator, count_tok);
+                try out2.append(allocator, ')');
+                try out2.appendSlice(allocator, suffix2);
+                // Free allocator-owned count_tok and offset_tok
+                allocator.free(count_tok);
+                if (offset_tok) |off| allocator.free(off);
+                return try out2.toOwnedSlice(allocator);
+            }
+            // Free any allocated items before falling through
+            for (items2.items) |it| {
+                allocator.free(it.count);
+                if (it.offset) |off| allocator.free(off);
+            }
+        }
+    }
+    // ── End fast path ──────────────────────────────────────────────────────────
 
     // Find end of ARRAY JOIN clause: WHERE, ORDER, GROUP, LIMIT, or end of string
     var aj_end: usize = aj_rest.len;
@@ -290,6 +442,247 @@ fn normalizeWhitespace(allocator: std.mem.Allocator, sql: []const u8) ![]u8 {
     return buf.toOwnedSlice(allocator);
 }
 
+/// Rewrite ClickHouse "expr AS alias" let-binding inside function arguments.
+/// Example: `abs(number - 10 as x) = (x < 0 ? -x : x)`
+///       → `abs((number - 10)) = ((number - 10) < 0 ? -(number - 10) : (number - 10))`
+/// Only handles the simple case where a single `AS ident` appears at the top level
+/// of a function's argument list and `ident` appears elsewhere in the expression.
+fn rewriteFuncArgAlias(allocator: std.mem.Allocator, sql: []const u8) ![]const u8 {
+    // Quick scan: if no " as " (case-insensitive), nothing to do.
+    if (std.ascii.indexOfIgnoreCase(sql, " as ") == null) return sql;
+
+    // We scan for patterns: <funcname>(<expr> AS <ident>)
+    // where <expr> contains no top-level comma (single-arg function).
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    try out.ensureTotalCapacity(allocator, sql.len * 2);
+    errdefer out.deinit(allocator);
+
+    var pos: usize = 0;
+    while (pos < sql.len) {
+        // Find " as " (case-insensitive) scanning forward
+        const as_pos = blk: {
+            var p = pos;
+            while (p + 4 <= sql.len) : (p += 1) {
+                if (std.ascii.startsWithIgnoreCase(sql[p..], " as ") and (p == 0 or isIdent(sql[p - 1]) or sql[p-1] == ')')) break :blk p;
+            }
+            break :blk null;
+        } orelse {
+            try out.appendSlice(allocator, sql[pos..]);
+            break;
+        };
+
+        // Check if the character after " as " starts an identifier
+        const alias_start = as_pos + 4;
+        if (alias_start >= sql.len or !isIdentStart(sql[alias_start])) {
+            try out.appendSlice(allocator, sql[pos..alias_start]);
+            pos = alias_start;
+            continue;
+        }
+        // Find end of alias identifier
+        var alias_end = alias_start;
+        while (alias_end < sql.len and isIdent(sql[alias_end])) alias_end += 1;
+        const alias = sql[alias_start..alias_end];
+
+        // Now backtrack from as_pos to find the opening '(' of the function call
+        // that contains this AS expression. Walk backwards tracking depth.
+        const open_paren = blk: {
+            var depth: usize = 0;
+            var p = as_pos;
+            while (p > pos) {
+                p -= 1;
+                if (sql[p] == ')') depth += 1
+                else if (sql[p] == '(') {
+                    if (depth == 0) break :blk p;
+                    depth -= 1;
+                }
+            }
+            break :blk null;
+        } orelse {
+            // No matching open paren, copy up to alias_end and continue
+            try out.appendSlice(allocator, sql[pos..alias_end]);
+            pos = alias_end;
+            continue;
+        };
+
+        // The expression inside is sql[open_paren+1..as_pos]
+        const inner_expr = std.mem.trim(u8, sql[open_paren + 1..as_pos], " \t");
+
+        // Ensure the '(' is from a function call (char before it must be ident char)
+        // and that inner_expr is not a subquery (no SELECT keyword).
+        if (open_paren == 0 or !isIdent(sql[open_paren - 1]) or
+            std.ascii.indexOfIgnoreCase(inner_expr, "SELECT") != null)
+        {
+            try out.appendSlice(allocator, sql[pos..alias_end]);
+            pos = alias_end;
+            continue;
+        }
+
+        // After alias_end: expect ')' closing the function call
+        if (alias_end >= sql.len or sql[alias_end] != ')') {
+            try out.appendSlice(allocator, sql[pos..alias_end]);
+            pos = alias_end;
+            continue;
+        }
+        const close_paren = alias_end; // the ')' that closes the function call
+
+        // Copy everything up to (but not including) the function's open paren
+        try out.appendSlice(allocator, sql[pos..open_paren]);
+        // Rewrite: funcname((inner_expr))
+        try out.append(allocator, '(');
+        try out.append(allocator, '(');
+        try out.appendSlice(allocator, inner_expr);
+        try out.append(allocator, ')');
+        try out.append(allocator, ')');
+
+        // Now scan the rest of the sql (after close_paren+1), replacing alias with (inner_expr)
+        // but only until end of current expression context (tricky — just do the full remainder)
+        const rest_start = close_paren + 1;
+        const rest = sql[rest_start..];
+        // Replace whole-word occurrences of alias in rest
+        var rp: usize = 0;
+        while (rp < rest.len) {
+            // Check for alias at word boundary
+            if (rp + alias.len <= rest.len and
+                std.mem.eql(u8, rest[rp..rp + alias.len], alias) and
+                (rp == 0 or !isIdent(rest[rp - 1])) and
+                (rp + alias.len >= rest.len or !isIdent(rest[rp + alias.len])))
+            {
+                try out.append(allocator, '(');
+                try out.appendSlice(allocator, inner_expr);
+                try out.append(allocator, ')');
+                rp += alias.len;
+            } else {
+                try out.append(allocator, rest[rp]);
+                rp += 1;
+            }
+        }
+        pos = sql.len; // done
+        break;
+    }
+
+    const result = try out.toOwnedSlice(allocator);
+    if (std.mem.eql(u8, result, sql)) {
+        allocator.free(result);
+        return sql;
+    }
+    return result;
+}
+
+fn isIdentStart(c: u8) bool {
+    return std.ascii.isAlphabetic(c) or c == '_';
+}
+
+/// Rewrite CH ternary `(cond ? then_expr : else_expr)` → `if(cond, then_expr, else_expr)`.
+/// Only handles ternaries enclosed in parentheses to avoid ambiguity.
+fn rewriteTernary(allocator: std.mem.Allocator, sql: []const u8) ![]const u8 {
+    if (std.mem.indexOf(u8, sql, "?") == null) return sql;
+
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    try buf.ensureTotalCapacity(allocator, sql.len + 16);
+    errdefer buf.deinit(allocator);
+
+    var i: usize = 0;
+    while (i < sql.len) {
+        const ch = sql[i];
+        // Skip string literals
+        if (ch == '\'') {
+            try buf.append(allocator, ch);
+            i += 1;
+            while (i < sql.len and sql[i] != '\'') { try buf.append(allocator, sql[i]); i += 1; }
+            if (i < sql.len) { try buf.append(allocator, sql[i]); i += 1; }
+            continue;
+        }
+        if (ch != '(') {
+            try buf.append(allocator, ch);
+            i += 1;
+            continue;
+        }
+        // Found '(' — check if the content is `cond ? then : else`
+        // Find the matching ')'
+        var close: usize = 0;
+        {
+            var depth: usize = 0;
+            var j = i;
+            while (j < sql.len) : (j += 1) {
+                if (sql[j] == '(') depth += 1
+                else if (sql[j] == ')') {
+                    depth -= 1;
+                    if (depth == 0) { close = j; break; }
+                }
+            }
+        }
+        if (close == 0) { try buf.append(allocator, ch); i += 1; continue; }
+
+        const inner = sql[i + 1..close];
+        // Find '?' at depth 0 inside inner
+        const q_pos = blk: {
+            var depth: usize = 0;
+            for (inner, 0..) |c, idx| {
+                if (c == '(' or c == '[') depth += 1
+                else if (c == ')' or c == ']') { if (depth > 0) depth -= 1; }
+                else if (c == '?' and depth == 0) break :blk idx;
+            }
+            break :blk null;
+        } orelse {
+            // No ternary — recursively rewrite the inner content
+            try buf.append(allocator, '(');
+            const inner_rw = try rewriteTernary(allocator, inner);
+            defer if (inner_rw.ptr != inner.ptr) allocator.free(inner_rw);
+            try buf.appendSlice(allocator, inner_rw);
+            try buf.append(allocator, ')');
+            i = close + 1;
+            continue;
+        };
+
+        const cond = std.mem.trim(u8, inner[0..q_pos], " \t");
+        // Find ':' at depth 0 after '?'
+        const colon_pos = blk: {
+            var depth: usize = 0;
+            var j = q_pos + 1;
+            while (j < inner.len) : (j += 1) {
+                const c = inner[j];
+                if (c == '(' or c == '[') depth += 1
+                else if (c == ')' or c == ']') { if (depth > 0) depth -= 1; }
+                else if (c == ':' and depth == 0) break :blk j;
+            }
+            break :blk null;
+        } orelse {
+            try buf.append(allocator, '(');
+            try buf.appendSlice(allocator, inner);
+            try buf.append(allocator, ')');
+            i = close + 1;
+            continue;
+        };
+
+        const then_expr = std.mem.trim(u8, inner[q_pos + 1..colon_pos], " \t");
+        const else_expr = std.mem.trim(u8, inner[colon_pos + 1..], " \t");
+
+        // Recursively rewrite each part
+        const cond_rw = try rewriteTernary(allocator, cond);
+        defer if (cond_rw.ptr != cond.ptr) allocator.free(cond_rw);
+        const then_rw = try rewriteTernary(allocator, then_expr);
+        defer if (then_rw.ptr != then_expr.ptr) allocator.free(then_rw);
+        const else_rw = try rewriteTernary(allocator, else_expr);
+        defer if (else_rw.ptr != else_expr.ptr) allocator.free(else_rw);
+
+        try buf.appendSlice(allocator, "if(");
+        try buf.appendSlice(allocator, cond_rw);
+        try buf.append(allocator, ',');
+        try buf.appendSlice(allocator, then_rw);
+        try buf.append(allocator, ',');
+        try buf.appendSlice(allocator, else_rw);
+        try buf.append(allocator, ')');
+        i = close + 1;
+    }
+
+    const result = try buf.toOwnedSlice(allocator);
+    if (std.mem.eql(u8, result, sql)) {
+        allocator.free(result);
+        return sql;
+    }
+    return result;
+}
+
 pub fn rewrite(allocator: std.mem.Allocator, sql: []const u8) !?[]u8 {
     // Normalize whitespace: collapse runs of \t\r\n and multiple spaces into a
     // single space so that keyword searches like " ARRAY JOIN " work regardless
@@ -329,28 +722,38 @@ pub fn rewrite(allocator: std.mem.Allocator, sql: []const u8) !?[]u8 {
     defer if (sql2.ptr != base2.ptr) allocator.free(sql2);
     defer if (base2.ptr != after_count.ptr) allocator.free(base2);
 
+    // Rewrite "expr AS alias" inside function arguments (CH let-binding syntax).
+    // Pattern: funcname(lhs AS varname) used-in-outer-expr
+    // → funcname((lhs)) with varname replaced by (lhs) in outer expression.
+    const sql2b = try rewriteFuncArgAlias(allocator, sql2);
+    defer if (sql2b.ptr != sql2.ptr) allocator.free(sql2b);
+
+    // Rewrite CH ternary `cond ? then : else` → `if(cond, then, else)`
+    const sql2c = try rewriteTernary(allocator, sql2b);
+    defer if (sql2c.ptr != sql2b.ptr) allocator.free(sql2c);
+
     var buf: std.ArrayListUnmanaged(u8) = .empty;
-    try buf.ensureTotalCapacity(allocator, sql2.len + 64);
+    try buf.ensureTotalCapacity(allocator, sql2c.len + 64);
     errdefer buf.deinit(allocator);
 
     var i: usize = 0;
-    while (i < sql2.len) {
+    while (i < sql2c.len) {
         // Only attempt rewrites at word boundaries.
-        const wb = i == 0 or !isIdent(sql2[i - 1]);
+        const wb = i == 0 or !isIdent(sql2c[i - 1]);
         if (wb) {
             const matched = inline for (rules) |rule| {
-                if (matchFn(sql2, i, rule.name)) |r| {
+                if (matchFn(sql2c, i, rule.name)) |r| {
                     switch (rule.kind) {
-                        .multiif    => { i = try rwMultiIf(allocator, &buf, sql2, r);              break true; },
-                        .cast       => { i = try rwCast(allocator, &buf, sql2, r, rule.param);     break true; },
-                        .date_trunc => { i = try rwTrunc(allocator, &buf, sql2, r, rule.param);    break true; },
+                        .multiif    => { i = try rwMultiIf(allocator, &buf, sql2c, r);              break true; },
+                        .cast       => { i = try rwCast(allocator, &buf, sql2c, r, rule.param);     break true; },
+                        .date_trunc => { i = try rwTrunc(allocator, &buf, sql2c, r, rule.param);    break true; },
                         .rename     => { try buf.appendSlice(allocator, rule.param); i = r;       break true; },
                     }
                 }
             } else false;
             if (matched) continue;
         }
-        try buf.append(allocator, sql2[i]);
+        try buf.append(allocator, sql2c[i]);
         i += 1;
     }
     return @as(?[]u8, try buf.toOwnedSlice(allocator));

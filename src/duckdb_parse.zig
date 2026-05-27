@@ -250,7 +250,7 @@ fn translateSelectNode(allocator: std.mem.Allocator, node_obj: std.json.ObjectMa
     // text is `CASE WHEN total > 0 THEN avg(confidence) ELSE 0 END`. The nested
     // `avg(confidence)` won't have a corresponding AggState unless we lift it here.
     {
-        const agg_fns = [_][]const u8{ "avg(", "max(", "min(", "sum(", "any(" };
+        const agg_fns = [_][]const u8{ "avg(", "max(", "min(", "sum(", "any(", "count(" };
         var extra: std.ArrayList(generic_sql.Expr) = .empty;
         defer extra.deinit(allocator);
         for (projections.items) |*proj| {
@@ -310,6 +310,7 @@ fn translateSelectNode(allocator: std.mem.Allocator, node_obj: std.json.ObjectMa
                             else if (std.mem.eql(u8, fn_name, "max")) .max
                             else if (std.mem.eql(u8, fn_name, "min")) .min
                             else if (std.mem.eql(u8, fn_name, "sum")) .sum
+                            else if (std.mem.eql(u8, fn_name, "count")) .count_star
                             else .any_val;
                         try extra.append(allocator, .{ .func = fn_func, .column = inner_col_dup, .alias = hidden_alias });
                     } else {
@@ -1597,6 +1598,10 @@ fn exprToText(allocator: std.mem.Allocator, val: std.json.Value) !?[]const u8 {
     if (std.mem.eql(u8, class, "FUNCTION")) {
         const fn_name = obj.get("function_name").?.string;
         const children = obj.get("children").?.array.items;
+        // count_star() → "count(*)" for consistent text representation
+        if (std.mem.eql(u8, fn_name, "count_star") and children.len == 0) {
+            return try allocator.dupe(u8, "count(*)");
+        }
         // list_value() / list_value(a, b, ...) — DuckDB's internal name for array constructors [...]
         if (std.mem.eql(u8, fn_name, "list_value")) {
             if (children.len == 0) return try allocator.dupe(u8, "[]");

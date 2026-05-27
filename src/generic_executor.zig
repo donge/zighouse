@@ -993,6 +993,19 @@ const Executor = struct {
         context: anytype,
         comptime callback: fn (@TypeOf(context), *const RowCtx) anyerror!void,
     ) anyerror!void {
+        // Virtual table: numbers(N) — generate rows number=0..N-1
+        if (self.plan.numbers_count) |count| {
+            var number_name: [6]u8 = "number".*;
+            const names: []const []const u8 = &[_][]const u8{number_name[0..]};
+            var vals: [1]Value = undefined;
+            var i: u64 = 0;
+            while (i < count) : (i += 1) {
+                vals[0] = Value{ .i64 = @intCast(i) };
+                const row = RowCtx{ .names = names, .values = vals[0..], .table = null, .parent = null };
+                try callback(context, &row);
+            }
+            return;
+        }
         switch (self.source) {
             .parquet => |path| return self.streamRowsParquet(path, needed, context, callback),
             .ch_part => |part_dir| return self.streamRowsChPart(part_dir, needed, context, callback),
@@ -2955,6 +2968,7 @@ const EvalKind = enum {
     arr_exists,        // arrayExists(x -> cond, arr)
     arr_flatten,       // arrayFlatten(arr)
     arr_distinct,      // arrayDistinct(arr)
+    arr_sum,           // arraySum(arr)
     arr_concat,        // arrayConcat(a, b)
     arr_max,           // arrayMax(arr)
     arr_min,           // arrayMin(arr)
@@ -3074,6 +3088,7 @@ const func_evals = [_]FuncEval{
     .{ .name = "arrayexists",                 .kind = .arr_exists       },
     .{ .name = "arrayflatten",                .kind = .arr_flatten      },
     .{ .name = "arraydistinct",               .kind = .arr_distinct     },
+    .{ .name = "arraysum",                    .kind = .arr_sum          },
     .{ .name = "arrayconcat",                 .kind = .arr_concat       },
     .{ .name = "arraymax",                    .kind = .arr_max          },
     .{ .name = "arraymin",                    .kind = .arr_min          },
@@ -3300,6 +3315,64 @@ fn evalTextExpr(expr: []const u8, row: *const RowCtx) ?Value {
         return Value{ .i64 = bit };
     }
 
+     // ── comparison operators: =, !=, <>, <=, >=, <, > (top-level) ──
+    // Lower precedence than arithmetic, higher than AND/OR.
+    {
+        const cmp_ops = [_][]const u8{ "!=", "<>", "<=", ">=", "=", "<", ">" };
+        var found_op_s: ?[]const u8 = null;
+        var found_pos_c: usize = 0;
+        scan_cmp: {
+            var depth: usize = 0;
+            var case_depth: usize = 0; // track CASE...END blocks (depth-0 but opaque)
+            var ci: usize = trimmed.len;
+            while (ci > 0) {
+                ci -= 1;
+                const ch = trimmed[ci];
+                if (ch == ')' or ch == ']') depth += 1;
+                if (ch == '(' or ch == '[') { if (depth > 0) depth -= 1; }
+                if (depth != 0) continue;
+                // Track CASE/END at top level of parens (right-to-left: END encountered before CASE)
+                if (ci + 3 <= trimmed.len and std.ascii.startsWithIgnoreCase(trimmed[ci..], "END") and
+                    (ci + 3 >= trimmed.len or !(std.ascii.isAlphanumeric(trimmed[ci + 3]) or trimmed[ci+3] == '_')) and
+                    (ci == 0 or !(std.ascii.isAlphanumeric(trimmed[ci - 1]) or trimmed[ci-1] == '_')))
+                    { case_depth += 1; }
+                if (ci + 4 <= trimmed.len and std.ascii.startsWithIgnoreCase(trimmed[ci..], "CASE") and
+                    (ci + 4 >= trimmed.len or !(std.ascii.isAlphanumeric(trimmed[ci + 4]) or trimmed[ci+4] == '_')) and
+                    (ci == 0 or !(std.ascii.isAlphanumeric(trimmed[ci - 1]) or trimmed[ci-1] == '_')))
+                    { if (case_depth > 0) case_depth -= 1; }
+                if (case_depth != 0) continue;
+                for (cmp_ops) |op| {
+                    if (ci + op.len > trimmed.len) continue;
+                    if (!std.mem.eql(u8, trimmed[ci..ci + op.len], op)) continue;
+                    found_op_s = op;
+                    found_pos_c = ci;
+                    break :scan_cmp;
+                }
+            }
+        }
+        if (found_op_s) |op_s| {
+            const lhs_s = std.mem.trim(u8, trimmed[0..found_pos_c], " \t\r\n");
+            const rhs_s = std.mem.trim(u8, trimmed[found_pos_c + op_s.len..], " \t\r\n");
+            if (lhs_s.len > 0 and rhs_s.len > 0) {
+                if (evalTextExpr(lhs_s, row)) |lv| {
+                    if (evalTextExpr(rhs_s, row)) |rv| {
+                        const result: bool = blk: {
+                            if (std.mem.eql(u8, op_s, "=")) break :blk Value.eql(lv, rv);
+                            if (std.mem.eql(u8, op_s, "!=") or std.mem.eql(u8, op_s, "<>")) break :blk !Value.eql(lv, rv);
+                            const ord = Value.order(lv, rv);
+                            if (std.mem.eql(u8, op_s, "<")) break :blk ord == .lt;
+                            if (std.mem.eql(u8, op_s, ">")) break :blk ord == .gt;
+                            if (std.mem.eql(u8, op_s, "<=")) break :blk ord != .gt;
+                            if (std.mem.eql(u8, op_s, ">=")) break :blk ord != .lt;
+                            break :blk false;
+                        };
+                        return Value{ .uint8 = if (result) 1 else 0 };
+                    }
+                }
+            }
+        }
+    }
+
     // ── CASE WHEN … END (keyword-prefix, not a function call) ──────
     if (std.ascii.startsWithIgnoreCase(trimmed, "CASE "))
         return evalCaseWhen(trimmed, row);
@@ -3313,8 +3386,26 @@ fn evalTextExpr(expr: []const u8, row: *const RowCtx) ?Value {
             if (trimmed.len > prefix.len and
                 std.ascii.startsWithIgnoreCase(trimmed, prefix))
             {
-                const inner = trimmed[prefix.len .. trimmed.len - 1];
-                return evalFunc(entry.kind, entry.name, inner, row);
+                // Verify the '(' at prefix.len-1 is matched by the final ')'.
+                // Otherwise this is "fn(args) op more" and should go to arithmetic.
+                const is_whole_call = blk: {
+                    var depth_check: usize = 0;
+                    for (trimmed[prefix.len - 1..], 0..) |ch, ci| {
+                        if (ch == '(') depth_check += 1
+                        else if (ch == ')') {
+                            if (depth_check > 0) depth_check -= 1;
+                            if (depth_check == 0) {
+                                // Check if this ')' is the last character
+                                break :blk ci == trimmed.len - prefix.len;
+                            }
+                        }
+                    }
+                    break :blk false;
+                };
+                if (is_whole_call) {
+                    const inner = trimmed[prefix.len .. trimmed.len - 1];
+                    return evalFunc(entry.kind, entry.name, inner, row);
+                }
             }
         }
         // ── user-defined functions (registered via CREATE FUNCTION) ──
@@ -3377,6 +3468,9 @@ fn evalTextExpr(expr: []const u8, row: *const RowCtx) ?Value {
             if (ch == ')' or ch == ']') depth += 1;
             if (ch == '(' or ch == '[') { if (depth > 0) depth -= 1; }
             if (depth == 0 and (ch == '+' or ch == '-') and i > 0) {
+                // Skip if this is the exponent sign in scientific notation (e.g. 1.0e-9)
+                const prev = trimmed[i - 1];
+                if (prev == 'e' or prev == 'E') continue;
                 found_op = ch;
                 found_pos = i;
                 break;
@@ -3421,6 +3515,18 @@ fn evalTextExpr(expr: []const u8, row: *const RowCtx) ?Value {
                         return Value{ .f64 = res };
                     }
                 }
+            }
+        }
+        // Unary minus: "-expr" with no +/- found at i>0
+        if (trimmed.len > 1 and trimmed[0] == '-') {
+            const inner_str = std.mem.trim(u8, trimmed[1..], " \t\r\n");
+            if (evalTextExpr(inner_str, row)) |rv| {
+                const ra = rv.toF64() orelse return null;
+                const res = -ra;
+                if (res == @floor(res) and res >= @as(f64, @floatFromInt(std.math.minInt(i64))) and res <= @as(f64, @floatFromInt(std.math.maxInt(i64)))) {
+                    return Value{ .i64 = @intFromFloat(res) };
+                }
+                return Value{ .f64 = res };
             }
         }
     }
@@ -3990,6 +4096,15 @@ fn evalFunc(kind: EvalKind, name: []const u8, inner: []const u8, row: *const Row
             }
             return Value{ .array = out.toOwnedSlice(std.heap.page_allocator) catch return null };
         },
+        .arr_sum => {
+            const arr_v = evalTextExpr(inner, row) orelse return null;
+            const arr = valueToArray(arr_v) orelse return null;
+            var total: f64 = 0;
+            for (arr) |elem| total += elem.toF64() orelse 0;
+            if (total == @floor(total) and @abs(total) < 9.007199e15)
+                return Value{ .i64 = @intFromFloat(total) };
+            return Value{ .f64 = total };
+        },
         .arr_distinct => {
             const arr_v = evalTextExpr(inner, row) orelse return null;
             const arr = valueToArray(arr_v) orelse return null;
@@ -4214,7 +4329,12 @@ fn evalFunc(kind: EvalKind, name: []const u8, inner: []const u8, row: *const Row
                 .math_asin   => std.math.asin(x),
                 .math_acos   => std.math.acos(x),
                 .math_atan   => std.math.atan(x),
-                .math_lgamma => std.math.lgamma(f64, x),
+                .math_lgamma => blk: {
+                    // lgamma is undefined (NaN) at negative integers; at 0 it's +inf.
+                    if (x < 0 and x == @floor(x)) break :blk std.math.nan(f64);
+                    if (x == 0) break :blk std.math.inf(f64);
+                    break :blk std.math.lgamma(f64, x);
+                },
                 .math_tgamma => std.math.gamma(f64, x),
                 .math_erf    => erf_c(x),
                 .math_erfc   => erfc_c(x),
@@ -4420,7 +4540,7 @@ fn evalTextBoolExpr(expr: []const u8, row: *const RowCtx) bool {
         return false;
     }
 
-    // col op val comparisons
+    // col op val comparisons — depth-aware scan to avoid matching inside parens or lambdas (->)
     const ops = [_]struct { text: []const u8, op: generic_sql.CmpOp }{
         .{ .text = "<>", .op = .ne },
         .{ .text = ">=", .op = .ge },
@@ -4430,10 +4550,34 @@ fn evalTextBoolExpr(expr: []const u8, row: *const RowCtx) bool {
         .{ .text = ">",  .op = .gt },
         .{ .text = "<",  .op = .lt },
     };
-    for (ops) |candidate| {
-        const pos = std.mem.indexOf(u8, trimmed, candidate.text) orelse continue;
-        const lhs_raw = std.mem.trim(u8, trimmed[0..pos], " \t\r\n");
-        const rhs_raw = std.mem.trim(u8, trimmed[pos + candidate.text.len ..], " \t\r\n");
+    // Find leftmost top-level comparison operator (depth-aware).
+    // At each position, prefer longer operators (priority order in ops ensures this).
+    var best_pos: usize = std.math.maxInt(usize);
+    var best_op_idx: usize = ops.len;
+    {
+        var depth: usize = 0;
+        for (trimmed, 0..) |ch, ci| {
+            if (ch == '(' or ch == '[') { depth += 1; continue; }
+            if (ch == ')' or ch == ']') { if (depth > 0) depth -= 1; continue; }
+            if (depth != 0) continue;
+            // Try each op in priority order; at a given position, take the first
+            // (highest priority = longest) match.  Only update best if ci < best_pos.
+            if (ci >= best_pos) continue;
+            for (ops, 0..) |candidate, oi| {
+                if (ci + candidate.text.len > trimmed.len) continue;
+                if (!std.mem.eql(u8, trimmed[ci..ci + candidate.text.len], candidate.text)) continue;
+                // Skip if this '>' is part of "->" lambda arrow
+                if (candidate.text[0] == '>' and ci > 0 and trimmed[ci - 1] == '-') continue;
+                best_pos = ci;
+                best_op_idx = oi;
+                break; // highest-priority match at this position
+            }
+        }
+    }
+    if (best_op_idx < ops.len) {
+        const candidate = ops[best_op_idx];
+        const lhs_raw = std.mem.trim(u8, trimmed[0..best_pos], " \t\r\n");
+        const rhs_raw = std.mem.trim(u8, trimmed[best_pos + candidate.text.len ..], " \t\r\n");
         const lv = evalTextExpr(lhs_raw, row) orelse Value{ .null_val = {} };
         const rv = evalTextExpr(rhs_raw, row) orelse Value{ .null_val = {} };
         const ord = Value.order(lv, rv);
