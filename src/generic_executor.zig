@@ -31,6 +31,11 @@ const build_options = @import("build_options");
 const ch_part = @import("ch_part");
 const csv_mod = @import("csv");
 
+extern fn erf(x: f64) f64;
+extern fn erfc(x: f64) f64;
+fn erf_c(x: f64) f64 { return erf(x); }
+fn erfc_c(x: f64) f64 { return erfc(x); }
+
 // ── User-defined functions (set by server before calling executor) ────────────
 
 /// Thread-local registry of user-defined functions: name → lambda text "(params) -> body".
@@ -2977,6 +2982,30 @@ const EvalKind = enum {
     append_trailing_char, // appendTrailingCharIfAbsent(s, c) → s with c appended if not already last
     // FixedString
     fixed_string,         // toFixedString(s, n) → s padded/truncated to n bytes (null-pad)
+    // Math functions (f64 → f64)
+    math_sqrt,   // sqrt(x)
+    math_cbrt,   // cbrt(x)
+    math_exp,    // exp(x)
+    math_exp2,   // exp2(x)
+    math_exp10,  // exp10(x)
+    math_log,    // log(x) / ln(x)
+    math_log2,   // log2(x)
+    math_log10,  // log10(x)
+    math_sin,    // sin(x)
+    math_cos,    // cos(x)
+    math_tan,    // tan(x)
+    math_asin,   // asin(x)
+    math_acos,   // acos(x)
+    math_atan,   // atan(x)
+    math_atan2,  // atan2(y, x)
+    math_pow,    // pow(x, y) / power(x, y)
+    math_lgamma, // lgamma(x)
+    math_tgamma, // tgamma(x)
+    math_erf,    // erf(x)
+    math_erfc,   // erfc(x)
+    math_is_nan, // isNaN(x)
+    math_is_inf, // isInfinite(x) / isInf(x)
+    math_is_finite, // isFinite(x)
 };
 
 const FuncEval = struct {
@@ -3055,6 +3084,33 @@ const func_evals = [_]FuncEval{
     .{ .name = "intdivorzero",                .kind = .int_div_or_zero  },
     .{ .name = "appendtrailingcharifabsent",  .kind = .append_trailing_char },
     .{ .name = "tofixedstring",               .kind = .fixed_string         },
+    // Math functions
+    .{ .name = "sqrt",    .kind = .math_sqrt  },
+    .{ .name = "cbrt",    .kind = .math_cbrt  },
+    .{ .name = "exp",     .kind = .math_exp   },
+    .{ .name = "exp2",    .kind = .math_exp2  },
+    .{ .name = "exp10",   .kind = .math_exp10 },
+    .{ .name = "log",     .kind = .math_log   },
+    .{ .name = "ln",      .kind = .math_log   },
+    .{ .name = "log2",    .kind = .math_log2  },
+    .{ .name = "log10",   .kind = .math_log10 },
+    .{ .name = "sin",     .kind = .math_sin   },
+    .{ .name = "cos",     .kind = .math_cos   },
+    .{ .name = "tan",     .kind = .math_tan   },
+    .{ .name = "asin",    .kind = .math_asin  },
+    .{ .name = "acos",    .kind = .math_acos  },
+    .{ .name = "atan",    .kind = .math_atan  },
+    .{ .name = "atan2",   .kind = .math_atan2 },
+    .{ .name = "pow",     .kind = .math_pow   },
+    .{ .name = "power",   .kind = .math_pow   },
+    .{ .name = "lgamma",  .kind = .math_lgamma },
+    .{ .name = "tgamma",  .kind = .math_tgamma },
+    .{ .name = "erf",     .kind = .math_erf   },
+    .{ .name = "erfc",    .kind = .math_erfc  },
+    .{ .name = "isnan",   .kind = .math_is_nan },
+    .{ .name = "isinfinite", .kind = .math_is_inf },
+    .{ .name = "isinf",   .kind = .math_is_inf },
+    .{ .name = "isfinite", .kind = .math_is_finite },
 };
 
 // ── Helper: resolve a Value from an array stored as \f-separated string ───────
@@ -4091,7 +4147,9 @@ fn evalFunc(kind: EvalKind, name: []const u8, inner: []const u8, row: *const Row
             const cv = (evalTextExpr(std.mem.trim(u8, args.items[1], " \t\r\n"), row) orelse return null).toStr() orelse return null;
             if (cv.len == 0) return Value{ .str = sv };
             const c = cv[0];
-            if (sv.len > 0 and sv[sv.len - 1] == c) return Value{ .str = sv };
+            // Empty string: return as-is (ClickHouse: don't append to empty strings)
+            if (sv.len == 0) return Value{ .str = sv };
+            if (sv[sv.len - 1] == c) return Value{ .str = sv };
             const result = std.heap.page_allocator.alloc(u8, sv.len + 1) catch return null;
             @memcpy(result[0..sv.len], sv);
             result[sv.len] = c;
@@ -4111,6 +4169,56 @@ fn evalFunc(kind: EvalKind, name: []const u8, inner: []const u8, row: *const Row
             @memcpy(result[0..copy_len], sv[0..copy_len]);
             if (n > sv.len) @memset(result[sv.len..], 0);
             return Value{ .str_owned = result };
+        },
+        // Math functions
+        .math_sqrt, .math_cbrt, .math_exp, .math_exp2, .math_exp10,
+        .math_log, .math_log2, .math_log10,
+        .math_sin, .math_cos, .math_tan,
+        .math_asin, .math_acos, .math_atan,
+        .math_lgamma, .math_tgamma, .math_erf, .math_erfc => {
+            const x = (evalTextExpr(std.mem.trim(u8, inner, " \t\r\n"), row) orelse return null).toF64() orelse return null;
+            const result: f64 = switch (kind) {
+                .math_sqrt   => @sqrt(x),
+                .math_cbrt   => std.math.cbrt(x),
+                .math_exp    => @exp(x),
+                .math_exp2   => @exp2(x),
+                .math_exp10  => std.math.pow(f64, 10.0, x),
+                .math_log    => @log(x),
+                .math_log2   => @log2(x),
+                .math_log10  => @log10(x),
+                .math_sin    => @sin(x),
+                .math_cos    => @cos(x),
+                .math_tan    => @tan(x),
+                .math_asin   => std.math.asin(x),
+                .math_acos   => std.math.acos(x),
+                .math_atan   => std.math.atan(x),
+                .math_lgamma => std.math.lgamma(f64, x),
+                .math_tgamma => std.math.gamma(f64, x),
+                .math_erf    => erf_c(x),
+                .math_erfc   => erfc_c(x),
+                else         => unreachable,
+            };
+            return Value{ .f64 = result };
+        },
+        .math_pow, .math_atan2 => {
+            const args = splitTopLevelArgs(inner) catch return null;
+            if (args.len != 2) return null;
+            const a = (evalTextExpr(std.mem.trim(u8, args.items[0], " \t\r\n"), row) orelse return null).toF64() orelse return null;
+            const b = (evalTextExpr(std.mem.trim(u8, args.items[1], " \t\r\n"), row) orelse return null).toF64() orelse return null;
+            const result: f64 = if (kind == .math_pow) std.math.pow(f64, a, b) else std.math.atan2(a, b);
+            return Value{ .f64 = result };
+        },
+        .math_is_nan => {
+            const x = (evalTextExpr(std.mem.trim(u8, inner, " \t\r\n"), row) orelse return null).toF64() orelse return null;
+            return Value{ .i64 = if (std.math.isNan(x)) 1 else 0 };
+        },
+        .math_is_inf => {
+            const x = (evalTextExpr(std.mem.trim(u8, inner, " \t\r\n"), row) orelse return null).toF64() orelse return null;
+            return Value{ .i64 = if (std.math.isInf(x)) 1 else 0 };
+        },
+        .math_is_finite => {
+            const x = (evalTextExpr(std.mem.trim(u8, inner, " \t\r\n"), row) orelse return null).toF64() orelse return null;
+            return Value{ .i64 = if (std.math.isFinite(x)) 1 else 0 };
         },
     }
 }
