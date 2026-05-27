@@ -3015,7 +3015,11 @@ const EvalKind = enum {
     // Cast
     cast_expr,         // CAST(expr AS type)
     str_tostring,      // toString(x) → string representation
-    fn_now,            // now() → current Unix timestamp (seconds)
+    fn_now,            // now() → current Unix timestamp as DateTime (seconds)
+    fn_today,          // today() → current date as Date
+    fn_yesterday,      // yesterday() → yesterday as Date
+    empty_arr_str,     // emptyArrayString() → []
+    empty_arr_int,     // emptyArrayUInt8/16/32/64() → []
     // Array construction
     arr_make,          // list_value(a, b, ...) / array(a, b, ...) → Value.array
     arr_split_char,    // splitByChar(delim, str) → array
@@ -3141,7 +3145,19 @@ const func_evals = [_]FuncEval{
     .{ .name = "tostring",                    .kind = .str_tostring     },
     .{ .name = "ch_tostring",                 .kind = .str_tostring     },
     .{ .name = "now",                         .kind = .fn_now           },
-    .{ .name = "today",                       .kind = .fn_now           },
+    .{ .name = "today",                       .kind = .fn_today         },
+    .{ .name = "yesterday",                   .kind = .fn_yesterday     },
+    .{ .name = "emptyarraystring",            .kind = .empty_arr_str    },
+    .{ .name = "emptyarrayuint8",             .kind = .empty_arr_int    },
+    .{ .name = "emptyarrayuint16",            .kind = .empty_arr_int    },
+    .{ .name = "emptyarrayuint32",            .kind = .empty_arr_int    },
+    .{ .name = "emptyarrayuint64",            .kind = .empty_arr_int    },
+    .{ .name = "emptyarrayint8",              .kind = .empty_arr_int    },
+    .{ .name = "emptyarrayint16",             .kind = .empty_arr_int    },
+    .{ .name = "emptyarrayint32",             .kind = .empty_arr_int    },
+    .{ .name = "emptyarrayint64",             .kind = .empty_arr_int    },
+    .{ .name = "emptyarrayfloat32",           .kind = .empty_arr_int    },
+    .{ .name = "emptyarrayfloat64",           .kind = .empty_arr_int    },
     .{ .name = "list_value",                  .kind = .arr_make         },
     .{ .name = "array",                       .kind = .arr_make         },
     .{ .name = "splitbychar",                 .kind = .arr_split_char   },
@@ -3318,6 +3334,114 @@ fn ipv4ToNum(s: []const u8) i64 {
 }
 
 // ── evalTextExpr ─────────────────────────────────────────────────────────────
+
+/// Parse "YYYY-MM-DD HH:MM:SS" or "YYYY-MM-DD" to Unix seconds. Returns null on failure.
+fn datetimeStrToSecs(s: []const u8) ?f64 {
+    if (s.len >= 19 and s[4] == '-' and s[7] == '-' and s[10] == ' ' and s[13] == ':' and s[16] == ':') {
+        const y  = std.fmt.parseInt(i32, s[0..4],   10) catch return null;
+        const mo = std.fmt.parseInt(u8,  s[5..7],   10) catch return null;
+        const dy = std.fmt.parseInt(u8,  s[8..10],  10) catch return null;
+        const hh = std.fmt.parseInt(u8,  s[11..13], 10) catch return null;
+        const mm = std.fmt.parseInt(u8,  s[14..16], 10) catch return null;
+        const ss = std.fmt.parseInt(u8,  s[17..19], 10) catch return null;
+        const days = dateToDays(y, mo, dy);
+        return @as(f64, @floatFromInt(days)) * 86400.0 + @as(f64, @floatFromInt(hh)) * 3600.0 + @as(f64, @floatFromInt(mm)) * 60.0 + @as(f64, @floatFromInt(ss));
+    }
+    if (s.len >= 10 and s[4] == '-' and s[7] == '-') {
+        const y  = std.fmt.parseInt(i32, s[0..4], 10) catch return null;
+        const mo = std.fmt.parseInt(u8,  s[5..7], 10) catch return null;
+        const dy = std.fmt.parseInt(u8,  s[8..10], 10) catch return null;
+        return @as(f64, @floatFromInt(dateToDays(y, mo, dy))) * 86400.0;
+    }
+    return null;
+}
+
+/// Infer the ClickHouse type name string for an expression, using AST-level
+/// knowledge before falling back to value evaluation.
+fn inferChTypeName(expr: []const u8, row: *const RowCtx) []const u8 {
+    const t = std.mem.trim(u8, expr, " \t\r\n");
+    // Strip outer parens
+    if (t.len >= 2 and t[0] == '(' and t[t.len - 1] == ')') {
+        var depth: i32 = 0;
+        var balanced = true;
+        for (t[0 .. t.len - 1], 0..) |c, i| {
+            if (c == '(') depth += 1 else if (c == ')') depth -= 1;
+            if (i > 0 and depth == 0) { balanced = false; break; }
+        }
+        if (balanced) return inferChTypeName(t[1 .. t.len - 1], row);
+    }
+    // Detect binary arithmetic: look for top-level +/-
+    if (findTopLevelOp(t, "+-")) |op_pos| {
+        const op = t[op_pos];
+        const lhs = std.mem.trim(u8, t[0..op_pos], " \t\r\n");
+        const rhs = std.mem.trim(u8, t[op_pos + 1 ..], " \t\r\n");
+        const lt = inferChTypeName(lhs, row);
+        const rt = inferChTypeName(rhs, row);
+        // DateTime ± Int → DateTime; DateTime - DateTime → Int32
+        if (std.mem.startsWith(u8, lt, "DateTime") and std.mem.startsWith(u8, rt, "DateTime"))
+            return "Int32";
+        if (std.mem.startsWith(u8, lt, "DateTime") or std.mem.startsWith(u8, rt, "DateTime"))
+            return "DateTime";
+        // Date ± Int → Date; Date - Date → Int32
+        if (std.mem.eql(u8, lt, "Date") and std.mem.eql(u8, rt, "Date"))
+            return "Int32";
+        if (std.mem.eql(u8, lt, "Date") or std.mem.eql(u8, rt, "Date"))
+            return "Date";
+        _ = op;
+        return "Int64";
+    }
+    // Detect function call: name(...)
+    if (std.mem.indexOfScalar(u8, t, '(')) |paren| {
+        if (paren > 0 and t[t.len - 1] == ')') {
+            const fname_raw = t[0..paren];
+            var fname_buf: [64]u8 = undefined;
+            const fname = std.ascii.lowerString(fname_buf[0..@min(fname_buf.len, fname_raw.len)], fname_raw);
+            if (std.mem.eql(u8, fname, "now"))        return "DateTime";
+            if (std.mem.eql(u8, fname, "today"))      return "Date";
+            if (std.mem.eql(u8, fname, "yesterday"))  return "Date";
+            if (std.mem.eql(u8, fname, "todatetime")) return "DateTime";
+            if (std.mem.eql(u8, fname, "todate"))     return "Date";
+            if (std.mem.startsWith(u8, fname, "todatetime")) return "DateTime";
+            if (std.mem.startsWith(u8, fname, "todate")) return "Date";
+            if (std.mem.eql(u8, fname, "totypename")) return "String";
+            if (std.mem.eql(u8, fname, "typename"))   return "String";
+        }
+    }
+    // Float literal
+    if (std.fmt.parseFloat(f64, t) catch null) |_| {
+        if (std.mem.indexOfScalar(u8, t, '.') != null) return "Float64";
+    }
+    // Fall back to evaluated value
+    const v = evalTextExpr(t, row) orelse return "Null";
+    return switch (v) {
+        .i64      => "Int64",
+        .uint8    => "UInt8",
+        .f64      => "Float64",
+        .date     => "Date",
+        .str, .str_owned => "String",
+        .array    => "Array(String)",
+        .null_val => "Null",
+    };
+}
+
+/// Find the position of a top-level (depth=0) operator char in ops string.
+/// Returns null if not found at top level.
+fn findTopLevelOp(expr: []const u8, ops: []const u8) ?usize {
+    var depth: i32 = 0;
+    var i: usize = expr.len;
+    while (i > 0) {
+        i -= 1;
+        const c = expr[i];
+        if (c == ')') { depth += 1; continue; }
+        if (c == '(') { depth -= 1; continue; }
+        if (depth == 0 and i > 0) {
+            for (ops) |op| {
+                if (c == op) return i;
+            }
+        }
+    }
+    return null;
+}
 
 /// Evaluate a text-encoded expression against a row.
 /// Returns null if the expression cannot be evaluated (unknown column or function).
@@ -3565,8 +3689,9 @@ fn evalTextExpr(expr: []const u8, row: *const RowCtx) ?Value {
             if (lhs_str.len > 0 and rhs_str.len > 0) {
                 if (evalTextExpr(lhs_str, row)) |lv| {
                     if (evalTextExpr(rhs_str, row)) |rv| {
-                        const la = lv.toF64() orelse return null;
-                        const ra = rv.toF64() orelse return null;
+                        // DateTime string arithmetic: parse "YYYY-MM-DD HH:MM:SS" as Unix seconds
+                        const la = lv.toF64() orelse datetimeStrToSecs(lv.toStr() orelse return null) orelse return null;
+                        const ra = rv.toF64() orelse datetimeStrToSecs(rv.toStr() orelse return null) orelse return null;
                         const res: f64 = switch (op) {
                             '+' => la + ra,
                             '-' => la - ra,
@@ -3927,6 +4052,20 @@ fn evalFunc(kind: EvalKind, name: []const u8, inner: []const u8, row: *const Row
             _ = std.posix.system.clock_gettime(.REALTIME, &ts);
             return Value{ .i64 = ts.sec };
         },
+        .fn_today => {
+            var ts: std.posix.timespec = undefined;
+            _ = std.posix.system.clock_gettime(.REALTIME, &ts);
+            // days since epoch
+            return Value{ .date = @intCast(@divFloor(ts.sec, 86400)) };
+        },
+        .fn_yesterday => {
+            var ts: std.posix.timespec = undefined;
+            _ = std.posix.system.clock_gettime(.REALTIME, &ts);
+            return Value{ .date = @intCast(@divFloor(ts.sec, 86400) - 1) };
+        },
+        .empty_arr_str, .empty_arr_int => {
+            return Value{ .array = &.{} };
+        },
         .str_tostring => {
             const v = evalTextExpr(inner, row) orelse return Value{ .str = "" };
             switch (v) {
@@ -4024,26 +4163,17 @@ fn evalFunc(kind: EvalKind, name: []const u8, inner: []const u8, row: *const Row
                     else => {},
                 }
             }
-            // TIMESTAMP / DATETIME: parse string "YYYY-MM-DD HH:MM:SS" and return as-is (str)
+            // TIMESTAMP / DATETIME: parse string "YYYY-MM-DD HH:MM:SS" and return as i64 seconds
             if (std.ascii.eqlIgnoreCase(type_part, "TIMESTAMP") or
                 std.ascii.eqlIgnoreCase(type_part, "DATETIME"))
             {
                 switch (v) {
-                    .str, .str_owned => return v, // already a datetime string
-                    .i64 => |ts| {
-                        // Unix timestamp → "YYYY-MM-DD HH:MM:SS"
-                        const ts_s: i64 = if (ts > 1_000_000_000_000) @divFloor(ts, 1000) else ts;
-                        const epoch_s: u64 = @intCast(@max(0, ts_s));
-                        const days: u32 = @intCast(epoch_s / 86400);
-                        const secs_in_day: u32 = @intCast(epoch_s % 86400);
-                        const h = secs_in_day / 3600;
-                        const m = (secs_in_day % 3600) / 60;
-                        const s2 = secs_in_day % 60;
-                        const ymd = epochDaysToYmd(@intCast(days));
-                        const yr: u32 = @intCast(@max(0, ymd.year));
-                        return Value{ .str_owned = std.fmt.allocPrint(std.heap.page_allocator,
-                            "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}",
-                            .{ yr, ymd.month, ymd.day, h, m, s2 }) catch return null };
+                    .i64 => return v, // integer → DateTime (keep as i64 seconds for arithmetic)
+                    .str, .str_owned => {
+                        // "YYYY-MM-DD HH:MM:SS" → parse to i64 Unix seconds
+                        const s = v.toStr().?;
+                        if (datetimeStrToSecs(s)) |secs| return Value{ .i64 = @intFromFloat(secs) };
+                        return v; // pass through if unparseable
                     },
                     else => return v,
                 }
@@ -4333,16 +4463,9 @@ fn evalFunc(kind: EvalKind, name: []const u8, inner: []const u8, row: *const Row
         .scalar_passthru => return evalTextExpr(inner, row) orelse Value{ .null_val = {} },
         .type_name => {
             // toTypeName(x) → CH type name as string
-            const v = evalTextExpr(inner, row) orelse return Value{ .str = "Null" };
-            return Value{ .str = switch (v) {
-                .i64      => "Int64",
-                .uint8    => "UInt8",
-                .f64      => "Float64",
-                .date     => "Date",
-                .str, .str_owned => "String",
-                .array    => "Array(String)",
-                .null_val => "Null",
-            }};
+            // Infer CH type from expression AST first, fall back to value tag.
+            const tn = inferChTypeName(inner, row);
+            return Value{ .str = tn };
         },
         .int_div_or_zero => {
             const args = splitTopLevelArgs(inner) catch return Value{ .i64 = 0 };
@@ -4613,6 +4736,29 @@ fn evalTextBoolExpr(expr: []const u8, row: *const RowCtx) bool {
             if (Value.order(lv, rv) == .eq) return true;
         }
         return false;
+    }
+
+    // LIKE / NOT LIKE / ILIKE
+    if (std.ascii.indexOfIgnoreCase(trimmed, " NOT LIKE ")) |pos| {
+        const lhs = std.mem.trim(u8, trimmed[0..pos], " \t\r\n");
+        const rhs = std.mem.trim(u8, trimmed[pos + 10 ..], " \t\r\n");
+        const lv = (evalTextExpr(lhs, row) orelse return false).toStr() orelse return false;
+        const pattern_raw = std.mem.trim(u8, rhs, "'");
+        return !likeMatch(lv, pattern_raw, false);
+    }
+    if (std.ascii.indexOfIgnoreCase(trimmed, " ILIKE ")) |pos| {
+        const lhs = std.mem.trim(u8, trimmed[0..pos], " \t\r\n");
+        const rhs = std.mem.trim(u8, trimmed[pos + 7 ..], " \t\r\n");
+        const lv = (evalTextExpr(lhs, row) orelse return false).toStr() orelse return false;
+        const pattern_raw = std.mem.trim(u8, rhs, "'");
+        return likeMatch(lv, pattern_raw, true);
+    }
+    if (std.ascii.indexOfIgnoreCase(trimmed, " LIKE ")) |pos| {
+        const lhs = std.mem.trim(u8, trimmed[0..pos], " \t\r\n");
+        const rhs = std.mem.trim(u8, trimmed[pos + 6 ..], " \t\r\n");
+        const lv = (evalTextExpr(lhs, row) orelse return false).toStr() orelse return false;
+        const pattern_raw = std.mem.trim(u8, rhs, "'");
+        return likeMatch(lv, pattern_raw, false);
     }
 
     // col op val comparisons — depth-aware scan to avoid matching inside parens or lambdas (->)

@@ -1449,6 +1449,13 @@ fn translateExpr(allocator: std.mem.Allocator, val: std.json.Value) !?generic_sq
                 }
             }
         }
+        // LIKE/NOT LIKE/ILIKE used as scalar value: ~~, !~~, ~~*, !~~*
+        if (std.mem.eql(u8, fn_name, "~~") or std.mem.eql(u8, fn_name, "~~*") or
+            std.mem.eql(u8, fn_name, "!~~") or std.mem.eql(u8, fn_name, "!~~*"))
+        {
+            const text = try exprToText(allocator, val) orelse return null;
+            return .{ .func = .cmp_expr, .column = text, .alias = alias };
+        }
         const fn_text = try exprToText(allocator, val) orelse return null;
         return .{ .func = .column_ref, .column = fn_text, .alias = alias };
     }
