@@ -195,6 +195,27 @@ fn translateSetOpNode(allocator: std.mem.Allocator, node_obj: std.json.ObjectMap
         try translateSetOpNode(allocator, right_val.object)
     else return error.Unsupported;
     left_plan.union_other = right_plan_ptr;
+    // Parse LIMIT/OFFSET modifiers on the SET_OPERATION_NODE itself.
+    // In ClickHouse, LIMIT on a UNION ALL applies to the last (right-most) branch.
+    if (node_obj.get("modifiers")) |mods_val| {
+        var union_limit: ?usize = null;
+        var union_offset: ?usize = null;
+        for (mods_val.array.items) |mod| {
+            const mt = (mod.object.get("type") orelse continue).string;
+            if (std.mem.eql(u8, mt, "LIMIT_MODIFIER")) {
+                if (mod.object.get("limit")) |lv| {
+                    if (lv != .null) union_limit = extractIntLiteral(lv);
+                }
+                if (mod.object.get("offset")) |ov| {
+                    if (ov != .null) union_offset = extractIntLiteral(ov);
+                }
+            }
+        }
+        if (union_limit != null or union_offset != null) {
+            right_plan_ptr.limit = union_limit;
+            right_plan_ptr.offset = union_offset;
+        }
+    }
     return left_plan;
 }
 
