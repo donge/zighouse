@@ -2930,6 +2930,7 @@ const EvalKind = enum {
     str_substring,     // substring(s, pos [, len]) — 1-based
     str_starts_with,   // startsWith(s, prefix)
     str_position_ci,   // positionCaseInsensitive(haystack, needle)
+    str_position,      // position(hay, ndl) / strpos(hay, ndl)
     str_length,        // length(s or array) — byte len or element count
     // Numeric
     num_floor,         // floor(x)
@@ -3046,6 +3047,9 @@ const func_evals = [_]FuncEval{
     .{ .name = "substr",                      .kind = .str_substring    },
     .{ .name = "startswith",                  .kind = .str_starts_with  },
     .{ .name = "positioncaseinsensitive",      .kind = .str_position_ci  },
+    .{ .name = "position",                     .kind = .str_position     },
+    .{ .name = "strpos",                       .kind = .str_position     },
+    .{ .name = "locate",                       .kind = .str_position     },
     .{ .name = "length",                      .kind = .str_length       },
     .{ .name = "floor",                       .kind = .num_floor        },
     .{ .name = "round",                       .kind = .num_round        },
@@ -3633,6 +3637,14 @@ fn evalFunc(kind: EvalKind, name: []const u8, inner: []const u8, row: *const Row
             const hay = (evalTextExpr(std.mem.trim(u8, args.items[0], " \t\r\n"), row) orelse return Value{ .i64 = 0 }).toStr() orelse return Value{ .i64 = 0 };
             const ndl = (evalTextExpr(std.mem.trim(u8, args.items[1], " \t\r\n"), row) orelse return Value{ .i64 = 0 }).toStr() orelse return Value{ .i64 = 0 };
             if (std.ascii.indexOfIgnoreCase(hay, ndl)) |pos| return Value{ .i64 = @intCast(pos + 1) };
+            return Value{ .i64 = 0 };
+        },
+        .str_position => {
+            const args = splitTopLevelArgs(inner) catch return Value{ .i64 = 0 };
+            if (args.len < 2) return Value{ .i64 = 0 };
+            const hay = (evalTextExpr(std.mem.trim(u8, args.items[0], " \t\r\n"), row) orelse return Value{ .i64 = 0 }).toStr() orelse return Value{ .i64 = 0 };
+            const ndl = (evalTextExpr(std.mem.trim(u8, args.items[1], " \t\r\n"), row) orelse return Value{ .i64 = 0 }).toStr() orelse return Value{ .i64 = 0 };
+            if (std.mem.indexOf(u8, hay, ndl)) |pos| return Value{ .i64 = @intCast(pos + 1) };
             return Value{ .i64 = 0 };
         },
         .str_length => {

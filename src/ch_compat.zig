@@ -54,6 +54,9 @@ const rules = [_]RewriteRule{
     .{ .name = "any",                  .kind = .rename,     .param = "any_value("        },
     .{ .name = "lowerUTF8",            .kind = .rename,     .param = "lower("            },
     .{ .name = "upperUTF8",            .kind = .rename,     .param = "upper("            },
+    // position(hay, ndl) → strpos(hay, ndl): DuckDB's `position` uses SQL syntax (needle IN hay)
+    .{ .name = "position",             .kind = .rename,     .param = "strpos("           },
+    .{ .name = "positionCaseInsensitive", .kind = .rename,  .param = "strpos("           },
     // arrayStringConcat(arr, sep) → array_to_string(arr, sep)
     // DuckDB's parser rejects arrayStringConcat when the first arg is an array literal.
     .{ .name = "arrayStringConcat",    .kind = .rename,     .param = "array_to_string("  },
