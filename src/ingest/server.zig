@@ -902,10 +902,14 @@ pub const Server = struct {
             // Create a fake table descriptor when the inner table is unknown (e.g. system.one, numbers(N)).
             const fake_inner_table = schema.Table{ .name = "", .columns = &.{} };
             const inner_table: *const schema.Table = if (inner_entry_opt) |e| &e.table else &fake_inner_table;
-            var inner_parts = try part_scanner.scan(self.allocator, self.io, self.config.data_dir, inner_db_table.db, inner_db_table.table);
-            defer inner_parts.deinit();
-            const inner_dirs: []const []const u8 = if (inner_entry_opt != null) inner_parts.dirs() else &.{};
-            const inner_csv = try generic_executor.runWithSource(self.allocator, self.io, inner_plan.*, .{ .ch_parts = inner_dirs }, inner_table);
+            const inner_csv = if (inner_plan.union_other != null)
+                try self.runUnionAllCsv(inner_plan.*)
+            else blk: {
+                var inner_parts = try part_scanner.scan(self.allocator, self.io, self.config.data_dir, inner_db_table.db, inner_db_table.table);
+                defer inner_parts.deinit();
+                const inner_dirs: []const []const u8 = if (inner_entry_opt != null) inner_parts.dirs() else &.{};
+                break :blk try generic_executor.runWithSource(self.allocator, self.io, inner_plan.*, .{ .ch_parts = inner_dirs }, inner_table);
+            };
             defer self.allocator.free(inner_csv);
             const result = try generic_executor.runOverCsv(self.allocator, plan, inner_csv, inner_table);
             defer self.allocator.free(result);
@@ -924,6 +928,24 @@ pub const Server = struct {
         }
 
         const db_table = splitDbTable(plan.table);
+
+        // UNION ALL: run each branch, concatenate CSV, then run outer ORDER BY/LIMIT if any.
+        if (plan.union_other != null) {
+            const union_csv = try self.runUnionAllCsv(plan);
+            defer self.allocator.free(union_csv);
+            if (want_tsv) {
+                const tsv = try csvToTsv(self.allocator, union_csv, true);
+                defer self.allocator.free(tsv);
+                try sendResponse(request, out, .ok, tsv);
+            } else {
+                var rs = try serializer.csvToResultSet(self.allocator, union_csv, null);
+                defer rs.deinit();
+                const nb = try serializer.toNativeBlock(self.allocator, rs);
+                defer self.allocator.free(nb);
+                try sendNativeBlock(self.allocator, request, out, nb);
+            }
+            return;
+        }
 
         const entry = self.schemas.find(db_table.db, db_table.table) orelse {
             // Unknown table: synthesise a zero-row result.
@@ -1026,6 +1048,56 @@ pub const Server = struct {
             defer self.allocator.free(nb);
             try sendNativeBlock(self.allocator, request, out, nb);
         }
+    }
+
+    /// Run a UNION ALL plan chain and return concatenated CSV (no header row).
+    fn runUnionAllCsv(self: *Server, plan: generic_sql.Plan) ![]u8 {
+        const fake_table = schema.Table{ .name = "", .columns = &.{} };
+        var parts: std.ArrayListUnmanaged([]u8) = .empty;
+        defer {
+            for (parts.items) |p| self.allocator.free(p);
+            parts.deinit(self.allocator);
+        }
+        // Traverse plan chain (left plan first, then union_other chain)
+        var cur: ?*const generic_sql.Plan = &plan;
+        while (cur) |p| {
+            // Determine the data source for this plan branch
+            const db_table = splitDbTable(p.table);
+            const entry_opt = self.schemas.find(db_table.db, db_table.table);
+            const table: *const schema.Table = if (entry_opt) |e| &e.table else &fake_table;
+            var branch_parts = try part_scanner.scan(self.allocator, self.io, self.config.data_dir, db_table.db, db_table.table);
+            defer branch_parts.deinit();
+            // Build a plan without union_other for this branch
+            var branch_plan = p.*;
+            branch_plan.union_other = null;
+            const csv = try generic_executor.runWithSource(self.allocator, self.io, branch_plan, .{ .ch_parts = branch_parts.dirs() }, table);
+            try parts.append(self.allocator, csv);
+            cur = if (p.union_other) |uo| uo else null;
+        }
+        // Concatenate all CSV parts (strip headers from all but the first)
+        var total_len: usize = 0;
+        for (parts.items, 0..) |p, i| {
+            if (i == 0) {
+                total_len += p.len;
+            } else {
+                // Skip first line (header row)
+                const newline = std.mem.indexOfScalar(u8, p, '\n') orelse p.len;
+                const skip = if (newline < p.len) newline + 1 else p.len;
+                total_len += p.len - skip;
+            }
+        }
+        const out_buf = try self.allocator.alloc(u8, total_len);
+        var off: usize = 0;
+        for (parts.items, 0..) |p, i| {
+            const data: []const u8 = if (i == 0) p else blk: {
+                const newline = std.mem.indexOfScalar(u8, p, '\n') orelse p.len;
+                const skip = if (newline < p.len) newline + 1 else p.len;
+                break :blk p[skip..];
+            };
+            @memcpy(out_buf[off .. off + data.len], data);
+            off += data.len;
+        }
+        return out_buf;
     }
 
     fn handleCreateSimple(self: *Server, request: *std.http.Server.Request, out: *std.Io.Writer, sql: []const u8) !void {

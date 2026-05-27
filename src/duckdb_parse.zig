@@ -166,26 +166,36 @@ fn translateJsonInner(allocator: std.mem.Allocator, json: []const u8) !generic_s
     // Only handle plain SELECT and UNION ALL
     const node_type = (node_obj.get("type") orelse return error.Unsupported).string;
     if (std.mem.eql(u8, node_type, "SET_OPERATION_NODE")) {
-        // UNION ALL: translate left and right, link via union_other
-        const set_op = (node_obj.get("setop_type") orelse return error.Unsupported).string;
-        if (!std.mem.eql(u8, set_op, "UNION_ALL") and !std.mem.eql(u8, set_op, "UNION")) return error.Unsupported;
-        const left_val = node_obj.get("left") orelse return error.Unsupported;
-        const right_val = node_obj.get("right") orelse return error.Unsupported;
-        const left_type = (left_val.object.get("type") orelse return error.Unsupported).string;
-        const right_type = (right_val.object.get("type") orelse return error.Unsupported).string;
-        if (!std.mem.eql(u8, left_type, "SELECT_NODE")) return error.Unsupported;
-        if (!std.mem.eql(u8, right_type, "SELECT_NODE")) return error.Unsupported;
-        var left_plan = try translateSelectNode(allocator, left_val.object);
-        errdefer generic_sql.deinit(allocator, left_plan);
-        const right_plan_ptr = try allocator.create(generic_sql.Plan);
-        errdefer { allocator.destroy(right_plan_ptr); }
-        right_plan_ptr.* = try translateSelectNode(allocator, right_val.object);
-        left_plan.union_other = right_plan_ptr;
-        return left_plan;
+        return try translateSetOpNode(allocator, node_obj);
     }
     if (!std.mem.eql(u8, node_type, "SELECT_NODE")) return error.Unsupported;
 
     return translateSelectNode(allocator, node_obj);
+}
+
+/// Translate a SET_OPERATION_NODE (UNION ALL) into a Plan.
+fn translateSetOpNode(allocator: std.mem.Allocator, node_obj: std.json.ObjectMap) anyerror!generic_sql.Plan {
+    const set_op = (node_obj.get("setop_type") orelse return error.Unsupported).string;
+    if (!std.mem.eql(u8, set_op, "UNION_ALL") and !std.mem.eql(u8, set_op, "UNION")) return error.Unsupported;
+    const left_val = node_obj.get("left") orelse return error.Unsupported;
+    const right_val = node_obj.get("right") orelse return error.Unsupported;
+    const left_type = (left_val.object.get("type") orelse return error.Unsupported).string;
+    const right_type = (right_val.object.get("type") orelse return error.Unsupported).string;
+    var left_plan = if (std.mem.eql(u8, left_type, "SELECT_NODE"))
+        try translateSelectNode(allocator, left_val.object)
+    else if (std.mem.eql(u8, left_type, "SET_OPERATION_NODE"))
+        try translateSetOpNode(allocator, left_val.object)
+    else return error.Unsupported;
+    errdefer generic_sql.deinit(allocator, left_plan);
+    const right_plan_ptr = try allocator.create(generic_sql.Plan);
+    errdefer allocator.destroy(right_plan_ptr);
+    right_plan_ptr.* = if (std.mem.eql(u8, right_type, "SELECT_NODE"))
+        try translateSelectNode(allocator, right_val.object)
+    else if (std.mem.eql(u8, right_type, "SET_OPERATION_NODE"))
+        try translateSetOpNode(allocator, right_val.object)
+    else return error.Unsupported;
+    left_plan.union_other = right_plan_ptr;
+    return left_plan;
 }
 
 /// Translate a SELECT_NODE JSON object into a Plan (recursive for subqueries).
@@ -857,8 +867,13 @@ fn extractTableNameOrSubquery(allocator: std.mem.Allocator, from: std.json.Value
         // subquery_val is {"node": {"type":"SELECT_NODE", ...}, "named_param_map":[]}
         const inner_node_val = subquery_val.object.get("node") orelse return null;
         const inner_type = (inner_node_val.object.get("type") orelse return null).string;
-        if (!std.mem.eql(u8, inner_type, "SELECT_NODE")) return null;
-        const inner_plan = try translateSelectNode(allocator, inner_node_val.object);
+        const inner_plan = blk: {
+            if (std.mem.eql(u8, inner_type, "SELECT_NODE")) {
+                break :blk try translateSelectNode(allocator, inner_node_val.object);
+            } else if (std.mem.eql(u8, inner_type, "SET_OPERATION_NODE")) {
+                break :blk try translateSetOpNode(allocator, inner_node_val.object);
+            } else return null;
+        };
         const sq = try allocator.create(generic_sql.Plan);
         sq.* = inner_plan;
         subquery_out.?.* = sq;
