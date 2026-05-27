@@ -731,16 +731,93 @@ pub fn rewrite(allocator: std.mem.Allocator, sql: []const u8) !?[]u8 {
     };
     defer allocator.free(norm);
 
+    // Rewrite hex literals 0x... → decimal, outside of string literals.
+    const after_hex = blk: {
+        if (std.ascii.indexOfIgnoreCase(norm, "0x") == null and
+            std.ascii.indexOfIgnoreCase(norm, "0X") == null) break :blk try allocator.dupe(u8, norm);
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        var i: usize = 0;
+        var in_str: bool = false;
+        while (i < norm.len) {
+            const c = norm[i];
+            if (in_str) {
+                try out.append(allocator, c);
+                if (c == '\'') in_str = false;
+                i += 1;
+                continue;
+            }
+            if (c == '\'') { in_str = true; try out.append(allocator, c); i += 1; continue; }
+            // Detect 0x or 0X prefix
+            if (c == '0' and i + 1 < norm.len and (norm[i+1] == 'x' or norm[i+1] == 'X')) {
+                // Scan hex digits (and maybe 'p' for float hex like 0x1p4)
+                var j = i + 2;
+                while (j < norm.len and (std.ascii.isHex(norm[j]) or norm[j] == 'p' or norm[j] == 'P' or norm[j] == '+' or norm[j] == '-')) j += 1;
+                const hex_str = norm[i+2..j];
+                // If it contains 'p'/'P', it's a hex float like 0x1p4 — convert to decimal float
+                const has_p = std.ascii.indexOfIgnoreCase(hex_str, "p") != null;
+                if (!has_p and hex_str.len > 0) {
+                    // Pure hex integer: parse and emit decimal
+                    if (std.fmt.parseInt(u128, hex_str, 16) catch null) |v| {
+                        if (v > std.math.maxInt(u64)) {
+                            // Too large for UBIGINT — emit as float
+                            const fv: f64 = @floatFromInt(v);
+                            const s = try std.fmt.allocPrint(allocator, "{d}", .{fv});
+                            defer allocator.free(s);
+                            try out.appendSlice(allocator, s);
+                        } else if (v > std.math.maxInt(i64)) {
+                            // Emit as UBIGINT cast so DuckDB can handle it
+                            const s = try std.fmt.allocPrint(allocator, "CAST({d} AS UBIGINT)", .{v});
+                            defer allocator.free(s);
+                            try out.appendSlice(allocator, s);
+                        } else {
+                            const s = try std.fmt.allocPrint(allocator, "{d}", .{v});
+                            defer allocator.free(s);
+                            try out.appendSlice(allocator, s);
+                        }
+                        i = j;
+                        continue;
+                    }
+                    // Too large for u128: emit as float
+                    if (std.fmt.parseFloat(f64, norm[i..j]) catch null) |fv| {
+                        const s = try std.fmt.allocPrint(allocator, "{d}", .{fv});
+                        defer allocator.free(s);
+                        try out.appendSlice(allocator, s);
+                        i = j;
+                        continue;
+                    }
+                }
+                if (has_p) {
+                    // Hex float like 0x1p4 or 0x1P1023: convert via float parse
+                    if (std.fmt.parseFloat(f64, norm[i..j]) catch null) |fv| {
+                        const s = try std.fmt.allocPrint(allocator, "{d}", .{fv});
+                        defer allocator.free(s);
+                        try out.appendSlice(allocator, s);
+                        i = j;
+                        continue;
+                    }
+                }
+                // Fallthrough: pass through unchanged
+                try out.appendSlice(allocator, norm[i..j]);
+                i = j;
+                continue;
+            }
+            try out.append(allocator, c);
+            i += 1;
+        }
+        break :blk try out.toOwnedSlice(allocator);
+    };
+    defer allocator.free(after_hex);
+
     // Rewrite count() → count(*): ClickHouse allows bare count() but DuckDB requires count(*).
     const after_count: []const u8 = blk: {
-        if (std.ascii.indexOfIgnoreCase(norm, "count()") != null) {
-            const r1 = try std.mem.replaceOwned(u8, allocator, norm, "count()", "count(*)");
+        if (std.ascii.indexOfIgnoreCase(after_hex, "count()") != null) {
+            const r1 = try std.mem.replaceOwned(u8, allocator, after_hex, "count()", "count(*)");
             errdefer allocator.free(r1);
             const r2 = try std.mem.replaceOwned(u8, allocator, r1, "COUNT()", "count(*)");
             allocator.free(r1);
             break :blk r2;
         }
-        break :blk try allocator.dupe(u8, norm);
+        break :blk try allocator.dupe(u8, after_hex);
     };
     defer allocator.free(after_count);
 

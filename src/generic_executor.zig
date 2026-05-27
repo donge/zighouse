@@ -3412,7 +3412,15 @@ fn inferChTypeName(expr: []const u8, row: *const RowCtx) []const u8 {
         if (std.mem.indexOfScalar(u8, t, '.') != null) return "Float64";
     }
     // Fall back to evaluated value
-    const v = evalTextExpr(t, row) orelse return "Null";
+    const v = evalTextExpr(t, row) orelse {
+        // If the expression looks like a plain identifier (no parens/operators/quotes)
+        // it could be a same-SELECT alias not yet in the row. Default to Int64.
+        const is_plain_ident = for (t) |c| {
+            if (!std.ascii.isAlphanumeric(c) and c != '_') break false;
+        } else true;
+        if (is_plain_ident and t.len > 0) return "Int64";
+        return "Null";
+    };
     return switch (v) {
         .i64      => "Int64",
         .uint8    => "UInt8",
