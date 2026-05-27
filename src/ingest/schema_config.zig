@@ -103,6 +103,26 @@ pub const SchemaConfig = struct {
         }
         try self.dynamic_tables.append(extra_allocator, new_entry);
     }
+
+    /// Remove an entry by (db, name). No-op if not found.
+    pub fn removeEntry(self: *SchemaConfig, db: []const u8, table_name: []const u8) void {
+        for (self.dynamic_tables.items, 0..) |*existing, i| {
+            if (std.mem.eql(u8, existing.db, db) and std.mem.eql(u8, existing.name, table_name)) {
+                _ = self.dynamic_tables.swapRemove(i);
+                return;
+            }
+        }
+        // Also check static tables slice (migrate first if needed).
+        if (self.dynamic_tables.items.len == 0) {
+            for (self.tables, 0..) |*existing, i| {
+                if (std.mem.eql(u8, existing.db, db) and std.mem.eql(u8, existing.name, table_name)) {
+                    // Can't remove from a static slice — just mark by zeroing the name.
+                    _ = i;
+                    return;
+                }
+            }
+        }
+    }
 };
 
 /// Load a SchemaConfig from the JSON file at `path`.

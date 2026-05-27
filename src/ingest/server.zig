@@ -241,7 +241,12 @@ pub const Server = struct {
                    asciiStartsWith(trimmed, "ALTER") or
                    asciiStartsWith(trimmed, "SET"))
         {
-            // DDL/admin commands we don't need to implement — no-op
+            // DROP TABLE: actually remove schema and data.
+            if (asciiStartsWith(trimmed, "DROP TABLE") or
+                std.ascii.startsWithIgnoreCase(trimmed, "DROP TABLE"))
+            {
+                try self.handleDropTable(trimmed);
+            }
             try sendResponse(request, out, .ok, "");
         } else {
             try sendResponse(request, out, .bad_request, "Only CREATE TABLE, INSERT and SELECT are supported\n");
@@ -404,6 +409,15 @@ pub const Server = struct {
         // VALUES INSERT: INSERT INTO table VALUES (...)
         if (std.ascii.indexOfIgnoreCase(sql, " VALUES") != null) {
             try self.handleInsertValues(request, out, sql);
+            return;
+        }
+
+        // INSERT INTO table SELECT ...: detect SELECT keyword after table name
+        if (std.ascii.indexOfIgnoreCase(sql, " SELECT ") != null or
+            std.ascii.indexOfIgnoreCase(sql, "\nSELECT ") != null or
+            std.ascii.endsWithIgnoreCase(sql, " SELECT *"))
+        {
+            try self.handleInsertSelect(request, out, sql);
             return;
         }
 
@@ -715,7 +729,42 @@ pub const Server = struct {
         }
     }
 
-    /// Walk a PhysicalNode tree to find the first part_scan and return its columns.
+    /// DROP TABLE [IF EXISTS] [db.]table — remove schema and all data parts.
+    fn handleDropTable(self: *Server, sql: []const u8) !void {
+        // Parse: DROP TABLE [IF EXISTS] [db.]table
+        var it = std.mem.tokenizeAny(u8, sql, " \t\r\n;");
+        _ = it.next(); // "DROP"
+        _ = it.next(); // "TABLE"
+        const next_tok = it.next() orelse return;
+        const tbl_token: []const u8 = if (asciiEql(next_tok, "IF")) blk: {
+            _ = it.next(); // "EXISTS"
+            break :blk it.next() orelse return;
+        } else next_tok;
+        const tbl_name = std.mem.trimEnd(u8, tbl_token, ";");
+        const dbt = splitDbTable(tbl_name);
+
+        // Remove schema entry.
+        self.schemas.removeEntry(dbt.db, dbt.table);
+
+        // Delete schema.json.
+        const schema_path = try std.fmt.allocPrint(
+            self.allocator, "{s}/{s}/{s}/schema.json",
+            .{ self.config.data_dir, dbt.db, dbt.table },
+        );
+        defer self.allocator.free(schema_path);
+        const cwd = std.Io.Dir.cwd();
+        cwd.deleteFile(self.io, schema_path) catch {};
+
+        // Delete all parts (entire table directory).
+        const table_path = try std.fmt.allocPrint(
+            self.allocator, "{s}/{s}/{s}",
+            .{ self.config.data_dir, dbt.db, dbt.table },
+        );
+        defer self.allocator.free(table_path);
+        cwd.deleteTree(self.io, table_path) catch {};
+    }
+
+
     /// Returns empty slice if no part_scan found or scan reads all columns.
     fn findPrunedCols(node: *ir_planner.PhysicalNode) []const []const u8 {
         return ir_planner.findPrunedCols(node);
@@ -1106,7 +1155,26 @@ pub const Server = struct {
         return new_plan;
     }
 
+    /// Expand SELECT * using a known table schema (no CSV needed).
+    fn expandStarPlan2(
+        allocator: std.mem.Allocator,
+        plan: generic_sql.Plan,
+        tbl: *const schema.Table,
+    ) !generic_sql.Plan {
+        const is_star = plan.projections.len == 1 and plan.projections[0].column == null and
+            plan.projections[0].func == .column_ref;
+        if (!is_star or tbl.columns.len == 0) return plan;
+        const new_projs = try allocator.alloc(generic_sql.Expr, tbl.columns.len);
+        for (tbl.columns, 0..) |col, i| {
+            new_projs[i] = .{ .func = .column_ref, .column = col.name };
+        }
+        var new_plan = plan;
+        new_plan.projections = new_projs;
+        return new_plan;
+    }
+
     /// Run a UNION ALL plan chain and return concatenated CSV (no header row).
+
     fn runUnionAllCsv(self: *Server, plan: generic_sql.Plan) ![]u8 {
         const fake_table = schema.Table{ .name = "", .columns = &.{} };
         var parts: std.ArrayListUnmanaged([]u8) = .empty;
@@ -1408,7 +1476,142 @@ pub const Server = struct {
         try sendResponse(request, out, .ok, "");
     }
 
-    /// Native Block INSERT for body-SQL mode (data already split from SQL line).
+    /// INSERT INTO table SELECT ... — execute SELECT, write rows to target table.
+    fn handleInsertSelect(
+        self: *Server,
+        request: *std.http.Server.Request,
+        out: *std.Io.Writer,
+        sql: []const u8,
+    ) !void {
+        // Parse: INSERT INTO [db.]table SELECT ...
+        // Find "SELECT" keyword position (case-insensitive)
+        const sel_pos = std.ascii.indexOfIgnoreCase(sql, " SELECT ") orelse
+            std.ascii.indexOfIgnoreCase(sql, "\nSELECT ") orelse {
+            try sendResponse(request, out, .bad_request, "INSERT SELECT: cannot find SELECT\n");
+            return;
+        };
+        const select_sql = std.mem.trim(u8, sql[sel_pos + 1 ..], " \t\r\n");
+
+        // Extract target table name from "INSERT INTO [db.]table"
+        const insert_into_end = sel_pos;
+        const header = sql[0..insert_into_end];
+        // tokenize header: skip INSERT INTO, take table token
+        var hpos: usize = 0;
+        // skip "INSERT"
+        while (hpos < header.len and !std.ascii.isWhitespace(header[hpos])) hpos += 1;
+        while (hpos < header.len and std.ascii.isWhitespace(header[hpos])) hpos += 1;
+        // skip "INTO"
+        while (hpos < header.len and !std.ascii.isWhitespace(header[hpos])) hpos += 1;
+        while (hpos < header.len and std.ascii.isWhitespace(header[hpos])) hpos += 1;
+        // read table name (stop at whitespace or '(')
+        const tname_start = hpos;
+        while (hpos < header.len and !std.ascii.isWhitespace(header[hpos]) and header[hpos] != '(') hpos += 1;
+        const tname_raw = std.mem.trim(u8, header[tname_start..hpos], " \t");
+        if (tname_raw.len == 0) {
+            try sendResponse(request, out, .bad_request, "INSERT SELECT: missing table name\n");
+            return;
+        }
+        var db_name: []const u8 = "default";
+        var table_name: []const u8 = tname_raw;
+        if (std.mem.indexOfScalar(u8, tname_raw, '.')) |dot| {
+            db_name = tname_raw[0..dot];
+            table_name = tname_raw[dot + 1 ..];
+        }
+
+        const entry = self.schemas.find(db_name, table_name) orelse {
+            try sendResponse(request, out, .bad_request, "INSERT SELECT: unknown target table\n");
+            return;
+        };
+
+        // Run SELECT to get TSV output (internal execution, no HTTP overhead).
+        generic_executor.udf_registry = &self.functions;
+        const plan = (try generic_sql.parse(self.allocator, select_sql)) orelse {
+            try sendResponse(request, out, .bad_request, "INSERT SELECT: cannot parse SELECT\n");
+            return;
+        };
+        defer generic_sql.deinit(self.allocator, plan);
+
+        // Execute the SELECT and get CSV result.
+        const src_db_table = splitDbTable(plan.table);
+        const src_entry_opt = self.schemas.find(src_db_table.db, src_db_table.table);
+        const fake_table = schema.Table{ .name = "", .columns = &.{} };
+        const src_table: *const schema.Table = if (src_entry_opt) |e| &e.table else &fake_table;
+
+        const result_csv = blk: {
+            if (plan.subquery_source) |inner_plan| {
+                const inner_db_table = splitDbTable(inner_plan.table);
+                const inner_entry_opt = self.schemas.find(inner_db_table.db, inner_db_table.table);
+                const inner_fake = schema.Table{ .name = "", .columns = &.{} };
+                const inner_table: *const schema.Table = if (inner_entry_opt) |e| &e.table else &inner_fake;
+                const inner_csv = try generic_executor.runWithSource(
+                    self.allocator, self.io, inner_plan.*, .{ .ch_parts = &.{} }, inner_table);
+                defer self.allocator.free(inner_csv);
+                const outer_plan = try expandStarPlan(self.allocator, plan, inner_csv);
+                defer if (outer_plan.projections.ptr != plan.projections.ptr) self.allocator.free(outer_plan.projections);
+                break :blk try generic_executor.runOverCsv(self.allocator, outer_plan, inner_csv, inner_table);
+            } else {
+                var src_parts = try part_scanner.scan(self.allocator, self.io, self.config.data_dir, src_db_table.db, src_db_table.table);
+                defer src_parts.deinit();
+                const src_dirs: []const []const u8 = if (src_entry_opt != null) src_parts.dirs() else &.{};
+                const exec_plan = try expandStarPlan2(self.allocator, plan, src_table);
+                defer if (exec_plan.projections.ptr != plan.projections.ptr) self.allocator.free(exec_plan.projections);
+                break :blk try generic_executor.runWithSource(self.allocator, self.io, exec_plan, .{ .ch_parts = src_dirs }, src_table);
+            }
+        };
+        defer self.allocator.free(result_csv);
+
+        // Convert CSV to TSV for row parsing (skip the type-annotated header).
+        const tsv = try csvToTsv(self.allocator, result_csv, true);
+        defer self.allocator.free(tsv);
+
+        // Parse TSV rows positionally into target table columns.
+        const col_bufs = try self.allocator.alloc(row_binary_decoder.ColumnBuffer, entry.table.columns.len);
+        for (col_bufs, entry.table.columns) |*buf, col| {
+            buf.* = .{ .col = col, .fixed_vals = .empty, .str_vals = .empty, .str_bytes = .empty };
+        }
+        defer {
+            for (col_bufs) |*buf| buf.deinit(self.allocator);
+            self.allocator.free(col_bufs);
+        }
+
+        var lines = std.mem.splitScalar(u8, tsv, '\n');
+        var row_count: usize = 0;
+        while (lines.next()) |line| {
+            if (line.len == 0) continue;
+            var fields = std.mem.splitScalar(u8, line, '\t');
+            const set_flags = try self.allocator.alloc(bool, entry.table.columns.len);
+            defer self.allocator.free(set_flags);
+            @memset(set_flags, false);
+
+            var fi: usize = 0;
+            while (fields.next()) |field| {
+                const di = fi; // positional
+                if (di < col_bufs.len) {
+                    try appendParsedField(self.allocator, entry.table.columns[di], field, &col_bufs[di]);
+                    set_flags[di] = true;
+                }
+                fi += 1;
+            }
+            // Fill unset columns with zero/empty.
+            for (col_bufs, set_flags) |*buf, was_set| {
+                if (was_set) continue;
+                switch (buf.col.ty) {
+                    .text, .char => try buf.str_vals.append(self.allocator, buf.str_bytes.items[0..0]),
+                    else         => try buf.fixed_vals.append(self.allocator, 0),
+                }
+            }
+            row_count += 1;
+        }
+
+        if (row_count > 0) {
+            const db_table = DbTable{ .db = db_name, .table = table_name };
+            try self.writePart(db_table, entry, col_bufs);
+        }
+
+        try sendResponse(request, out, .ok, "");
+    }
+
+
     fn handleInsertNativeData(
         self: *Server,
         request: *std.http.Server.Request,
