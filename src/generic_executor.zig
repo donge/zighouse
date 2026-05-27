@@ -349,6 +349,20 @@ fn epochDaysToYmd(days: i32) struct { year: i32, month: u32, day: u32 } {
     return .{ .year = y + @as(i32, if (m <= 2) 1 else 0), .month = m, .day = d };
 }
 
+/// Format Unix seconds as "YYYY-MM-DD HH:MM:SS" (UTC).
+fn secsToDatetimeStr(secs: i64) ![]u8 {
+    const s_of_day: u32 = @intCast(@mod(secs, 86400));
+    const days: i32 = @intCast(@divFloor(secs, 86400));
+    const ymd = epochDaysToYmd(days);
+    const h = s_of_day / 3600;
+    const m = (s_of_day % 3600) / 60;
+    const s = s_of_day % 60;
+    const y: u32 = @intCast(@max(0, ymd.year));
+    return std.fmt.allocPrint(std.heap.page_allocator, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}",
+        .{ y, ymd.month, ymd.day, h, m, s });
+}
+
+
 // ── Predicate evaluation ──────────────────────────────────────────────────────
 
 /// Evaluate a `WhereNode` predicate tree against a row.
@@ -3024,6 +3038,8 @@ const EvalKind = enum {
     // Cast
     cast_expr,         // CAST(expr AS type)
     str_tostring,      // toString(x) → string representation
+    fn_to_datetime,    // toDateTime(x) → unix seconds i64
+    fn_array_element,  // ch_array_element(arr, idx) → arr[idx] 1-based, 0/empty on OOB
     fn_now,            // now() → current Unix timestamp as DateTime (seconds)
     fn_today,          // today() → current date as Date
     fn_yesterday,      // yesterday() → yesterday as Date
@@ -3155,6 +3171,9 @@ const func_evals = [_]FuncEval{
     .{ .name = "cast",                        .kind = .cast_expr        },
     .{ .name = "tostring",                    .kind = .str_tostring     },
     .{ .name = "ch_tostring",                 .kind = .str_tostring     },
+    .{ .name = "todatetime",                  .kind = .fn_to_datetime   },
+    .{ .name = "todatetime64",                .kind = .fn_to_datetime   },
+    .{ .name = "ch_array_element",            .kind = .fn_array_element },
     .{ .name = "now",                         .kind = .fn_now           },
     .{ .name = "today",                       .kind = .fn_today         },
     .{ .name = "yesterday",                   .kind = .fn_yesterday     },
@@ -4130,8 +4149,62 @@ fn evalFunc(kind: EvalKind, name: []const u8, inner: []const u8, row: *const Row
         .empty_arr_str, .empty_arr_int => {
             return Value{ .array = &.{} };
         },
+        .fn_to_datetime => {
+            const v = evalTextExpr(inner, row) orelse return null;
+            switch (v) {
+                .i64, .uint8 => return v, // already seconds
+                .f64 => |f| return Value{ .i64 = @intFromFloat(f) },
+                .str, .str_owned => {
+                    const s = v.toStr().?;
+                    if (datetimeStrToSecs(s)) |secs| return Value{ .i64 = @intFromFloat(secs) };
+                    if (std.fmt.parseInt(i64, s, 10) catch null) |n| return Value{ .i64 = n };
+                    return null;
+                },
+                else => return null,
+            }
+        },
+        .fn_array_element => {
+            const args = splitTopLevelArgs(inner) catch return null;
+            if (args.len < 2) return null;
+            const arr_val = evalTextExpr(std.mem.trim(u8, args.items[0], " \t\r\n"), row) orelse return null;
+            const idx_val = evalTextExpr(std.mem.trim(u8, args.items[1], " \t\r\n"), row) orelse return null;
+            const arr = switch (arr_val) {
+                .array => |a| a,
+                else => return null,
+            };
+            const idx_raw: i64 = switch (idx_val) {
+                .i64 => |n| n,
+                .uint8 => |n| @intCast(n),
+                .f64 => |f| @intFromFloat(f),
+                else => return null,
+            };
+            // ClickHouse 1-based; negative counts from end; 0 or OOB → default (0 or empty)
+            const len: i64 = @intCast(arr.len);
+            const real_idx: i64 = if (idx_raw > 0) idx_raw - 1
+                                  else if (idx_raw < 0) len + idx_raw
+                                  else return Value{ .i64 = 0 };
+            if (real_idx < 0 or real_idx >= len) return Value{ .i64 = 0 };
+            return arr[@intCast(real_idx)];
+        },
         .str_tostring => {
             const v = evalTextExpr(inner, row) orelse return Value{ .str = "" };
+            // If argument is a datetime expression, format result as datetime string
+            const inner_trim = std.mem.trim(u8, inner, " \t");
+            const is_datetime_arg = std.ascii.startsWithIgnoreCase(inner_trim, "todatetime(") or
+                std.ascii.startsWithIgnoreCase(inner_trim, "toDateTime64(") or
+                (std.ascii.startsWithIgnoreCase(inner_trim, "CAST(") and
+                 std.ascii.endsWithIgnoreCase(inner_trim, "AS TIMESTAMP)"));
+            if (is_datetime_arg) {
+                const secs: i64 = switch (v) {
+                    .i64 => |n| n,
+                    .uint8 => |u| @intCast(u),
+                    else => blk: {
+                        if (v.toF64()) |f| break :blk @intFromFloat(f);
+                        break :blk 0;
+                    },
+                };
+                return Value{ .str_owned = secsToDatetimeStr(secs) catch return Value{ .str = "" } };
+            }
             switch (v) {
                 .str, .str_owned => {
                     const s = v.toStr().?;

@@ -1016,13 +1016,19 @@ fn translateExpr(allocator: std.mem.Allocator, val: std.json.Value) !?generic_sq
         const children_node = obj.get("children") orelse return null;
         const children = children_node.array.items;
         if (std.mem.eql(u8, op_type, "ARRAY_EXTRACT") and children.len == 2) {
-            // Reconstruct as text: col['key']
+            // Map subscript: col['key'] → string index
             const map_col = columnName(children[0]) orelse return null;
-            const key = strLiteralValue(children[1]) orelse return null;
-            const col_text = try std.fmt.allocPrint(allocator, "{s}['{s}']", .{ map_col, key });
+            if (strLiteralValue(children[1])) |key| {
+                const col_text = try std.fmt.allocPrint(allocator, "{s}['{s}']", .{ map_col, key });
+                errdefer allocator.free(col_text);
+                return .{ .func = .column_ref, .column = col_text, .alias = alias };
+            }
+            // Array subscript: arr[idx] → emit as ch_array_element(arr, idx)
+            const idx_text = try exprToText(allocator, children[1]) orelse return null;
+            defer allocator.free(idx_text);
+            const col_text = try std.fmt.allocPrint(allocator, "ch_array_element({s},{s})", .{ map_col, idx_text });
             errdefer allocator.free(col_text);
-            const alias_owned = alias;
-            return .{ .func = .column_ref, .column = col_text, .alias = alias_owned };
+            return .{ .func = .column_ref, .column = col_text, .alias = alias };
         }
         // IN / NOT IN used as value expression: "1 IN (1,2)" → cmp_expr
         if (std.mem.eql(u8, op_type, "OPERATOR_IN") or std.mem.eql(u8, op_type, "OPERATOR_NOT_IN") or
