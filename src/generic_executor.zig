@@ -961,8 +961,10 @@ const Executor = struct {
         ctx.table = self.table;
         defer ctx.deinit(self.allocator);
         if (self.plan.table.len == 0 or std.mem.eql(u8, self.plan.table, "system.one")) {
-            // No FROM clause: evaluate projections against a synthetic empty row.
-            const empty_row = RowCtx{ .names = &.{}, .values = &.{}, .table = null, .parent = null };
+            // No FROM clause or system.one: evaluate projections against a row with dummy=0.
+            const dummy_names: []const []const u8 = &.{"dummy"};
+            var dummy_vals: [1]Value = .{Value{ .uint8 = 0 }};
+            const empty_row = RowCtx{ .names = dummy_names, .values = dummy_vals[0..], .table = null, .parent = null };
             try ScanCtx.observe(&ctx, &empty_row);
         } else if (self.plan.numbers_count) |count| {
             // numbers(N) / system.numbers: generate rows number=0..N-1
