@@ -6,6 +6,9 @@ pub const AggregateFn = enum {
     count_star, count_distinct,
     count_if,         // countIf(expr) — condition stored in cond_col/cond_op/cond_val
     sum, avg, min, max,
+    min_if, max_if,   // minIf(col, cond) / maxIf(col, cond) — conditional min/max
+    sum_array,        // sumArray(arr) — sum of all elements across rows
+    sum_array_if,     // sumArrayIf(arr, cond) — conditional sumArray
     uniq_exact,       // uniqExact(col) — exact distinct count using string set
     uniq_exact_if,    // uniqExactIf(col, cond) — conditional exact distinct
     group_uniq_array, // groupUniqArray(col) — array of distinct values (joined as string)

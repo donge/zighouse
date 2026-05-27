@@ -1105,6 +1105,31 @@ fn translateExpr(allocator: std.mem.Allocator, val: std.json.Value) !?generic_sq
                 try exprToText(allocator, children[0]) orelse return null;
             return .{ .func = .max, .column = col, .alias = alias };
         }
+        // minIf(col, cond) / maxIf(col, cond)
+        if (std.mem.eql(u8, fn_name, "minif") and children.len == 2) {
+            const col = if (columnName(children[0])) |cn| try allocator.dupe(u8, cn)
+                        else try exprToText(allocator, children[0]) orelse return null;
+            const cond = try parseCondExpr(allocator, children[1]) orelse { allocator.free(col); return null; };
+            return .{ .func = .min_if, .column = col, .alias = alias, .cond = cond };
+        }
+        if (std.mem.eql(u8, fn_name, "maxif") and children.len == 2) {
+            const col = if (columnName(children[0])) |cn| try allocator.dupe(u8, cn)
+                        else try exprToText(allocator, children[0]) orelse return null;
+            const cond = try parseCondExpr(allocator, children[1]) orelse { allocator.free(col); return null; };
+            return .{ .func = .max_if, .column = col, .alias = alias, .cond = cond };
+        }
+        // sumArray(arr) / sumArrayIf(arr, cond)
+        if (std.mem.eql(u8, fn_name, "sumarray") and children.len == 1) {
+            const col = if (columnName(children[0])) |cn| try allocator.dupe(u8, cn)
+                        else try exprToText(allocator, children[0]) orelse return null;
+            return .{ .func = .sum_array, .column = col, .alias = alias };
+        }
+         if (std.mem.eql(u8, fn_name, "sumarrayif") and children.len == 2) {
+            const col = if (columnName(children[0])) |cn| try allocator.dupe(u8, cn)
+                        else try exprToText(allocator, children[0]) orelse return null;
+            const cond = try parseCondExpr(allocator, children[1]) orelse { allocator.free(col); return null; };
+            return .{ .func = .sum_array_if, .column = col, .alias = alias, .cond = cond };
+        }
         if ((std.mem.eql(u8, fn_name, "count_distinct") or
             std.mem.eql(u8, fn_name, "approx_count_distinct")) and children.len == 1)
         {

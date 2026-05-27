@@ -193,7 +193,8 @@ fn executeProjection(expr: generic_sql.Expr, ctx: ScalarContext, predicate: ?[]c
         .count_distinct => error.UnsupportedGenericQuery,
         .count_star => unreachable,
         .count_if, .uniq_exact, .uniq_exact_if,
-        .group_uniq_array, .any_val, .case_when, .cmp_expr => error.UnsupportedGenericQuery,
+        .group_uniq_array, .any_val, .case_when, .cmp_expr,
+        .min_if, .max_if, .sum_array, .sum_array_if => error.UnsupportedGenericQuery,
         .sum => aggregateSum(column, predicate, expr.int_offset),
         .avg => aggregateAvg(column, predicate),
         .min => aggregateMin(column, predicate),
@@ -336,6 +337,10 @@ fn writeHeader(out: *std.ArrayList(u8), allocator: std.mem.Allocator, plan: gene
             .any_val => try out.print(allocator, "any({s})", .{expr.column orelse ""}),
             .case_when => try out.appendSlice(allocator, expr.alias orelse "case_when"),
             .cmp_expr => try out.appendSlice(allocator, expr.alias orelse expr.column orelse "cmp_expr"),
+            .min_if => try out.print(allocator, "minIf({s},...)", .{expr.column orelse ""}),
+            .max_if => try out.print(allocator, "maxIf({s},...)", .{expr.column orelse ""}),
+            .sum_array => try out.print(allocator, "sumArray({s})", .{expr.column orelse ""}),
+            .sum_array_if => try out.print(allocator, "sumArrayIf({s},...)", .{expr.column orelse ""}),
         }
     }
     try out.append(allocator, '\n');

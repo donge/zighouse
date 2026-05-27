@@ -1535,7 +1535,55 @@ const AggState = struct {
                     } else {
                         self.max = v;
                     }
+                 }
+            },
+            .min_if => {
+                if (!evalCondExpr(proj.cond, row)) return;
+                if (self.min == null or Value.order(v, self.min.?) == .lt) {
+                    if (v == .str) {
+                        if (self.min) |old| if (old == .str_owned) alloc.free(old.str_owned);
+                        self.min = Value{ .str_owned = try alloc.dupe(u8, v.str) };
+                    } else if (v == .array) {
+                        self.min = v; // store array reference
+                    } else {
+                        self.min = v;
+                    }
                 }
+            },
+            .max_if => {
+                if (!evalCondExpr(proj.cond, row)) return;
+                if (self.max == null or Value.order(v, self.max.?) == .gt) {
+                    if (v == .str) {
+                        if (self.max) |old| if (old == .str_owned) alloc.free(old.str_owned);
+                        self.max = Value{ .str_owned = try alloc.dupe(u8, v.str) };
+                    } else if (v == .array) {
+                        self.max = v;
+                    } else {
+                        self.max = v;
+                    }
+                }
+            },
+            .sum_array => {
+                // Sum all elements of the array value
+                const arr = switch (v) {
+                    .array => |a| a,
+                    else => return,
+                };
+                for (arr) |elem| {
+                    if (elem.toF64()) |fv| self.sum += fv;
+                }
+                self.count += 1; // mark as having seen data
+            },
+            .sum_array_if => {
+                if (!evalCondExpr(proj.cond, row)) return;
+                const arr = switch (v) {
+                    .array => |a| a,
+                    else => return,
+                };
+                for (arr) |elem| {
+                    if (elem.toF64()) |fv| self.sum += fv;
+                }
+                self.count += 1;
             },
             .column_ref, .int_literal, .float_literal, .case_when, .cmp_expr => {},
         }
@@ -1553,6 +1601,12 @@ const AggState = struct {
             .avg => if (self.count == 0) Value{ .f64 = 0 } else Value{ .f64 = self.sum / @as(f64, @floatFromInt(self.count)) },
             .min => self.min orelse Value{ .null_val = {} },
             .max => self.max orelse Value{ .null_val = {} },
+            .min_if => self.min orelse Value{ .null_val = {} },
+            .max_if => self.max orelse Value{ .null_val = {} },
+            .sum_array, .sum_array_if => if (self.sum == @trunc(self.sum) and @abs(self.sum) < 9.007199e15)
+                Value{ .i64 = @intFromFloat(self.sum) }
+            else
+                Value{ .f64 = self.sum },
             .group_uniq_array => blk: {
                 // Return as a separator-joined string.
                 // When post_fn is set, use \x0c separator so array functions
@@ -2724,9 +2778,9 @@ fn collectNeededColumns(
         }
         // Also collect columns from cond expressions (countIf/uniqExactIf)
         if (proj.cond) |cond| {
-            if (cond.cond_text != null) {
-                // For text conditions we load all columns (can't easily parse column refs)
-                // so just skip targeted collection; the row will have all columns anyway.
+            if (cond.cond_text) |ct| {
+                // Parse column refs from the text condition so they get scanned.
+                try addFuncColumns(allocator, &seen, needed, ct, table, &add);
             } else if (parseMapSubscript(cond.cond_col)) |sub| {
                 try add(allocator, &seen, needed, sub.col, table);
             } else if (cond.cond_col.len > 0) {
@@ -2958,6 +3012,7 @@ fn evalProjectionExpr(proj: generic_sql.Expr, row: *const RowCtx) Value {
         .float_literal => return Value{ .f64 = proj.float_val },
         .count_star, .count_if  => return Value{ .i64 = 1 }, // counted by AggState
         .count_distinct, .sum, .avg, .min, .max,
+        .min_if, .max_if, .sum_array, .sum_array_if,
         .uniq_exact, .uniq_exact_if,
         .group_uniq_array, .any_val => {
             const col = proj.column orelse return Value{ .null_val = {} };
@@ -5183,6 +5238,10 @@ fn writeExprHeader(out: *std.ArrayList(u8), allocator: std.mem.Allocator, proj: 
         .any_val => try out.print(allocator, "any({s})", .{proj.column orelse ""}),
         .case_when => try out.appendSlice(allocator, proj.alias orelse "case_when"),
         .cmp_expr => try out.appendSlice(allocator, proj.alias orelse proj.column orelse "cmp_expr"),
+        .min_if => try out.print(allocator, "minIf({s},...)", .{proj.column orelse ""}),
+        .max_if => try out.print(allocator, "maxIf({s},...)", .{proj.column orelse ""}),
+        .sum_array => try out.print(allocator, "sumArray({s})", .{proj.column orelse ""}),
+        .sum_array_if => try out.print(allocator, "sumArrayIf({s},...)", .{proj.column orelse ""}),
     }
 }
 
@@ -5221,6 +5280,7 @@ fn allAggregates(projections: []const generic_sql.Expr) bool {
         switch (p.func) {
             .count_star, .count_distinct, .count_if,
             .sum, .avg, .min, .max,
+            .min_if, .max_if, .sum_array, .sum_array_if,
             .uniq_exact, .uniq_exact_if,
             .group_uniq_array, .any_val => {},
             .column_ref, .int_literal, .float_literal, .case_when, .cmp_expr => return false,
@@ -5234,6 +5294,7 @@ fn anyAggregate(projections: []const generic_sql.Expr) bool {
         switch (p.func) {
             .count_star, .count_distinct, .count_if,
             .sum, .avg, .min, .max,
+            .min_if, .max_if, .sum_array, .sum_array_if,
             .uniq_exact, .uniq_exact_if,
             .group_uniq_array, .any_val => return true,
             .column_ref, .int_literal, .float_literal, .case_when, .cmp_expr => {},

@@ -867,6 +867,7 @@ fn isAggregate(func: generic_sql.AggregateFn) bool {
     return switch (func) {
         .count_star, .count_distinct, .count_if,
         .sum, .avg, .min, .max,
+        .min_if, .max_if, .sum_array, .sum_array_if,
         .uniq_exact, .uniq_exact_if,
         .group_uniq_array, .any_val => true,
         .column_ref, .int_literal, .float_literal, .case_when, .cmp_expr => false,
