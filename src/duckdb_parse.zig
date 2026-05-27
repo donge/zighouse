@@ -398,7 +398,7 @@ fn translateSelectNode(allocator: std.mem.Allocator, node_obj: std.json.ObjectMa
                         order_by_text = null;
                     } else {
                         // DESC or ASC: check if expr is a COLUMN_REF matching a projection alias
-                        const is_asc = std.mem.eql(u8, dir, "ORDER_ASCENDING") or std.mem.eql(u8, dir, "ASCENDING");
+                        const is_asc = !std.mem.eql(u8, dir, "ORDER_DESCENDING") and !std.mem.eql(u8, dir, "DESCENDING");
                         const alias_candidate: ?[]const u8 = if (exprAlias(expr0)) |a| a
                             else if (columnName(expr0)) |col| col
                             else null;

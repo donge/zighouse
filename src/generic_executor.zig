@@ -2312,7 +2312,17 @@ const ScanCtx = struct {
             // Determine sort column index and direction from order_by_text or defaults.
             var sort_col_idx: usize = 0;
             var sort_desc: bool = plan.order_by_count_desc;
-            if (plan.order_by_text) |obt| {
+            if (plan.order_by_alias) |alias| {
+                // ORDER BY alias [ASC|DESC] — find projection index
+                for (plan.projections, 0..) |proj, ci| {
+                    const a = proj.alias orelse proj.column orelse "";
+                    if (std.ascii.eqlIgnoreCase(a, alias)) {
+                        sort_col_idx = ci;
+                        break;
+                    }
+                }
+                sort_desc = !plan.order_by_alias_asc;
+            } else if (plan.order_by_text) |obt| {
                 // Parse "col_name [ASC|DESC]" from order_by_text
                 var tok_it = std.mem.tokenizeAny(u8, obt, " \t\r\n");
                 if (tok_it.next()) |col_name| {
