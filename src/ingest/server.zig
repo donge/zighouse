@@ -274,6 +274,7 @@ pub const Server = struct {
             {
                 try self.handleDropTable(trimmed);
             }
+            // ALTER TABLE ... DROP PARTITION — no-op (silently succeed)
             try sendResponse(request, out, .ok, "");
         } else {
             try sendResponse(request, out, .bad_request, "Only CREATE TABLE, INSERT and SELECT are supported\n");
@@ -974,6 +975,28 @@ pub const Server = struct {
                 const bytes = try native_block.encodeOneRow(self.allocator, &cols);
                 defer self.allocator.free(bytes);
                 try sendNativeBlock(self.allocator, request, out, bytes);
+            }
+            return;
+        }
+
+        // Fast path: system.disks — return one stub row (large free space, no cleanup triggered)
+        if (std.ascii.indexOfIgnoreCase(sql, "system.disks") != null) {
+            // Always return the full row so any column projection in the SQL still gets valid data.
+            // Fields match ClickHouse system.disks: name, path, free_space, total_space, keep_free_space, type
+            const body = "name\tpath\tfree_space\ttotal_space\tkeep_free_space\ttype\ndefault\t/var/lib/zighouse\t1000000000000\t2000000000000\t0\tlocal\n";
+            const body_no_hdr = "default\t/var/lib/zighouse\t1000000000000\t2000000000000\t0\tlocal\n";
+            try sendResponse(request, out, .ok, if (skip_header) body_no_hdr else body);
+            return;
+        }
+
+        // Fast path: system.parts — return empty result set (no partitions to drop)
+        if (std.ascii.indexOfIgnoreCase(sql, "system.parts") != null) {
+            if (want_tsv) {
+                try sendResponse(request, out, .ok, if (skip_header) "" else "table\tpartition\tdata_compressed_bytes\tdisk_name\n");
+            } else {
+                const empty = try native_block.encodeEmpty(self.allocator);
+                defer self.allocator.free(empty);
+                try sendNativeBlock(self.allocator, request, out, empty);
             }
             return;
         }

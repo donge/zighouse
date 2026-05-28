@@ -142,6 +142,13 @@ pub fn parse(allocator: std.mem.Allocator, sql: []const u8) !ParseResult {
                 if (tok.peekKeyword("DEFAULT") or tok.peekKeyword("COMMENT") or tok.peekKeyword("CODEC")) tok.skipToColumnDelimiter();
                 continue;
             }
+            // DateTime(tz) → timestamp
+            if (asciiEql(col_type_raw, "DateTime")) {
+                const col_name_owned = try allocator.dupe(u8, col_name_raw);
+                try cols.append(allocator, .{ .name = col_name_owned, .ty = .timestamp, .ch_type = ch_type_owned });
+                if (tok.peekKeyword("DEFAULT") or tok.peekKeyword("COMMENT") or tok.peekKeyword("CODEC")) tok.skipToColumnDelimiter();
+                continue;
+            }
             // FixedString(N) → text
             if (asciiEql(col_type_raw, "FixedString")) {
                 const col_name_owned = try allocator.dupe(u8, col_name_raw);
@@ -163,7 +170,24 @@ pub fn parse(allocator: std.mem.Allocator, sql: []const u8) !ParseResult {
                 if (tok.peekKeyword("DEFAULT") or tok.peekKeyword("COMMENT") or tok.peekKeyword("CODEC")) tok.skipToColumnDelimiter();
                 continue;
             }
-            // Nullable(T) / LowCardinality(T) → resolve inner type
+            // Tuple(...) → text (blob)
+            if (asciiEql(col_type_raw, "Tuple")) {
+                const col_name_owned = try allocator.dupe(u8, col_name_raw);
+                try cols.append(allocator, .{ .name = col_name_owned, .ty = .text, .ch_type = ch_type_owned });
+                if (tok.peekKeyword("DEFAULT") or tok.peekKeyword("COMMENT") or tok.peekKeyword("CODEC")) tok.skipToColumnDelimiter();
+                continue;
+            }
+            // LowCardinality(T) — keep outer type consistent with RowBinary wire path (.text),
+            // but record ch_type for schema fidelity. The LC write/read paths in CompactPart
+            // are activated by ty=.low_card; for now we stay on the String path for VALUES INSERT.
+            if (asciiEql(col_type_raw, "LowCardinality")) {
+                const inner_ty = parseColumnType(inner) orelse .text;
+                const col_name_owned = try allocator.dupe(u8, col_name_raw);
+                try cols.append(allocator, .{ .name = col_name_owned, .ty = inner_ty, .ch_type = ch_type_owned });
+                if (tok.peekKeyword("DEFAULT") or tok.peekKeyword("COMMENT") or tok.peekKeyword("CODEC")) tok.skipToColumnDelimiter();
+                continue;
+            }
+            // Nullable(T) → resolve inner type
             const eff_ty = parseColumnType(inner) orelse return error.UnsupportedColumnType;
             const col_name_owned = try allocator.dupe(u8, col_name_raw);
             try cols.append(allocator, .{ .name = col_name_owned, .ty = eff_ty, .ch_type = ch_type_owned });
@@ -227,6 +251,19 @@ pub fn parse(allocator: std.mem.Allocator, sql: []const u8) !ParseResult {
             } else {
                 const pk_col = tok.next() orelse break;
                 if (pk == null) pk = try allocator.dupe(u8, pk_col);
+            }
+        } else if (asciiEql(kw, "TTL")) {
+            // TTL <expr> — skip until next known keyword or EOF
+            // e.g. TTL ts + INTERVAL 30 DAY or TTL dt + toIntervalMonth(1)
+            // We just consume tokens until we see a top-level keyword we recognise.
+            while (true) {
+                var tmp = tok;
+                const peek = tmp.next() orelse break;
+                if (asciiEql(peek, "SETTINGS") or asciiEql(peek, "ORDER") or
+                    asciiEql(peek, "PRIMARY") or asciiEql(peek, "PARTITION") or
+                    asciiEql(peek, "SAMPLE") or asciiEql(peek, "INDEX"))
+                    break;
+                _ = tok.next();
             }
         }
         // ignore ENGINE, SETTINGS, PARTITION BY etc.
@@ -309,8 +346,8 @@ const Tokenizer = struct {
                 self.pos += 1;
                 return tok;
             },
-            // Backtick / double-quote quoted identifier
-            '`', '"' => {
+            // Backtick / double-quote / single-quote quoted identifier or string literal
+            '`', '"', '\'' => {
                 const quote = c;
                 self.pos += 1;
                 const start = self.pos;
