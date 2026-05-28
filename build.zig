@@ -580,6 +580,28 @@ pub fn build(b: *std.Build) void {
      exe.root_module.addImport("generic_sql", generic_sql_mod);
      exe.root_module.addImport("parquet", parquet_mod);
 
+    // ── compactor module ───────────────────────────────────────────────────────
+    const compactor_mod = b.createModule(.{
+        .root_source_file = b.path("src/compactor.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    compactor_mod.addImport("schema", schema_mod);
+    compactor_mod.addImport("schema_config", schema_config_mod);
+    compactor_mod.addImport("schema_persist", schema_persist_mod);
+    compactor_mod.addImport("ch_part", ch_part_mod);
+    compactor_mod.addImport("part_scanner", part_scanner_mod);
+    compactor_mod.link_libc = true;
+    compactor_mod.addIncludePath(.{ .cwd_relative = lz4_include });
+    compactor_mod.addLibraryPath(.{ .cwd_relative = lz4_lib });
+    compactor_mod.addRPath(.{ .cwd_relative = lz4_lib });
+    compactor_mod.linkSystemLibrary("lz4", .{});
+    compactor_mod.addIncludePath(.{ .cwd_relative = zstd_include });
+    compactor_mod.addLibraryPath(.{ .cwd_relative = zstd_lib });
+    compactor_mod.addRPath(.{ .cwd_relative = zstd_lib });
+    compactor_mod.linkSystemLibrary("zstd", .{});
+    exe.root_module.addImport("compactor", compactor_mod);
+
      unit_tests.root_module.addImport("ingest_server", ingest_server_mod);
      unit_tests.root_module.addImport("ingest_schema_config", schema_config_mod);
      unit_tests.root_module.addImport("ingest_schema_persist", schema_persist_mod);

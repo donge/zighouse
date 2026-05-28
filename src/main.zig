@@ -5,6 +5,7 @@ const catalog = @import("catalog.zig");
 const schema_infer = @import("schema_infer.zig");
 const schema_persist = @import("ingest_schema_persist");
 const schema_config = @import("ingest_schema_config");
+const compactor = @import("compactor");
 const loader = @import("loader.zig");
 const generic_executor = @import("generic_executor");
 const generic_sql = @import("generic_sql");
@@ -21,6 +22,7 @@ const usage =
     \\  zighouse init <data_dir>
     \\  zighouse import-parquet [--format=generic|ch|ch-compact|ch-http] [--pk=<col>] <parquet_path> <store_dir> <table_name>
     \\  zighouse serve --data-dir=<dir> [--schemas=<schemas.json>] [--port=<port>]
+    \\  zighouse compactor --data-dir=<dir> [--interval=<secs>] [--min-parts=<n>] [--max-parts=<n>] [--max-rows=<n>]
     \\  zighouse generic-query <store_dir> <table_name> <sql>
     \\  zighouse import-clickbench-parquet-hot <hits.parquet> <data_dir> [limit_rows]
     \\  zighouse parquet-inspect <hits.parquet>
@@ -452,6 +454,24 @@ fn runCommand(init: std.process.Init, allocator: std.mem.Allocator, args: *std.p
         });
         defer srv.deinit();
         try srv.run();
+    } else if (std.mem.eql(u8, command, "compactor")) {
+        // zighouse compactor --data-dir=<dir> [--interval=<s>] [--min-parts=<n>] [--max-parts=<n>] [--max-rows=<n>]
+        var cfg = compactor.Config{ .data_dir = "" };
+        while (args.next()) |arg| {
+            if (std.mem.startsWith(u8, arg, "--data-dir=")) {
+                cfg.data_dir = arg["--data-dir=".len..];
+            } else if (std.mem.startsWith(u8, arg, "--interval=")) {
+                cfg.interval_s = std.fmt.parseInt(u64, arg["--interval=".len..], 10) catch cfg.interval_s;
+            } else if (std.mem.startsWith(u8, arg, "--min-parts=")) {
+                cfg.min_parts_to_merge = std.fmt.parseInt(usize, arg["--min-parts=".len..], 10) catch cfg.min_parts_to_merge;
+            } else if (std.mem.startsWith(u8, arg, "--max-parts=")) {
+                cfg.max_parts_per_merge = std.fmt.parseInt(usize, arg["--max-parts=".len..], 10) catch cfg.max_parts_per_merge;
+            } else if (std.mem.startsWith(u8, arg, "--max-rows=")) {
+                cfg.max_rows_per_merge = std.fmt.parseInt(u64, arg["--max-rows=".len..], 10) catch cfg.max_rows_per_merge;
+            }
+        }
+        if (cfg.data_dir.len == 0) return error.MissingDataDir;
+        try compactor.run(allocator, init.io, cfg);
     } else if (std.mem.eql(u8, command, "help") or std.mem.eql(u8, command, "--help") or std.mem.eql(u8, command, "-h")) {
         try printUsage(init.io);
     } else {
