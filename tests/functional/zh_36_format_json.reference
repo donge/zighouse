@@ -1,0 +1,1 @@
+{"meta":[{"name":"id","type":"UInt64"},{"name":"val","type":"String"}],"data":[{"id":1,"val":"alpha"},{"id":2,"val":"beta"}],"rows":2,"statistics":{"elapsed":0.001,"rows_read":2,"bytes_read":0}}

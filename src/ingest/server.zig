@@ -964,9 +964,28 @@ pub const Server = struct {
         // Make user-defined functions available to the executor.
         generic_executor.udf_registry = &self.functions;
 
+        // Detect and strip FORMAT JSON — switch to JSON output mode.
+        var want_json = false;
+        const sql_stripped: []const u8 = blk: {
+            // Use case-insensitive search to detect FORMAT JSON variants.
+            if (std.ascii.indexOfIgnoreCase(sql, "FORMAT JSON") != null or
+                std.ascii.indexOfIgnoreCase(sql, "FORMAT JSONCompact") != null or
+                std.ascii.indexOfIgnoreCase(sql, "FORMAT JSONEachRow") != null)
+            {
+                want_json = true;
+                break :blk stripFormatClause(sql);
+            }
+            break :blk sql;
+        };
+        _ = sql_stripped; // used below via `sql` reassignment
+        // Reassign for convenience: use stripped SQL for all further processing.
+        const sql_clean_input: []const u8 = if (want_json) stripFormatClause(sql) else sql;
+
         // Fast path: SELECT 1
-        if (std.mem.eql(u8, sql, "SELECT 1") or std.mem.eql(u8, sql, "select 1")) {
-            if (want_tsv) {
+        if (std.mem.eql(u8, sql_clean_input, "SELECT 1") or std.mem.eql(u8, sql_clean_input, "select 1")) {
+            if (want_json) {
+                try sendResponse(request, out, .ok, "{\"meta\":[{\"name\":\"1\",\"type\":\"UInt8\"}],\"data\":[{\"1\":1}],\"rows\":1,\"statistics\":{\"elapsed\":0.001,\"rows_read\":1,\"bytes_read\":0}}");
+            } else if (want_tsv) {
                 try sendResponse(request, out, .ok, if (!skip_header) "1\n1\n" else "1\n");
             } else {
                 const cols = [_]native_block.Col{
@@ -980,18 +999,28 @@ pub const Server = struct {
         }
 
         // Fast path: system.disks — return one stub row (large free space, no cleanup triggered)
-        if (std.ascii.indexOfIgnoreCase(sql, "system.disks") != null) {
-            // Always return the full row so any column projection in the SQL still gets valid data.
-            // Fields match ClickHouse system.disks: name, path, free_space, total_space, keep_free_space, type
-            const body = "name\tpath\tfree_space\ttotal_space\tkeep_free_space\ttype\ndefault\t/var/lib/zighouse\t1000000000000\t2000000000000\t0\tlocal\n";
-            const body_no_hdr = "default\t/var/lib/zighouse\t1000000000000\t2000000000000\t0\tlocal\n";
-            try sendResponse(request, out, .ok, if (skip_header) body_no_hdr else body);
+        if (std.ascii.indexOfIgnoreCase(sql_clean_input, "system.disks") != null) {
+            if (want_json) {
+                // ClickHouse FORMAT JSON with fields tequila expects
+                try sendResponse(request, out, .ok,
+                    \\{"meta":[{"name":"name","type":"String"},{"name":"path","type":"String"},{"name":"free_space","type":"UInt64"},{"name":"total_space","type":"UInt64"},{"name":"keep_free_space","type":"UInt64"},{"name":"type","type":"String"}],"data":[{"name":"default","path":"/var/lib/zighouse","free_space":1000000000000,"total_space":2000000000000,"keep_free_space":0,"type":"local"}],"rows":1,"statistics":{"elapsed":0.001,"rows_read":1,"bytes_read":0}}
+                );
+            } else {
+                // Always return the full row so any column projection in the SQL still gets valid data.
+                const body = "name\tpath\tfree_space\ttotal_space\tkeep_free_space\ttype\ndefault\t/var/lib/zighouse\t1000000000000\t2000000000000\t0\tlocal\n";
+                const body_no_hdr = "default\t/var/lib/zighouse\t1000000000000\t2000000000000\t0\tlocal\n";
+                try sendResponse(request, out, .ok, if (skip_header) body_no_hdr else body);
+            }
             return;
         }
 
         // Fast path: system.parts — return empty result set (no partitions to drop)
-        if (std.ascii.indexOfIgnoreCase(sql, "system.parts") != null) {
-            if (want_tsv) {
+        if (std.ascii.indexOfIgnoreCase(sql_clean_input, "system.parts") != null) {
+            if (want_json) {
+                try sendResponse(request, out, .ok,
+                    \\{"meta":[{"name":"table","type":"String"},{"name":"partition","type":"String"},{"name":"data_compressed_bytes","type":"UInt64"},{"name":"disk_name","type":"String"}],"data":[],"rows":0,"statistics":{"elapsed":0.001,"rows_read":0,"bytes_read":0}}
+                );
+            } else if (want_tsv) {
                 try sendResponse(request, out, .ok, if (skip_header) "" else "table\tpartition\tdata_compressed_bytes\tdisk_name\n");
             } else {
                 const empty = try native_block.encodeEmpty(self.allocator);
@@ -1001,9 +1030,41 @@ pub const Server = struct {
             return;
         }
 
+        // Fast path: system.tables — return empty (no tables visible externally)
+        if (std.ascii.indexOfIgnoreCase(sql_clean_input, "system.tables") != null) {
+            if (want_json) {
+                try sendResponse(request, out, .ok,
+                    \\{"meta":[{"name":"engine_full","type":"String"}],"data":[],"rows":0,"statistics":{"elapsed":0.001,"rows_read":0,"bytes_read":0}}
+                );
+            } else if (want_tsv) {
+                try sendResponse(request, out, .ok, "");
+            } else {
+                const empty = try native_block.encodeEmpty(self.allocator);
+                defer self.allocator.free(empty);
+                try sendNativeBlock(self.allocator, request, out, empty);
+            }
+            return;
+        }
+
+        // Fast path: system.columns — return empty (GORM AutoMigrate compatibility)
+        if (std.ascii.indexOfIgnoreCase(sql_clean_input, "system.columns") != null) {
+            if (want_json) {
+                try sendResponse(request, out, .ok,
+                    \\{"meta":[{"name":"name","type":"String"},{"name":"type","type":"String"}],"data":[],"rows":0,"statistics":{"elapsed":0.001,"rows_read":0,"bytes_read":0}}
+                );
+            } else if (want_tsv) {
+                try sendResponse(request, out, .ok, "");
+            } else {
+                const empty = try native_block.encodeEmpty(self.allocator);
+                defer self.allocator.free(empty);
+                try sendNativeBlock(self.allocator, request, out, empty);
+            }
+            return;
+        }
+
         // Strip FINAL modifier.
-        const sql_needs_free = std.ascii.indexOfIgnoreCase(sql, "FINAL") != null;
-        const sql_after_final = try removeFinal(self.allocator, sql);
+        const sql_needs_free = std.ascii.indexOfIgnoreCase(sql_clean_input, "FINAL") != null;
+        const sql_after_final = try removeFinal(self.allocator, sql_clean_input);
         errdefer if (sql_needs_free) self.allocator.free(sql_after_final);
         const sql_clean: []const u8 = blk_sc: {
             if (sql_needs_free and std.ascii.indexOfIgnoreCase(sql_after_final, "ORDER BY") == null) {
@@ -1193,7 +1254,17 @@ pub const Server = struct {
         );
         defer self.allocator.free(result);
 
-        if (want_tsv) {
+        if (want_json) {
+            // Build optional col_types slice from the schema for this table.
+            const col_types_buf = try self.allocator.alloc(?[]const u8, entry.table.columns.len);
+            defer self.allocator.free(col_types_buf);
+            for (entry.table.columns, col_types_buf) |col, *ct| {
+                ct.* = col.ch_type;
+            }
+            const json_out = try csvToJson(self.allocator, result, col_types_buf);
+            defer self.allocator.free(json_out);
+            try sendResponse(request, out, .ok, json_out);
+        } else if (want_tsv) {
             const tsv = try csvToTsv(self.allocator, result, skip_header);
             defer self.allocator.free(tsv);
             try sendResponse(request, out, .ok, tsv);
@@ -2237,6 +2308,180 @@ fn csvToTsv(allocator: std.mem.Allocator, csv: []const u8, skip_header: bool) ![
         }
     }
     return out.toOwnedSlice(allocator);
+}
+
+/// Convert a CSV byte slice (produced by generic_executor) to ClickHouse FORMAT JSON.
+/// Output: {"meta":[{"name":"col","type":"String"}],"data":[{"col":"val",...}],"rows":N,"statistics":{"elapsed":0.001,"rows_read":N,"bytes_read":0}}
+/// col_types: parallel slice of ch_type strings for each column (or null to default to "String").
+fn csvToJson(allocator: std.mem.Allocator, csv: []const u8, col_types: ?[]const ?[]const u8) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8){ .items = &.{}, .capacity = 0 };
+    errdefer out.deinit(allocator);
+
+    // Parse header line to get column names.
+    const hdr_end = std.mem.indexOfScalar(u8, csv, '\n') orelse csv.len;
+    const hdr_line = csv[0..hdr_end];
+    var col_names = std.ArrayListUnmanaged([]const u8){ .items = &.{}, .capacity = 0 };
+    defer col_names.deinit(allocator);
+    {
+        var pos: usize = 0;
+        while (pos <= hdr_line.len) {
+            const end = std.mem.indexOfScalarPos(u8, hdr_line, pos, ',') orelse hdr_line.len;
+            var name = std.mem.trim(u8, hdr_line[pos..end], " \t\r");
+            // Strip type sentinels (\x03U8:, \x02D:, \x01A:, \x05F:)
+            if (name.len > 4 and name[0] == 0x03 and name[1] == 'U' and name[2] == '8' and name[3] == ':')
+                name = name[4..]
+            else if (name.len > 3 and name[0] == 0x02 and name[1] == 'D' and name[2] == ':')
+                name = name[3..]
+            else if (name.len > 3 and name[0] == 0x01 and name[1] == 'A' and name[2] == ':')
+                name = name[3..]
+            else if (name.len > 3 and name[0] == 0x05 and name[1] == 'F' and name[2] == ':')
+                name = name[3..];
+            try col_names.append(allocator, name);
+            if (end >= hdr_line.len) break;
+            pos = end + 1;
+        }
+    }
+    const ncols = col_names.items.len;
+
+    // meta
+    try out.appendSlice(allocator, "{\"meta\":[");
+    for (col_names.items, 0..) |name, ci| {
+        if (ci > 0) try out.append(allocator, ',');
+        const ct: []const u8 = if (col_types) |cts| (if (ci < cts.len) (cts[ci] orelse "String") else "String") else "String";
+        try out.appendSlice(allocator, "{\"name\":\"");
+        try jsonEscapeAppend(allocator, &out, name);
+        try out.appendSlice(allocator, "\",\"type\":\"");
+        try jsonEscapeAppend(allocator, &out, ct);
+        try out.appendSlice(allocator, "\"}");
+    }
+    try out.appendSlice(allocator, "],\"data\":[");
+
+    // data rows
+    var row_count: u64 = 0;
+    var src = if (hdr_end < csv.len) csv[hdr_end + 1 ..] else csv[csv.len..];
+    var first_row = true;
+    while (src.len > 0) {
+        // Find end of row
+        const row_end = std.mem.indexOfScalar(u8, src, '\n') orelse src.len;
+        const row_line = std.mem.trimEnd(u8, src[0..row_end], "\r");
+        src = if (row_end < src.len) src[row_end + 1 ..] else src[src.len..];
+        if (row_line.len == 0) continue;
+
+        if (!first_row) try out.append(allocator, ',');
+        first_row = false;
+        try out.append(allocator, '{');
+
+        // Parse CSV fields
+        var ci: usize = 0;
+        var pos: usize = 0;
+        while (ci < ncols and pos <= row_line.len) {
+            if (ci > 0) try out.append(allocator, ',');
+            try out.append(allocator, '"');
+            try jsonEscapeAppend(allocator, &out, col_names.items[ci]);
+            try out.appendSlice(allocator, "\":");
+
+            // Extract field value
+            var field: []const u8 = "";
+            if (pos < row_line.len and row_line[pos] == '"') {
+                // Quoted field — unescape
+                pos += 1;
+                var fbuf = std.ArrayListUnmanaged(u8){ .items = &.{}, .capacity = 0 };
+                defer fbuf.deinit(allocator);
+                while (pos < row_line.len) {
+                    if (row_line[pos] == '"') {
+                        pos += 1;
+                        if (pos < row_line.len and row_line[pos] == '"') {
+                            try fbuf.append(allocator, '"');
+                            pos += 1;
+                        } else break;
+                    } else {
+                        try fbuf.append(allocator, row_line[pos]);
+                        pos += 1;
+                    }
+                }
+                try out.append(allocator, '"');
+                try jsonEscapeAppend(allocator, &out, fbuf.items);
+                try out.append(allocator, '"');
+            } else if (pos < row_line.len and row_line[pos] == 0x01) {
+                // Array sentinel
+                pos += 1;
+                const fend = std.mem.indexOfScalarPos(u8, row_line, pos, ',') orelse row_line.len;
+                field = row_line[pos..fend];
+                pos = fend;
+                // Emit as JSON array
+                try out.append(allocator, '[');
+                var first_e = true;
+                var eit = std.mem.splitScalar(u8, field, '\x0c');
+                while (eit.next()) |elem| {
+                    if (!first_e) try out.append(allocator, ',');
+                    first_e = false;
+                    const is_num = for (elem) |c| {
+                        if (c != '-' and (c < '0' or c > '9') and c != '.') break false;
+                    } else true;
+                    if (is_num or elem.len == 0) {
+                        if (elem.len == 0) try out.appendSlice(allocator, "null") else try out.appendSlice(allocator, elem);
+                    } else {
+                        try out.append(allocator, '"');
+                        try jsonEscapeAppend(allocator, &out, elem);
+                        try out.append(allocator, '"');
+                    }
+                }
+                try out.append(allocator, ']');
+            } else {
+                // Unquoted field
+                const fend = std.mem.indexOfScalarPos(u8, row_line, pos, ',') orelse row_line.len;
+                field = row_line[pos..fend];
+                pos = fend;
+                // Determine if numeric
+                const is_num = field.len > 0 and for (field) |c| {
+                    if (c != '-' and (c < '0' or c > '9') and c != '.' and c != 'e' and c != 'E' and c != '+') break false;
+                } else true;
+                if (is_num) {
+                    try out.appendSlice(allocator, field);
+                } else {
+                    try out.append(allocator, '"');
+                    try jsonEscapeAppend(allocator, &out, field);
+                    try out.append(allocator, '"');
+                }
+            }
+
+            // Skip comma separator
+            if (pos < row_line.len and row_line[pos] == ',') pos += 1;
+            ci += 1;
+        }
+        // Fill missing columns with null
+        while (ci < ncols) : (ci += 1) {
+            try out.appendSlice(allocator, ",\"");
+            try jsonEscapeAppend(allocator, &out, col_names.items[ci]);
+            try out.appendSlice(allocator, "\":null");
+        }
+        try out.append(allocator, '}');
+        row_count += 1;
+    }
+
+    const suffix = try std.fmt.allocPrint(allocator, "],\"rows\":{d},\"statistics\":{{\"elapsed\":0.001,\"rows_read\":{d},\"bytes_read\":0}}}}", .{ row_count, row_count });
+    defer allocator.free(suffix);
+    try out.appendSlice(allocator, suffix);
+    return out.toOwnedSlice(allocator);
+}
+
+/// JSON-escape a string slice, appending to an ArrayListUnmanaged(u8).
+fn jsonEscapeAppend(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), s: []const u8) !void {
+    for (s) |c| {
+        switch (c) {
+            '"'  => try out.appendSlice(allocator, "\\\""),
+            '\\' => try out.appendSlice(allocator, "\\\\"),
+            '\n' => try out.appendSlice(allocator, "\\n"),
+            '\r' => try out.appendSlice(allocator, "\\r"),
+            '\t' => try out.appendSlice(allocator, "\\t"),
+            0x00...0x08, 0x0b...0x0c, 0x0e...0x1f => {
+                const esc = try std.fmt.allocPrint(allocator, "\\u{x:0>4}", .{c});
+                defer allocator.free(esc);
+                try out.appendSlice(allocator, esc);
+            },
+            else => try out.append(allocator, c),
+        }
+    }
 }
 
 /// Parse the seq number from a part directory name "all_{seq}_{seq}_0".
