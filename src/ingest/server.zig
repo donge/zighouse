@@ -43,6 +43,8 @@ const part_writer_session = @import("part_writer_session");
 const generic_executor = @import("generic_executor");
 const generic_sql = @import("generic_sql");
 const ddl_parser = @import("ddl_parser");
+const mv_parse = @import("mv_parse");
+const mv_persist = @import("mv_persist");
 const native_block = @import("native_block");
 const csv_mod = @import("csv");
 const serializer = @import("serializer");
@@ -70,6 +72,8 @@ pub const Server = struct {
     views: std.StringHashMap([]const u8),
     /// In-memory function registry: fn_name → lambda text "(params) -> body" (owned strings).
     functions: std.StringHashMap([]const u8),
+    /// In-memory materialized view registry: "db.mv_name" → MatViewEntry (owned).
+    mat_views: std.StringHashMap(mv_parse.MatViewEntry),
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, config: Config) !Server {
         // Load all persisted schemas from disk.
@@ -94,6 +98,19 @@ pub const Server = struct {
             .seq = scanMaxPartSeq(io, config.data_dir) + 1,
             .views = std.StringHashMap([]const u8).init(allocator),
             .functions = std.StringHashMap([]const u8).init(allocator),
+            .mat_views = blk: {
+                var mv_map = std.StringHashMap(mv_parse.MatViewEntry).init(allocator);
+                const loaded = mv_persist.loadAll(allocator, io, config.data_dir) catch &.{};
+                for (loaded) |entry| {
+                    const key = std.fmt.allocPrint(allocator, "{s}.{s}", .{ entry.db, entry.mv_name }) catch continue;
+                    mv_map.put(key, entry) catch {
+                        allocator.free(key);
+                        continue;
+                    };
+                }
+                allocator.free(loaded);
+                break :blk mv_map;
+            },
         };
     }
 
@@ -111,6 +128,13 @@ pub const Server = struct {
             self.allocator.free(entry.value_ptr.*);
         }
         self.functions.deinit();
+        var mv_it = self.mat_views.iterator();
+        while (mv_it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            var mv = entry.value_ptr.*;
+            mv.deinit();
+        }
+        self.mat_views.deinit();
     }
 
     /// Block and serve requests until an error or signal.
@@ -376,6 +400,29 @@ pub const Server = struct {
             const fn_val = try self.allocator.dupe(u8, lambda_body);
             errdefer self.allocator.free(fn_val);
             try self.functions.put(fn_key, fn_val);
+            try sendResponse(request, out, .ok, "");
+            return;
+        }
+        // CREATE MATERIALIZED VIEW — parse and persist.
+        if (asciiEql(second2, "MATERIALIZED") and asciiEql(third2, "VIEW")) {
+            var parsed_mv = mv_parse.parse(self.allocator, sql) catch |err| {
+                const msg = try std.fmt.allocPrint(self.allocator, "MV parse error: {s}\n", .{@errorName(err)});
+                defer self.allocator.free(msg);
+                try sendResponse(request, out, .bad_request, msg);
+                return;
+            };
+            // Idempotent: if MV already exists, succeed without overwriting.
+            const mv_key = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ parsed_mv.db, parsed_mv.mv_name });
+            if (self.mat_views.contains(mv_key)) {
+                self.allocator.free(mv_key);
+                parsed_mv.deinit();
+                try sendResponse(request, out, .ok, "");
+                return;
+            }
+            mv_persist.save(self.io, self.allocator, self.config.data_dir, &parsed_mv) catch |err| {
+                std.debug.print("mv_persist.save warning: {s}\n", .{@errorName(err)});
+            };
+            try self.mat_views.put(mv_key, parsed_mv);
             try sendResponse(request, out, .ok, "");
             return;
         }
@@ -1336,6 +1383,30 @@ pub const Server = struct {
                     errdefer self.allocator.free(fn_val2);
                     try self.functions.put(fn_key2, fn_val2);
                 }
+            }
+            const empty = try native_block.encodeEmpty(self.allocator);
+            defer self.allocator.free(empty);
+            try sendNativeBlock(self.allocator, request, out, empty);
+            return;
+        }
+
+        // CREATE MATERIALIZED VIEW — parse and persist (Simple/Native path).
+        if (asciiEql(second, "MATERIALIZED") and asciiEql(third, "VIEW")) {
+            var parsed_mv2 = mv_parse.parse(self.allocator, sql) catch {
+                const empty = try native_block.encodeEmpty(self.allocator);
+                defer self.allocator.free(empty);
+                try sendNativeBlock(self.allocator, request, out, empty);
+                return;
+            };
+            const mv_key2 = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ parsed_mv2.db, parsed_mv2.mv_name });
+            if (self.mat_views.contains(mv_key2)) {
+                self.allocator.free(mv_key2);
+                parsed_mv2.deinit();
+            } else {
+                mv_persist.save(self.io, self.allocator, self.config.data_dir, &parsed_mv2) catch |err| {
+                    std.debug.print("mv_persist.save warning: {s}\n", .{@errorName(err)});
+                };
+                try self.mat_views.put(mv_key2, parsed_mv2);
             }
             const empty = try native_block.encodeEmpty(self.allocator);
             defer self.allocator.free(empty);

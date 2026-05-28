@@ -6,6 +6,7 @@ const schema_infer = @import("schema_infer.zig");
 const schema_persist = @import("ingest_schema_persist");
 const schema_config = @import("ingest_schema_config");
 const compactor = @import("compactor");
+const mv_persist = @import("mv_persist");
 const loader = @import("loader.zig");
 const generic_executor = @import("generic_executor");
 const generic_sql = @import("generic_sql");
@@ -480,6 +481,16 @@ fn runCommand(init: std.process.Init, allocator: std.mem.Allocator, args: *std.p
             }
         }
         if (cfg.data_dir.len == 0) return error.MissingDataDir;
+        // Load materialized views from metadata/ and inject into compactor config.
+        const mat_views = mv_persist.loadAll(allocator, init.io, cfg.data_dir) catch &.{};
+        defer {
+            for (mat_views) |*mv| {
+                var m = mv.*;
+                m.deinit();
+            }
+            allocator.free(mat_views);
+        }
+        cfg.mat_views = mat_views;
         try compactor.run(allocator, init.io, cfg);
     } else if (std.mem.eql(u8, command, "help") or std.mem.eql(u8, command, "--help") or std.mem.eql(u8, command, "-h")) {
         try printUsage(init.io);

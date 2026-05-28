@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# Pre-test hook for zh_31_materialized_view.
+# Creates tables, materialized view, inserts data, then runs the compactor
+# so the MV is applied before the SQL queries run.
+set -euo pipefail
+
+CURL="curl -s --noproxy localhost,127.0.0.1"
+
+# Create source and target tables.
+$CURL -X POST "http://localhost:$PORT/" \
+    --data-binary "CREATE TABLE zh_mv_src (id UInt32, val Int64) ENGINE = MergeTree ORDER BY id"
+
+$CURL -X POST "http://localhost:$PORT/" \
+    --data-binary "CREATE TABLE zh_mv_dst (id UInt32, val_doubled Int64) ENGINE = MergeTree ORDER BY id"
+
+# Create materialized view.
+$CURL -X POST "http://localhost:$PORT/" \
+    --data-binary "CREATE MATERIALIZED VIEW default.zh_mv TO default.zh_mv_dst AS SELECT id, val * 2 AS val_doubled FROM zh_mv_src"
+
+# Insert data into source.
+$CURL -X POST "http://localhost:$PORT/" \
+    --data-binary "INSERT INTO zh_mv_src VALUES (1, 10), (2, 20), (3, 30)"
+
+# Run compactor once to apply the materialized view.
+"$BINARY" compactor --data-dir="$DATA_DIR" --min-parts=1 --once

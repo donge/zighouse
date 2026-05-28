@@ -540,6 +540,23 @@ pub fn build(b: *std.Build) void {
     const ddl_parser_tests = b.addTest(.{ .root_module = ddl_parser_mod });
     const ddl_parser_test_cmd = b.addRunArtifact(ddl_parser_tests);
 
+    // ── mv_parse module (CREATE MATERIALIZED VIEW DDL parser) ─────────────────
+    const mv_parse_mod = b.createModule(.{
+        .root_source_file = b.path("src/ingest/mv_parse.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const mv_parse_tests = b.addTest(.{ .root_module = mv_parse_mod });
+    const mv_parse_test_cmd = b.addRunArtifact(mv_parse_tests);
+
+    // ── mv_persist module (MV metadata save/load) ─────────────────────────────
+    const mv_persist_mod = b.createModule(.{
+        .root_source_file = b.path("src/ingest/mv_persist.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    mv_persist_mod.addImport("mv_parse", mv_parse_mod);
+
     const ingest_server_mod = b.createModule(.{
         .root_source_file = b.path("src/ingest/server.zig"),
         .target = target,
@@ -554,6 +571,8 @@ pub fn build(b: *std.Build) void {
     ingest_server_mod.addImport("generic_executor", generic_executor_mod);
     ingest_server_mod.addImport("generic_sql", generic_sql_mod);
     ingest_server_mod.addImport("ddl_parser", ddl_parser_mod);
+    ingest_server_mod.addImport("mv_parse", mv_parse_mod);
+    ingest_server_mod.addImport("mv_persist", mv_persist_mod);
     ingest_server_mod.addImport("native_block", native_block_mod);
     ingest_server_mod.addImport("csv", csv_mod);
     ingest_server_mod.link_libc = true;
@@ -578,7 +597,9 @@ pub fn build(b: *std.Build) void {
      exe.root_module.addImport("ingest_schema_persist", schema_persist_mod);
      exe.root_module.addImport("generic_executor", generic_executor_mod);
      exe.root_module.addImport("generic_sql", generic_sql_mod);
-     exe.root_module.addImport("parquet", parquet_mod);
+    exe.root_module.addImport("parquet", parquet_mod);
+    exe.root_module.addImport("mv_persist", mv_persist_mod);
+    exe.root_module.addImport("mv_parse", mv_parse_mod);
 
     // ── compactor module ───────────────────────────────────────────────────────
     const compactor_mod = b.createModule(.{
@@ -591,6 +612,8 @@ pub fn build(b: *std.Build) void {
     compactor_mod.addImport("schema_persist", schema_persist_mod);
     compactor_mod.addImport("ch_part", ch_part_mod);
     compactor_mod.addImport("part_scanner", part_scanner_mod);
+    compactor_mod.addImport("mv_parse", mv_parse_mod);
+    compactor_mod.addImport("mv_persist", mv_persist_mod);
     compactor_mod.link_libc = true;
     compactor_mod.addIncludePath(.{ .cwd_relative = lz4_include });
     compactor_mod.addLibraryPath(.{ .cwd_relative = lz4_lib });
@@ -668,6 +691,12 @@ pub fn build(b: *std.Build) void {
     ingest_server_mod.addImport("ir_planner", ir_planner_mod);
     ingest_server_mod.addImport("part_scan_bridge", part_scan_bridge_mod);
 
+    // Wire query engine into compactor (for MV apply)
+    compactor_mod.addImport("generic_sql", generic_sql_mod);
+    compactor_mod.addImport("ir_planner", ir_planner_mod);
+    compactor_mod.addImport("core", core_mod);
+    compactor_mod.addImport("part_scan_bridge", part_scan_bridge_mod);
+
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&ir_planner_test_cmd.step);
     test_step.dependOn(&core_test_cmd.step);
@@ -701,6 +730,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&part_scanner_test_cmd.step);
     test_step.dependOn(&part_writer_session_test_cmd.step);
     test_step.dependOn(&ddl_parser_test_cmd.step);
+    test_step.dependOn(&mv_parse_test_cmd.step);
     test_step.dependOn(&native_block_test_cmd.step);
     test_step.dependOn(&ingest_server_test_cmd.step);
 
