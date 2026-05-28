@@ -181,7 +181,10 @@ pub const Server = struct {
              // Substitute $N parameters from URL query string params.
              const after_params = try substituteParams(self.allocator, target, trimmed_raw);
              defer self.allocator.free(after_params);
-             try self.dispatchSql(request, out, after_params);
+             // When default_format is explicitly specified (e.g. by the CH test harness),
+             // suppress the column-name header line; otherwise include it for HTTP API clients.
+             const has_explicit_fmt = extractQueryParam(target, "default_format") != null;
+             try self.dispatchSqlWithHeader(request, out, after_params, !has_explicit_fmt);
         } else {
             // clickhouse-go sends SQL in POST body.
             // The body may contain: just the SQL (DDL/SELECT), or SQL\ndata (INSERT).
@@ -226,11 +229,11 @@ pub const Server = struct {
         }
     }
 
-    fn dispatchSql(self: *Server, request: *std.http.Server.Request, out: *std.Io.Writer, trimmed: []const u8) !void {
+    fn dispatchSqlWithHeader(self: *Server, request: *std.http.Server.Request, out: *std.Io.Writer, trimmed: []const u8, with_header: bool) !void {
         if (asciiStartsWith(trimmed, "INSERT")) {
             try self.handleInsert(request, out, trimmed);
         } else if (asciiStartsWith(trimmed, "SELECT") or asciiStartsWith(trimmed, "WITH")) {
-            try self.handleSelectNoDrain(request, out, trimmed, true);
+            try self.handleSelectNoDrainEx(request, out, trimmed, true, !with_header);
         } else if (asciiStartsWith(trimmed, "CREATE")) {
             try self.handleCreate(request, out, trimmed);
         } else if (asciiStartsWith(trimmed, "TRUNCATE")) {
@@ -905,13 +908,17 @@ pub const Server = struct {
 
     /// SELECT that doesn't drain the body (already consumed by handleRequest).
     fn handleSelectNoDrain(self: *Server, request: *std.http.Server.Request, out: *std.Io.Writer, sql: []const u8, want_tsv: bool) !void {
+        return self.handleSelectNoDrainEx(request, out, sql, want_tsv, true);
+    }
+
+    fn handleSelectNoDrainEx(self: *Server, request: *std.http.Server.Request, out: *std.Io.Writer, sql: []const u8, want_tsv: bool, skip_header: bool) !void {
         // Make user-defined functions available to the executor.
         generic_executor.udf_registry = &self.functions;
 
         // Fast path: SELECT 1
         if (std.mem.eql(u8, sql, "SELECT 1") or std.mem.eql(u8, sql, "select 1")) {
             if (want_tsv) {
-                try sendResponse(request, out, .ok, "1\n");
+                try sendResponse(request, out, .ok, if (!skip_header) "1\n1\n" else "1\n");
             } else {
                 const cols = [_]native_block.Col{
                     .{ .name = "1", .kind = .int64, .i64_val = 1 },
@@ -944,6 +951,32 @@ pub const Server = struct {
         };
         defer generic_sql.deinit(self.allocator, plan);
 
+        // View resolution: if the FROM table is a registered view, rewrite SQL to
+        // use a subquery from the view's underlying SELECT.
+        {
+            const tbl_full = plan.table;
+            const tbl_short = if (std.mem.indexOfScalar(u8, tbl_full, '.')) |dot| tbl_full[dot+1..] else tbl_full;
+            const view_sql_opt = self.views.get(tbl_full) orelse self.views.get(tbl_short);
+            if (view_sql_opt) |view_sql| {
+                // Rewrite: replace "FROM <view_name>" with "FROM (<view_sql>)" subquery.
+                // Find and replace the table name in sql_clean.
+                const from_full = try std.fmt.allocPrint(self.allocator, "FROM {s}", .{tbl_full});
+                defer self.allocator.free(from_full);
+                const from_short = try std.fmt.allocPrint(self.allocator, "FROM {s}", .{tbl_short});
+                defer self.allocator.free(from_short);
+                const from_sub = try std.fmt.allocPrint(self.allocator, "FROM ({s})", .{view_sql});
+                defer self.allocator.free(from_sub);
+                const needle = if (std.ascii.indexOfIgnoreCase(sql_clean, from_full) != null) from_full else from_short;
+                if (std.ascii.indexOfIgnoreCase(sql_clean, needle)) |pos| {
+                    const rewritten = try std.fmt.allocPrint(self.allocator, "{s}{s}{s}", .{
+                        sql_clean[0..pos], from_sub, sql_clean[pos + needle.len..],
+                    });
+                    defer self.allocator.free(rewritten);
+                    return self.handleSelectNoDrainEx(request, out, rewritten, want_tsv, skip_header);
+                }
+            }
+        }
+
         // Subquery: materialize inner, run outer, return result.
         if (plan.subquery_source) |inner_plan| {
             const inner_db_table = splitDbTable(inner_plan.table);
@@ -965,8 +998,8 @@ pub const Server = struct {
             defer if (outer_plan.projections.ptr != plan.projections.ptr) self.allocator.free(outer_plan.projections);
             const result = try generic_executor.runOverCsv(self.allocator, outer_plan, inner_csv, inner_table);
             defer self.allocator.free(result);
-            if (want_tsv) {
-                const tsv = try csvToTsv(self.allocator, result, true);
+             if (want_tsv) {
+                const tsv = try csvToTsv(self.allocator, result, skip_header);
                 defer self.allocator.free(tsv);
                 try sendResponse(request, out, .ok, tsv);
                 return;
@@ -986,7 +1019,7 @@ pub const Server = struct {
             const union_csv = try self.runUnionAllCsv(plan);
             defer self.allocator.free(union_csv);
             if (want_tsv) {
-                const tsv = try csvToTsv(self.allocator, union_csv, true);
+                const tsv = try csvToTsv(self.allocator, union_csv, skip_header);
                 defer self.allocator.free(tsv);
                 try sendResponse(request, out, .ok, tsv);
             } else {
@@ -1010,7 +1043,7 @@ pub const Server = struct {
             )            ) |fake_result| {
                 defer self.allocator.free(fake_result);
                 if (want_tsv) {
-                    const tsv = try csvToTsv(self.allocator, fake_result, true);
+                    const tsv = try csvToTsv(self.allocator, fake_result, skip_header);
                     defer self.allocator.free(tsv);
                     try sendResponse(request, out, .ok, tsv);
                 } else {
@@ -1047,7 +1080,7 @@ pub const Server = struct {
             )) |empty_result| {
                 defer self.allocator.free(empty_result);
                 if (want_tsv) {
-                    const tsv = try csvToTsv(self.allocator, empty_result, true);
+                    const tsv = try csvToTsv(self.allocator, empty_result, skip_header);
                     defer self.allocator.free(tsv);
                     try sendResponse(request, out, .ok, tsv);
                 } else {
@@ -1090,7 +1123,7 @@ pub const Server = struct {
         defer self.allocator.free(result);
 
         if (want_tsv) {
-            const tsv = try csvToTsv(self.allocator, result, true);
+            const tsv = try csvToTsv(self.allocator, result, skip_header);
             defer self.allocator.free(tsv);
             try sendResponse(request, out, .ok, tsv);
         } else {
@@ -1239,8 +1272,42 @@ pub const Server = struct {
             return;
         }
 
-        // CREATE DICTIONARY / VIEW — no-op.
-        if (asciiEql(second, "DICTIONARY") or asciiEql(second, "VIEW")) {
+        // CREATE DICTIONARY — no-op.
+        if (asciiEql(second, "DICTIONARY")) {
+            const empty = try native_block.encodeEmpty(self.allocator);
+            defer self.allocator.free(empty);
+            try sendNativeBlock(self.allocator, request, out, empty);
+            return;
+        }
+
+        // CREATE VIEW / CREATE OR REPLACE VIEW — store view definition.
+        if (asciiEql(second, "VIEW") or
+            (asciiEql(second, "OR") and asciiEql(third, "REPLACE"))) {
+            const view_kw_pos = std.ascii.indexOfIgnoreCase(sql, "VIEW ") orelse {
+                const empty = try native_block.encodeEmpty(self.allocator);
+                defer self.allocator.free(empty);
+                try sendNativeBlock(self.allocator, request, out, empty);
+                return;
+            };
+            const after_view = sql[view_kw_pos + 5..];
+            const as_pos2 = std.ascii.indexOfIgnoreCase(after_view, " AS ") orelse {
+                const empty = try native_block.encodeEmpty(self.allocator);
+                defer self.allocator.free(empty);
+                try sendNativeBlock(self.allocator, request, out, empty);
+                return;
+            };
+            const view_full_name = std.mem.trim(u8, after_view[0..as_pos2], " \t\r\n");
+            const select_sql2 = std.mem.trim(u8, after_view[as_pos2 + 4..], " \t\r\n");
+            const view_name2 = if (std.mem.indexOfScalar(u8, view_full_name, '.')) |dot_pos|
+                view_full_name[dot_pos + 1..] else view_full_name;
+            const key_s = try self.allocator.dupe(u8, view_name2);
+            const val_s = try self.allocator.dupe(u8, select_sql2);
+            try self.views.put(key_s, val_s);
+            if (std.mem.indexOfScalar(u8, view_full_name, '.') != null) {
+                const key_f = try self.allocator.dupe(u8, view_full_name);
+                const val_f = try self.allocator.dupe(u8, select_sql2);
+                try self.views.put(key_f, val_f);
+            }
             const empty = try native_block.encodeEmpty(self.allocator);
             defer self.allocator.free(empty);
             try sendNativeBlock(self.allocator, request, out, empty);

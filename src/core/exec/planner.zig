@@ -393,6 +393,11 @@ pub fn plan_query(
             const post_agg_projs = try post_agg_projs_list.toOwnedSlice(ctx.alloc);
 
             const agg_node = try ctx.alloc.create(PhysicalNode);
+            if (key_items.len == 0 and gplan.group_by != null) {
+                // GROUP BY is present but no key projections found in SELECT:
+                // fall back to generic executor which can evaluate complex GROUP BY expressions.
+                return null;
+            }
             if (key_items.len == 0) {
                 agg_node.* = .{ .scalar_agg = .{ .input = source, .aggs = agg_items } };
             } else {
@@ -2177,6 +2182,9 @@ fn aggExprToProjectItem(ctx: *PlannerCtx, p: generic_sql.Expr) !?ProjectItem {
             return ProjectItem{ .expr = .{ .agg_call = agg_call }, .alias = alias, .out_type = col_type };
         },
         .group_uniq_array, .uniq_exact_if => {
+            // If a post-processing function (e.g. arrayFlatten) is needed, fall back to
+            // the generic executor which handles post_fn application.
+            if (p.post_fn != null) return null;
             const arg_expr = resolveColExpr(ctx, col_name) orelse return null;
             agg_call.* = .{ .kind = .group_uniq_array, .arg = arg_expr, .distinct = false, .sep = p.sep };
             // When sep is present (arrayStringConcat pattern), the result is a joined string.

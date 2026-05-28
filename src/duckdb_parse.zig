@@ -497,7 +497,7 @@ fn translateSelectNode(allocator: std.mem.Allocator, node_obj: std.json.ObjectMa
                 // multiple of the LIMIT as the scan cap to avoid infinite loops
                 // when the WHERE filter never matches unknown functions.
                 const lim = limit orelse 0;
-                const scan_cap: u64 = if (lim > 0) @min(lim * 10_000, 10_000_000) else 10_000_000;
+                const scan_cap: u64 = if (lim > 0) @min(lim * 100_000, 10_000_000) else 10_000_000;
                 break :blk scan_cap;
             }
             if (std.mem.startsWith(u8, table_name, "numbers:")) {
@@ -1755,6 +1755,13 @@ fn exprToText(allocator: std.mem.Allocator, val: std.json.Value) !?[]const u8 {
             }
         }
         // Generic function: fn_name(arg1, arg2, ...)
+        // Special case: to_days(CAST(trunc(CAST(N AS DOUBLE)) AS INTEGER))
+        // → simplify to to_days(N) so our text evaluator doesn't have to parse nested CASTs.
+        if (std.mem.eql(u8, fn_name, "to_days") and children.len == 1) {
+            if (extractIntThroughCasts(children[0])) |n| {
+                return try std.fmt.allocPrint(allocator, "to_days({d})", .{n});
+            }
+        }
         var args: std.ArrayList(u8) = .empty;
         defer args.deinit(allocator);
         try args.appendSlice(allocator, fn_name);
@@ -1955,6 +1962,32 @@ fn extractIntLiteral(val: std.json.Value) ?usize {
     const i = intLiteralValue(val) orelse return null;
     if (i < 0) return null;
     return @intCast(i);
+}
+
+/// Recursively extract an integer value through CAST/trunc/etc wrappers.
+/// Used to simplify DuckDB's INTERVAL-to-days translation.
+fn extractIntThroughCasts(val: std.json.Value) ?i64 {
+    if (val == .null) return null;
+    const obj = val.object;
+    const class = (obj.get("class") orelse return null).string;
+    if (std.mem.eql(u8, class, "CONSTANT")) {
+        return intLiteralValue(val);
+    }
+    if (std.mem.eql(u8, class, "CAST")) {
+        const child = obj.get("child") orelse return null;
+        return extractIntThroughCasts(child);
+    }
+    if (std.mem.eql(u8, class, "FUNCTION")) {
+        const fn_name = (obj.get("function_name") orelse return null).string;
+        const children_val = obj.get("children") orelse return null;
+        if (children_val.array.items.len == 1 and
+            (std.mem.eql(u8, fn_name, "trunc") or std.mem.eql(u8, fn_name, "floor") or
+             std.mem.eql(u8, fn_name, "ceil") or std.mem.eql(u8, fn_name, "round")))
+        {
+            return extractIntThroughCasts(children_val.array.items[0]);
+        }
+    }
+    return null;
 }
 
 fn isCountStar(val: std.json.Value) bool {
