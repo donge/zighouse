@@ -27,6 +27,12 @@ if [[ ! -f "$BINARY" ]]; then
     (cd "$REPO_DIR" && zig build -Doptimize=ReleaseFast)
 fi
 
+# ── Pre-import: populate data dir before server starts so schema is auto-loaded ──
+FIXTURE_PARQUET="$REPO_DIR/data/fixture_hits.parquet"
+if [[ -f "$FIXTURE_PARQUET" ]]; then
+    "$BINARY" import-parquet --format=ch-compact "$FIXTURE_PARQUET" "$DATA_DIR/default" hits >/dev/null 2>&1 || true
+fi
+
 # Start server.
 "$BINARY" serve "--data-dir=$DATA_DIR" "--port=$PORT" &>/tmp/zh-func-server.log &
 SERVER_PID=$!
@@ -68,9 +74,9 @@ for sql_file in "$TESTS_DIR"/*.sql; do
 
         upper="$(echo "$stmt" | tr '[:lower:]' '[:upper:]' | sed 's/^[[:space:]]*//')"
         if [[ "$upper" == SELECT* ]] || [[ "$upper" == WITH* ]]; then
-            # GET with ?query= → TSV output.
+            # GET with ?query= → TabSeparated (no header) output, matching ClickHouse behaviour.
             encoded="$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "$stmt")"
-            response="$($CURL "http://localhost:$PORT/?query=$encoded")"
+            response="$($CURL "http://localhost:$PORT/?query=$encoded&default_format=TabSeparated")"
             if [[ -n "$response" ]]; then
                 actual_output="${actual_output}${response}"$'\n'
             fi

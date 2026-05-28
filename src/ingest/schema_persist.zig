@@ -76,6 +76,49 @@ pub fn save(
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = file_path, .data = buf.items });
 }
 
+/// Write schema.json directly into `table_dir` (i.e. `<table_dir>/schema.json`).
+/// Use this when `table_dir` is already the table-level directory
+/// (e.g. from `import-parquet <parquet> <data_dir>/<db>/<table> <table>`).
+pub fn saveToDir(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    table_dir: []const u8,
+    db: []const u8,
+    entry: *const schema_config.TableEntry,
+) !void {
+    try std.Io.Dir.cwd().createDirPath(io, table_dir);
+    const file_path = try std.fmt.allocPrint(allocator, "{s}/schema.json", .{table_dir});
+    defer allocator.free(file_path);
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    try buf.appendSlice(allocator, "{\n  \"db\": \"");
+    try writeJsonString(&buf, allocator, db);
+    try buf.appendSlice(allocator, "\",\n  \"name\": \"");
+    try writeJsonString(&buf, allocator, entry.name);
+    try buf.appendSlice(allocator, "\"");
+    if (entry.pk) |pk| {
+        try buf.appendSlice(allocator, ",\n  \"pk\": \"");
+        try writeJsonString(&buf, allocator, pk);
+        try buf.appendSlice(allocator, "\"");
+    }
+    try buf.appendSlice(allocator, ",\n  \"columns\": [\n");
+    for (entry.table.columns, 0..) |col, i| {
+        try buf.appendSlice(allocator, "    {\"name\": \"");
+        try writeJsonString(&buf, allocator, col.name);
+        try buf.appendSlice(allocator, "\", \"type\": \"");
+        if (col.ch_type) |ct| {
+            try writeJsonString(&buf, allocator, ct);
+        } else {
+            try buf.appendSlice(allocator, columnTypeName(col.ty));
+        }
+        try buf.appendSlice(allocator, "\"}");
+        if (i + 1 < entry.table.columns.len) try buf.append(allocator, ',');
+        try buf.append(allocator, '\n');
+    }
+    try buf.appendSlice(allocator, "  ]\n}\n");
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = file_path, .data = buf.items });
+}
+
 /// Load schema.json for a single table.
 /// Returns null if the file doesn't exist.
 /// Caller owns the returned TableEntry via the returned SchemaConfig (call .deinit()).

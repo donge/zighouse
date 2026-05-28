@@ -573,16 +573,18 @@ pub fn build(b: *std.Build) void {
     const ingest_server_test_cmd = b.addRunArtifact(ingest_server_tests);
 
     // Wire ingest modules into main exe and unit tests
-    exe.root_module.addImport("ingest_server", ingest_server_mod);
-    exe.root_module.addImport("ingest_schema_config", schema_config_mod);
-    exe.root_module.addImport("generic_executor", generic_executor_mod);
-    exe.root_module.addImport("generic_sql", generic_sql_mod);
-    exe.root_module.addImport("parquet", parquet_mod);
+     exe.root_module.addImport("ingest_server", ingest_server_mod);
+     exe.root_module.addImport("ingest_schema_config", schema_config_mod);
+     exe.root_module.addImport("ingest_schema_persist", schema_persist_mod);
+     exe.root_module.addImport("generic_executor", generic_executor_mod);
+     exe.root_module.addImport("generic_sql", generic_sql_mod);
+     exe.root_module.addImport("parquet", parquet_mod);
 
-    unit_tests.root_module.addImport("ingest_server", ingest_server_mod);
-    unit_tests.root_module.addImport("ingest_schema_config", schema_config_mod);
-    unit_tests.root_module.addImport("generic_executor", generic_executor_mod);
-    unit_tests.root_module.addImport("generic_sql", generic_sql_mod);
+     unit_tests.root_module.addImport("ingest_server", ingest_server_mod);
+     unit_tests.root_module.addImport("ingest_schema_config", schema_config_mod);
+     unit_tests.root_module.addImport("ingest_schema_persist", schema_persist_mod);
+     unit_tests.root_module.addImport("generic_executor", generic_executor_mod);
+     unit_tests.root_module.addImport("generic_sql", generic_sql_mod);
     unit_tests.root_module.addImport("parquet", parquet_mod);
 
     // ── core module (shared engine, no external deps) ───────────────────────

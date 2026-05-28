@@ -3,6 +3,8 @@ const build_options = @import("build_options");
 const clickbench_schema = schema.clickbench;
 const catalog = @import("catalog.zig");
 const schema_infer = @import("schema_infer.zig");
+const schema_persist = @import("ingest_schema_persist");
+const schema_config = @import("ingest_schema_config");
 const loader = @import("loader.zig");
 const generic_executor = @import("generic_executor");
 const generic_sql = @import("generic_sql");
@@ -143,6 +145,27 @@ fn runCommand(init: std.process.Init, allocator: std.mem.Allocator, args: *std.p
         if (format != .ch_http) {
             try catalog.Catalog.writeManifest(init.io, allocator, store_dir, table_name, parquet_path, part_fmt);
         }
+        // Write schema.json so `zighouse serve` auto-discovers this table.
+        // Split "db.table" or use "default" as the database name.
+        const db_name: []const u8 = if (std.mem.indexOfScalar(u8, table_name, '.')) |dot|
+            table_name[0..dot]
+        else
+            "default";
+        const bare_table: []const u8 = if (std.mem.indexOfScalar(u8, table_name, '.')) |dot|
+            table_name[dot + 1 ..]
+        else
+            table_name;
+        const entry = schema_config.TableEntry{
+            .db   = db_name,
+            .name = bare_table,
+            .pk   = pk_col_name,
+            .table = inferred.table,
+        };
+        // Parts land at <store_dir>/<table_name>/parts/ (via catalog.writeManifest).
+        // schema.json must be at <store_dir>/<table_name>/schema.json for `serve` to find it.
+        const table_dir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ store_dir, bare_table });
+        defer allocator.free(table_dir);
+        try schema_persist.saveToDir(init.io, allocator, table_dir, db_name, &entry);
         try printOut(init.io, "imported {d} rows {s} -> {s}/{s}\n", .{ row_count, parquet_path, store_dir, table_name });
     } else if (std.mem.eql(u8, command, "generic-query")) {
         // Query a generic_part store.
