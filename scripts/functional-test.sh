@@ -64,6 +64,12 @@ for sql_file in "$TESTS_DIR"/*.sql; do
         continue
     fi
 
+    # Optional pre-test shell hook (e.g. run compactor, import extra data).
+    pretest_file="$TESTS_DIR/$test_name.pretest"
+    if [[ -f "$pretest_file" ]]; then
+        BINARY="$BINARY" DATA_DIR="$DATA_DIR" PORT="$PORT" bash "$pretest_file"
+    fi
+
     # Execute each statement in the file via HTTP.
     # Non-SELECT statements go via POST body; SELECT goes via ?query=.
     actual_output=""

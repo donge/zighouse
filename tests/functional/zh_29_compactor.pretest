@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Pre-test hook for zh_29_compactor.
+# Imports the fixture a second time (creating a second part) then runs the
+# compactor in --once mode so it merges the two parts before the SQL queries.
+set -euo pipefail
+
+FIXTURE_PARQUET="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/data/fixture_hits.parquet"
+if [[ ! -f "$FIXTURE_PARQUET" ]]; then
+    echo "zh_29_compactor: fixture not found, skipping compactor setup"
+    exit 0
+fi
+
+# Import a second copy (creates a second part alongside the first from zh_28 setup).
+"$BINARY" import-parquet --format=ch-compact "$FIXTURE_PARQUET" "$DATA_DIR/default" hits >/dev/null 2>&1 || true
+
+# Run compactor once to merge all parts (min-parts=2 so 2 parts always triggers).
+"$BINARY" compactor --data-dir="$DATA_DIR" --min-parts=2 --once

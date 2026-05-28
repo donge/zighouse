@@ -22,7 +22,7 @@ const usage =
     \\  zighouse init <data_dir>
     \\  zighouse import-parquet [--format=generic|ch|ch-compact|ch-http] [--pk=<col>] <parquet_path> <store_dir> <table_name>
     \\  zighouse serve --data-dir=<dir> [--schemas=<schemas.json>] [--port=<port>]
-    \\  zighouse compactor --data-dir=<dir> [--interval=<secs>] [--min-parts=<n>] [--max-parts=<n>] [--max-rows=<n>]
+    \\  zighouse compactor --data-dir=<dir> [--interval=<secs>] [--min-parts=<n>] [--max-parts=<n>] [--max-rows=<n>] [--once]
     \\  zighouse generic-query <store_dir> <table_name> <sql>
     \\  zighouse import-clickbench-parquet-hot <hits.parquet> <data_dir> [limit_rows]
     \\  zighouse parquet-inspect <hits.parquet>
@@ -468,6 +468,8 @@ fn runCommand(init: std.process.Init, allocator: std.mem.Allocator, args: *std.p
                 cfg.max_parts_per_merge = std.fmt.parseInt(usize, arg["--max-parts=".len..], 10) catch cfg.max_parts_per_merge;
             } else if (std.mem.startsWith(u8, arg, "--max-rows=")) {
                 cfg.max_rows_per_merge = std.fmt.parseInt(u64, arg["--max-rows=".len..], 10) catch cfg.max_rows_per_merge;
+            } else if (std.mem.eql(u8, arg, "--once")) {
+                cfg.once = true;
             }
         }
         if (cfg.data_dir.len == 0) return error.MissingDataDir;

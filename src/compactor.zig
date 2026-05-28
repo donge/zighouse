@@ -32,6 +32,8 @@ pub const Config = struct {
     max_parts_per_merge: usize = 32,
     /// Maximum total rows in a merged part (0 = unlimited).
     max_rows_per_merge: u64 = 0,
+    /// Run one pass and exit instead of looping forever.
+    once: bool = false,
 };
 
 /// Run the compactor loop forever.  Call from main.
@@ -45,6 +47,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, config: Config) !void {
         runOnce(allocator, io, config) catch |err| {
             std.debug.print("compactor: runOnce error: {}\n", .{err});
         };
+        if (config.once) return;
         const sleep_dur = std.Io.Clock.Duration{
             .raw = .{ .nanoseconds = @as(i96, config.interval_s) * std.time.ns_per_s },
             .clock = .awake,

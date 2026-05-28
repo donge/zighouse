@@ -371,8 +371,32 @@ fn chAllStrValue(ctx: CHAllColsCtx, slot: usize, value: []const u8) anyerror!voi
 ///   columns.txt, columns_substreams.txt, count.txt,
 ///   checksums.txt, default_compression_codec.txt, metadata_version.txt
 ///
-/// The resulting part can be ATTACHed directly to a CH table or read back via
-/// CompactOpenedPart / PartScanBridge.
+/// Returns max_seq+1 by scanning existing `parts/all_*` directories under
+/// `<store_dir>/<table_name>/parts/`.  Falls back to 1 on any error.
+fn nextPartSeq(allocator: std.mem.Allocator, io: std.Io, store_dir: []const u8, table_name: []const u8) u64 {
+    const parts_path = std.fmt.allocPrint(allocator, "{s}/{s}/parts", .{ store_dir, table_name }) catch return 1;
+    defer allocator.free(parts_path);
+
+    var dir = std.Io.Dir.cwd().openDir(io, parts_path, .{ .iterate = true }) catch return 1;
+    defer dir.close(io);
+
+    var max: u64 = 0;
+    var it = dir.iterate();
+    while (it.next(io) catch null) |entry| {
+        if (entry.kind != .directory) continue;
+        const name = entry.name;
+        // Parse "all_<min>_<max>_<level>" — we only need max_seq field.
+        if (!std.mem.startsWith(u8, name, "all_")) continue;
+        var parts = std.mem.splitScalar(u8, name["all_".len..], '_');
+        _ = parts.next(); // min_seq
+        const max_s = parts.next() orelse continue;
+        const v = std.fmt.parseInt(u64, max_s, 10) catch continue;
+        if (v > max) max = v;
+    }
+    return max + 1;
+}
+
+/// Imports a Parquet file as a ClickHouse Compact MergeTree part.
 pub fn importParquetCompact(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -382,10 +406,13 @@ pub fn importParquetCompact(
 ) !u64 {
     const total_rows: u64 = try parquet.rowCountPath(allocator, io, parquet_path);
 
+    // Choose a seq that doesn't collide with existing parts.
+    const seq = nextPartSeq(allocator, io, store_dir, table.name);
+
     const part_dir = try std.fmt.allocPrint(
         allocator,
-        "{s}/{s}/parts/all_1_1_0",
-        .{ store_dir, table.name },
+        "{s}/{s}/parts/all_{d}_{d}_0",
+        .{ store_dir, table.name, seq, seq },
     );
     defer allocator.free(part_dir);
 
