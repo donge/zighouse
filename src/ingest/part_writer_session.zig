@@ -47,6 +47,7 @@ pub const PartWriterSession = struct {
         table:        schema.Table,
         pk_col_name:  ?[]const u8,
         seq:          u64,
+        codec:        u8,
     ) !PartWriterSession {
         const tmp_dir = try std.fmt.allocPrint(
             allocator,
@@ -62,7 +63,7 @@ pub const PartWriterSession = struct {
         );
         errdefer allocator.free(part_dir);
 
-        const part = try ch_part.Part.open(io, allocator, tmp_dir, table, pk_col_name);
+        const part = try ch_part.Part.open(io, allocator, tmp_dir, table, pk_col_name, codec);
         return .{
             .allocator = allocator,
             .io        = io,
@@ -137,6 +138,7 @@ pub const CompactPartWriterSession = struct {
         table_name: []const u8,
         table:      schema.Table,
         seq:        u64,
+        codec:      u8,
     ) !CompactPartWriterSession {
         const tmp_dir = try std.fmt.allocPrint(
             allocator,
@@ -152,7 +154,7 @@ pub const CompactPartWriterSession = struct {
         );
         errdefer allocator.free(part_dir);
 
-        const part = try ch_part.CompactPart.open(io, allocator, tmp_dir, table);
+        const part = try ch_part.CompactPart.open(io, allocator, tmp_dir, table, codec);
         return .{
             .allocator = allocator,
             .io        = io,

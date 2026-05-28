@@ -22,7 +22,7 @@ const usage =
     \\  zighouse init <data_dir>
     \\  zighouse import-parquet [--format=generic|ch|ch-compact|ch-http] [--pk=<col>] <parquet_path> <store_dir> <table_name>
     \\  zighouse serve --data-dir=<dir> [--schemas=<schemas.json>] [--port=<port>]
-    \\  zighouse compactor --data-dir=<dir> [--interval=<secs>] [--min-parts=<n>] [--max-parts=<n>] [--max-rows=<n>] [--once]
+    \\  zighouse compactor --data-dir=<dir> [--interval=<secs>] [--min-parts=<n>] [--max-parts=<n>] [--max-rows=<n>] [--once] [--codec=lz4|zstd]
     \\  zighouse generic-query <store_dir> <table_name> <sql>
     \\  zighouse import-clickbench-parquet-hot <hits.parquet> <data_dir> [limit_rows]
     \\  zighouse parquet-inspect <hits.parquet>
@@ -470,6 +470,13 @@ fn runCommand(init: std.process.Init, allocator: std.mem.Allocator, args: *std.p
                 cfg.max_rows_per_merge = std.fmt.parseInt(u64, arg["--max-rows=".len..], 10) catch cfg.max_rows_per_merge;
             } else if (std.mem.eql(u8, arg, "--once")) {
                 cfg.once = true;
+            } else if (std.mem.startsWith(u8, arg, "--codec=")) {
+                const codec_str = arg["--codec=".len..];
+                if (std.mem.eql(u8, codec_str, "zstd")) {
+                    cfg.codec = 0x90; // METHOD_ZSTD
+                } else {
+                    cfg.codec = 0x82; // METHOD_LZ4 (default)
+                }
             }
         }
         if (cfg.data_dir.len == 0) return error.MissingDataDir;

@@ -663,6 +663,7 @@ pub const Server = struct {
             db_table.table,
             entry.table,
             seq,
+            0x82, // METHOD_LZ4
         );
         defer sess.deinit();
 

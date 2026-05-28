@@ -197,7 +197,7 @@ pub fn writeCmrk4(
     }
     std.mem.writeInt(u64, raw[pos..][0..8], 0, .little); // granularity=0 for EOF
 
-    try block.writeBlock(writer, raw);
+    try block.writeBlock(writer, raw, block.METHOD_LZ4);
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

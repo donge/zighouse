@@ -78,7 +78,7 @@ pub fn write(
     }
 
     // 3. Write the compressed block containing the payload
-    try block.writeBlock(writer, payload.items);
+    try block.writeBlock(writer, payload.items, block.METHOD_LZ4);
 }
 
 /// Compute CityHash128 of a file's bytes, returning as u128.

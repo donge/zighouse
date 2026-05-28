@@ -42,10 +42,16 @@ pub const Error = error{
     ZstdDecompressFailed,
 };
 
-/// Write a single compressed block to `writer`.
+/// Write a single compressed block to `writer` using the given `method`.
+/// `method` must be METHOD_LZ4 (0x82) or METHOD_ZSTD (0x90).
 /// `src` is the raw (uncompressed) data for this block.
-pub fn writeBlock(writer: *std.Io.Writer, src: []const u8) !void {
-    const bound = lz4.compressBound(src.len);
+pub fn writeBlock(writer: *std.Io.Writer, src: []const u8, method: u8) !void {
+    // Compute upper-bound for compressed output size.
+    const bound: usize = switch (method) {
+        METHOD_ZSTD => zstd.ZSTD_compressBound(src.len),
+        else => lz4.compressBound(src.len),
+    };
+
     // Stack-allocate for small blocks; heap for large.
     var heap_buf: ?[]u8 = null;
     var stack_buf: [65536 + 512]u8 = undefined;
@@ -53,14 +59,27 @@ pub fn writeBlock(writer: *std.Io.Writer, src: []const u8) !void {
     const compressed_buf: []u8 = if (bound <= stack_buf.len)
         stack_buf[0..bound]
     else blk: {
-        // Use a fixed large buffer; caller drives block size
         const hb = try std.heap.page_allocator.alloc(u8, bound);
         heap_buf = hb;
         break :blk hb;
     };
     defer if (heap_buf) |hb| std.heap.page_allocator.free(hb);
 
-    const compressed_len = try lz4.compress(src, compressed_buf);
+    const compressed_len: usize = switch (method) {
+        METHOD_ZSTD => blk: {
+            // ZSTD_compress returns 0 on error; positive = success.
+            const n = zstd.ZSTD_compress(
+                compressed_buf.ptr,
+                compressed_buf.len,
+                src.ptr,
+                src.len,
+                1, // compression level 1 = ClickHouse default
+            );
+            if (zstd.ZSTD_isError(n) != 0) return error.ZstdDecompressFailed;
+            break :blk n;
+        },
+        else => try lz4.compress(src, compressed_buf),
+    };
     const compressed = compressed_buf[0..compressed_len];
 
     // Build the 9-byte header + compressed data region, then checksum it.
@@ -69,7 +88,7 @@ pub fn writeBlock(writer: *std.Io.Writer, src: []const u8) !void {
 
     // Build header bytes for checksum computation
     var header_bytes: [HEADER_SIZE]u8 = undefined;
-    header_bytes[0] = METHOD_LZ4;
+    header_bytes[0] = method;
     std.mem.writeInt(u32, header_bytes[1..5], size_with_header, .little);
     std.mem.writeInt(u32, header_bytes[5..9], size_decompressed, .little);
 
@@ -117,7 +136,8 @@ pub fn readBlock(allocator: std.mem.Allocator, reader: *std.Io.Reader) ![]u8 {
     try reader.readSliceAll(&header_bytes);
 
     const method = header_bytes[0];
-    if (method != METHOD_LZ4 and method != METHOD_NONE) return error.UnsupportedCompressionMethod;
+    if (method != METHOD_LZ4 and method != METHOD_NONE and method != METHOD_ZSTD)
+        return error.UnsupportedCompressionMethod;
     const size_with_header = std.mem.readInt(u32, header_bytes[1..5], .little);
     const size_decompressed = std.mem.readInt(u32, header_bytes[5..9], .little);
     if (size_with_header < HEADER_SIZE) return error.TruncatedBlock;
@@ -178,6 +198,7 @@ pub const BlockWriter = struct {
     buf: std.ArrayList(u8),
     target_block_size: usize,
     bytes_written_compressed: u64 = 0, // tracks .bin file offset
+    method: u8 = METHOD_LZ4,
 
     pub fn init(allocator: std.mem.Allocator, target_block_size: usize) BlockWriter {
         return .{
@@ -201,7 +222,7 @@ pub const BlockWriter = struct {
             // Track bytes written
             const start_pos: u64 = self.bytes_written_compressed;
             _ = start_pos;
-            try writeBlock(writer, block_data);
+            try writeBlock(writer, block_data, self.method);
             // Estimate written size for mark tracking (actual: checksum + header + compressed)
             // Callers that need exact offsets should use a counting writer.
             const compressed_estimate = lz4.compressBound(self.target_block_size) + BLOCK_HEADER_TOTAL;
@@ -217,7 +238,7 @@ pub const BlockWriter = struct {
     /// Flush any remaining buffered bytes as a final block.
     pub fn flush(self: *BlockWriter, writer: *std.Io.Writer) !void {
         if (self.buf.items.len > 0) {
-            try writeBlock(writer, self.buf.items);
+            try writeBlock(writer, self.buf.items, self.method);
             self.buf.items.len = 0;
         }
     }
@@ -235,7 +256,7 @@ const TEST_BUF_SIZE = 64 * 1024 + 4096;
 test "block round-trip empty" {
     var buf: [TEST_BUF_SIZE]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
-    try writeBlock(&w, "");
+    try writeBlock(&w, "", METHOD_LZ4);
 
     var r = std.Io.Reader.fixed(std.Io.Writer.buffered(&w));
     const decompressed = try readBlock(std.testing.allocator, &r);
@@ -247,7 +268,7 @@ test "block round-trip short" {
     const src = "hello, ClickHouse!";
     var buf: [TEST_BUF_SIZE]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
-    try writeBlock(&w, src);
+    try writeBlock(&w, src, METHOD_LZ4);
 
     var r = std.Io.Reader.fixed(std.Io.Writer.buffered(&w));
     const decompressed = try readBlock(std.testing.allocator, &r);
@@ -265,7 +286,7 @@ test "block round-trip 64KB" {
     const buf = try allocator.alloc(u8, bound);
     defer allocator.free(buf);
     var w = std.Io.Writer.fixed(buf);
-    try writeBlock(&w, &src);
+    try writeBlock(&w, &src, METHOD_LZ4);
 
     var r = std.Io.Reader.fixed(std.Io.Writer.buffered(&w));
     const decompressed = try readBlock(allocator, &r);
@@ -277,7 +298,7 @@ test "block checksum mismatch detected" {
     const src = "tamper test";
     var buf: [TEST_BUF_SIZE]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
-    try writeBlock(&w, src);
+    try writeBlock(&w, src, METHOD_LZ4);
 
     // Corrupt a byte in the compressed data area (after checksum + header)
     const written = std.Io.Writer.buffered(&w);
@@ -294,7 +315,7 @@ test "block multiple sequential" {
     var w = std.Io.Writer.fixed(&buf);
 
     const payloads = [_][]const u8{ "first block", "second block data here", "third" };
-    for (payloads) |p| try writeBlock(&w, p);
+    for (payloads) |p| try writeBlock(&w, p, METHOD_LZ4);
 
     var r = std.Io.Reader.fixed(std.Io.Writer.buffered(&w));
     for (payloads) |expected| {

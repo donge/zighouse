@@ -41,7 +41,7 @@ pub fn main() !void {
 
     std.debug.print("Writing compact part to {s}\n", .{part_dir});
 
-    var cp = try part_mod.CompactPart.open(io, allocator, part_dir, table);
+    var cp = try part_mod.CompactPart.open(io, allocator, part_dir, table, 0x82);
     defer cp.deinit();
 
     // Same 5 rows as in CH (ordered by event_date, user_id)

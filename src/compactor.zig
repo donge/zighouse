@@ -34,6 +34,8 @@ pub const Config = struct {
     max_rows_per_merge: u64 = 0,
     /// Run one pass and exit instead of looping forever.
     once: bool = false,
+    /// Compression codec for merged parts: 0x82=LZ4 (default), 0x90=ZSTD.
+    codec: u8 = 0x82, // METHOD_LZ4
 };
 
 /// Run the compactor loop forever.  Call from main.
@@ -131,7 +133,7 @@ fn maybeCompact(
     if (n_candidates < 2) return; // nothing to merge
 
     const candidates = ms[0..n_candidates];
-    try mergeParts(allocator, io, config.data_dir, db, table_name, entry.table, candidates);
+    try mergeParts(allocator, io, config.data_dir, db, table_name, entry.table, candidates, config.codec);
 
     std.debug.print("compactor: {s}.{s}: merged {d} parts into all_{d}_{d}_{d}\n", .{
         db, table_name, n_candidates,
@@ -167,6 +169,7 @@ fn mergeParts(
     table_name: []const u8,
     table:      @import("schema").Table,
     candidates: []const part_scanner.PartMeta,
+    codec:      u8,
 ) !void {
     const cwd = std.Io.Dir.cwd();
 
@@ -190,7 +193,7 @@ fn mergeParts(
     defer allocator.free(final_dir);
 
     // ── 2. Open writer into tmp_dir ───────────────────────────────────────────
-    var writer = try ch_part.CompactPart.open(io, allocator, tmp_dir, table);
+    var writer = try ch_part.CompactPart.open(io, allocator, tmp_dir, table, codec);
     defer writer.deinit();
 
     var total_rows: u64 = 0;

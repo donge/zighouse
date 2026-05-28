@@ -92,7 +92,7 @@ pub fn importParquetCH(
     );
     defer allocator.free(part_dir);
 
-    var part = try ch_part.Part.open(io, allocator, part_dir, table, pk_col_name);
+    var part = try ch_part.Part.open(io, allocator, part_dir, table, pk_col_name, 0x82); // METHOD_LZ4
     defer part.deinit();
 
     // Build separate index lists for fixed vs string columns.
@@ -416,7 +416,7 @@ pub fn importParquetCompact(
     );
     defer allocator.free(part_dir);
 
-    var part = try ch_part.CompactPart.open(io, allocator, part_dir, table);
+    var part = try ch_part.CompactPart.open(io, allocator, part_dir, table, 0x82); // METHOD_LZ4
     defer part.deinit();
 
     // Build separate index lists for fixed vs string columns.

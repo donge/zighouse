@@ -81,6 +81,8 @@ const ColumnWriter = struct {
     /// For String columns: pointer to companion size-stream writer.
     /// Owned by Part.column_size_writers; do NOT call deinit() from here.
     size_writer: ?*ColumnWriter = null,
+    /// Compression codec for this column's .bin file.
+    codec: u8 = block.METHOD_LZ4,
 
     fn init(
         allocator: std.mem.Allocator,
@@ -88,6 +90,7 @@ const ColumnWriter = struct {
         col: schema.Column,
         bin_file: std.Io.File,
         bin_path: []u8,
+        codec: u8,
     ) ColumnWriter {
         return .{
             .buf = .empty,
@@ -103,6 +106,7 @@ const ColumnWriter = struct {
             .bin_file = bin_file,
             .bin_path = bin_path,
             .size_writer = null,
+            .codec = codec,
         };
     }
 
@@ -166,11 +170,14 @@ const ColumnWriter = struct {
         }
 
         const uncompressed = self.buf.items;
-        const bound = block.BLOCK_HEADER_TOTAL + @import("lz4.zig").compressBound(uncompressed.len);
+        const bound = block.BLOCK_HEADER_TOTAL + switch (self.codec) {
+            block.METHOD_ZSTD => block.zstd.ZSTD_compressBound(uncompressed.len),
+            else => @import("lz4.zig").compressBound(uncompressed.len),
+        };
         const compressed_buf = try self.allocator.alloc(u8, bound);
         defer self.allocator.free(compressed_buf);
         var w = std.Io.Writer.fixed(compressed_buf);
-        try block.writeBlock(&w, uncompressed);
+        try block.writeBlock(&w, uncompressed, self.codec);
         const compressed = std.Io.Writer.buffered(&w);
 
         // Record mark
@@ -222,6 +229,8 @@ pub const Part = struct {
     pk_col_idx: usize,
     /// Primary key granule entries (one per granule, for the first PK column).
     pk_entries: std.ArrayList(primary_idx.PkValue),
+    /// Compression codec for all column .bin files.
+    codec: u8 = block.METHOD_LZ4,
 
     /// Open (create) a new part directory for writing.
     ///
@@ -234,6 +243,7 @@ pub const Part = struct {
         part_dir: []const u8,
         table: schema.Table,
         pk_col_name: ?[]const u8,
+        codec: u8,
     ) !Part {
         // Resolve pk_col_idx from name
         const resolved_pk_col_idx: usize = blk: {
@@ -269,7 +279,7 @@ pub const Part = struct {
             var bin_file = try std.Io.Dir.cwd().createFile(io, bin_path, .{ .truncate = true });
             errdefer bin_file.close(io);
 
-            column_writers[i] = ColumnWriter.init(allocator, io, col, bin_file, bin_path);
+            column_writers[i] = ColumnWriter.init(allocator, io, col, bin_file, bin_path, codec);
             init_count += 1;
 
             // For String columns, create a companion size-stream writer
@@ -279,7 +289,7 @@ pub const Part = struct {
                     errdefer allocator.free(sz_bin_path);
                     var sz_bin_file = try std.Io.Dir.cwd().createFile(io, sz_bin_path, .{ .truncate = true });
                     errdefer sz_bin_file.close(io);
-                    column_size_writers[i] = ColumnWriter.init(allocator, io, col, sz_bin_file, sz_bin_path);
+                    column_size_writers[i] = ColumnWriter.init(allocator, io, col, sz_bin_file, sz_bin_path, codec);
                     column_writers[i].size_writer = &column_size_writers[i].?;
                 },
                 else => {
@@ -299,6 +309,7 @@ pub const Part = struct {
             .row_count = 0,
             .pk_col_idx = resolved_pk_col_idx,
             .pk_entries = .empty,
+            .codec = codec,
         };
     }
 
@@ -539,6 +550,21 @@ pub const Part = struct {
             });
         }
 
+        // Write default_compression_codec.txt
+        {
+            const codec_str: []const u8 = if (self.codec == block.METHOD_ZSTD) "CODEC(ZSTD(1))\n" else "CODEC(LZ4)\n";
+            const path = try std.fmt.allocPrint(self.allocator, "{s}/default_compression_codec.txt", .{self.part_dir});
+            defer self.allocator.free(path);
+            try writeFile(self.io, path, codec_str);
+            const h = cityhash.cityHash128(codec_str);
+            try checksum_entries.append(self.allocator, .{
+                .name = "default_compression_codec.txt",
+                .file_size = codec_str.len,
+                .file_hash = h,
+                .is_compressed = false,
+            });
+        }
+
         // Write primary.idx
         {
             var aw = std.Io.Writer.Allocating.init(self.allocator);
@@ -685,7 +711,7 @@ pub const Part = struct {
         const cmrk_buf = try self.allocator.alloc(u8, bound);
         defer self.allocator.free(cmrk_buf);
         var cmrk_w = std.Io.Writer.fixed(cmrk_buf);
-        try block.writeBlock(&cmrk_w, mrk_bytes);
+        try block.writeBlock(&cmrk_w, mrk_bytes, block.METHOD_LZ4);
         const cmrk_bytes = std.Io.Writer.buffered(&cmrk_w);
 
         try writeFile(self.io, mrk_path, cmrk_bytes);
@@ -1193,12 +1219,15 @@ pub const CompactPart = struct {
     /// For String columns: per-column size stream buffer (one u64 LE per row = string byte length).
     size_bufs: []?ManagedList,
     row_count: u64,
+    /// Compression codec for data.bin.
+    codec: u8 = block.METHOD_LZ4,
 
     pub fn open(
         io: std.Io,
         allocator: std.mem.Allocator,
         part_dir: []const u8,
         table: schema.Table,
+        codec: u8,
     ) !CompactPart {
         const dir = try allocator.dupe(u8, part_dir);
         errdefer allocator.free(dir);
@@ -1224,6 +1253,7 @@ pub const CompactPart = struct {
             .col_bufs = col_bufs,
             .size_bufs = size_bufs,
             .row_count = 0,
+            .codec = codec,
         };
     }
 
@@ -1336,14 +1366,14 @@ pub const CompactPart = struct {
                         const n_rows_in_gran = ge - gs;
                         try cm_list.append(.{ .offset_in_file = block_offset, .offset_in_block = 0 });
                         try cm_list.append(.{ .offset_in_file = block_offset, .offset_in_block = @intCast(n_rows_in_gran * 8) });
-                        try block.writeBlock(&bin_aw.writer, combined);
+                        try block.writeBlock(&bin_aw.writer, combined, self.codec);
                     },
                     else => {
                         const width = types.chFixedWidth(col.ty) orelse continue;
                         const bs = gs * width;
                         const be = ge * width;
                         try cm_list.append(.{ .offset_in_file = @intCast(bin_aw.writer.end), .offset_in_block = 0 });
-                        try block.writeBlock(&bin_aw.writer, self.col_bufs[ci].items[bs..be]);
+                        try block.writeBlock(&bin_aw.writer, self.col_bufs[ci].items[bs..be], self.codec);
                     },
                 }
             }
@@ -1382,7 +1412,7 @@ pub const CompactPart = struct {
             }
             var cidx_aw = std.Io.Writer.Allocating.init(self.allocator);
             defer cidx_aw.deinit();
-            try block.writeBlock(&cidx_aw.writer, pk_raw.items);
+            try block.writeBlock(&cidx_aw.writer, pk_raw.items, block.METHOD_LZ4);
             var cidx_al = cidx_aw.toArrayList();
             defer cidx_al.deinit(self.allocator);
             try compactWriteFile(self.io, self.part_dir, "primary.cidx", cidx_al.items);
@@ -1460,7 +1490,8 @@ pub const CompactPart = struct {
 
         // ── static metadata files ─────────────────────────────────────────────
         try compactWriteFile(self.io, self.part_dir, "metadata_version.txt", "1\n");
-        try compactWriteFile(self.io, self.part_dir, "default_compression_codec.txt", "CODEC(LZ4)\n");
+        const codec_str: []const u8 = if (self.codec == block.METHOD_ZSTD) "CODEC(ZSTD(1))\n" else "CODEC(LZ4)\n";
+        try compactWriteFile(self.io, self.part_dir, "default_compression_codec.txt", codec_str);
         // Note: format_version.txt is NOT written — CH 26.5 compact parts don't use it
 
         // ── checksums.txt ─────────────────────────────────────────────────────
@@ -1529,7 +1560,7 @@ test "CompactPart write + read round-trip" {
 
     // Write
     {
-        var cp = try CompactPart.open(io, allocator, part_dir, table);
+        var cp = try CompactPart.open(io, allocator, part_dir, table, 0x82);
         defer cp.deinit();
 
         const dates   = [_]i64{ 19723, 19723, 19724 };
@@ -1667,7 +1698,7 @@ test "CompactPart write events schema for CH ATTACH" {
     };
     const table = schema.Table{ .name = "events", .columns = &cols };
 
-    var cp = try CompactPart.open(io, allocator, part_dir, table);
+    var cp = try CompactPart.open(io, allocator, part_dir, table, 0x82);
     defer cp.deinit();
 
     // 5 rows ordered by (event_date, user_id)
@@ -1747,7 +1778,7 @@ test "CompactPart write all_3_3_0 for CH ATTACH E2E" {
     };
     const table = schema.Table{ .name = "events", .columns = &cols };
 
-    var cp = try CompactPart.open(io, allocator, part_dir, table);
+    var cp = try CompactPart.open(io, allocator, part_dir, table, 0x82);
     defer cp.deinit();
 
     // 3 new rows (user_id 5,6,7) — not overlapping with existing 1..4
@@ -1791,7 +1822,7 @@ test "part write and verify files exist" {
     };
     const table = schema.Table{ .name = "test", .columns = &cols };
 
-    var part = try Part.open(io, allocator, part_dir, table, null);
+    var part = try Part.open(io, allocator, part_dir, table, null, 0x82);
     defer part.deinit();
 
     // Write 100 rows
@@ -1833,7 +1864,7 @@ test "Part write + OpenedPart read round-trips fixed and string columns" {
 
     // ── Write ──────────────────────────────────────────────────────────────────
     {
-        var part = try Part.open(io, allocator, part_dir, table, null);
+        var part = try Part.open(io, allocator, part_dir, table, null, 0x82);
         defer part.deinit();
 
         // Write fixed column (col 0 = PK, drives row_count)
@@ -1925,7 +1956,7 @@ test "pk_col_name: primary.idx stores correct PK column values" {
     // Write exactly GRANULE_SIZE rows so we get exactly 1 granule mark entry.
     // First row values: WatchID=999, CounterID=42.
     {
-        var part = try Part.open(io, allocator, part_dir, table, "CounterID");
+        var part = try Part.open(io, allocator, part_dir, table, "CounterID", 0x82);
         defer part.deinit();
 
         // Write GRANULE_SIZE rows for WatchID (col 0)
@@ -1975,7 +2006,7 @@ test "pk_col_name null defaults to col 0" {
     const table = schema.Table{ .name = "pk_default_test", .columns = &cols };
 
     {
-        var part = try Part.open(io, allocator, part_dir, table, null);
+        var part = try Part.open(io, allocator, part_dir, table, null, 0x82);
         defer part.deinit();
 
         var watch_ids: [GRANULE_SIZE]i64 = undefined;
@@ -2010,7 +2041,7 @@ test "pk_col_name unknown returns PkColumnNotFound error" {
     };
     const table = schema.Table{ .name = "pk_err_test", .columns = &cols };
 
-    const result = Part.open(io, allocator, "/tmp/zig_test_pk_err", table, "NonExistentColumn");
+    const result = Part.open(io, allocator, "/tmp/zig_test_pk_err", table, "NonExistentColumn", 0x82);
     try std.testing.expectError(error.PkColumnNotFound, result);
 }
 
