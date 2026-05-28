@@ -47,7 +47,7 @@ fn toCoreColType(ty: schema.ColumnType) ColumnType {
         .float32, .float64            => .float64,
         .date                         => .date_u16,
         .timestamp                    => .datetime64_ms,
-        .text, .char                  => .string,
+        .text, .char, .low_card          => .string,
     };
 }
 

@@ -585,7 +585,7 @@ fn importColumn(
     total_rows: u64,
 ) !void {
     switch (col.ty) {
-        .text, .char => try importStringColumn(allocator, io, parquet_path, part, col.name, col_idx, total_rows),
+        .text, .char, .low_card => try importStringColumn(allocator, io, parquet_path, part, col.name, col_idx, total_rows),
         .int8 => try importFixedColumn(i8, allocator, io, parquet_path, part, col.name, col_idx),
         .int16 => try importFixedColumn(i16, allocator, io, parquet_path, part, col.name, col_idx),
         .int32, .date => try importFixedColumn(i32, allocator, io, parquet_path, part, col.name, col_idx),

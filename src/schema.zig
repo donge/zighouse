@@ -13,6 +13,8 @@ pub const ColumnType = enum {
     char,
     float32,
     float64,
+    /// LowCardinality(T) — inner type stored in Column.low_card_inner.
+    low_card,
 
     pub fn fixedWidth(self: ColumnType) ?usize {
         return switch (self) {
@@ -20,13 +22,13 @@ pub const ColumnType = enum {
             .int16 => 2,
             .int32, .date, .float32 => 4,
             .int64, .timestamp, .float64 => 8,
-            .text => null,
+            .text, .low_card => null,
         };
     }
 
     pub fn isString(self: ColumnType) bool {
         return switch (self) {
-            .text => true,
+            .text, .low_card => true,
             else => false,
         };
     }
@@ -147,6 +149,8 @@ pub const StringCapabilities = struct {
 pub const Column = struct {
     name: []const u8,
     ty: ColumnType,
+    /// When ty == .low_card, the inner (wrapped) type.  Defaults to .text.
+    low_card_inner: ColumnType = .text,
     /// Original ClickHouse type string as received on the wire (e.g. "Array(String)",
     /// "Map(String, Float64)", "LowCardinality(String)", "IPv6").
     /// null means unknown / use schemaTypeToChType(ty) fallback.
@@ -157,6 +161,11 @@ pub const Column = struct {
     physical: PhysicalColumn = .none,
     materialize: []const MaterializationHint = &.{},
     capabilities: StringCapabilities = .{},
+
+    /// Return the inner type for LowCardinality columns, or self.ty for others.
+    pub fn lowCardInner(self: Column) ColumnType {
+        return if (self.ty == .low_card) self.low_card_inner else self.ty;
+    }
 };
 
 pub const Table = struct {
@@ -234,10 +243,10 @@ pub fn capabilityTag(col: Column) CapabilityTag {
             .timestamp => .fixed_timestamp,
             .char => .fixed_char,
             .float32, .float64 => @panic("capabilityTag: float type in fixed physical is not supported for ClickBench"),
-            .text => @panic("capabilityTag: fixed physical with text ty is invalid"),
+            .text, .low_card => @panic("capabilityTag: fixed physical with text/lc ty is invalid"),
         },
         .none => switch (col.ty) {
-            .text, .char => .lazy_text,
+            .text, .char, .low_card => .lazy_text,
             else => @panic("capabilityTag: numeric column has no physical representation"),
         },
     };

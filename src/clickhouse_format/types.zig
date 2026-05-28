@@ -22,6 +22,7 @@ pub fn chTypeName(ty: schema.ColumnType) []const u8 {
         .char => "String", // CH has no single-byte Char type; map to String
         .float32 => "Float32",
         .float64 => "Float64",
+        .low_card => "String", // inner type resolved separately via Column.low_card_inner
     };
 }
 
@@ -37,6 +38,7 @@ pub fn chFixedWidth(ty: schema.ColumnType) ?usize {
         .float32 => 4,
         .float64 => 8,
         .text => null,
+        .low_card => null, // variable-width (dict+index streams)
     };
 }
 

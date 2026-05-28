@@ -40,7 +40,7 @@ pub fn fromTable(allocator: std.mem.Allocator, table: schema.Table) ![]ChColumn 
     errdefer list.deinit(allocator);
     for (table.columns) |col| {
         switch (col.ty) {
-            .int8, .int16, .int32, .int64, .date, .timestamp, .text, .float32, .float64 => {
+            .int8, .int16, .int32, .int64, .date, .timestamp, .text, .float32, .float64, .low_card => {
                 try list.append(allocator, .{
                     .name = col.name,
                     .ch_type = col.ch_type orelse types.chTypeName(col.ty),

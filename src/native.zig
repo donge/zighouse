@@ -3660,7 +3660,7 @@ fn writeQ24NativeRow(allocator: std.mem.Allocator, out: *std.ArrayList(u8), cell
         if (i != 0) try out.append(allocator, ',');
         const cell = cells[i];
         switch (col.ty) {
-            .text, .char => switch (cell) {
+            .text, .char, .low_card => switch (cell) {
                 .bytes => |v| try writeCsvField(allocator, out, v),
                 else => return error.CorruptHotColumns,
             },

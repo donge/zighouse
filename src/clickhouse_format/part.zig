@@ -18,8 +18,7 @@
 ///   part.deinit();
 
 const std = @import("std");
-// schema and types: use named module when available (standalone tests),
-// falling back handled via build.zig addImport("schema", ...).
+
 const schema = @import("schema");
 const types = @import("types");
 const columns_txt = @import("columns_txt.zig");
@@ -30,6 +29,7 @@ const checksums = @import("checksums.zig");
 const string_codec = @import("string_codec.zig");
 const cityhash = @import("cityhash.zig");
 const block = @import("block.zig");
+const low_card = @import("low_card.zig");
 
 pub const GRANULE_SIZE: u64 = 8192;
 /// Maximum uncompressed bytes per LZ4 block (~1 MiB, matching CH default).
@@ -908,13 +908,14 @@ pub const ColumnReader = struct {
         callback: anytype,
     ) !usize {
         switch (self.col.ty) {
-            .text, .char => {},
+            .text, .char, .low_card => {},
             else => return error.NotAStringColumn,
         }
         const sd = self.size_data orelse return error.MissingSizeStream;
         const remaining_rows = self.row_count - self.rows_read;
         const count = @min(n, remaining_rows);
         var read: usize = 0;
+
         while (read < count) : (read += 1) {
             // Read u64 LE length from size sub-stream
             if (self.size_cursor + 8 > sd.len) return error.UnexpectedEndOfData;
@@ -1162,10 +1163,41 @@ pub const CompactOpenedPart = struct {
                     try size_buf.appendSlice(self.allocator, combined[0..sizes_bytes]);
                     try data_buf.appendSlice(self.allocator, combined[sizes_bytes..]);
                 },
+                .low_card => {
+                    // LC: 2 substream blocks per granule.
+                    // block at ss_start   = dict (full dict only in granule 0)
+                    // block at ss_start+1 = index for this granule
+                    // Accumulate dict from granule 0, and all index payloads.
+                    if (g == 0) {
+                        try data_buf.appendSlice(self.allocator, self.substream_data[block_idx]);
+                    }
+                    try size_buf.appendSlice(self.allocator, self.substream_data[block_idx + 1]);
+                },
                 else => {
                     try data_buf.appendSlice(self.allocator, self.substream_data[block_idx]);
                 },
             }
+        }
+
+        if (col.ty == .low_card) {
+            // data_buf = dict stream, size_buf = all index payloads concatenated
+            const dict_raw = try data_buf.toOwnedSlice(self.allocator);
+            defer self.allocator.free(dict_raw);
+            const index_raw = try size_buf.toOwnedSlice(self.allocator);
+            defer self.allocator.free(index_raw);
+            const deserialized = try low_card.deserializeToStringBuf(
+                self.allocator, dict_raw, index_raw, self.row_count,
+            );
+            return ColumnReader{
+                .allocator = self.allocator,
+                .col = col,
+                .row_count = self.row_count,
+                .data = deserialized.data,
+                .size_data = deserialized.size_data,
+                .cursor = 0,
+                .size_cursor = 0,
+                .rows_read = 0,
+            };
         }
 
         const size_data: ?[]u8 = switch (col.ty) {
@@ -1218,6 +1250,8 @@ pub const CompactPart = struct {
     col_bufs: []ManagedList,
     /// For String columns: per-column size stream buffer (one u64 LE per row = string byte length).
     size_bufs: []?ManagedList,
+    /// For LowCardinality columns: per-column DictBuilder pointer (null for non-LC cols).
+    lc_builders: []?*low_card.DictBuilder,
     row_count: u64,
     /// Compression codec for data.bin.
     codec: u8 = block.METHOD_LZ4,
@@ -1245,6 +1279,17 @@ pub const CompactPart = struct {
             };
         }
 
+        const lc_builders = try allocator.alloc(?*low_card.DictBuilder, table.columns.len);
+        for (lc_builders, table.columns) |*lb, col| {
+            if (col.ty == .low_card) {
+                const b = try allocator.create(low_card.DictBuilder);
+                b.* = low_card.DictBuilder.init(allocator);
+                lb.* = b;
+            } else {
+                lb.* = null;
+            }
+        }
+
         return .{
             .allocator = allocator,
             .io = io,
@@ -1252,6 +1297,7 @@ pub const CompactPart = struct {
             .table = table,
             .col_bufs = col_bufs,
             .size_bufs = size_bufs,
+            .lc_builders = lc_builders,
             .row_count = 0,
             .codec = codec,
         };
@@ -1260,8 +1306,15 @@ pub const CompactPart = struct {
     pub fn deinit(self: *CompactPart) void {
         for (self.col_bufs) |*b| b.deinit();
         for (self.size_bufs) |*sb| if (sb.*) |*b| b.deinit();
+        for (self.lc_builders) |lb| {
+            if (lb) |b| {
+                b.deinit();
+                self.allocator.destroy(b);
+            }
+        }
         self.allocator.free(self.col_bufs);
         self.allocator.free(self.size_bufs);
+        self.allocator.free(self.lc_builders);
         self.allocator.free(self.part_dir);
     }
 
@@ -1290,12 +1343,24 @@ pub const CompactPart = struct {
     }
 
     /// Append a single string value for column `col_idx`.
+    /// For .text/.char columns, stores in size_bufs+col_bufs.
+    /// For .low_card columns, stores in the lc_builder dict.
     pub fn appendString(self: *CompactPart, col_idx: usize, s: []const u8) !void {
-        const sb = &(self.size_bufs[col_idx] orelse return error.NotAStringColumn);
-        var len_buf: [8]u8 = undefined;
-        std.mem.writeInt(u64, &len_buf, s.len, .little);
-        try sb.appendSlice(&len_buf);
-        try self.col_bufs[col_idx].appendSlice(s);
+        const col = self.table.columns[col_idx];
+        switch (col.ty) {
+            .text, .char => {
+                const sb = &(self.size_bufs[col_idx] orelse return error.NotAStringColumn);
+                var len_buf: [8]u8 = undefined;
+                std.mem.writeInt(u64, &len_buf, s.len, .little);
+                try sb.appendSlice(&len_buf);
+                try self.col_bufs[col_idx].appendSlice(s);
+            },
+            .low_card => {
+                const b = self.lc_builders[col_idx] orelse return error.NotALCColumn;
+                try b.append(s);
+            },
+            else => return error.NotAStringColumn,
+        }
     }
 
     /// Append a batch of strings to a string column.
@@ -1311,13 +1376,25 @@ pub const CompactPart = struct {
 
     /// Finalize: write all compact part files to disk.
     pub fn finish(self: *CompactPart) !void {
-        // n_substreams (logical: String = 2 substreams)
-        var n_sub: usize = 0;
-        for (self.table.columns) |col| {
-            n_sub += switch (col.ty) { .text, .char => 2, else => 1 };
+        const n_gran: usize = if (self.row_count == 0) 0 else (self.row_count + GRANULE_SIZE - 1) / GRANULE_SIZE;
+
+        // Populate granule_starts for LC builders (based on GRANULE_SIZE boundaries)
+        for (self.lc_builders) |lb| {
+            if (lb) |b| {
+                try b.granule_starts.resize(b.allocator, n_gran);
+                for (0..n_gran) |g| {
+                    b.granule_starts.items[g] = @intCast(g * GRANULE_SIZE);
+                }
+            }
         }
 
-        const n_gran: usize = if (self.row_count == 0) 0 else (self.row_count + GRANULE_SIZE - 1) / GRANULE_SIZE;
+        // n_substreams (logical: String/LC = 2 substreams)
+        var n_sub: usize = 0;
+        for (self.table.columns) |col| {
+            n_sub += switch (col.ty) { .text, .char, .low_card => 2, else => 1 };
+        }
+
+        // n_gran already computed above
 
         // ── data.bin + cmrk4 marks ────────────────────────────────────────────
         var bin_aw = std.Io.Writer.Allocating.init(self.allocator);
@@ -1329,6 +1406,26 @@ pub const CompactPart = struct {
         // Track row count per granule for adaptive marks
         const gran_rows = try self.allocator.alloc(u64, n_gran);
         defer self.allocator.free(gran_rows);
+
+        // Pre-serialize LC column index payloads (per-column, per-granule slices)
+        const lc_index_gran = try self.allocator.alloc(?[][]u8, self.table.columns.len);
+        defer {
+            for (lc_index_gran) |maybe_g| {
+                if (maybe_g) |g| {
+                    for (g) |b| self.allocator.free(b);
+                    self.allocator.free(g);
+                }
+            }
+            self.allocator.free(lc_index_gran);
+        }
+        for (self.table.columns, 0..) |col, ci| {
+            if (col.ty == .low_card) {
+                const b = self.lc_builders[ci].?;
+                lc_index_gran[ci] = try b.serializeIndexAllGranules(self.allocator);
+            } else {
+                lc_index_gran[ci] = null;
+            }
+        }
 
         for (0..n_gran) |g| {
             const gs = g * GRANULE_SIZE;
@@ -1367,6 +1464,34 @@ pub const CompactPart = struct {
                         try cm_list.append(.{ .offset_in_file = block_offset, .offset_in_block = 0 });
                         try cm_list.append(.{ .offset_in_file = block_offset, .offset_in_block = @intCast(n_rows_in_gran * 8) });
                         try block.writeBlock(&bin_aw.writer, combined, self.codec);
+                    },
+                    .low_card => {
+                        // LC: 2 physical blocks per granule.
+                        // Block 0 (dict substream): full dict bytes only for granule 0, else empty.
+                        // Block 1 (index substream): per-granule index payload.
+                        const b = self.lc_builders[ci].?;
+                        const gran_bufs = lc_index_gran[ci].?;
+
+                        // Dict substream block
+                        const dict_offset: u64 = @intCast(bin_aw.writer.end);
+                        if (g == 0) {
+                            var dict_aw = std.Io.Writer.Allocating.init(self.allocator);
+                            defer dict_aw.deinit();
+                            try b.serializeDict(&dict_aw.writer);
+                            var dict_al = dict_aw.toArrayList();
+                            defer dict_al.deinit(self.allocator);
+                            try cm_list.append(.{ .offset_in_file = dict_offset, .offset_in_block = 0 });
+                            try block.writeBlock(&bin_aw.writer, dict_al.items, self.codec);
+                        } else {
+                            // Empty dict block for subsequent granules
+                            try cm_list.append(.{ .offset_in_file = dict_offset, .offset_in_block = 0 });
+                            try block.writeBlock(&bin_aw.writer, &[_]u8{}, self.codec);
+                        }
+
+                        // Index substream block
+                        const idx_offset: u64 = @intCast(bin_aw.writer.end);
+                        try cm_list.append(.{ .offset_in_file = idx_offset, .offset_in_block = 0 });
+                        try block.writeBlock(&bin_aw.writer, gran_bufs[g], self.codec);
                     },
                     else => {
                         const width = types.chFixedWidth(col.ty) orelse continue;
@@ -1445,6 +1570,7 @@ pub const CompactPart = struct {
             for (self.table.columns) |col| {
                 switch (col.ty) {
                     .text, .char => try ssw.writer.print("2 substreams for column `{s}`:\n\t{s}.size\n\t{s}\n", .{ col.name, col.name, col.name }),
+                    .low_card => try ssw.writer.print("2 substreams for column `{s}`:\n\t{s}.dict\n\t{s}\n", .{ col.name, col.name, col.name }),
                     else => try ssw.writer.print("1 substreams for column `{s}`:\n\t{s}\n", .{ col.name, col.name }),
                 }
             }
@@ -1465,10 +1591,12 @@ pub const CompactPart = struct {
                 }
             }.lessThan);
 
-            // Check if any String columns exist (need types_serialization_versions)
+            // Check if any String or LC columns exist (need types_serialization_versions)
             var has_string = false;
+            var has_lc = false;
             for (self.table.columns) |col| {
-                if (col.ty == .text or col.ty == .char) { has_string = true; break; }
+                if (col.ty == .text or col.ty == .char) has_string = true;
+                if (col.ty == .low_card) has_lc = true;
             }
 
             var sjw = std.Io.Writer.Allocating.init(self.allocator);
@@ -1478,8 +1606,12 @@ pub const CompactPart = struct {
                 if (i > 0) try sjw.writer.print(",", .{});
                 try sjw.writer.print("{{\"kind\":\"Default\",\"name\":\"{s}\",\"num_defaults\":0,\"num_rows\":{d}}}", .{ col.name, self.row_count });
             }
-            if (has_string) {
+            if (has_string and has_lc) {
+                try sjw.writer.print("],\"propagate_types_serialization_versions_to_nested_types\":true,\"types_serialization_versions\":{{\"low_cardinality\":1,\"string\":1}},\"version\":1}}", .{});
+            } else if (has_string) {
                 try sjw.writer.print("],\"propagate_types_serialization_versions_to_nested_types\":true,\"types_serialization_versions\":{{\"string\":1}},\"version\":1}}", .{});
+            } else if (has_lc) {
+                try sjw.writer.print("],\"propagate_types_serialization_versions_to_nested_types\":true,\"types_serialization_versions\":{{\"low_cardinality\":1}},\"version\":1}}", .{});
             } else {
                 try sjw.writer.print("],\"version\":1}}", .{});
             }

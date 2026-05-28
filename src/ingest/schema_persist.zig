@@ -222,7 +222,7 @@ fn columnTypeName(ty: schema.ColumnType) []const u8 {
         .int64 => "Int64",
         .date => "Date",
         .timestamp => "DateTime",
-        .text, .char => "String",
+        .text, .char, .low_card => "String",
         .float32 => "Float32",
         .float64 => "Float64",
     };

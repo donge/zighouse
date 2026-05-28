@@ -862,7 +862,7 @@ fn schemaToCore(ty: schema_mod.ColumnType, ch_type: ?[]const u8) ColumnType {
         .date      => .date_u16,
         .timestamp => .datetime64_ms,
         .float32, .float64 => .float64,
-        .text, .char => .string,
+        .text, .char, .low_card => .string,
     };
 }
 

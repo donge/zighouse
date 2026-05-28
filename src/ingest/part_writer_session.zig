@@ -179,7 +179,7 @@ pub const CompactPartWriterSession = struct {
 
         for (columns, 0..) |*col_buf, col_idx| {
             switch (col_buf.col.ty) {
-                .text, .char => {
+                .text, .char, .low_card => {
                     for (col_buf.str_vals.items) |s| {
                         try self.part.appendString(col_idx, s);
                     }

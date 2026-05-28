@@ -1527,7 +1527,7 @@ pub const Server = struct {
             for (col_bufs, set_flags) |*buf, was_set| {
                 if (was_set) continue;
                 switch (buf.col.ty) {
-                    .text, .char => try buf.str_vals.append(self.allocator, buf.str_bytes.items[0..0]),
+                    .text, .char, .low_card => try buf.str_vals.append(self.allocator, buf.str_bytes.items[0..0]),
                     else         => try buf.fixed_vals.append(self.allocator, 0),
                 }
             }
@@ -1664,7 +1664,7 @@ pub const Server = struct {
             for (col_bufs, set_flags) |*buf, was_set| {
                 if (was_set) continue;
                 switch (buf.col.ty) {
-                    .text, .char => try buf.str_vals.append(self.allocator, buf.str_bytes.items[0..0]),
+                    .text, .char, .low_card => try buf.str_vals.append(self.allocator, buf.str_bytes.items[0..0]),
                     else         => try buf.fixed_vals.append(self.allocator, 0),
                 }
             }
@@ -1935,7 +1935,7 @@ fn appendParsedField(
         }
     }
     switch (col.ty) {
-        .text, .char => {
+        .text, .char, .low_card => {
             const start = buf.str_bytes.items.len;
             try buf.str_bytes.appendSlice(allocator, field);
             const end = buf.str_bytes.items.len;
@@ -2482,6 +2482,7 @@ fn schemaTypeToChType(ty: schema.ColumnType) []const u8 {
         .float64 => "Float64",
         .text    => "String",
         .char    => "String",
+        .low_card => "String",
         .date    => "Date",
         .timestamp => "DateTime64(3)",
     };

@@ -218,7 +218,7 @@ fn mergeParts(
             defer cr.deinit();
 
             switch (col.ty) {
-                .text, .char => {
+                .text, .char, .low_card => {
                     // Read all strings and append.
                     const ReadCtx = struct {
                         part_writer: *ch_part.CompactPart,

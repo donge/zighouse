@@ -195,7 +195,7 @@ pub const RowBinaryDecoder = struct {
                         try buf.fixed_vals.append(self.allocator, @bitCast(bits));
                         pos += 8;
                     },
-                    .text, .char => {
+        .text, .char, .low_card => {
                         // Dispatch based on ch_type for special encodings.
                         // Note: ch_ty already declared in outer scope; reuse it here.
                         if (chTypeEql(ch_ty, "IPv6")) {
@@ -263,7 +263,7 @@ fn skipRowBinaryValue(col: schema.Column, ch_ty: []const u8, data: []const u8, p
         .int64, .timestamp => pos += 8,
         .float32 => pos += 4,
         .float64 => pos += 8,
-        .text, .char => {
+        .text, .char, .low_card => {
             if (chTypeEql(inner_ch_ty, "IPv6")) {
                 pos += 16;
             } else if (chTypeEql(inner_ch_ty, "IPv4")) {
@@ -630,7 +630,7 @@ pub fn decodeNativeBlock(allocator: std.mem.Allocator, data: []const u8) !WithHe
                         try col_bufs[ci].fixed_vals.append(allocator, @bitCast(bits));
                         pos += 8;
                     },
-                    .text, .char => unreachable, // handled above
+                    .text, .char, .low_card => unreachable, // handled above
                 }
             }
             } // end else fixed

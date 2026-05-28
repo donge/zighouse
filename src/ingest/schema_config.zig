@@ -205,7 +205,12 @@ pub fn loadFromSlice(allocator: std.mem.Allocator, json_bytes: []const u8) !Sche
             };
 
             const ty = parseColumnType(col_type_str) orelse return error.UnknownColumnType;
-            col.* = .{ .name = col_name, .ty = ty, .ch_type = col_type_str };
+            const lc_inner: schema.ColumnType = if (ty == .low_card) blk: {
+                // Extract inner type from "LowCardinality(<inner>)"
+                const inner_str = col_type_str["LowCardinality(".len .. col_type_str.len - 1];
+                break :blk parseColumnType(inner_str) orelse .text;
+            } else .text;
+            col.* = .{ .name = col_name, .ty = ty, .low_card_inner = lc_inner, .ch_type = col_type_str };
         }
 
         entry.* = .{
@@ -239,7 +244,7 @@ fn parseColumnType(s: []const u8) ?schema.ColumnType {
     if (asciiEql(s, "Float32")) return .float32;
     if (asciiEql(s, "Float64")) return .float64;
     // Extended CH types: map to closest base type (ch_type preserved for wire encoding).
-    if (std.mem.startsWith(u8, s, "LowCardinality(")) return .text;
+    if (std.mem.startsWith(u8, s, "LowCardinality(")) return .low_card;
     if (std.mem.startsWith(u8, s, "DateTime64(")) return .timestamp;
     if (asciiEql(s, "IPv4")) return .text;
     if (asciiEql(s, "IPv6")) return .text;

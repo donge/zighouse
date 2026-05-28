@@ -151,7 +151,7 @@ fn lookupColumn(tbl: *const schema.Table, name: []const u8) ?ColDesc {
         .timestamp => .fixed_timestamp,
         .float32 => .fixed_f32,
         .float64 => .fixed_f64,
-        .text, .char => blk: {
+        .text, .char, .low_card => blk: {
             // Check if this is an Array(String) column
             if (col.ch_type) |ct| {
                 if (std.ascii.startsWithIgnoreCase(ct, "Array(")) break :blk .array_string;

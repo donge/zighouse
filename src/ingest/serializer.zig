@@ -364,7 +364,7 @@ fn schemaToCore(ty: schema.ColumnType, ch_type: ?[]const u8) core.ColumnType {
         .timestamp => .datetime64_ms,
         .float32   => .float64, // upcast to float64
         .float64   => .float64,
-        .text, .char => .string,
+        .text, .char, .low_card => .string,
     };
 }
 
