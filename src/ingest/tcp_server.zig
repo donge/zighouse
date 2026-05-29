@@ -313,7 +313,7 @@ fn skipBlockInfo(rd: TcpReader) !void {
 
 // ── Wire type classification ─────────────────────────────────────────────────
 
-const WireKind = enum { string, fixed1, fixed2, fixed4, fixed8, low_card };
+const WireKind = enum { string, fixed1, fixed2, fixed4, fixed8, low_card, array_str, array_lc_str, array_fixed1, array_fixed4, array_fixed8 };
 
 fn wireKind(ch_type: []const u8) WireKind {
     if (std.ascii.eqlIgnoreCase(ch_type, "Int8") or std.ascii.eqlIgnoreCase(ch_type, "UInt8")) return .fixed1;
@@ -325,6 +325,19 @@ fn wireKind(ch_type: []const u8) WireKind {
     if (std.ascii.startsWithIgnoreCase(ch_type, "DateTime64")) return .fixed8;
     if (std.ascii.startsWithIgnoreCase(ch_type, "DateTime")) return .fixed4;
     if (std.ascii.startsWithIgnoreCase(ch_type, "LowCardinality(")) return .low_card;
+    // Array types
+    if (std.ascii.startsWithIgnoreCase(ch_type, "Array(")) {
+        const inner = ch_type[6 .. ch_type.len - 1]; // strip "Array(" and ")"
+        if (std.ascii.startsWithIgnoreCase(inner, "LowCardinality(")) return .array_lc_str;
+        if (std.ascii.eqlIgnoreCase(inner, "String") or std.ascii.startsWithIgnoreCase(inner, "FixedString(") or
+            std.ascii.startsWithIgnoreCase(inner, "Nullable(")) return .array_str;
+        if (std.ascii.eqlIgnoreCase(inner, "Int8") or std.ascii.eqlIgnoreCase(inner, "UInt8")) return .array_fixed1;
+        if (std.ascii.eqlIgnoreCase(inner, "Int32") or std.ascii.eqlIgnoreCase(inner, "UInt32") or
+            std.ascii.eqlIgnoreCase(inner, "Float32")) return .array_fixed4;
+        if (std.ascii.eqlIgnoreCase(inner, "Int64") or std.ascii.eqlIgnoreCase(inner, "UInt64") or
+            std.ascii.eqlIgnoreCase(inner, "Float64")) return .array_fixed8;
+        return .array_str; // fallback
+    }
     return .string;
 }
 
@@ -419,6 +432,153 @@ fn readClientDataBlock(
             continue;
         }
 
+        // Array types: read offsets then element data, store as \x01-prefixed blob
+        if (kind == .array_str or kind == .array_lc_str or
+            kind == .array_fixed1 or kind == .array_fixed4 or kind == .array_fixed8)
+        {
+            // Array(LC(String)) wire layout (from clickhouse-go block.go):
+            //   WriteStatePrefix: LC state prefix (8 bytes)  [before Encode]
+            //   Encode: offsets (num_rows × uint64) + LC block (flags+dict+keys)
+            // Other Array types:
+            //   Encode: offsets (num_rows × uint64) + element data
+            if (kind == .array_lc_str) {
+                _ = try rd.readInt(u64, .little); // LC state prefix (from WriteStatePrefix)
+            }
+
+            // Wire format: num_rows cumulative end-offsets (uint64), then element data.
+            // offsets[r] = cumulative count of elements through row r (0-indexed).
+            // Row r's elements span [offsets[r-1]..offsets[r]] (with offsets[-1]=0).
+            const offsets = try a.alloc(u64, num_rows);
+            defer a.free(offsets);
+            for (0..num_rows) |oi| {
+                offsets[oi] = try rd.readInt(u64, .little);
+            }
+
+            // Total element count = last offset value
+            const total_elems: u64 = if (num_rows > 0) offsets[num_rows - 1] else 0;
+
+            if (kind == .array_lc_str) {
+                // LC block: flags(8) + dict_count(8) + dict strings + key_count(8) + key_indices
+                const flags = try rd.readInt(u64, .little);
+                const key_type_lc: u2 = @truncate(flags & 0xFF);
+                const dict_count_lc = try rd.readInt(i64, .little);
+                if (dict_count_lc < 0) return error.InvalidLCData;
+
+                // Read dict strings, tracking per-entry lengths
+                var dict_lens = try a.alloc(usize, @intCast(dict_count_lc));
+                defer a.free(dict_lens);
+                var lc_dict_bytes: std.ArrayListUnmanaged(u8) = .empty;
+                defer lc_dict_bytes.deinit(a);
+                for (0..@intCast(dict_count_lc)) |di| {
+                    const ds = try rd.readString(a);
+                    dict_lens[di] = ds.len;
+                    try lc_dict_bytes.appendSlice(a, ds);
+                    a.free(ds);
+                }
+                // Build slice refs into contiguous buffer
+                var lc_dict = try a.alloc([]const u8, @intCast(dict_count_lc));
+                defer a.free(lc_dict);
+                {
+                    var dp: usize = 0;
+                    for (0..@intCast(dict_count_lc)) |di| {
+                        lc_dict[di] = lc_dict_bytes.items[dp .. dp + dict_lens[di]];
+                        dp += dict_lens[di];
+                    }
+                }
+
+                const key_count_lc = try rd.readInt(i64, .little);
+                if (key_count_lc < 0) return error.InvalidLCData;
+                const kw_lc: usize = switch (key_type_lc) { 0 => 1, 1 => 2, 2 => 4, 3 => 8 };
+
+                // Read all key indices and resolve to strings
+                const all_elems = try a.alloc([]const u8, @intCast(key_count_lc));
+                defer a.free(all_elems);
+                for (0..@intCast(key_count_lc)) |ei| {
+                    const key_lc: u64 = switch (kw_lc) {
+                        1 => try rd.readInt(u8, .little),
+                        2 => try rd.readInt(u16, .little),
+                        4 => try rd.readInt(u32, .little),
+                        else => try rd.readInt(u64, .little),
+                    };
+                    all_elems[ei] = if (key_lc < lc_dict.len) lc_dict[key_lc] else "";
+                }
+
+                // Per-row: build \x01-prefixed blob
+                for (0..num_rows) |r| {
+                    const elem_start: usize = if (r == 0) 0 else @intCast(offsets[r - 1]);
+                    const elem_end: usize = @intCast(offsets[r]);
+                    if (col_bufs) |bs| if (buf_idx) |idx| {
+                        var blob: std.ArrayListUnmanaged(u8) = .empty;
+                        defer blob.deinit(a);
+                        try blob.append(a, 0x01);
+                        for (elem_start..elem_end) |ei| {
+                            if (ei > elem_start) try blob.append(a, 0x0c);
+                            try blob.appendSlice(a, all_elems[ei]);
+                        }
+                        const off3 = bs[idx].str_bytes.items.len;
+                        try bs[idx].str_bytes.appendSlice(a, blob.items);
+                        try bs[idx].str_vals.append(a, bs[idx].str_bytes.items[off3 .. off3 + blob.items.len]);
+                    };
+                }
+            } else if (kind == .array_str) {
+                // Array(String): varuint_len + bytes per element
+                // Collect all elements then build per-row blobs
+                var all_strs_list: std.ArrayListUnmanaged([]const u8) = .empty;
+                defer all_strs_list.deinit(a);
+                var str_bytes_buf: std.ArrayListUnmanaged(u8) = .empty;
+                defer str_bytes_buf.deinit(a);
+                var str_lens_list: std.ArrayListUnmanaged(usize) = .empty;
+                defer str_lens_list.deinit(a);
+
+                for (0..@intCast(total_elems)) |_| {
+                    const es = try rd.readString(a);
+                    const slen = es.len;
+                    try str_bytes_buf.appendSlice(a, es);
+                    a.free(es);
+                    try str_lens_list.append(a, slen);
+                }
+                // Build slice refs from buffer + lengths
+                var spos2: usize = 0;
+                for (str_lens_list.items) |slen2| {
+                    try all_strs_list.append(a, str_bytes_buf.items[spos2 .. spos2 + slen2]);
+                    spos2 += slen2;
+                }
+
+                for (0..num_rows) |r| {
+                    const elem_start: usize = if (r == 0) 0 else @intCast(offsets[r - 1]);
+                    const elem_end: usize = @intCast(offsets[r]);
+                    if (col_bufs) |bs| if (buf_idx) |idx| {
+                        var blob: std.ArrayListUnmanaged(u8) = .empty;
+                        defer blob.deinit(a);
+                        try blob.append(a, 0x01);
+                        for (elem_start..elem_end) |ei| {
+                            if (ei > elem_start) try blob.append(a, 0x0c);
+                            try blob.appendSlice(a, all_strs_list.items[ei]);
+                        }
+                        const off5 = bs[idx].str_bytes.items.len;
+                        try bs[idx].str_bytes.appendSlice(a, blob.items);
+                        try bs[idx].str_vals.append(a, bs[idx].str_bytes.items[off5 .. off5 + blob.items.len]);
+                    };
+                }
+            } else {
+                // Array(fixed-width): skip element data
+                const elem_width: usize = switch (kind) { .array_fixed1 => 1, .array_fixed4 => 4, .array_fixed8 => 8, else => 1 };
+                for (0..@intCast(total_elems)) |_| {
+                    var tmp: [8]u8 = undefined;
+                    try rd.readNoEof(tmp[0..elem_width]);
+                }
+                for (0..num_rows) |_| {
+                    if (col_bufs) |bs| if (buf_idx) |idx| {
+                        const blob = "\x01";
+                        const off6 = bs[idx].str_bytes.items.len;
+                        try bs[idx].str_bytes.appendSlice(a, blob);
+                        try bs[idx].str_vals.append(a, bs[idx].str_bytes.items[off6 .. off6 + blob.len]);
+                    };
+                }
+            }
+            continue;
+        }
+
         for (0..num_rows) |_| {
             switch (kind) {
                 .fixed1 => {
@@ -451,6 +611,8 @@ fn readClientDataBlock(
                     }
                 },
                 .low_card => unreachable,
+                // Array types: handled below per-column (not per-row)
+                .array_str, .array_lc_str, .array_fixed1, .array_fixed4, .array_fixed8 => unreachable,
             }
         }
     }

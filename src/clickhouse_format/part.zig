@@ -940,7 +940,7 @@ pub const ColumnReader = struct {
     ///
     /// The callback receives (ctx, [][]const u8) — a slice of strings for each row.
     /// String slices point into `self.data`; array slices are allocated from `arena`.
-    pub fn readArrayStrings(
+     pub fn readArrayStrings(
         self: *ColumnReader,
         n: usize,
         arena: std.mem.Allocator,
@@ -965,33 +965,52 @@ pub const ColumnReader = struct {
             const blob = self.data[self.cursor .. self.cursor + blob_len];
             self.cursor += blob_len;
 
-            // Count elements first to allocate the right size
-            var elem_count: usize = 0;
-            {
-                var off: usize = 0;
-                while (off < blob.len) {
-                    const r = readVarUIntLocal(blob[off..]) orelse return error.UnexpectedEndOfData;
-                    const slen = r[0];
-                    const lb = r[1];
-                    off += lb + slen;
-                    elem_count += 1;
+            // Detect storage format:
+            // Format A (\x01-sentinel): \x01 + elements joined by \x0c
+            // Format B (varuint):       varuint(len) + bytes per element
+            if (blob.len > 0 and blob[0] == 0x01) {
+                // Format A: decode \x01...\x0c... blob
+                const content = blob[1..];
+                if (content.len == 0) {
+                    const elems: [][]const u8 = &.{};
+                    try callback(ctx, elems);
+                } else {
+                    var it = std.mem.splitScalar(u8, content, '\x0c');
+                    var elem_list: std.ArrayListUnmanaged([]const u8) = .empty;
+                    while (it.next()) |elem| {
+                        try elem_list.append(arena, try arena.dupe(u8, elem));
+                    }
+                    try callback(ctx, try elem_list.toOwnedSlice(arena));
                 }
-            }
-            const elems = try arena.alloc([]const u8, elem_count);
-            {
-                var off: usize = 0;
-                var ei: usize = 0;
-                while (off < blob.len) {
-                    const r = readVarUIntLocal(blob[off..]) orelse return error.UnexpectedEndOfData;
-                    const slen = r[0];
-                    const lb = r[1];
-                    off += lb;
-                    elems[ei] = try arena.dupe(u8, blob[off .. off + slen]);
-                    off += slen;
-                    ei += 1;
+            } else {
+                // Format B: varuint(len) + bytes per element
+                var elem_count: usize = 0;
+                {
+                    var off: usize = 0;
+                    while (off < blob.len) {
+                        const r = readVarUIntLocal(blob[off..]) orelse return error.UnexpectedEndOfData;
+                        const slen = r[0];
+                        const lb = r[1];
+                        off += lb + slen;
+                        elem_count += 1;
+                    }
                 }
+                const elems = try arena.alloc([]const u8, elem_count);
+                {
+                    var off: usize = 0;
+                    var ei: usize = 0;
+                    while (off < blob.len) {
+                        const r = readVarUIntLocal(blob[off..]) orelse return error.UnexpectedEndOfData;
+                        const slen = r[0];
+                        const lb = r[1];
+                        off += lb;
+                        elems[ei] = try arena.dupe(u8, blob[off .. off + slen]);
+                        off += slen;
+                        ei += 1;
+                    }
+                }
+                try callback(ctx, elems);
             }
-            try callback(ctx, elems);
         }
         self.rows_read += count;
         return count;
