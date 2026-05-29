@@ -1,1 +1,1 @@
-default	/var/lib/zighouse	1000000000000	2000000000000	0	local
+default	/DATA_DIR	1000000000000	2000000000000	0	local

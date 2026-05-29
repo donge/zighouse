@@ -96,7 +96,7 @@ pub fn parse(allocator: std.mem.Allocator, sql: []const u8) !ParseResult {
         // Could be ')' as a token string — handle edge case
         if (col_name_raw.len == 1 and col_name_raw[0] == ')') break;
         // Skip "PRIMARY KEY (...)" inside column list (ClickHouse syntax variant)
-        if (asciiEql(col_name_raw, "PRIMARY")) {
+        if (std.ascii.eqlIgnoreCase(col_name_raw, "PRIMARY")) {
             try expectKeyword(&tok, "KEY");
             _ = tok.next(); // consume key column
             continue;
@@ -136,62 +136,46 @@ pub fn parse(allocator: std.mem.Allocator, sql: []const u8) !ParseResult {
             errdefer allocator.free(ch_type_owned);
 
             // DateTime64(p[, tz]) → timestamp
-            if (asciiEql(col_type_raw, "DateTime64")) {
-                const col_name_owned = try allocator.dupe(u8, col_name_raw);
-                try cols.append(allocator, .{ .name = col_name_owned, .ty = .timestamp, .ch_type = ch_type_owned });
-                if (tok.peekKeyword("DEFAULT") or tok.peekKeyword("COMMENT") or tok.peekKeyword("CODEC")) tok.skipToColumnDelimiter();
+            if (std.ascii.eqlIgnoreCase(col_type_raw, "DateTime64")) {
+                try appendAndSkip(allocator, &cols, &tok, col_name_raw, .timestamp, ch_type_owned);
                 continue;
             }
             // DateTime(tz) → timestamp
-            if (asciiEql(col_type_raw, "DateTime")) {
-                const col_name_owned = try allocator.dupe(u8, col_name_raw);
-                try cols.append(allocator, .{ .name = col_name_owned, .ty = .timestamp, .ch_type = ch_type_owned });
-                if (tok.peekKeyword("DEFAULT") or tok.peekKeyword("COMMENT") or tok.peekKeyword("CODEC")) tok.skipToColumnDelimiter();
+            if (std.ascii.eqlIgnoreCase(col_type_raw, "DateTime")) {
+                try appendAndSkip(allocator, &cols, &tok, col_name_raw, .timestamp, ch_type_owned);
                 continue;
             }
             // FixedString(N) → text
-            if (asciiEql(col_type_raw, "FixedString")) {
-                const col_name_owned = try allocator.dupe(u8, col_name_raw);
-                try cols.append(allocator, .{ .name = col_name_owned, .ty = .text, .ch_type = ch_type_owned });
-                if (tok.peekKeyword("DEFAULT") or tok.peekKeyword("COMMENT") or tok.peekKeyword("CODEC")) tok.skipToColumnDelimiter();
+            if (std.ascii.eqlIgnoreCase(col_type_raw, "FixedString")) {
+                try appendAndSkip(allocator, &cols, &tok, col_name_raw, .text, ch_type_owned);
                 continue;
             }
             // Array(...) → text (blob)
-            if (asciiEql(col_type_raw, "Array")) {
-                const col_name_owned = try allocator.dupe(u8, col_name_raw);
-                try cols.append(allocator, .{ .name = col_name_owned, .ty = .text, .ch_type = ch_type_owned });
-                if (tok.peekKeyword("DEFAULT") or tok.peekKeyword("COMMENT") or tok.peekKeyword("CODEC")) tok.skipToColumnDelimiter();
+            if (std.ascii.eqlIgnoreCase(col_type_raw, "Array")) {
+                try appendAndSkip(allocator, &cols, &tok, col_name_raw, .text, ch_type_owned);
                 continue;
             }
             // Map(...) → text (blob)
-            if (asciiEql(col_type_raw, "Map")) {
-                const col_name_owned = try allocator.dupe(u8, col_name_raw);
-                try cols.append(allocator, .{ .name = col_name_owned, .ty = .text, .ch_type = ch_type_owned });
-                if (tok.peekKeyword("DEFAULT") or tok.peekKeyword("COMMENT") or tok.peekKeyword("CODEC")) tok.skipToColumnDelimiter();
+            if (std.ascii.eqlIgnoreCase(col_type_raw, "Map")) {
+                try appendAndSkip(allocator, &cols, &tok, col_name_raw, .text, ch_type_owned);
                 continue;
             }
             // Tuple(...) → text (blob)
-            if (asciiEql(col_type_raw, "Tuple")) {
-                const col_name_owned = try allocator.dupe(u8, col_name_raw);
-                try cols.append(allocator, .{ .name = col_name_owned, .ty = .text, .ch_type = ch_type_owned });
-                if (tok.peekKeyword("DEFAULT") or tok.peekKeyword("COMMENT") or tok.peekKeyword("CODEC")) tok.skipToColumnDelimiter();
+            if (std.ascii.eqlIgnoreCase(col_type_raw, "Tuple")) {
+                try appendAndSkip(allocator, &cols, &tok, col_name_raw, .text, ch_type_owned);
                 continue;
             }
             // LowCardinality(T) — keep outer type consistent with RowBinary wire path (.text),
             // but record ch_type for schema fidelity. The LC write/read paths in CompactPart
             // are activated by ty=.low_card; for now we stay on the String path for VALUES INSERT.
-            if (asciiEql(col_type_raw, "LowCardinality")) {
+            if (std.ascii.eqlIgnoreCase(col_type_raw, "LowCardinality")) {
                 const inner_ty = parseColumnType(inner) orelse .text;
-                const col_name_owned = try allocator.dupe(u8, col_name_raw);
-                try cols.append(allocator, .{ .name = col_name_owned, .ty = inner_ty, .ch_type = ch_type_owned });
-                if (tok.peekKeyword("DEFAULT") or tok.peekKeyword("COMMENT") or tok.peekKeyword("CODEC")) tok.skipToColumnDelimiter();
+                try appendAndSkip(allocator, &cols, &tok, col_name_raw, inner_ty, ch_type_owned);
                 continue;
             }
             // Nullable(T) → resolve inner type
             const eff_ty = parseColumnType(inner) orelse return error.UnsupportedColumnType;
-            const col_name_owned = try allocator.dupe(u8, col_name_raw);
-            try cols.append(allocator, .{ .name = col_name_owned, .ty = eff_ty, .ch_type = ch_type_owned });
-            if (tok.peekKeyword("DEFAULT") or tok.peekKeyword("COMMENT") or tok.peekKeyword("CODEC")) tok.skipToColumnDelimiter();
+            try appendAndSkip(allocator, &cols, &tok, col_name_raw, eff_ty, ch_type_owned);
             continue;
         }
 
@@ -219,15 +203,15 @@ pub fn parse(allocator: std.mem.Allocator, sql: []const u8) !ParseResult {
     errdefer if (pk) |p| allocator.free(p);
 
     while (tok.next()) |kw| {
-        if (asciiEql(kw, "ORDER")) {
+        if (std.ascii.eqlIgnoreCase(kw, "ORDER")) {
             const by = tok.next() orelse break;
-            if (!asciiEql(by, "BY")) break;
+            if (!std.ascii.eqlIgnoreCase(by, "BY")) break;
             // ORDER BY can be (col1, col2) or just col1
             if (tok.peekChar('(')) {
                 tok.skip(); // consume '('
                 const first_col = tok.next() orelse break;
                 // ORDER BY tuple() means no meaningful pk — use default (col 0)
-                if (!asciiEql(first_col, "tuple")) {
+                if (!std.ascii.eqlIgnoreCase(first_col, "tuple")) {
                     pk = try allocator.dupe(u8, first_col);
                 }
                 // drain rest of tuple
@@ -238,9 +222,9 @@ pub fn parse(allocator: std.mem.Allocator, sql: []const u8) !ParseResult {
                 const order_col = tok.next() orelse break;
                 pk = try allocator.dupe(u8, order_col);
             }
-        } else if (asciiEql(kw, "PRIMARY")) {
+        } else if (std.ascii.eqlIgnoreCase(kw, "PRIMARY")) {
             const key_kw = tok.next() orelse break;
-            if (!asciiEql(key_kw, "KEY")) break;
+            if (!std.ascii.eqlIgnoreCase(key_kw, "KEY")) break;
             if (tok.peekChar('(')) {
                 tok.skip();
                 const first_col = tok.next() orelse break;
@@ -252,16 +236,16 @@ pub fn parse(allocator: std.mem.Allocator, sql: []const u8) !ParseResult {
                 const pk_col = tok.next() orelse break;
                 if (pk == null) pk = try allocator.dupe(u8, pk_col);
             }
-        } else if (asciiEql(kw, "TTL")) {
+        } else if (std.ascii.eqlIgnoreCase(kw, "TTL")) {
             // TTL <expr> — skip until next known keyword or EOF
             // e.g. TTL ts + INTERVAL 30 DAY or TTL dt + toIntervalMonth(1)
             // We just consume tokens until we see a top-level keyword we recognise.
             while (true) {
                 var tmp = tok;
                 const peek = tmp.next() orelse break;
-                if (asciiEql(peek, "SETTINGS") or asciiEql(peek, "ORDER") or
-                    asciiEql(peek, "PRIMARY") or asciiEql(peek, "PARTITION") or
-                    asciiEql(peek, "SAMPLE") or asciiEql(peek, "INDEX"))
+                if (std.ascii.eqlIgnoreCase(peek, "SETTINGS") or std.ascii.eqlIgnoreCase(peek, "ORDER") or
+                    std.ascii.eqlIgnoreCase(peek, "PRIMARY") or std.ascii.eqlIgnoreCase(peek, "PARTITION") or
+                    std.ascii.eqlIgnoreCase(peek, "SAMPLE") or std.ascii.eqlIgnoreCase(peek, "INDEX"))
                     break;
                 _ = tok.next();
             }
@@ -286,24 +270,24 @@ pub fn parse(allocator: std.mem.Allocator, sql: []const u8) !ParseResult {
 // ── Type mapping ──────────────────────────────────────────────────────────────
 
 fn parseColumnType(s: []const u8) ?schema.ColumnType {
-    if (asciiEql(s, "Int8"))  return .int8;
-    if (asciiEql(s, "Int16")) return .int16;
-    if (asciiEql(s, "Int32")) return .int32;
-    if (asciiEql(s, "Int64")) return .int64;
-    if (asciiEql(s, "UInt16")) return .int16;
-    if (asciiEql(s, "UInt32")) return .int32;
-    if (asciiEql(s, "UInt8"))  return .int8;
-    if (asciiEql(s, "UInt64")) return .int64;
-    if (asciiEql(s, "Date")) return .date;
-    if (asciiEql(s, "Date32")) return .date;
-    if (asciiEql(s, "DateTime")) return .timestamp;
-    if (asciiEql(s, "DateTime64")) return .timestamp;
-    if (asciiEql(s, "String")) return .text;
-    if (asciiEql(s, "FixedString")) return .text;
-    if (asciiEql(s, "IPv4")) return .text;
-    if (asciiEql(s, "IPv6")) return .text;
-    if (asciiEql(s, "Float32")) return .float32;
-    if (asciiEql(s, "Float64")) return .float64;
+    if (std.ascii.eqlIgnoreCase(s, "Int8"))  return .int8;
+    if (std.ascii.eqlIgnoreCase(s, "Int16")) return .int16;
+    if (std.ascii.eqlIgnoreCase(s, "Int32")) return .int32;
+    if (std.ascii.eqlIgnoreCase(s, "Int64")) return .int64;
+    if (std.ascii.eqlIgnoreCase(s, "UInt16")) return .int16;
+    if (std.ascii.eqlIgnoreCase(s, "UInt32")) return .int32;
+    if (std.ascii.eqlIgnoreCase(s, "UInt8"))  return .int8;
+    if (std.ascii.eqlIgnoreCase(s, "UInt64")) return .int64;
+    if (std.ascii.eqlIgnoreCase(s, "Date")) return .date;
+    if (std.ascii.eqlIgnoreCase(s, "Date32")) return .date;
+    if (std.ascii.eqlIgnoreCase(s, "DateTime")) return .timestamp;
+    if (std.ascii.eqlIgnoreCase(s, "DateTime64")) return .timestamp;
+    if (std.ascii.eqlIgnoreCase(s, "String")) return .text;
+    if (std.ascii.eqlIgnoreCase(s, "FixedString")) return .text;
+    if (std.ascii.eqlIgnoreCase(s, "IPv4")) return .text;
+    if (std.ascii.eqlIgnoreCase(s, "IPv6")) return .text;
+    if (std.ascii.eqlIgnoreCase(s, "Float32")) return .float32;
+    if (std.ascii.eqlIgnoreCase(s, "Float64")) return .float64;
     return null;
 }
 
@@ -398,7 +382,7 @@ const Tokenizer = struct {
     fn peekKeyword(self: *Tokenizer, kw: []const u8) bool {
         var tmp = self.*;
         const tok = tmp.next() orelse return false;
-        return asciiEql(tok, kw);
+        return std.ascii.eqlIgnoreCase(tok, kw);
     }
 
     fn skip(self: *Tokenizer) void {
@@ -408,7 +392,7 @@ const Tokenizer = struct {
 
 fn expectKeyword(tok: *Tokenizer, kw: []const u8) !void {
     const t = tok.next() orelse return error.UnexpectedEndOfInput;
-    if (!asciiEql(t, kw)) return error.UnexpectedToken;
+    if (!std.ascii.eqlIgnoreCase(t, kw)) return error.UnexpectedToken;
 }
 
 fn expectChar(tok: *Tokenizer, c: u8) !void {
@@ -416,14 +400,19 @@ fn expectChar(tok: *Tokenizer, c: u8) !void {
     if (t.len != 1 or t[0] != c) return error.UnexpectedToken;
 }
 
-fn asciiEql(a: []const u8, b: []const u8) bool {
-    if (a.len != b.len) return false;
-    for (a, b) |ca, cb| {
-        const la: u8 = if (ca >= 'A' and ca <= 'Z') ca + 32 else ca;
-        const lb: u8 = if (cb >= 'A' and cb <= 'Z') cb + 32 else cb;
-        if (la != lb) return false;
-    }
-    return true;
+/// Append a column to `cols` and skip any trailing column-modifier keywords.
+fn appendAndSkip(
+    allocator: std.mem.Allocator,
+    cols: *std.ArrayListUnmanaged(schema.Column),
+    tok: *Tokenizer,
+    col_name_raw: []const u8,
+    ty: schema.ColumnType,
+    ch_type_owned: ?[]const u8,
+) !void {
+    const col_name_owned = try allocator.dupe(u8, col_name_raw);
+    try cols.append(allocator, .{ .name = col_name_owned, .ty = ty, .ch_type = ch_type_owned });
+    if (tok.peekKeyword("DEFAULT") or tok.peekKeyword("COMMENT") or tok.peekKeyword("CODEC"))
+        tok.skipToColumnDelimiter();
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

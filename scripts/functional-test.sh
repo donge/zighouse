@@ -96,6 +96,13 @@ for sql_file in "$TESTS_DIR"/*.sql; do
     actual_trimmed="$(printf '%s' "$actual_output" | sed 's/[[:space:]]*$//')"
     expected_trimmed="$(sed 's/[[:space:]]*$//' "$ref_file")"
 
+    # Optional normalize hook: pipe both through DATA_DIR-aware sed substitution.
+    normalize_file="$TESTS_DIR/$test_name.normalize"
+    if [[ -f "$normalize_file" ]]; then
+        actual_trimmed="$(printf '%s' "$actual_trimmed" | DATA_DIR="$DATA_DIR" bash "$normalize_file")"
+        expected_trimmed="$(printf '%s' "$expected_trimmed" | DATA_DIR="$DATA_DIR" bash "$normalize_file")"
+    fi
+
     if [[ "$actual_trimmed" == "$expected_trimmed" ]]; then
         echo "PASS  $test_name"
         PASS=$((PASS + 1))

@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Normalize system.disks output: replace the data_dir path with a fixed placeholder.
+sed "s|${DATA_DIR}|/DATA_DIR|g" | sed 's|/var/lib/zighouse|/DATA_DIR|g'

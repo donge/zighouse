@@ -293,14 +293,10 @@ pub const Server = struct {
             try self.handleDescribeSimple(request, out, trimmed);
         } else if (asciiStartsWith(trimmed, "TRUNCATE")) {
             try self.handleTruncate(request, out, trimmed);
-            const empty = try native_block.encodeEmpty(self.allocator);
-            defer self.allocator.free(empty);
-            try sendNativeBlock(self.allocator, request, out, empty);
+            try self.sendEmptyNativeBlock(request, out);
         } else {
             // Other DDL/admin commands (SYSTEM, DROP, ALTER, SET, etc.) — no-op
-            const empty = try native_block.encodeEmpty(self.allocator);
-            defer self.allocator.free(empty);
-            try sendNativeBlock(self.allocator, request, out, empty);
+            try self.sendEmptyNativeBlock(request, out);
         }
     }
 
@@ -310,59 +306,68 @@ pub const Server = struct {
         // Drain body (DDL has no body).
         var body_buf: [64]u8 = undefined;
         _ = request.readerExpectNone(&body_buf);
+        return self.handleCreateCore(request, out, sql, false);
+    }
 
-        var it2 = std.mem.tokenizeAny(u8, sql, " \t\r\n");
-        _ = it2.next(); // CREATE
-        const second2 = it2.next() orelse "";
-        const third2  = it2.next() orelse "";
+    /// Shared CREATE logic.
+    /// native_path=false → respond with HTTP 200 + empty body (TSV/HTTP path).
+    /// native_path=true  → respond with empty Native block (TCP path).
+    fn handleCreateCore(self: *Server, request: *std.http.Server.Request, out: *std.Io.Writer, sql: []const u8, native_path: bool) !void {
+        // Inline helper: send success response appropriate for the protocol.
+        const respondOk = struct {
+            fn f(srv: *Server, req: *std.http.Server.Request, o: *std.Io.Writer, native: bool) !void {
+                if (native) try srv.sendEmptyNativeBlock(req, o)
+                else         try sendResponse(req, o, .ok, "");
+            }
+        }.f;
+
+        var it = std.mem.tokenizeAny(u8, sql, " \t\r\n");
+        _ = it.next(); // CREATE
+        const second = it.next() orelse "";
+        const third  = it.next() orelse "";
 
         // CREATE DATABASE — no-op.
-        if (asciiEql(second2, "DATABASE")) {
-            try sendResponse(request, out, .ok, "");
+        if (std.ascii.eqlIgnoreCase(second, "DATABASE")) {
+            try respondOk(self, request, out, native_path);
             return;
         }
         // CREATE DICTIONARY — no-op (dictionary support is not implemented yet).
-        if (asciiEql(second2, "DICTIONARY")) {
-            try sendResponse(request, out, .ok, "");
+        if (std.ascii.eqlIgnoreCase(second, "DICTIONARY")) {
+            try respondOk(self, request, out, native_path);
             return;
         }
         // CREATE VIEW [OR REPLACE] — store view definition.
-        if (asciiEql(second2, "VIEW") or
-            (asciiEql(second2, "OR") and asciiEql(third2, "REPLACE") and blk: {
+        if (std.ascii.eqlIgnoreCase(second, "VIEW") or
+            (std.ascii.eqlIgnoreCase(second, "OR") and std.ascii.eqlIgnoreCase(third, "REPLACE") and blk: {
                 var it3 = std.mem.tokenizeAny(u8, sql, " \t\r\n");
                 _ = it3.next(); // CREATE
                 _ = it3.next(); // OR
                 _ = it3.next(); // REPLACE
                 const fourth = it3.next() orelse "";
-                break :blk asciiEql(fourth, "VIEW");
+                break :blk std.ascii.eqlIgnoreCase(fourth, "VIEW");
             }))
         {
             // Parse: CREATE [OR REPLACE] VIEW [db.]name AS <select>
-            // Find "VIEW" keyword position
             const view_kw_pos = std.ascii.indexOfIgnoreCase(sql, "VIEW ") orelse {
-                try sendResponse(request, out, .ok, "");
+                try respondOk(self, request, out, native_path);
                 return;
             };
             const after_view = sql[view_kw_pos + 5..];
-            // Find "AS" keyword
             const as_pos = std.ascii.indexOfIgnoreCase(after_view, " AS ") orelse {
-                try sendResponse(request, out, .ok, "");
+                try respondOk(self, request, out, native_path);
                 return;
             };
             const view_full_name = std.mem.trim(u8, after_view[0..as_pos], " \t\r\n");
             const select_sql = std.mem.trim(u8, after_view[as_pos + 4..], " \t\r\n");
-            // view_full_name may be "db.name" or just "name"
             const view_name = if (std.mem.indexOfScalar(u8, view_full_name, '.')) |dot_pos|
                 view_full_name[dot_pos + 1..]
             else
                 view_full_name;
-            // Also store with db prefix
             const key_short = try self.allocator.dupe(u8, view_name);
             errdefer self.allocator.free(key_short);
             const val = try self.allocator.dupe(u8, select_sql);
             errdefer self.allocator.free(val);
             try self.views.put(key_short, val);
-            // Also store with full name (db.name)
             if (std.mem.indexOfScalar(u8, view_full_name, '.') != null) {
                 const key_full = try self.allocator.dupe(u8, view_full_name);
                 errdefer self.allocator.free(key_full);
@@ -370,29 +375,25 @@ pub const Server = struct {
                 errdefer self.allocator.free(val2);
                 try self.views.put(key_full, val2);
             }
-            try sendResponse(request, out, .ok, "");
+            try respondOk(self, request, out, native_path);
             return;
         }
         // CREATE [OR REPLACE] FUNCTION — store function definition.
-        if (asciiEql(second2, "FUNCTION") or
-            (asciiEql(second2, "OR") and asciiEql(third2, "REPLACE")))
+        if (std.ascii.eqlIgnoreCase(second, "FUNCTION") or
+            (std.ascii.eqlIgnoreCase(second, "OR") and std.ascii.eqlIgnoreCase(third, "REPLACE")))
         {
-            // Parse: CREATE [OR REPLACE] FUNCTION name AS (params) -> body
-            // Find FUNCTION keyword
             const fn_kw_pos = std.ascii.indexOfIgnoreCase(sql, "FUNCTION ") orelse {
-                try sendResponse(request, out, .ok, "");
+                try respondOk(self, request, out, native_path);
                 return;
             };
             const after_fn = sql[fn_kw_pos + 9..];
-            // Next token is function name
-            var tok_it2 = std.mem.tokenizeAny(u8, after_fn, " \t\r\n");
-            const fn_name_tok = tok_it2.next() orelse {
-                try sendResponse(request, out, .ok, "");
+            var tok_it = std.mem.tokenizeAny(u8, after_fn, " \t\r\n");
+            const fn_name_tok = tok_it.next() orelse {
+                try respondOk(self, request, out, native_path);
                 return;
             };
-            // Find " AS " keyword
             const as_pos2 = std.ascii.indexOfIgnoreCase(after_fn, " AS ") orelse {
-                try sendResponse(request, out, .ok, "");
+                try respondOk(self, request, out, native_path);
                 return;
             };
             const lambda_body = std.mem.trim(u8, after_fn[as_pos2 + 4..], " \t\r\n");
@@ -401,15 +402,19 @@ pub const Server = struct {
             const fn_val = try self.allocator.dupe(u8, lambda_body);
             errdefer self.allocator.free(fn_val);
             try self.functions.put(fn_key, fn_val);
-            try sendResponse(request, out, .ok, "");
+            try respondOk(self, request, out, native_path);
             return;
         }
         // CREATE MATERIALIZED VIEW — parse and persist.
-        if (asciiEql(second2, "MATERIALIZED") and asciiEql(third2, "VIEW")) {
+        if (std.ascii.eqlIgnoreCase(second, "MATERIALIZED") and std.ascii.eqlIgnoreCase(third, "VIEW")) {
             var parsed_mv = mv_parse.parse(self.allocator, sql) catch |err| {
-                const msg = try std.fmt.allocPrint(self.allocator, "MV parse error: {s}\n", .{@errorName(err)});
-                defer self.allocator.free(msg);
-                try sendResponse(request, out, .bad_request, msg);
+                if (native_path) {
+                    try self.sendEmptyNativeBlock(request, out);
+                } else {
+                    const msg = try std.fmt.allocPrint(self.allocator, "MV parse error: {s}\n", .{@errorName(err)});
+                    defer self.allocator.free(msg);
+                    try sendResponse(request, out, .bad_request, msg);
+                }
                 return;
             };
             // Idempotent: if MV already exists, succeed without overwriting.
@@ -417,14 +422,13 @@ pub const Server = struct {
             if (self.mat_views.contains(mv_key)) {
                 self.allocator.free(mv_key);
                 parsed_mv.deinit();
-                try sendResponse(request, out, .ok, "");
-                return;
+            } else {
+                mv_persist.save(self.io, self.allocator, self.config.data_dir, &parsed_mv) catch |e| {
+                    std.debug.print("mv_persist.save warning: {s}\n", .{@errorName(e)});
+                };
+                try self.mat_views.put(mv_key, parsed_mv);
             }
-            mv_persist.save(self.io, self.allocator, self.config.data_dir, &parsed_mv) catch |err| {
-                std.debug.print("mv_persist.save warning: {s}\n", .{@errorName(err)});
-            };
-            try self.mat_views.put(mv_key, parsed_mv);
-            try sendResponse(request, out, .ok, "");
+            try respondOk(self, request, out, native_path);
             return;
         }
 
@@ -437,21 +441,13 @@ pub const Server = struct {
         defer parsed.deinit();
 
         // Idempotent: if table already exists, succeed without overwriting.
-        if (self.schemas.find(parsed.entry.db, parsed.entry.name) != null) {
-            try sendResponse(request, out, .ok, "");
-            return;
+        if (self.schemas.find(parsed.entry.db, parsed.entry.name) == null) {
+            try self.schemas.addEntry(self.allocator, parsed.entry);
+            const stored = self.schemas.find(parsed.entry.db, parsed.entry.name).?;
+            self.tryPersistSchema(stored.db, stored);
         }
 
-        // Register in memory.
-        try self.schemas.addEntry(self.allocator, parsed.entry);
-
-        // Persist schema.json for this table.
-        const stored = self.schemas.find(parsed.entry.db, parsed.entry.name).?;
-        schema_persist.save(self.io, self.allocator, self.config.data_dir, stored.db, stored) catch |err| {
-            std.debug.print("schema_persist.save warning: {s}\n", .{@errorName(err)});
-        };
-
-        try sendResponse(request, out, .ok, "");
+        try respondOk(self, request, out, native_path);
     }
 
     // ── INSERT handler ─────────────────────────────────────────────────────────
@@ -496,7 +492,7 @@ pub const Server = struct {
         } else if (insert_info.with_names_and_types) {
             try self.handleInsertWithHeader(request, out, insert_info.db_table, body);
         } else if (insert_info.csv_fmt) {
-            try self.handleInsertCSV(request, out, insert_info.db_table, body);
+            try self.handleInsertJSONEachRow(request, out, insert_info.db_table, body);
         } else if (insert_info.json_each_row_fmt) {
             try self.handleInsertJSONEachRow(request, out, insert_info.db_table, body);
         } else {
@@ -557,9 +553,7 @@ pub const Server = struct {
         defer decoded.deinit(self.allocator);
 
         if (decoded.table.columns.len == 0) {
-            const empty = try native_block.encodeEmpty(self.allocator);
-            defer self.allocator.free(empty);
-            try sendNativeBlock(self.allocator, request, out, empty);
+            try self.sendEmptyNativeBlock(request, out);
             return;
         }
 
@@ -575,15 +569,11 @@ pub const Server = struct {
             };
             try self.schemas.addEntry(self.allocator, new_entry);
             const stored = self.schemas.find(db_table.db, db_table.table).?;
-            schema_persist.save(self.io, self.allocator, self.config.data_dir, stored.db, stored) catch |err| {
-                std.debug.print("schema_persist.save warning: {s}\n", .{@errorName(err)});
-            };
+            self.tryPersistSchema(stored.db, stored);
             try self.writePart(db_table, stored, decoded.decoder.columns);
         }
 
-        const empty = try native_block.encodeEmpty(self.allocator);
-        defer self.allocator.free(empty);
-        try sendNativeBlock(self.allocator, request, out, empty);
+        try self.sendEmptyNativeBlock(request, out);
     }
 
     fn handleInsertWithHeader(
@@ -623,9 +613,7 @@ pub const Server = struct {
             try self.schemas.addEntry(self.allocator, new_entry);
             const stored = self.schemas.find(db_table.db, db_table.table).?;
             // Persist schema.json
-            schema_persist.save(self.io, self.allocator, self.config.data_dir, stored.db, stored) catch |err| {
-                std.debug.print("schema_persist.save warning: {s}\n", .{@errorName(err)});
-            };
+            self.tryPersistSchema(stored.db, stored);
             try self.writePart(db_table, stored, decoded.decoder.columns);
         }
 
@@ -634,37 +622,7 @@ pub const Server = struct {
 
     /// INSERT FORMAT CSV — comma-separated values, one row per line.
     /// Requires table schema to be pre-registered (no auto-inference).
-    fn handleInsertCSV(
-        self: *Server,
-        request: *std.http.Server.Request,
-        out: *std.Io.Writer,
-        db_table: DbTable,
-        body: []const u8,
-    ) !void {
-        const entry = self.schemas.find(db_table.db, db_table.table) orelse {
-            try sendResponse(request, out, .bad_request,
-                "Unknown table; use CREATE TABLE or RowBinaryWithNamesAndTypes first\n");
-            return;
-        };
-        const cols = try row_binary_decoder.ColumnBuffer.initAll(self.allocator, entry.table);
-        defer row_binary_decoder.ColumnBuffer.deinitAll(self.allocator, cols);
-
-
-        var line_it = std.mem.splitScalar(u8, body, '\n');
-        while (line_it.next()) |line| {
-            const trimmed = std.mem.trim(u8, line, " \t\r");
-            if (trimmed.len == 0 or trimmed[0] != '{') continue;
-            // For each column in schema order, extract the value from the JSON object.
-            for (entry.table.columns, cols) |col, *buf| {
-                const val = extractJsonField(trimmed, col.name) orelse "";
-                try appendParsedField(self.allocator, col, val, buf);
-            }
-        }
-        try self.writePart(db_table, entry, cols);
-        try sendResponse(request, out, .ok, "");
-    }
-
-    /// INSERT FORMAT JSONEachRow — one JSON object per line.
+    /// INSERT FORMAT CSV / JSONEachRow — one JSON object per line.
     fn handleInsertJSONEachRow(
         self: *Server,
         request: *std.http.Server.Request,
@@ -746,7 +704,7 @@ pub const Server = struct {
         var it = std.mem.tokenizeAny(u8, sql, " \t\r\n;");
         _ = it.next(); // "TRUNCATE"
         const maybe_table_kw = it.next() orelse return;
-        const tbl_token = if (asciiEql(maybe_table_kw, "TABLE")) (it.next() orelse return) else maybe_table_kw;
+        const tbl_token = if (std.ascii.eqlIgnoreCase(maybe_table_kw, "TABLE")) (it.next() orelse return) else maybe_table_kw;
         // Strip trailing semicolons
         const tbl_name = std.mem.trimEnd(u8, tbl_token, ";");
         const dbt = splitDbTable(tbl_name);
@@ -788,7 +746,7 @@ pub const Server = struct {
         _ = it.next(); // "DROP"
         _ = it.next(); // "TABLE"
         const next_tok = it.next() orelse return;
-        const tbl_token: []const u8 = if (asciiEql(next_tok, "IF")) blk: {
+        const tbl_token: []const u8 = if (std.ascii.eqlIgnoreCase(next_tok, "IF")) blk: {
             _ = it.next(); // "EXISTS"
             break :blk it.next() orelse return;
         } else next_tok;
@@ -888,16 +846,12 @@ pub const Server = struct {
         _ = it.next(); // DESCRIBE
         _ = it.next(); // TABLE
         const tbl_name = it.next() orelse {
-            const empty = try native_block.encodeEmpty(self.allocator);
-            defer self.allocator.free(empty);
-            try sendNativeBlock(self.allocator, request, out, empty);
+            try self.sendEmptyNativeBlock(request, out);
             return;
         };
         const db_table = splitDbTable(tbl_name);
         const entry = self.schemas.find(db_table.db, db_table.table) orelse {
-            const empty = try native_block.encodeEmpty(self.allocator);
-            defer self.allocator.free(empty);
-            try sendNativeBlock(self.allocator, request, out, empty);
+            try self.sendEmptyNativeBlock(request, out);
             return;
         };
 
@@ -952,12 +906,7 @@ pub const Server = struct {
             return;
         }
         // Generic SELECT: route through normal path (body already consumed).
-        try self.handleSelectNoDrain(request, out, sql, want_tsv);
-    }
-
-    /// SELECT that doesn't drain the body (already consumed by handleRequest).
-    fn handleSelectNoDrain(self: *Server, request: *std.http.Server.Request, out: *std.Io.Writer, sql: []const u8, want_tsv: bool) !void {
-        return self.handleSelectNoDrainEx(request, out, sql, want_tsv, true);
+        try self.handleSelectNoDrainEx(request, out, sql, want_tsv, true);
     }
 
     fn handleSelectNoDrainEx(self: *Server, request: *std.http.Server.Request, out: *std.Io.Writer, sql: []const u8, want_tsv: bool, skip_header: bool) !void {
@@ -965,20 +914,9 @@ pub const Server = struct {
         generic_executor.udf_registry = &self.functions;
 
         // Detect and strip FORMAT JSON — switch to JSON output mode.
-        var want_json = false;
-        const sql_stripped: []const u8 = blk: {
-            // Use case-insensitive search to detect FORMAT JSON variants.
-            if (std.ascii.indexOfIgnoreCase(sql, "FORMAT JSON") != null or
-                std.ascii.indexOfIgnoreCase(sql, "FORMAT JSONCompact") != null or
-                std.ascii.indexOfIgnoreCase(sql, "FORMAT JSONEachRow") != null)
-            {
-                want_json = true;
-                break :blk stripFormatClause(sql);
-            }
-            break :blk sql;
-        };
-        _ = sql_stripped; // used below via `sql` reassignment
-        // Reassign for convenience: use stripped SQL for all further processing.
+        const want_json = std.ascii.indexOfIgnoreCase(sql, "FORMAT JSON") != null or
+            std.ascii.indexOfIgnoreCase(sql, "FORMAT JSONCompact") != null or
+            std.ascii.indexOfIgnoreCase(sql, "FORMAT JSONEachRow") != null;
         const sql_clean_input: []const u8 = if (want_json) stripFormatClause(sql) else sql;
 
         // Fast path: SELECT 1
@@ -1000,15 +938,24 @@ pub const Server = struct {
 
         // Fast path: system.disks — return one stub row (large free space, no cleanup triggered)
         if (std.ascii.indexOfIgnoreCase(sql_clean_input, "system.disks") != null) {
+            const data_dir = self.config.data_dir;
             if (want_json) {
                 // ClickHouse FORMAT JSON with fields tequila expects
-                try sendResponse(request, out, .ok,
-                    \\{"meta":[{"name":"name","type":"String"},{"name":"path","type":"String"},{"name":"free_space","type":"UInt64"},{"name":"total_space","type":"UInt64"},{"name":"keep_free_space","type":"UInt64"},{"name":"type","type":"String"}],"data":[{"name":"default","path":"/var/lib/zighouse","free_space":1000000000000,"total_space":2000000000000,"keep_free_space":0,"type":"local"}],"rows":1,"statistics":{"elapsed":0.001,"rows_read":1,"bytes_read":0}}
-                );
+                const json = try std.fmt.allocPrint(self.allocator,
+                    \\{{"meta":[{{"name":"name","type":"String"}},{{"name":"path","type":"String"}},{{"name":"free_space","type":"UInt64"}},{{"name":"total_space","type":"UInt64"}},{{"name":"keep_free_space","type":"UInt64"}},{{"name":"type","type":"String"}}],"data":[{{"name":"default","path":"{s}","free_space":1000000000000,"total_space":2000000000000,"keep_free_space":0,"type":"local"}}],"rows":1,"statistics":{{"elapsed":0.001,"rows_read":1,"bytes_read":0}}}}
+                , .{data_dir});
+                defer self.allocator.free(json);
+                try sendResponse(request, out, .ok, json);
             } else {
                 // Always return the full row so any column projection in the SQL still gets valid data.
-                const body = "name\tpath\tfree_space\ttotal_space\tkeep_free_space\ttype\ndefault\t/var/lib/zighouse\t1000000000000\t2000000000000\t0\tlocal\n";
-                const body_no_hdr = "default\t/var/lib/zighouse\t1000000000000\t2000000000000\t0\tlocal\n";
+                const body = try std.fmt.allocPrint(self.allocator,
+                    "name\tpath\tfree_space\ttotal_space\tkeep_free_space\ttype\ndefault\t{s}\t1000000000000\t2000000000000\t0\tlocal\n",
+                    .{data_dir});
+                defer self.allocator.free(body);
+                const body_no_hdr = try std.fmt.allocPrint(self.allocator,
+                    "default\t{s}\t1000000000000\t2000000000000\t0\tlocal\n",
+                    .{data_dir});
+                defer self.allocator.free(body_no_hdr);
                 try sendResponse(request, out, .ok, if (skip_header) body_no_hdr else body);
             }
             return;
@@ -1023,9 +970,7 @@ pub const Server = struct {
             } else if (want_tsv) {
                 try sendResponse(request, out, .ok, if (skip_header) "" else "table\tpartition\tdata_compressed_bytes\tdisk_name\n");
             } else {
-                const empty = try native_block.encodeEmpty(self.allocator);
-                defer self.allocator.free(empty);
-                try sendNativeBlock(self.allocator, request, out, empty);
+                try self.sendEmptyNativeBlock(request, out);
             }
             return;
         }
@@ -1039,9 +984,7 @@ pub const Server = struct {
             } else if (want_tsv) {
                 try sendResponse(request, out, .ok, "");
             } else {
-                const empty = try native_block.encodeEmpty(self.allocator);
-                defer self.allocator.free(empty);
-                try sendNativeBlock(self.allocator, request, out, empty);
+                try self.sendEmptyNativeBlock(request, out);
             }
             return;
         }
@@ -1055,9 +998,7 @@ pub const Server = struct {
             } else if (want_tsv) {
                 try sendResponse(request, out, .ok, "");
             } else {
-                const empty = try native_block.encodeEmpty(self.allocator);
-                defer self.allocator.free(empty);
-                try sendNativeBlock(self.allocator, request, out, empty);
+                try self.sendEmptyNativeBlock(request, out);
             }
             return;
         }
@@ -1189,9 +1130,7 @@ pub const Server = struct {
                 if (want_tsv) {
                     try sendResponse(request, out, .ok, "");
                 } else {
-                    const nb = try native_block.encodeEmpty(self.allocator);
-                    defer self.allocator.free(nb);
-                    try sendNativeBlock(self.allocator, request, out, nb);
+                    try self.sendEmptyNativeBlock(request, out);
                 }
             }
             return;
@@ -1226,9 +1165,7 @@ pub const Server = struct {
                 if (want_tsv) {
                     try sendResponse(request, out, .ok, "");
                 } else {
-                    const nb = try native_block.encodeEmpty(self.allocator);
-                    defer self.allocator.free(nb);
-                    try sendNativeBlock(self.allocator, request, out, nb);
+                    try self.sendEmptyNativeBlock(request, out);
                 }
             }
             return;
@@ -1400,133 +1337,7 @@ pub const Server = struct {
     }
 
     fn handleCreateSimple(self: *Server, request: *std.http.Server.Request, out: *std.Io.Writer, sql: []const u8) !void {
-        // Classify by second (and possibly third) token.
-        var it = std.mem.tokenizeAny(u8, sql, " \t\r\n");
-        _ = it.next(); // CREATE
-        const second = it.next() orelse "";
-        const third  = it.next() orelse "";
-
-        // CREATE DATABASE — no-op.
-        if (asciiEql(second, "DATABASE")) {
-            const empty = try native_block.encodeEmpty(self.allocator);
-            defer self.allocator.free(empty);
-            try sendNativeBlock(self.allocator, request, out, empty);
-            return;
-        }
-
-        // CREATE DICTIONARY — no-op.
-        if (asciiEql(second, "DICTIONARY")) {
-            const empty = try native_block.encodeEmpty(self.allocator);
-            defer self.allocator.free(empty);
-            try sendNativeBlock(self.allocator, request, out, empty);
-            return;
-        }
-
-        // CREATE VIEW / CREATE OR REPLACE VIEW — store view definition.
-        if (asciiEql(second, "VIEW") or
-            (asciiEql(second, "OR") and asciiEql(third, "REPLACE"))) {
-            const view_kw_pos = std.ascii.indexOfIgnoreCase(sql, "VIEW ") orelse {
-                const empty = try native_block.encodeEmpty(self.allocator);
-                defer self.allocator.free(empty);
-                try sendNativeBlock(self.allocator, request, out, empty);
-                return;
-            };
-            const after_view = sql[view_kw_pos + 5..];
-            const as_pos2 = std.ascii.indexOfIgnoreCase(after_view, " AS ") orelse {
-                const empty = try native_block.encodeEmpty(self.allocator);
-                defer self.allocator.free(empty);
-                try sendNativeBlock(self.allocator, request, out, empty);
-                return;
-            };
-            const view_full_name = std.mem.trim(u8, after_view[0..as_pos2], " \t\r\n");
-            const select_sql2 = std.mem.trim(u8, after_view[as_pos2 + 4..], " \t\r\n");
-            const view_name2 = if (std.mem.indexOfScalar(u8, view_full_name, '.')) |dot_pos|
-                view_full_name[dot_pos + 1..] else view_full_name;
-            const key_s = try self.allocator.dupe(u8, view_name2);
-            const val_s = try self.allocator.dupe(u8, select_sql2);
-            try self.views.put(key_s, val_s);
-            if (std.mem.indexOfScalar(u8, view_full_name, '.') != null) {
-                const key_f = try self.allocator.dupe(u8, view_full_name);
-                const val_f = try self.allocator.dupe(u8, select_sql2);
-                try self.views.put(key_f, val_f);
-            }
-            const empty = try native_block.encodeEmpty(self.allocator);
-            defer self.allocator.free(empty);
-            try sendNativeBlock(self.allocator, request, out, empty);
-            return;
-        }
-
-        // CREATE OR REPLACE FUNCTION / CREATE FUNCTION — store definition.
-        if (asciiEql(second, "FUNCTION") or
-            (asciiEql(second, "OR") and asciiEql(third, "REPLACE")))
-        {
-            const fn_kw_pos2 = std.ascii.indexOfIgnoreCase(sql, "FUNCTION ") orelse {
-                const empty = try native_block.encodeEmpty(self.allocator);
-                defer self.allocator.free(empty);
-                try sendNativeBlock(self.allocator, request, out, empty);
-                return;
-            };
-            const after_fn2 = sql[fn_kw_pos2 + 9..];
-            var tok_fn2 = std.mem.tokenizeAny(u8, after_fn2, " \t\r\n");
-            if (tok_fn2.next()) |fn_name2| {
-                if (std.ascii.indexOfIgnoreCase(after_fn2, " AS ")) |as_pos3| {
-                    const lambda_body2 = std.mem.trim(u8, after_fn2[as_pos3 + 4..], " \t\r\n");
-                    const fn_key2 = try self.allocator.dupe(u8, fn_name2);
-                    errdefer self.allocator.free(fn_key2);
-                    const fn_val2 = try self.allocator.dupe(u8, lambda_body2);
-                    errdefer self.allocator.free(fn_val2);
-                    try self.functions.put(fn_key2, fn_val2);
-                }
-            }
-            const empty = try native_block.encodeEmpty(self.allocator);
-            defer self.allocator.free(empty);
-            try sendNativeBlock(self.allocator, request, out, empty);
-            return;
-        }
-
-        // CREATE MATERIALIZED VIEW — parse and persist (Simple/Native path).
-        if (asciiEql(second, "MATERIALIZED") and asciiEql(third, "VIEW")) {
-            var parsed_mv2 = mv_parse.parse(self.allocator, sql) catch {
-                const empty = try native_block.encodeEmpty(self.allocator);
-                defer self.allocator.free(empty);
-                try sendNativeBlock(self.allocator, request, out, empty);
-                return;
-            };
-            const mv_key2 = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ parsed_mv2.db, parsed_mv2.mv_name });
-            if (self.mat_views.contains(mv_key2)) {
-                self.allocator.free(mv_key2);
-                parsed_mv2.deinit();
-            } else {
-                mv_persist.save(self.io, self.allocator, self.config.data_dir, &parsed_mv2) catch |err| {
-                    std.debug.print("mv_persist.save warning: {s}\n", .{@errorName(err)});
-                };
-                try self.mat_views.put(mv_key2, parsed_mv2);
-            }
-            const empty = try native_block.encodeEmpty(self.allocator);
-            defer self.allocator.free(empty);
-            try sendNativeBlock(self.allocator, request, out, empty);
-            return;
-        }
-
-        var parsed = ddl_parser.parse(self.allocator, sql) catch |err| {
-            const msg = try std.fmt.allocPrint(self.allocator, "DDL parse error: {s}\n", .{@errorName(err)});
-            defer self.allocator.free(msg);
-            try sendResponse(request, out, .bad_request, msg);
-            return;
-        };
-        defer parsed.deinit();
-
-        if (self.schemas.find(parsed.entry.db, parsed.entry.name) == null) {
-            try self.schemas.addEntry(self.allocator, parsed.entry);
-            const stored = self.schemas.find(parsed.entry.db, parsed.entry.name).?;
-            schema_persist.save(self.io, self.allocator, self.config.data_dir, stored.db, stored) catch |err| {
-                std.debug.print("schema_persist.save warning: {s}\n", .{@errorName(err)});
-            };
-        }
-
-        const empty = try native_block.encodeEmpty(self.allocator);
-        defer self.allocator.free(empty);
-        try sendNativeBlock(self.allocator, request, out, empty);
+        return self.handleCreateCore(request, out, sql, true);
     }
 
     /// INSERT handler for body-SQL mode.
@@ -1545,9 +1356,7 @@ pub const Server = struct {
         }
 
         if (data.len == 0) {
-            const empty = try native_block.encodeEmpty(self.allocator);
-            defer self.allocator.free(empty);
-            try sendNativeBlock(self.allocator, request, out, empty);
+            try self.sendEmptyNativeBlock(request, out);
             return;
         }
 
@@ -1862,9 +1671,7 @@ pub const Server = struct {
         defer decoded.deinit(self.allocator);
 
         if (decoded.table.columns.len == 0) {
-            const empty = try native_block.encodeEmpty(self.allocator);
-            defer self.allocator.free(empty);
-            try sendNativeBlock(self.allocator, request, out, empty);
+            try self.sendEmptyNativeBlock(request, out);
             return;
         }
 
@@ -1879,15 +1686,11 @@ pub const Server = struct {
             };
             try self.schemas.addEntry(self.allocator, new_entry);
             const stored = self.schemas.find(db_table.db, db_table.table).?;
-            schema_persist.save(self.io, self.allocator, self.config.data_dir, stored.db, stored) catch |err| {
-                std.debug.print("schema_persist.save warning: {s}\n", .{@errorName(err)});
-            };
+            self.tryPersistSchema(stored.db, stored);
             try self.writePart(db_table, stored, decoded.decoder.columns);
         }
 
-        const empty = try native_block.encodeEmpty(self.allocator);
-        defer self.allocator.free(empty);
-        try sendNativeBlock(self.allocator, request, out, empty);
+        try self.sendEmptyNativeBlock(request, out);
     }
 
     fn handleInsertWithHeaderData(
@@ -1922,15 +1725,11 @@ pub const Server = struct {
             };
             try self.schemas.addEntry(self.allocator, new_entry);
             const stored = self.schemas.find(db_table.db, db_table.table).?;
-            schema_persist.save(self.io, self.allocator, self.config.data_dir, stored.db, stored) catch |err| {
-                std.debug.print("schema_persist.save warning: {s}\n", .{@errorName(err)});
-            };
+            self.tryPersistSchema(stored.db, stored);
             try self.writePart(db_table, stored, decoded.decoder.columns);
         }
 
-        const empty = try native_block.encodeEmpty(self.allocator);
-        defer self.allocator.free(empty);
-        try sendNativeBlock(self.allocator, request, out, empty);
+        try self.sendEmptyNativeBlock(request, out);
     }
 
     fn handleInsertRowBinaryData(
@@ -1959,16 +1758,26 @@ pub const Server = struct {
         };
 
         if (n_rows == 0) {
-            const empty = try native_block.encodeEmpty(self.allocator);
-            defer self.allocator.free(empty);
-            try sendNativeBlock(self.allocator, request, out, empty);
+            try self.sendEmptyNativeBlock(request, out);
             return;
         }
 
         try self.writePart(db_table, entry, dec.columns);
+        try self.sendEmptyNativeBlock(request, out);
+    }
+
+    /// Send an empty Native-protocol block and flush.
+    fn sendEmptyNativeBlock(self: *Server, request: *std.http.Server.Request, out: *std.Io.Writer) !void {
         const empty = try native_block.encodeEmpty(self.allocator);
         defer self.allocator.free(empty);
         try sendNativeBlock(self.allocator, request, out, empty);
+    }
+
+    /// Persist schema to disk, logging any error as a warning.
+    fn tryPersistSchema(self: *Server, db: []const u8, stored: *const schema_config.TableEntry) void {
+        schema_persist.save(self.io, self.allocator, self.config.data_dir, db, stored) catch |err| {
+            std.debug.print("schema_persist.save warning: {s}\n", .{@errorName(err)});
+        };
     }
 };
 
@@ -2759,8 +2568,8 @@ fn parseInsertTarget(q: []const u8) ?InsertInfo {
     const t0 = it.next() orelse return null;
     const t1 = it.next() orelse return null;
     const t2 = it.next() orelse return null;
-    if (!asciiEql(t0, "INSERT")) return null;
-    if (!asciiEql(t1, "INTO")) return null;
+    if (!std.ascii.eqlIgnoreCase(t0, "INSERT")) return null;
+    if (!std.ascii.eqlIgnoreCase(t1, "INTO")) return null;
     // t2 is the table name (possibly db.table)
     const db_table = splitDbTable(t2);
     // Skip optional column list in parentheses: (col1, col2, ...)
@@ -2768,7 +2577,7 @@ fn parseInsertTarget(q: []const u8) ?InsertInfo {
     var found_format = false;
     var fmt: []const u8 = "";
     while (it.next()) |tok| {
-        if (asciiEql(tok, "FORMAT")) {
+        if (std.ascii.eqlIgnoreCase(tok, "FORMAT")) {
             fmt = it.next() orelse return null;
             found_format = true;
             break;
@@ -2786,11 +2595,11 @@ fn parseInsertTarget(q: []const u8) ?InsertInfo {
             .values_fmt = true,
         };
     }
-    const with_header = asciiEql(fmt, "RowBinaryWithNamesAndTypes");
-    const native_fmt = asciiEql(fmt, "Native");
-    const csv_fmt = asciiEql(fmt, "CSV") or asciiEql(fmt, "CSVWithNames");
-    const json_fmt = asciiEql(fmt, "JSONEachRow") or asciiEql(fmt, "NDJSON");
-    if (!with_header and !asciiEql(fmt, "RowBinary") and !native_fmt and !csv_fmt and !json_fmt) return null;
+    const with_header = std.ascii.eqlIgnoreCase(fmt, "RowBinaryWithNamesAndTypes");
+    const native_fmt = std.ascii.eqlIgnoreCase(fmt, "Native");
+    const csv_fmt = std.ascii.eqlIgnoreCase(fmt, "CSV") or std.ascii.eqlIgnoreCase(fmt, "CSVWithNames");
+    const json_fmt = std.ascii.eqlIgnoreCase(fmt, "JSONEachRow") or std.ascii.eqlIgnoreCase(fmt, "NDJSON");
+    if (!with_header and !std.ascii.eqlIgnoreCase(fmt, "RowBinary") and !native_fmt and !csv_fmt and !json_fmt) return null;
     return .{
         .db_table = db_table,
         .with_names_and_types = with_header,
@@ -2827,15 +2636,6 @@ fn schemaTypeToChType(ty: schema.ColumnType) []const u8 {
     };
 }
 
-fn asciiEql(a: []const u8, b: []const u8) bool {
-    if (a.len != b.len) return false;
-    for (a, b) |ca, cb| {
-        const la: u8 = if (ca >= 'A' and ca <= 'Z') ca + 32 else ca;
-        const lb: u8 = if (cb >= 'A' and cb <= 'Z') cb + 32 else cb;
-        if (la != lb) return false;
-    }
-    return true;
-}
 
 /// Parser for SQL VALUES INSERT statements.
 const SqlValuesParser = struct {
@@ -2928,7 +2728,7 @@ fn isValuesWs(c: u8) bool {
 
 fn asciiStartsWith(s: []const u8, prefix: []const u8) bool {
     if (s.len < prefix.len) return false;
-    return asciiEql(s[0..prefix.len], prefix);
+    return std.ascii.eqlIgnoreCase(s[0..prefix.len], prefix);
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
