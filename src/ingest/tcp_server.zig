@@ -363,7 +363,7 @@ fn readClientDataBlock(
                     if (col_bufs) |bs| if (buf_idx) |idx| try bs[idx].fixed_vals.append(a, @intCast(v));
                 },
                 .fixed4 => {
-                    const v = try rd.readInt(i32, .little);
+                    const v = try rd.readInt(u32, .little);
                     if (col_bufs) |bs| if (buf_idx) |idx| try bs[idx].fixed_vals.append(a, @intCast(v));
                 },
                 .fixed8 => {
@@ -803,6 +803,12 @@ pub fn listenAndServe(ctx: *ServerCtx, port: u16) !void {
             std.debug.print("tcp: accept error: {s}\n", .{@errorName(err)});
             continue;
         };
-        handleConnection(ctx, stream);
+        // Spawn a thread per connection so accept loop is never blocked.
+        const t = std.Thread.spawn(.{}, handleConnection, .{ ctx, stream }) catch |err| {
+            std.debug.print("tcp: spawn error: {s}\n", .{@errorName(err)});
+            stream.close(ctx.io);
+            continue;
+        };
+        t.detach();
     }
 }

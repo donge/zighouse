@@ -3317,6 +3317,7 @@ const func_evals = [_]FuncEval{
     .{ .name = "ch_tostring",                 .kind = .str_tostring     },
     .{ .name = "todatetime",                  .kind = .fn_to_datetime   },
     .{ .name = "todatetime64",                .kind = .fn_to_datetime   },
+    .{ .name = "tounixtimestamp",             .kind = .fn_to_datetime   },
     .{ .name = "ch_array_element",            .kind = .fn_array_element },
     .{ .name = "now",                         .kind = .fn_now           },
     .{ .name = "to_days",                     .kind = .fn_to_days       },

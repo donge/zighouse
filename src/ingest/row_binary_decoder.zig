@@ -174,12 +174,21 @@ pub const RowBinaryDecoder = struct {
                         pos += 4;
                     },
                     .int64, .timestamp => {
-                        if (pos + 8 > data.len) return error.UnexpectedEndOfData;
-                        // UInt64 / Int64: both stored as raw i64 bits (bitCast).
-                        // The query layer uses Value.uint64 for UInt columns.
-                        const v = std.mem.readInt(u64, data[pos..][0..8], .little);
-                        try buf.fixed_vals.append(self.allocator, @bitCast(v));
-                        pos += 8;
+                        // DateTime64 is 8 bytes; plain DateTime is 4 bytes (UInt32).
+                        const is_dt32 = std.ascii.eqlIgnoreCase(ch_ty, "DateTime");
+                        if (is_dt32) {
+                            if (pos + 4 > data.len) return error.UnexpectedEndOfData;
+                            const v: i64 = @as(i64, std.mem.readInt(u32, data[pos..][0..4], .little));
+                            try buf.fixed_vals.append(self.allocator, v);
+                            pos += 4;
+                        } else {
+                            if (pos + 8 > data.len) return error.UnexpectedEndOfData;
+                            // UInt64 / Int64: both stored as raw i64 bits (bitCast).
+                            // The query layer uses Value.uint64 for UInt columns.
+                            const v = std.mem.readInt(u64, data[pos..][0..8], .little);
+                            try buf.fixed_vals.append(self.allocator, @bitCast(v));
+                            pos += 8;
+                        }
                     },
                     // Float32: 4 bytes IEEE 754. Store raw bits sign-extended to i64.
                     .float32 => {
@@ -260,7 +269,10 @@ fn skipRowBinaryValue(col: schema.Column, ch_ty: []const u8, data: []const u8, p
         .int8  => pos += 1,
         .int16 => pos += 2,
         .int32, .date => pos += 4,
-        .int64, .timestamp => pos += 8,
+        .int64, .timestamp => {
+            const is_dt32 = std.ascii.eqlIgnoreCase(inner_ch_ty, "DateTime");
+            pos += if (is_dt32) 4 else 8;
+        },
         .float32 => pos += 4,
         .float64 => pos += 8,
         .text, .char, .low_card => {

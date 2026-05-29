@@ -227,12 +227,14 @@ pub fn csvToResultSet(
         if (is_array[ci]) {
             col_types[ci] = .array_string;
         } else if (is_int[ci]) {
-            // Timestamp heuristic: large non-negative ints are DateTime64
+            // Timestamp heuristic: large non-negative ints
             const fv = if (num_rows > 0) std.fmt.parseInt(i64, cell_data[ci][0], 10) catch 0 else 0;
             if (!has_neg[ci] and fv >= 1_000_000_000_000) {
                 col_types[ci] = .datetime64_ms;
-            } else if (!has_neg[ci] and fv >= 1_000_000_000) {
-                col_types[ci] = .datetime64_ms; // seconds → will scale below
+            } else if (!has_neg[ci] and fv >= 1_000_000_000 and fv < 4_000_000_000) {
+                // Unix timestamp seconds (e.g. toUnixTimestamp result) → UInt32
+                col_types[ci] = .uint64;
+                ch_type_overrides[ci] = "UInt32";
             } else if (has_neg[ci]) {
                 col_types[ci] = .int64;
             } else {
