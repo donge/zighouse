@@ -1073,13 +1073,24 @@ pub const CompactOpenedPart = struct {
         // So total physical blocks = n_gran * n_columns.
         const n_cols = table.columns.len;
 
-        // col_substream_start[ci] = ci (one block per column per granule).
+        // Compute actual physical block count per granule and per-column start.
+        // String/char: 1 physical block (combined sizes+data)
+        // LowCardinality: 2 physical blocks (dict + index)
+        // Fixed-width: 1 physical block
+        // This must match the write-side physical block emission in CompactWriter.finalize().
         const col_ss = try allocator.alloc(usize, n_cols);
         errdefer allocator.free(col_ss);
-        for (0..n_cols) |ci| col_ss[ci] = ci;
+        var total_substreams: usize = 0;
+        for (0..n_cols) |ci| {
+            col_ss[ci] = total_substreams;
+            total_substreams += switch (table.columns[ci].ty) {
+                .low_card => 2,  // dict block + index block
+                else => 1,       // single physical block (fixed or combined string)
+            };
+        }
 
         // Read and decompress all blocks from data.bin.
-        const total_blocks = n_gran * n_cols;
+        const total_blocks = n_gran * total_substreams;
         const substream_data = try allocator.alloc([]u8, total_blocks);
         errdefer {
             for (substream_data) |sd| allocator.free(sd);
@@ -1110,7 +1121,7 @@ pub const CompactOpenedPart = struct {
             .table = table,
             .row_count = row_count,
             .substream_data = substream_data,
-            .n_substreams = n_cols,
+            .n_substreams = total_substreams,
             .n_granules = n_gran,
             .col_substream_start = col_ss,
         };

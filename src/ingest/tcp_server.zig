@@ -313,7 +313,7 @@ fn skipBlockInfo(rd: TcpReader) !void {
 
 // ── Wire type classification ─────────────────────────────────────────────────
 
-const WireKind = enum { string, fixed1, fixed2, fixed4, fixed8 };
+const WireKind = enum { string, fixed1, fixed2, fixed4, fixed8, low_card };
 
 fn wireKind(ch_type: []const u8) WireKind {
     if (std.ascii.eqlIgnoreCase(ch_type, "Int8") or std.ascii.eqlIgnoreCase(ch_type, "UInt8")) return .fixed1;
@@ -324,6 +324,7 @@ fn wireKind(ch_type: []const u8) WireKind {
         std.ascii.eqlIgnoreCase(ch_type, "Float64")) return .fixed8;
     if (std.ascii.startsWithIgnoreCase(ch_type, "DateTime64")) return .fixed8;
     if (std.ascii.startsWithIgnoreCase(ch_type, "DateTime")) return .fixed4;
+    if (std.ascii.startsWithIgnoreCase(ch_type, "LowCardinality(")) return .low_card;
     return .string;
 }
 
@@ -359,6 +360,65 @@ fn readClientDataBlock(
         }
 
         const kind = wireKind(col_type_str);
+
+        // LowCardinality: block-level encoding (state prefix + dict + key indices)
+        if (kind == .low_card) {
+            // State prefix: uint64 (= 1 for sharedDictionariesWithAdditionalKeys)
+            _ = try rd.readInt(u64, .little);
+
+            // flags: uint64 (bits 0-1 = key_type, bits 9-10 = updateAll)
+            const flags = try rd.readInt(u64, .little);
+            const key_type: u2 = @truncate(flags & 0xFF);
+
+            // dict_count: int64
+            const dict_count = try rd.readInt(i64, .little);
+            if (dict_count < 0) return error.InvalidLCData;
+
+            // Read dictionary strings
+            const dict = try a.alloc([]const u8, @intCast(dict_count));
+            defer a.free(dict);
+            var dict_owned: std.ArrayListUnmanaged(u8) = .empty;
+            defer dict_owned.deinit(a);
+            for (0..@intCast(dict_count)) |di| {
+                const s = try rd.readString(a);
+                const offset = dict_owned.items.len;
+                try dict_owned.appendSlice(a, s);
+                a.free(s);
+                dict[di] = dict_owned.items[offset..];
+            }
+            // Fix up dict slices after appendSlice (potential realloc)
+            var dict_pos: usize = 0;
+            for (0..@intCast(dict_count)) |di| {
+                const s_len = dict[di].len;
+                dict[di] = dict_owned.items[dict_pos .. dict_pos + s_len];
+                dict_pos += s_len;
+            }
+
+            // key_count: int64
+            const key_count = try rd.readInt(i64, .little);
+            if (key_count < 0 or key_count != @as(i64, @intCast(num_rows))) return error.InvalidLCData;
+
+            // Read indices and expand to strings
+            const key_width: usize = switch (key_type) {
+                0 => 1, 1 => 2, 2 => 4, 3 => 8,
+            };
+            for (0..@intCast(key_count)) |_| {
+                const key: u64 = switch (key_width) {
+                    1 => try rd.readInt(u8, .little),
+                    2 => try rd.readInt(u16, .little),
+                    4 => try rd.readInt(u32, .little),
+                    else => try rd.readInt(u64, .little),
+                };
+                const s: []const u8 = if (key < dict.len) dict[key] else "";
+                if (col_bufs) |bs| if (buf_idx) |idx| {
+                    const offset = bs[idx].str_bytes.items.len;
+                    try bs[idx].str_bytes.appendSlice(a, s);
+                    try bs[idx].str_vals.append(a, bs[idx].str_bytes.items[offset .. offset + s.len]);
+                };
+            }
+            continue;
+        }
+
         for (0..num_rows) |_| {
             switch (kind) {
                 .fixed1 => {
@@ -390,6 +450,7 @@ fn readClientDataBlock(
                         a.free(s);
                     }
                 },
+                .low_card => unreachable,
             }
         }
     }
@@ -766,6 +827,53 @@ fn handleSelect(ctx: *ServerCtx, a: std.mem.Allocator, w: *Io.Writer, sql: []con
     }
     const plan = plan_opt.?;
     defer generic_sql.deinit(a, plan);
+
+    // ── Subquery: SELECT … FROM (SELECT …) ───────────────────────────────
+    if (plan.subquery_source) |inner_plan| {
+        const inner_db_table = splitDbTable(inner_plan.table);
+        const inner_entry_opt = ctx.schemas.find(inner_db_table.db, inner_db_table.table);
+        const fake_inner_table = schema.Table{ .name = "", .columns = &.{} };
+        const inner_table: *const schema.Table = if (inner_entry_opt) |e| &e.table else &fake_inner_table;
+
+        var inner_parts = try part_scanner.scan(a, ctx.io, ctx.data_dir, inner_db_table.db, inner_db_table.table);
+        defer inner_parts.deinit();
+
+        const inner_csv = generic_executor.runWithSource(
+            a, ctx.io, inner_plan.*,
+            .{ .ch_parts = if (inner_entry_opt != null) inner_parts.dirs() else &.{} },
+            inner_table,
+        ) catch |err| {
+            std.log.warn("tcp subquery inner executor error: {}", .{err});
+            var block_buf: std.ArrayListUnmanaged(u8) = .empty;
+            defer block_buf.deinit(a);
+            try writeBlockInfo(&block_buf, a); try wuv(&block_buf, a, 0); try wuv(&block_buf, a, 0);
+            try sendData(a, w, block_buf.items); try sendProfileInfo(a, w); try sendEos(w);
+            return;
+        };
+        defer a.free(inner_csv);
+
+        const outer_result = generic_executor.runOverCsv(a, plan, inner_csv, inner_table) catch |err| {
+            std.log.warn("tcp subquery outer executor error: {}", .{err});
+            var block_buf: std.ArrayListUnmanaged(u8) = .empty;
+            defer block_buf.deinit(a);
+            try writeBlockInfo(&block_buf, a); try wuv(&block_buf, a, 0); try wuv(&block_buf, a, 0);
+            try sendData(a, w, block_buf.items); try sendProfileInfo(a, w); try sendEos(w);
+            return;
+        };
+        defer a.free(outer_result);
+
+        // Use null schema for outer result so that heuristic type inference is used.
+        // The outer columns (e.g. `ts` alias from toUnixTimestamp) don't match the
+        // inner table's schema column names and types, leading to mismatches.
+        var rs = try serializer.csvToResultSet(a, outer_result, null);
+        defer rs.deinit();
+        const nb = try serializer.toNativeBlock(a, rs);
+        defer a.free(nb);
+        try sendData(a, w, nb);
+        try sendProfileInfo(a, w);
+        try sendEos(w);
+        return;
+    }
 
     const db_table = splitDbTable(plan.table);
     const entry_opt = ctx.schemas.find(db_table.db, db_table.table);
