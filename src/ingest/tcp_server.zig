@@ -463,31 +463,190 @@ fn dispatchQuery(
     } else if (std.ascii.startsWithIgnoreCase(s, "SELECT") or
                std.ascii.startsWithIgnoreCase(s, "SHOW") or
                std.ascii.startsWithIgnoreCase(s, "DESC")) {
-        try handleSelect(a, w, s);
+        try handleSelect(ctx, a, w, s);
     } else {
         try sendEos(w);
     }
 }
 
-fn handleSelect(a: std.mem.Allocator, w: *Io.Writer, sql: []const u8) !void {
-    var block_buf: std.ArrayListUnmanaged(u8) = .empty;
-    defer block_buf.deinit(a);
+/// Extract table name from `WHERE table = 'X'` or `WHERE table = "X"`.
+/// Returns slice of sql (no allocation).
+fn extractWhereTableName(sql: []const u8) ?[]const u8 {
+    return extractWhereNameField(sql, "table");
+}
 
-    if (std.ascii.indexOfIgnoreCase(sql, "system.tables") != null) {
-        try writeBlockInfo(&block_buf, a);
-        try wuv(&block_buf, a, 1); try wuv(&block_buf, a, 0);
-        try wstr(&block_buf, a, "engine_full"); try wstr(&block_buf, a, "String");
-        try block_buf.append(a, 0);
-    } else if (std.ascii.indexOfIgnoreCase(sql, "system.columns") != null) {
-        try writeBlockInfo(&block_buf, a);
-        try wuv(&block_buf, a, 2); try wuv(&block_buf, a, 0);
-        try wstr(&block_buf, a, "name"); try wstr(&block_buf, a, "String"); try block_buf.append(a, 0);
-        try wstr(&block_buf, a, "type"); try wstr(&block_buf, a, "String"); try block_buf.append(a, 0);
-    } else {
-        try writeBlockInfo(&block_buf, a);
-        try wuv(&block_buf, a, 0); try wuv(&block_buf, a, 0);
+/// Extract value from `WHERE <field> = 'X'` pattern in SQL.
+fn extractWhereNameField(sql: []const u8, field: []const u8) ?[]const u8 {
+    var pos: usize = 0;
+    while (pos < sql.len) {
+        const idx = std.ascii.indexOfIgnoreCase(sql[pos..], field) orelse break;
+        pos += idx + field.len;
+        // Must be followed by whitespace or '='
+        if (pos < sql.len and std.ascii.isAlphanumeric(sql[pos])) continue; // part of longer word
+        // Skip whitespace and '='
+        while (pos < sql.len and (sql[pos] == ' ' or sql[pos] == '\t')) pos += 1;
+        if (pos >= sql.len or sql[pos] != '=') continue;
+        pos += 1;
+        while (pos < sql.len and (sql[pos] == ' ' or sql[pos] == '\t')) pos += 1;
+        if (pos >= sql.len) break;
+        const q = sql[pos];
+        if (q != '\'' and q != '"') continue;
+        pos += 1;
+        const start = pos;
+        while (pos < sql.len and sql[pos] != q) pos += 1;
+        if (pos >= sql.len) break;
+        return sql[start..pos];
+    }
+    return null;
+}
+
+/// Send a single-column, single-row result with a String value.
+fn sendScalarString(a: std.mem.Allocator, w: *Io.Writer, col_name: []const u8, value: []const u8) !void {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(a);
+    try writeBlockInfo(&buf, a);
+    try wuv(&buf, a, 1); // 1 column
+    try wuv(&buf, a, 1); // 1 row
+    try wstr(&buf, a, col_name); try wstr(&buf, a, "String"); try buf.append(a, 0);
+    try wstr(&buf, a, value);
+    try sendData(a, w, buf.items);
+    try sendProfileInfo(a, w);
+    try sendEos(w);
+}
+
+/// Send a single-column, single-row result with a UInt64 value.
+fn sendScalarUInt64(a: std.mem.Allocator, w: *Io.Writer, col_name: []const u8, value: u64) !void {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(a);
+    try writeBlockInfo(&buf, a);
+    try wuv(&buf, a, 1); // 1 column
+    try wuv(&buf, a, 1); // 1 row
+    try wstr(&buf, a, col_name); try wstr(&buf, a, "UInt64"); try buf.append(a, 0);
+    var v_bytes: [8]u8 = undefined;
+    std.mem.writeInt(u64, &v_bytes, value, .little);
+    try buf.appendSlice(a, &v_bytes);
+    try sendData(a, w, buf.items);
+    try sendProfileInfo(a, w);
+    try sendEos(w);
+}
+
+fn handleSelect(ctx: *ServerCtx, a: std.mem.Allocator, w: *Io.Writer, sql: []const u8) !void {
+    // ── SELECT version() ─────────────────────────────────────────────────
+    if (std.ascii.indexOfIgnoreCase(sql, "version()") != null) {
+        try sendScalarString(a, w, "version()", "24.3.0.1-ZigHouse");
+        return;
     }
 
+    // ── SELECT currentDatabase() ──────────────────────────────────────────
+    if (std.ascii.indexOfIgnoreCase(sql, "currentDatabase()") != null or
+        std.ascii.indexOfIgnoreCase(sql, "current_database()") != null) {
+        try sendScalarString(a, w, "currentDatabase()", "default");
+        return;
+    }
+
+    // ── SELECT count(*) FROM system.tables WHERE ... ─────────────────────
+    if (std.ascii.indexOfIgnoreCase(sql, "system.tables") != null and
+        std.ascii.indexOfIgnoreCase(sql, "count(") != null) {
+        const table_filter = extractWhereNameField(sql, "name");
+        var count: u64 = 0;
+        if (table_filter) |tf| {
+            if (ctx.schemas.find("default", tf) != null) count = 1;
+        }
+        try sendScalarUInt64(a, w, "count(*)", count);
+        return;
+    }
+
+    // ── SELECT count(*) FROM system.columns WHERE ... ─────────────────────
+    if (std.ascii.indexOfIgnoreCase(sql, "system.columns") != null and
+        std.ascii.indexOfIgnoreCase(sql, "count(") != null) {
+        const table_filter = extractWhereTableName(sql);
+        const col_filter = extractWhereNameField(sql, "name");
+        var count: u64 = 0;
+        if (table_filter) |tf| {
+            if (ctx.schemas.find("default", tf)) |entry| {
+                if (col_filter) |cf| {
+                    for (entry.table.columns) |col| {
+                        if (std.ascii.eqlIgnoreCase(col.name, cf)) { count = 1; break; }
+                    }
+                } else {
+                    count = @intCast(entry.table.columns.len);
+                }
+            }
+        }
+        try sendScalarUInt64(a, w, "count(*)", count);
+        return;
+    }
+
+    // ── SELECT engine_full FROM system.tables WHERE ... ──────────────────
+    if (std.ascii.indexOfIgnoreCase(sql, "system.tables") != null) {
+        const table_filter = extractWhereTableName(sql);
+        var block_buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer block_buf.deinit(a);
+
+        try writeBlockInfo(&block_buf, a);
+        try wuv(&block_buf, a, 1); // 1 column: engine_full
+
+        // Count matching tables
+        var matching: u64 = 0;
+        if (table_filter) |tf| {
+            if (ctx.schemas.find("default", tf) != null) matching = 1;
+        } else {
+            const list = if (ctx.schemas.dynamic_tables.items.len > 0)
+                ctx.schemas.dynamic_tables.items else ctx.schemas.tables;
+            matching = @intCast(list.len);
+        }
+        try wuv(&block_buf, a, matching);
+        try wstr(&block_buf, a, "engine_full");
+        try wstr(&block_buf, a, "String");
+        try block_buf.append(a, 0); // custom_serialization
+        // Emit rows
+        for (0..matching) |_| {
+            try wstr(&block_buf, a, "MergeTree() ORDER BY tuple()");
+        }
+        try sendData(a, w, block_buf.items);
+        try sendProfileInfo(a, w);
+        try sendEos(w);
+        return;
+    }
+
+    // ── SELECT name FROM system.columns WHERE ... ─────────────────────────
+    // ── SELECT name, type, ... FROM system.columns WHERE ... ──────────────
+    if (std.ascii.indexOfIgnoreCase(sql, "system.columns") != null) {
+        const table_filter = extractWhereTableName(sql);
+        var block_buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer block_buf.deinit(a);
+
+        var entry_opt: ?*const schema_config.TableEntry = null;
+        if (table_filter) |tf| {
+            entry_opt = ctx.schemas.find("default", tf);
+        }
+
+        const num_rows: u64 = if (entry_opt) |e| @intCast(e.table.columns.len) else 0;
+
+        try writeBlockInfo(&block_buf, a);
+        try wuv(&block_buf, a, 2); // 2 columns: name, type
+        try wuv(&block_buf, a, num_rows);
+        // Column 1: name (meta + data)
+        try wstr(&block_buf, a, "name"); try wstr(&block_buf, a, "String"); try block_buf.append(a, 0);
+        if (entry_opt) |e| {
+            for (e.table.columns) |col| try wstr(&block_buf, a, col.name);
+        }
+        // Column 2: type (meta + data)
+        try wstr(&block_buf, a, "type"); try wstr(&block_buf, a, "String"); try block_buf.append(a, 0);
+        if (entry_opt) |e| {
+            for (e.table.columns) |col| try wstr(&block_buf, a, chTypeName(col));
+        }
+        try sendData(a, w, block_buf.items);
+        try sendProfileInfo(a, w);
+        try sendEos(w);
+        return;
+    }
+
+    // ── Default: empty result ─────────────────────────────────────────────
+    var block_buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer block_buf.deinit(a);
+    try writeBlockInfo(&block_buf, a);
+    try wuv(&block_buf, a, 0); try wuv(&block_buf, a, 0);
     try sendData(a, w, block_buf.items);
     try sendProfileInfo(a, w);
     try sendEos(w);
