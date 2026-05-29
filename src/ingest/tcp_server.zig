@@ -541,6 +541,24 @@ fn sendScalarUInt64(a: std.mem.Allocator, w: *Io.Writer, col_name: []const u8, v
 }
 
 fn handleSelect(ctx: *ServerCtx, a: std.mem.Allocator, w: *Io.Writer, sql: []const u8) !void {
+    // ── SHOW TABLES ───────────────────────────────────────────────────────
+    if (std.ascii.startsWithIgnoreCase(sql, "SHOW TABLES") or
+        std.ascii.startsWithIgnoreCase(sql, "SHOW FULL TABLES")) {
+        const list = if (ctx.schemas.dynamic_tables.items.len > 0)
+            ctx.schemas.dynamic_tables.items else ctx.schemas.tables;
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer buf.deinit(a);
+        try writeBlockInfo(&buf, a);
+        try wuv(&buf, a, 1);
+        try wuv(&buf, a, @intCast(list.len));
+        try wstr(&buf, a, "name"); try wstr(&buf, a, "String"); try buf.append(a, 0);
+        for (list) |entry| try wstr(&buf, a, entry.name);
+        try sendData(a, w, buf.items);
+        try sendProfileInfo(a, w);
+        try sendEos(w);
+        return;
+    }
+
     // ── SELECT version() ─────────────────────────────────────────────────
     if (std.ascii.indexOfIgnoreCase(sql, "version()") != null) {
         try sendScalarString(a, w, "version()", "24.3.0.1-ZigHouse");
