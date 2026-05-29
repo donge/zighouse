@@ -502,6 +502,7 @@ pub fn build(b: *std.Build) void {
     schema_persist_mod.addImport("schema_config", schema_config_mod);
     const schema_persist_tests = b.addTest(.{ .root_module = schema_persist_mod });
     const schema_persist_test_cmd = b.addRunArtifact(schema_persist_tests);
+    tcp_server_mod.addImport("schema_persist", schema_persist_mod);
 
     const part_scanner_mod = b.createModule(.{
         .root_source_file = b.path("src/ingest/part_scanner.zig"),

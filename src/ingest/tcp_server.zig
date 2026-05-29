@@ -11,6 +11,7 @@ const schema_config = @import("schema_config");
 const row_binary_decoder = @import("row_binary_decoder");
 const part_writer_session = @import("part_writer_session");
 const ddl_parser = @import("ddl_parser");
+const schema_persist = @import("schema_persist");
 const generic_sql = @import("generic_sql");
 const generic_executor = @import("generic_executor");
 const serializer = @import("serializer");
@@ -721,6 +722,11 @@ fn handleCreateTable(ctx: *ServerCtx, a: std.mem.Allocator, w: *Io.Writer, sql: 
 
     if (ctx.schemas.find(parsed.entry.db, parsed.entry.name) == null) {
         try ctx.schemas.addEntry(a, parsed.entry);
+        if (ctx.schemas.find(parsed.entry.db, parsed.entry.name)) |stored| {
+            schema_persist.save(ctx.io, a, ctx.data_dir, stored.db, stored) catch |err| {
+                std.debug.print("tcp: schema_persist.save warning: {s}\n", .{@errorName(err)});
+            };
+        }
     }
     try sendEos(w);
 }
