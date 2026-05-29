@@ -429,7 +429,7 @@ pub const Native = struct {
     }
 
     fn executeGenericSql(self: *Native, plan: generic_sql.Plan) anyerror![]u8 {
-        if (!asciiEqlIgnoreCase(plan.table, "hits")) {
+        if (!std.ascii.eqlIgnoreCase(plan.table, "hits")) {
             std.debug.print("error: unknown table '{s}'\n", .{plan.table});
             return error.UnknownTable;
         }
@@ -458,7 +458,7 @@ pub const Native = struct {
         const expr = plan.projections[0];
         if (expr.func != .count_distinct) return null;
         const column = expr.column orelse return error.UnsupportedGenericQuery;
-        if (asciiEqlIgnoreCase(column, "UserID")) return try formatUserIdDistinctCountCached(self.allocator, try self.getUserIdEncoding());
+        if (std.ascii.eqlIgnoreCase(column, "UserID")) return try formatUserIdDistinctCountCached(self.allocator, try self.getUserIdEncoding());
         return error.UnsupportedGenericQuery;
     }
 
@@ -466,7 +466,7 @@ pub const Native = struct {
         const group_col = plan.group_by orelse return error.UnsupportedGenericQuery;
         var group_data = GroupContextData{ .native = self, .hot = hot };
         if (try native_group.execute(self.allocator, plan, groupContext(&group_data))) |output| return output;
-        if (plan.filter) |filter| if (asciiEqlIgnoreCase(filter.column, "SearchPhrase")) {
+        if (plan.filter) |filter| if (std.ascii.eqlIgnoreCase(filter.column, "SearchPhrase")) {
             group_data.search_phrase = try self.getSearchPhraseColumn();
             if (try native_group.execute(self.allocator, plan, groupContext(&group_data))) |output| return output;
         };
@@ -475,8 +475,8 @@ pub const Native = struct {
         if (plan.projections.len != 2) return error.UnsupportedGenericQuery;
         if (plan.projections[0].func != .column_ref or plan.projections[1].func != .count_star) return error.UnsupportedGenericQuery;
         const selected_col = plan.projections[0].column orelse return error.UnsupportedGenericQuery;
-        if (!asciiEqlIgnoreCase(selected_col, group_col)) return error.UnsupportedGenericQuery;
-        if (asciiEqlIgnoreCase(group_col, "UserID")) {
+        if (!std.ascii.eqlIgnoreCase(selected_col, group_col)) return error.UnsupportedGenericQuery;
+        if (std.ascii.eqlIgnoreCase(group_col, "UserID")) {
             if (plan.filter != null or plan.limit != 10) return error.UnsupportedGenericQuery;
             return formatUserIdCountTop10DenseCached(self.allocator, try self.getUserIdEncoding());
         }
@@ -495,7 +495,7 @@ pub const Native = struct {
         if (plan.projections.len == 1 and plan.projections[0].func == .column_ref) {
             const column_name = plan.projections[0].column orelse return error.UnsupportedGenericQuery;
             const column = bindGenericColumn(self, hot, column_name) catch return error.UnsupportedGenericQuery;
-            if (filter.second == null and filter.op == .equal and asciiEqlIgnoreCase(column_name, filter.column)) {
+            if (filter.second == null and filter.op == .equal and std.ascii.eqlIgnoreCase(column_name, filter.column)) {
                 return formatGenericPointLookupColumn(self.allocator, column_name, column, filter.int_value);
             }
             const predicate = try self.materializePlanFilter(self.allocator, hot, filter);
@@ -1025,7 +1025,7 @@ pub const Native = struct {
         // import time as the i32 sidecar `hot.url_length`, so expose it
         // here as a regular fixed_i32 BoundColumn to keep group/reduce
         // binders schema-driven (no per-call-site special cases).
-        if (asciiEqlIgnoreCase(name, "length(URL)")) {
+        if (std.ascii.eqlIgnoreCase(name, "length(URL)")) {
             const hot = try self.getHotColumns();
             const values = hot.url_length orelse return error.UnsupportedNativeQuery;
             return .{ .fixed_i32 = .{ .name = "length(URL)", .values = values } };
@@ -1036,7 +1036,7 @@ pub const Native = struct {
         return switch (tag) {
             .fixed_i16, .fixed_i32, .fixed_i64, .fixed_date, .fixed_timestamp => self.bindFixedColumn(column, tag),
             .lowcard_text => blk: {
-                if (asciiEqlIgnoreCase(column.name, "SearchPhrase")) {
+                if (std.ascii.eqlIgnoreCase(column.name, "SearchPhrase")) {
                     const col = try self.getSearchPhraseColumn();
                     break :blk bind.BoundColumn{ .lowcard_text = .{
                         .name = column.name,
@@ -1046,7 +1046,7 @@ pub const Native = struct {
                         .capabilities = column.capabilities,
                     } };
                 }
-                if (asciiEqlIgnoreCase(column.name, "URL")) {
+                if (std.ascii.eqlIgnoreCase(column.name, "URL")) {
                     const col = try self.getUrlColumn();
                     break :blk bind.BoundColumn{ .lowcard_text = .{
                         .name = column.name,
@@ -1058,7 +1058,7 @@ pub const Native = struct {
                         .capabilities = column.capabilities,
                     } };
                 }
-                if (asciiEqlIgnoreCase(column.name, "Title")) {
+                if (std.ascii.eqlIgnoreCase(column.name, "Title")) {
                     const col = try self.getTitleColumn();
                     break :blk bind.BoundColumn{ .lowcard_text = .{
                         .name = column.name,
@@ -1082,28 +1082,28 @@ pub const Native = struct {
     fn bindFixedColumn(self: *Native, column: schema.Column, tag: schema.CapabilityTag) !bind.BoundColumn {
         const hot = try self.getHotColumns();
         const slice_i16: ?[]const i16 = blk: {
-            if (asciiEqlIgnoreCase(column.name, "AdvEngineID")) break :blk hot.adv_engine_id;
-            if (asciiEqlIgnoreCase(column.name, "ResolutionWidth")) break :blk hot.resolution_width;
-            if (asciiEqlIgnoreCase(column.name, "IsRefresh")) break :blk hot.is_refresh;
-            if (asciiEqlIgnoreCase(column.name, "DontCountHits")) break :blk hot.dont_count_hits;
+            if (std.ascii.eqlIgnoreCase(column.name, "AdvEngineID")) break :blk hot.adv_engine_id;
+            if (std.ascii.eqlIgnoreCase(column.name, "ResolutionWidth")) break :blk hot.resolution_width;
+            if (std.ascii.eqlIgnoreCase(column.name, "IsRefresh")) break :blk hot.is_refresh;
+            if (std.ascii.eqlIgnoreCase(column.name, "DontCountHits")) break :blk hot.dont_count_hits;
             break :blk null;
         };
         if (slice_i16) |values| return .{ .fixed_i16 = .{ .name = column.name, .values = values } };
 
         const slice_i32: ?[]const i32 = blk: {
-            if (asciiEqlIgnoreCase(column.name, "CounterID")) break :blk hot.counter_id;
-            if (asciiEqlIgnoreCase(column.name, "ClientIP")) break :blk hot.client_ip;
+            if (std.ascii.eqlIgnoreCase(column.name, "CounterID")) break :blk hot.counter_id;
+            if (std.ascii.eqlIgnoreCase(column.name, "ClientIP")) break :blk hot.client_ip;
             break :blk null;
         };
         if (slice_i32) |values| return .{ .fixed_i32 = .{ .name = column.name, .values = values } };
 
-        if (tag == .fixed_date and asciiEqlIgnoreCase(column.name, "EventDate")) {
+        if (tag == .fixed_date and std.ascii.eqlIgnoreCase(column.name, "EventDate")) {
             return .{ .fixed_date = .{ .name = column.name, .values = hot.event_date } };
         }
 
         const slice_i64: ?[]const i64 = blk: {
-            if (asciiEqlIgnoreCase(column.name, "UserID")) break :blk hot.user_id;
-            if (asciiEqlIgnoreCase(column.name, "WatchID")) break :blk hot.watch_id;
+            if (std.ascii.eqlIgnoreCase(column.name, "UserID")) break :blk hot.user_id;
+            if (std.ascii.eqlIgnoreCase(column.name, "WatchID")) break :blk hot.watch_id;
             break :blk null;
         };
         if (slice_i64) |values| return .{ .fixed_i64 = .{ .name = column.name, .values = values } };
@@ -5727,7 +5727,7 @@ fn bindClickBenchReduceFilterColumn(ptr: *const anyopaque, name: []const u8) any
 /// (materialized at import time as `hot.url_length`); callers must accept
 /// `null` and fall back to a different encoding.
 fn nonemptyLengthSidecar(hot: *const HotColumns, name: []const u8) ?[]const i32 {
-    if (asciiEqlIgnoreCase(name, "URL")) return hot.url_length;
+    if (std.ascii.eqlIgnoreCase(name, "URL")) return hot.url_length;
     return null;
 }
 
@@ -6244,12 +6244,6 @@ fn singleDataRow(bytes: []const u8) ?[]const u8 {
     const row = trimmed[first_newline + 1 ..];
     if (std.mem.indexOfScalar(u8, row, '\n') != null) return null;
     return row;
-}
-
-fn asciiEqlIgnoreCase(a: []const u8, b: []const u8) bool {
-    if (a.len != b.len) return false;
-    for (a, b) |ac, bc| if (std.ascii.toLower(ac) != std.ascii.toLower(bc)) return false;
-    return true;
 }
 
 fn formatUserIdPointLookup(allocator: std.mem.Allocator, values: []const i64, target: i64) ![]u8 {
