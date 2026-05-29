@@ -258,6 +258,28 @@ const Value = union(enum) {
                     }
                     return std.math.order(av.len, bv.len);
                 },
+                .str, .str_owned => {
+                    // Try to decode b as a \x01-sentinel array blob and compare element-wise.
+                    const bs = b.toStr().?;
+                    if (bs.len > 0 and bs[0] == 0x01) {
+                        const content = bs[1..];
+                        var bv_list: std.ArrayListUnmanaged(Value) = .empty;
+                        if (content.len > 0) {
+                            var bit = std.mem.splitScalar(u8, content, '\x0c');
+                            while (bit.next()) |elem| {
+                                bv_list.append(std.heap.page_allocator, Value{ .str = elem }) catch {};
+                            }
+                        }
+                        const bv2 = bv_list.items;
+                        const len2 = @min(av.len, bv2.len);
+                        for (0..len2) |i| {
+                            const o = Value.order(av[i], bv2[i]);
+                            if (o != .eq) return o;
+                        }
+                        return std.math.order(av.len, bv2.len);
+                    }
+                    return .gt;
+                },
                 else => return .gt,
             },
             .null_val => return if (b == .null_val) .eq else .lt,
@@ -550,10 +572,34 @@ const RowCtx = struct {
         }
         // Chain to parent scope (lambda bindings)
         if (self.parent) |p| return p.get(name);
-        // Slow path: Map subscript access like data['key'] or features['key']
+        // Slow path: Map/Array subscript access like data['key'], features['key'], or arr[2]
         if (parseMapSubscript(name)) |sub| {
             for (self.names, self.values) |n, v| {
                 if (std.ascii.eqlIgnoreCase(n, sub.col)) {
+                    // Check if this column is an Array type — if so, use integer subscript (1-based).
+                    var col_ch_type_opt: ?[]const u8 = null;
+                    if (self.table) |tbl| {
+                        if (tbl.findColumn(sub.col)) |ci| {
+                            col_ch_type_opt = tbl.columns[ci].ch_type;
+                        }
+                    }
+                    const is_array_col = if (col_ch_type_opt) |ct|
+                        std.mem.startsWith(u8, ct, "Array(")
+                    else
+                        false;
+                    if (is_array_col) {
+                        // Integer subscript path: sub.key is the index (1-based, ClickHouse convention)
+                        const idx = std.fmt.parseInt(i64, sub.key, 10) catch return Value{ .str = "" };
+                        const arr_val = decodeArrayBlob(col_ch_type_opt.?, v.toStr() orelse return Value{ .str = "" });
+                        const arr: []const Value = switch (arr_val) {
+                            .array => |a| a,
+                            else => return Value{ .str = "" },
+                        };
+                        // ClickHouse uses 1-based indexing; out-of-bounds returns empty string
+                        const zero_idx: usize = if (idx > 0) @intCast(idx - 1) else return Value{ .str = "" };
+                        if (zero_idx >= arr.len) return Value{ .str = "" };
+                        return arr[zero_idx];
+                    }
                     const blob = v.toStr() orelse return Value{ .str = "" };
                     // Determine value type from schema if available
                     var val_ch_type: []const u8 = "String";
@@ -4170,10 +4216,17 @@ fn evalFunc(kind: EvalKind, name: []const u8, inner: []const u8, row: *const Row
                 .array => |a| return Value{ .i64 = @intCast(a.len) },
                 .str, .str_owned => {
                     const sv = v.toStr().?;
+                    // \x01-sentinel blob format: \x01 + elements joined by \x0c
+                    if (sv.len > 0 and sv[0] == 0x01) {
+                        const content = sv[1..];
+                        if (content.len == 0) return Value{ .i64 = 0 };
+                        var count: usize = 1;
+                        for (content) |ch| if (ch == '\x0c') { count += 1; };
+                        return Value{ .i64 = @intCast(count) };
+                    }
                     if (std.mem.indexOfScalar(u8, sv, '\x0c') != null) {
-                        // \x0c-delimited array: each element is preceded by \x0c
-                        // so element count == number of \x0c characters
-                        var count: usize = 0;
+                        // Legacy \x0c-delimited array without sentinel
+                        var count: usize = 1;
                         for (sv) |ch| if (ch == '\x0c') { count += 1; };
                         return Value{ .i64 = @intCast(count) };
                     }
@@ -4737,10 +4790,52 @@ fn evalFunc(kind: EvalKind, name: []const u8, inner: []const u8, row: *const Row
             return Value{ .array = out.toOwnedSlice(std.heap.page_allocator) catch return null };
         },
         .arr_map => {
-            // arrayMap(x -> expr, arr)
+            // arrayMap(lambda, arr [, arr2, ...])
+            // Lambda can be:  x -> expr   OR   (x,y,...) -> expr
             const args = splitTopLevelArgs(inner) catch return null;
             if (args.len < 2) return null;
             const lambda = std.mem.trim(u8, args.items[0], " \t\r\n");
+            // Detect multi-param lambda: starts with '('
+            const is_multi_param = lambda.len > 0 and lambda[0] == '(';
+            if (is_multi_param and args.len >= 3) {
+                // Parse "(x,y,...) -> body"
+                const arrow = std.mem.indexOf(u8, lambda, " -> ") orelse return null;
+                const body = std.mem.trim(u8, lambda[arrow + 4 ..], " \t\r\n");
+                const params_raw = std.mem.trim(u8, lambda[1..arrow - 0], "() \t\r\n");
+                // params_raw is like "x,y" — split by comma
+                var param_names: std.ArrayListUnmanaged([]const u8) = .empty;
+                defer param_names.deinit(std.heap.page_allocator);
+                var pit = std.mem.splitScalar(u8, params_raw, ',');
+                while (pit.next()) |pn|
+                    param_names.append(std.heap.page_allocator, std.mem.trim(u8, pn, " \t\r\n")) catch {};
+                // Evaluate each array argument (args[1], args[2], ...)
+                const num_arrs = @min(args.len - 1, param_names.items.len);
+                var arrs: std.ArrayListUnmanaged([]const Value) = .empty;
+                defer arrs.deinit(std.heap.page_allocator);
+                for (0..num_arrs) |ai| {
+                    const av = evalTextExpr(std.mem.trim(u8, args.items[ai + 1], " \t\r\n"), row) orelse return null;
+                    arrs.append(std.heap.page_allocator, valueToArray(av) orelse return null) catch {};
+                }
+                // Determine result length (min of all arrays)
+                var min_len: usize = std.math.maxInt(usize);
+                for (arrs.items) |a| if (a.len < min_len) { min_len = a.len; };
+                if (min_len == std.math.maxInt(usize)) min_len = 0;
+                var out2: std.ArrayListUnmanaged(Value) = .empty;
+                for (0..min_len) |ei| {
+                    var names_buf: [8][]const u8 = undefined;
+                    var vals_buf:  [8]Value        = undefined;
+                    const np = @min(param_names.items.len, 8);
+                    for (0..np) |pi| {
+                        names_buf[pi] = param_names.items[pi];
+                        vals_buf[pi]  = arrs.items[pi][ei];
+                    }
+                    const lambda_row = RowCtx{ .names = names_buf[0..np], .values = vals_buf[0..np], .parent = row };
+                    const mapped = evalTextExpr(body, &lambda_row) orelse Value{ .null_val = {} };
+                    out2.append(std.heap.page_allocator, mapped) catch {};
+                }
+                return Value{ .array = out2.toOwnedSlice(std.heap.page_allocator) catch return null };
+            }
+            // Single-param lambda: x -> expr
             const arr_expr2 = std.mem.trim(u8, args.items[1], " \t\r\n");
             const arr_v  = evalTextExpr(arr_expr2, row) orelse return null;
             const arr = valueToArray(arr_v) orelse return null;
@@ -5722,11 +5817,18 @@ fn evalTextBoolExpr(expr: []const u8, row: *const RowCtx) bool {
     // isIPv4String / isIPv6String / dictHas / arrayExists:
     // These are evaluated by evalTextExpr (which returns 0 or 1), then truthy-checked below.
 
-    // NOT IN / IN set membership
-    if (std.ascii.indexOfIgnoreCase(trimmed, " NOT IN (")) |pos| {
+    // NOT IN / IN set membership — supports both (...) and [...] list syntax
+    // ClickHouse uses `col in ['a','b']` (square brackets) for tuple/array literals.
+    if (std.ascii.indexOfIgnoreCase(trimmed, " NOT IN (") != null or
+        std.ascii.indexOfIgnoreCase(trimmed, " NOT IN [") != null)
+    {
+        const use_bracket = std.ascii.indexOfIgnoreCase(trimmed, " NOT IN [") != null;
+        const needle = if (use_bracket) " NOT IN [" else " NOT IN (";
+        const pos = std.ascii.indexOfIgnoreCase(trimmed, needle).?;
         const lhs_raw = std.mem.trim(u8, trimmed[0..pos], " \t\r\n");
-        const list_start = pos + 9; // len(" NOT IN (")
-        const list_end = std.mem.lastIndexOfScalar(u8, trimmed, ')') orelse trimmed.len;
+        const list_start = pos + needle.len;
+        const close_char: u8 = if (use_bracket) ']' else ')';
+        const list_end = std.mem.lastIndexOfScalar(u8, trimmed, close_char) orelse trimmed.len;
         const lv = evalTextExpr(lhs_raw, row) orelse Value{ .null_val = {} };
         var it = std.mem.splitScalar(u8, trimmed[list_start..list_end], ',');
         while (it.next()) |item| {
@@ -5735,10 +5837,16 @@ fn evalTextBoolExpr(expr: []const u8, row: *const RowCtx) bool {
         }
         return true;
     }
-    if (std.ascii.indexOfIgnoreCase(trimmed, " IN (")) |pos| {
+    if (std.ascii.indexOfIgnoreCase(trimmed, " IN (") != null or
+        std.ascii.indexOfIgnoreCase(trimmed, " IN [") != null)
+    {
+        const use_bracket = std.ascii.indexOfIgnoreCase(trimmed, " IN [") != null;
+        const needle = if (use_bracket) " IN [" else " IN (";
+        const pos = std.ascii.indexOfIgnoreCase(trimmed, needle).?;
         const lhs_raw = std.mem.trim(u8, trimmed[0..pos], " \t\r\n");
-        const list_start = pos + 5; // len(" IN (")
-        const list_end = std.mem.lastIndexOfScalar(u8, trimmed, ')') orelse trimmed.len;
+        const list_start = pos + needle.len;
+        const close_char: u8 = if (use_bracket) ']' else ')';
+        const list_end = std.mem.lastIndexOfScalar(u8, trimmed, close_char) orelse trimmed.len;
         const lv = evalTextExpr(lhs_raw, row) orelse Value{ .null_val = {} };
         var it = std.mem.splitScalar(u8, trimmed[list_start..list_end], ',');
         while (it.next()) |item| {

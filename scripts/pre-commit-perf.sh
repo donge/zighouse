@@ -14,11 +14,6 @@ STORE_DIR="${ZIGHOUSE_PERF_STORE:-${TMP_ROOT%/}/zighouse-precommit-ir-store}"
 BENCH_REPEATS=${ZIGHOUSE_PERF_BENCH_REPEATS:-2}
 ZIGHOUSE=${ZIGHOUSE:-zig-out/bin/zighouse}
 
-if [[ ! -f "$PARQUET_PATH" ]]; then
-  echo "pre-commit perf: missing $PARQUET_PATH" >&2
-  exit 1
-fi
-
 if [[ ! -f "$BASELINE" ]]; then
   echo "pre-commit perf: missing $BASELINE" >&2
   exit 1
@@ -35,6 +30,12 @@ elif [[ ! -f "$FINGERPRINT_FILE" ]]; then
   needs_import=true
 elif [[ "$(cat "$FINGERPRINT_FILE")" != "$FINGERPRINT" ]]; then
   needs_import=true
+fi
+
+# Only check for parquet file if we actually need to import.
+if $needs_import && [[ ! -f "$PARQUET_PATH" ]]; then
+  echo "pre-commit perf: missing $PARQUET_PATH (needed for import)" >&2
+  exit 1
 fi
 
 zig build -Doptimize=ReleaseFast

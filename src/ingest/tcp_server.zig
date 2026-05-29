@@ -316,6 +316,27 @@ fn skipBlockInfo(rd: TcpReader) !void {
 const WireKind = enum { string, fixed1, fixed2, fixed4, fixed8, low_card, array_str, array_lc_str, array_fixed1, array_fixed4, array_fixed8 };
 
 fn wireKind(ch_type: []const u8) WireKind {
+    // SimpleAggregateFunction(func, InnerType) → unwrap to InnerType
+    if (std.ascii.startsWithIgnoreCase(ch_type, "SimpleAggregateFunction(")) {
+        // Find the comma separating func name from inner type (may be nested parens)
+        const inner_start = "SimpleAggregateFunction(".len;
+        const body = ch_type[inner_start .. ch_type.len - 1]; // strip trailing ')'
+        var depth: usize = 0;
+        var i: usize = 0;
+        while (i < body.len) : (i += 1) {
+            if (body[i] == '(') { depth += 1; continue; }
+            if (body[i] == ')') { if (depth > 0) depth -= 1; continue; }
+            if (body[i] == ',' and depth == 0) {
+                const inner_type = std.mem.trim(u8, body[i + 1 ..], " \t");
+                return wireKind(inner_type);
+            }
+        }
+    }
+    // Nullable(T) → unwrap T
+    if (std.ascii.startsWithIgnoreCase(ch_type, "Nullable(")) {
+        const inner_type = std.mem.trim(u8, ch_type[9 .. ch_type.len - 1], " \t");
+        return wireKind(inner_type);
+    }
     if (std.ascii.eqlIgnoreCase(ch_type, "Int8") or std.ascii.eqlIgnoreCase(ch_type, "UInt8")) return .fixed1;
     if (std.ascii.eqlIgnoreCase(ch_type, "Int16") or std.ascii.eqlIgnoreCase(ch_type, "UInt16")) return .fixed2;
     if (std.ascii.eqlIgnoreCase(ch_type, "Int32") or std.ascii.eqlIgnoreCase(ch_type, "UInt32") or

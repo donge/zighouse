@@ -263,7 +263,21 @@ fn parseColumnType(s: []const u8) ?schema.ColumnType {
     if (std.mem.startsWith(u8, s, "Decimal64(")) return .float64;
     if (std.mem.startsWith(u8, s, "Decimal128(")) return .float64;
     if (std.mem.startsWith(u8, s, "Tuple(")) return .text;
-    if (std.mem.startsWith(u8, s, "SimpleAggregateFunction(")) return .text;
+    if (std.mem.startsWith(u8, s, "SimpleAggregateFunction(")) {
+        // Unwrap to inner type (second argument after the first comma at top level)
+        const body = s["SimpleAggregateFunction(".len .. s.len - 1];
+        var depth: usize = 0;
+        var i: usize = 0;
+        while (i < body.len) : (i += 1) {
+            if (body[i] == '(') { depth += 1; continue; }
+            if (body[i] == ')') { if (depth > 0) depth -= 1; continue; }
+            if (body[i] == ',' and depth == 0) {
+                const inner = std.mem.trim(u8, body[i + 1 ..], " \t");
+                return parseColumnType(inner);
+            }
+        }
+        return .text;
+    }
     if (std.mem.startsWith(u8, s, "AggregateFunction(")) return .text;
     return null;
 }
