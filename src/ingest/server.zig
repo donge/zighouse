@@ -51,6 +51,7 @@ const serializer = @import("serializer");
 const core = @import("core");
 const ir_planner = @import("ir_planner");
 const part_scan_bridge = @import("part_scan_bridge");
+const tcp_server = @import("tcp_server");
 
 /// Server configuration.
 pub const Config = struct {
@@ -67,7 +68,8 @@ pub const Server = struct {
     /// Live schema registry (heap-allocated, mutable at runtime).
     schemas: schema_config.SchemaConfig,
     /// Monotonically increasing part sequence number (per-process, not per-table).
-    seq: u64,
+    /// Atomic so both the HTTP and TCP servers can increment it safely.
+    seq: std.atomic.Value(u64),
     /// In-memory view registry: view_name → SELECT SQL (owned strings).
     views: std.StringHashMap([]const u8),
     /// In-memory function registry: fn_name → lambda text "(params) -> body" (owned strings).
@@ -95,7 +97,7 @@ pub const Server = struct {
             .io = io,
             .config = config,
             .schemas = schemas,
-            .seq = scanMaxPartSeq(io, config.data_dir) + 1,
+            .seq = std.atomic.Value(u64).init(scanMaxPartSeq(io, config.data_dir) + 1),
             .views = std.StringHashMap([]const u8).init(allocator),
             .functions = std.StringHashMap([]const u8).init(allocator),
             .mat_views = blk: {
@@ -139,6 +141,13 @@ pub const Server = struct {
 
     /// Block and serve requests until an error or signal.
     pub fn run(self: *Server) !void {
+        // Spawn TCP server (port 9000) in a background thread.
+        const tcp_thread = std.Thread.spawn(.{}, tcpServerThread, .{self}) catch |err| blk: {
+            std.debug.print("tcp: failed to start Native TCP server: {s}\n", .{@errorName(err)});
+            break :blk null;
+        };
+        _ = tcp_thread; // detached; runs until process exit
+
         const net = std.Io.net;
         const address = try net.IpAddress.parseIp4("127.0.0.1", self.config.port);
         var listener = try address.listen(self.io, .{});
@@ -152,6 +161,19 @@ pub const Server = struct {
                 std.debug.print("connection error: {s}\n", .{@errorName(err)});
             };
         }
+    }
+
+    fn tcpServerThread(self: *Server) void {
+        var ctx = tcp_server.ServerCtx{
+            .allocator  = self.allocator,
+            .io         = self.io,
+            .data_dir   = self.config.data_dir,
+            .schemas    = &self.schemas,
+            .seq        = &self.seq,
+        };
+        tcp_server.listenAndServe(&ctx, 9000) catch |err| {
+            std.debug.print("tcp: server exited: {s}\n", .{@errorName(err)});
+        };
     }
 
     // ── Per-connection handling ────────────────────────────────────────────────
@@ -658,8 +680,7 @@ pub const Server = struct {
         entry: *const schema_config.TableEntry,
         columns: []row_binary_decoder.ColumnBuffer,
     ) !void {
-        const seq = self.seq;
-        self.seq += 1;
+        const seq = self.seq.fetchAdd(1, .monotonic);
 
         var sess = try part_writer_session.CompactPartWriterSession.open(
             self.allocator,

@@ -478,6 +478,21 @@ pub fn build(b: *std.Build) void {
     const part_writer_session_tests = b.addTest(.{ .root_module = part_writer_session_mod });
     const part_writer_session_test_cmd = b.addRunArtifact(part_writer_session_tests);
 
+    const tcp_server_mod = b.createModule(.{
+        .root_source_file = b.path("src/ingest/tcp_server.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    tcp_server_mod.addImport("schema", schema_mod);
+    tcp_server_mod.addImport("schema_config", schema_config_mod);
+    tcp_server_mod.addImport("row_binary_decoder", row_binary_decoder_mod);
+    tcp_server_mod.addImport("part_writer_session", part_writer_session_mod);
+    tcp_server_mod.link_libc = true;
+    tcp_server_mod.addIncludePath(.{ .cwd_relative = lz4_include });
+    tcp_server_mod.addLibraryPath(.{ .cwd_relative = lz4_lib });
+    tcp_server_mod.addRPath(.{ .cwd_relative = lz4_lib });
+    tcp_server_mod.linkSystemLibrary("lz4", .{});
+
     const schema_persist_mod = b.createModule(.{
         .root_source_file = b.path("src/ingest/schema_persist.zig"),
         .target = target,
@@ -575,6 +590,7 @@ pub fn build(b: *std.Build) void {
     ingest_server_mod.addImport("mv_persist", mv_persist_mod);
     ingest_server_mod.addImport("native_block", native_block_mod);
     ingest_server_mod.addImport("csv", csv_mod);
+    ingest_server_mod.addImport("tcp_server", tcp_server_mod);
     ingest_server_mod.link_libc = true;
     ingest_server_mod.addIncludePath(.{ .cwd_relative = lz4_include });
     ingest_server_mod.addLibraryPath(.{ .cwd_relative = lz4_lib });
