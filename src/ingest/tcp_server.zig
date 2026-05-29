@@ -217,7 +217,13 @@ fn buildSchemaBlock(a: std.mem.Allocator, entry: *const schema_config.TableEntry
 }
 
 fn chTypeName(col: schema.Column) []const u8 {
-    if (col.ch_type) |ct| return ct;
+    if (col.ch_type) |ct| {
+        // Normalize DateTime(tz) variants to plain "DateTime" for wire protocol
+        if (std.ascii.startsWithIgnoreCase(ct, "DateTime(") and
+            !std.ascii.startsWithIgnoreCase(ct, "DateTime64("))
+            return "DateTime";
+        return ct;
+    }
     return switch (col.ty) {
         .int8    => "Int8",
         .int16   => "Int16",

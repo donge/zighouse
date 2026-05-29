@@ -240,6 +240,8 @@ fn parseColumnType(s: []const u8) ?schema.ColumnType {
     if (asciiEql(s, "UInt64")) return .int64;
     if (asciiEql(s, "Date")) return .date;
     if (asciiEql(s, "DateTime")) return .timestamp;
+    if (std.mem.startsWith(u8, s, "DateTime(")) return .timestamp;
+    if (std.mem.startsWith(u8, s, "datetime(")) return .timestamp;
     if (asciiEql(s, "String")) return .text;
     if (asciiEql(s, "Float32")) return .float32;
     if (asciiEql(s, "Float64")) return .float64;

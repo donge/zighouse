@@ -175,7 +175,8 @@ pub const RowBinaryDecoder = struct {
                     },
                     .int64, .timestamp => {
                         // DateTime64 is 8 bytes; plain DateTime is 4 bytes (UInt32).
-                        const is_dt32 = std.ascii.eqlIgnoreCase(ch_ty, "DateTime");
+                        const is_dt32 = std.ascii.startsWithIgnoreCase(ch_ty, "DateTime") and
+                            !std.ascii.startsWithIgnoreCase(ch_ty, "DateTime64");
                         if (is_dt32) {
                             if (pos + 4 > data.len) return error.UnexpectedEndOfData;
                             const v: i64 = @as(i64, std.mem.readInt(u32, data[pos..][0..4], .little));
@@ -270,7 +271,8 @@ fn skipRowBinaryValue(col: schema.Column, ch_ty: []const u8, data: []const u8, p
         .int16 => pos += 2,
         .int32, .date => pos += 4,
         .int64, .timestamp => {
-            const is_dt32 = std.ascii.eqlIgnoreCase(inner_ch_ty, "DateTime");
+            const is_dt32 = std.ascii.startsWithIgnoreCase(inner_ch_ty, "DateTime") and
+                !std.ascii.startsWithIgnoreCase(inner_ch_ty, "DateTime64");
             pos += if (is_dt32) 4 else 8;
         },
         .float32 => pos += 4,
