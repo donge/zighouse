@@ -552,6 +552,7 @@ pub fn build(b: *std.Build) void {
     });
     ddl_parser_mod.addImport("schema", schema_mod);
     ddl_parser_mod.addImport("schema_config", schema_config_mod);
+    tcp_server_mod.addImport("ddl_parser", ddl_parser_mod);
     const ddl_parser_tests = b.addTest(.{ .root_module = ddl_parser_mod });
     const ddl_parser_test_cmd = b.addRunArtifact(ddl_parser_tests);
 
@@ -700,6 +701,13 @@ pub fn build(b: *std.Build) void {
     serializer_mod.addImport("csv", csv_mod);
     const serializer_tests = b.addTest(.{ .root_module = serializer_mod });
     const serializer_test_cmd = b.addRunArtifact(serializer_tests);
+
+    // Wire query engine into tcp_server (for SELECT on real tables)
+    tcp_server_mod.addImport("generic_sql", generic_sql_mod);
+    tcp_server_mod.addImport("generic_executor", generic_executor_mod);
+    tcp_server_mod.addImport("serializer", serializer_mod);
+    tcp_server_mod.addImport("part_scanner", part_scanner_mod);
+    tcp_server_mod.addImport("csv", csv_mod);
 
     // Wire serializer into ingest_server
     ingest_server_mod.addImport("core", core_mod);

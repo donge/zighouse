@@ -10,6 +10,11 @@ const schema = @import("schema");
 const schema_config = @import("schema_config");
 const row_binary_decoder = @import("row_binary_decoder");
 const part_writer_session = @import("part_writer_session");
+const ddl_parser = @import("ddl_parser");
+const generic_sql = @import("generic_sql");
+const generic_executor = @import("generic_executor");
+const serializer = @import("serializer");
+const part_scanner = @import("part_scanner");
 
 const Io = std.Io;
 const net = std.Io.net;
@@ -464,7 +469,11 @@ fn dispatchQuery(
                std.ascii.startsWithIgnoreCase(s, "SHOW") or
                std.ascii.startsWithIgnoreCase(s, "DESC")) {
         try handleSelect(ctx, a, w, s);
+    } else if (std.ascii.startsWithIgnoreCase(s, "CREATE TABLE") or
+               std.ascii.startsWithIgnoreCase(s, "CREATE OR REPLACE TABLE")) {
+        try handleCreateTable(ctx, a, w, s);
     } else {
+        // Other DDL (ALTER, DROP, etc.) — acknowledge with empty result
         try sendEos(w);
     }
 }
@@ -642,13 +651,77 @@ fn handleSelect(ctx: *ServerCtx, a: std.mem.Allocator, w: *Io.Writer, sql: []con
         return;
     }
 
-    // ── Default: empty result ─────────────────────────────────────────────
-    var block_buf: std.ArrayListUnmanaged(u8) = .empty;
-    defer block_buf.deinit(a);
-    try writeBlockInfo(&block_buf, a);
-    try wuv(&block_buf, a, 0); try wuv(&block_buf, a, 0);
-    try sendData(a, w, block_buf.items);
+    // ── Default: execute against real table data ──────────────────────────
+    generic_executor.udf_registry = null;
+    const plan_opt = try generic_sql.parse(a, sql);
+    if (plan_opt == null) {
+        // Unknown SQL — return empty result
+        var block_buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer block_buf.deinit(a);
+        try writeBlockInfo(&block_buf, a);
+        try wuv(&block_buf, a, 0); try wuv(&block_buf, a, 0);
+        try sendData(a, w, block_buf.items);
+        try sendProfileInfo(a, w);
+        try sendEos(w);
+        return;
+    }
+    const plan = plan_opt.?;
+    defer generic_sql.deinit(a, plan);
+
+    const db_table = splitDbTable(plan.table);
+    const entry_opt = ctx.schemas.find(db_table.db, db_table.table);
+    const fake_table = schema.Table{ .name = "", .columns = &.{} };
+    const table: *const schema.Table = if (entry_opt) |e| &e.table else &fake_table;
+
+    var parts = try part_scanner.scan(a, ctx.io, ctx.data_dir, db_table.db, db_table.table);
+    defer parts.deinit();
+
+    const csv_result = generic_executor.runWithSource(
+        a, ctx.io, plan,
+        .{ .ch_parts = if (entry_opt != null) parts.dirs() else &.{} },
+        table,
+    ) catch |err| {
+        std.log.warn("tcp_server: generic_executor error: {}", .{err});
+        var block_buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer block_buf.deinit(a);
+        try writeBlockInfo(&block_buf, a);
+        try wuv(&block_buf, a, 0); try wuv(&block_buf, a, 0);
+        try sendData(a, w, block_buf.items);
+        try sendProfileInfo(a, w);
+        try sendEos(w);
+        return;
+    };
+    defer a.free(csv_result);
+
+    var rs = try serializer.csvToResultSet(a, csv_result, table);
+    defer rs.deinit();
+    const nb = try serializer.toNativeBlock(a, rs);
+    defer a.free(nb);
+    try sendData(a, w, nb);
     try sendProfileInfo(a, w);
+    try sendEos(w);
+}
+
+// Helper: split "db.table" or just "table" into {db, table}.
+const DbTable = struct { db: []const u8, table: []const u8 };
+fn splitDbTable(name: []const u8) DbTable {
+    if (std.mem.indexOfScalar(u8, name, '.')) |dot| {
+        return .{ .db = name[0..dot], .table = name[dot+1..] };
+    }
+    return .{ .db = "default", .table = name };
+}
+
+fn handleCreateTable(ctx: *ServerCtx, a: std.mem.Allocator, w: *Io.Writer, sql: []const u8) !void {
+    var parsed = ddl_parser.parse(a, sql) catch {
+        // DDL parse failure — still ack with EOS so client doesn't hang
+        try sendEos(w);
+        return;
+    };
+    defer parsed.deinit();
+
+    if (ctx.schemas.find(parsed.entry.db, parsed.entry.name) == null) {
+        try ctx.schemas.addEntry(a, parsed.entry);
+    }
     try sendEos(w);
 }
 
