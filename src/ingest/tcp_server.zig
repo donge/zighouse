@@ -475,7 +475,10 @@ fn dispatchQuery(
     } else if (std.ascii.startsWithIgnoreCase(s, "SELECT") or
                std.ascii.startsWithIgnoreCase(s, "SHOW") or
                std.ascii.startsWithIgnoreCase(s, "DESC")) {
-        try handleSelect(ctx, a, w, s);
+        // Normalize: strip FINAL keyword and SETTINGS clause
+        const normalized = try normalizeSql(a, s);
+        defer a.free(normalized);
+        try handleSelect(ctx, a, w, normalized);
     } else if (std.ascii.startsWithIgnoreCase(s, "CREATE TABLE") or
                std.ascii.startsWithIgnoreCase(s, "CREATE OR REPLACE TABLE")) {
         try handleCreateTable(ctx, a, w, s);
@@ -483,6 +486,77 @@ fn dispatchQuery(
         // Other DDL (ALTER, DROP, etc.) — acknowledge with empty result
         try sendEos(w);
     }
+}
+
+/// Strip FINAL keyword and SETTINGS clause from SQL.
+fn normalizeSql(a: std.mem.Allocator, sql: []const u8) ![]u8 {
+    // Step 1: Remove SETTINGS ... at end (top-level, after query body)
+    const after_settings = stripSettingsClause(sql);
+    // Step 2: Remove FINAL keyword
+    const result = try removeFinalKeyword(a, after_settings);
+    return result;
+}
+
+fn stripSettingsClause(sql: []const u8) []const u8 {
+    // Find top-level SETTINGS keyword (not inside parentheses or quotes)
+    var depth: usize = 0;
+    var in_quote: bool = false;
+    var quote_char: u8 = 0;
+    var i: usize = 0;
+    while (i < sql.len) {
+        const c = sql[i];
+        if (in_quote) {
+            if (c == quote_char) in_quote = false;
+            i += 1;
+            continue;
+        }
+        if (c == '\'' or c == '"' or c == '`') {
+            in_quote = true; quote_char = c; i += 1; continue;
+        }
+        if (c == '(') { depth += 1; i += 1; continue; }
+        if (c == ')') { if (depth > 0) depth -= 1; i += 1; continue; }
+        if (depth == 0) {
+            const kw = "SETTINGS";
+            if (i + kw.len <= sql.len and std.ascii.eqlIgnoreCase(sql[i..i + kw.len], kw)) {
+                const before = i == 0 or !std.ascii.isAlphanumeric(sql[i - 1]);
+                const after_pos = i + kw.len;
+                const after = after_pos >= sql.len or !std.ascii.isAlphanumeric(sql[after_pos]);
+                if (before and after) {
+                    // Strip from here to end
+                    var end = i;
+                    while (end > 0 and (sql[end-1] == ' ' or sql[end-1] == '\t' or sql[end-1] == '\r' or sql[end-1] == '\n')) end -= 1;
+                    return sql[0..end];
+                }
+            }
+        }
+        i += 1;
+    }
+    return sql;
+}
+
+fn removeFinalKeyword(a: std.mem.Allocator, sql: []const u8) ![]u8 {
+    var result: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer result.deinit(a);
+    var i: usize = 0;
+    while (i < sql.len) {
+        const kw = "FINAL";
+        if (i + kw.len <= sql.len and std.ascii.eqlIgnoreCase(sql[i..i + kw.len], kw)) {
+            const before_ok = i == 0 or (!std.ascii.isAlphanumeric(sql[i-1]) and sql[i-1] != '_');
+            const after_pos = i + kw.len;
+            const after_ok = after_pos >= sql.len or (!std.ascii.isAlphanumeric(sql[after_pos]) and sql[after_pos] != '_');
+            if (before_ok and after_ok) {
+                i = after_pos;
+                // Remove one preceding space if present
+                if (result.items.len > 0 and result.items[result.items.len - 1] == ' ') {
+                    result.items.len -= 1;
+                }
+                continue;
+            }
+        }
+        try result.append(a, sql[i]);
+        i += 1;
+    }
+    return result.toOwnedSlice(a);
 }
 
 /// Extract table name from `WHERE table = 'X'` or `WHERE table = "X"`.
