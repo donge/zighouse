@@ -3263,6 +3263,38 @@ const EvalKind = enum {
     math_hypot, // hypot(x,y)
     // Range/sequence function
     fn_range,   // range(n) or range(start, end) → array [0..n-1]
+    // JSON extraction
+    json_extract_str,  // simpleJSONExtractString(json, key) / JSONExtractString(json, key)
+    json_extract_int,  // simpleJSONExtractInt / JSONExtractInt
+    json_extract_float, // simpleJSONExtractFloat / JSONExtractFloat
+    json_extract_raw,  // simpleJSONExtractRaw / JSONExtractRaw
+    json_extract_bool, // simpleJSONExtractBool / JSONExtractBool
+    // Regex
+    fn_match,          // match(s, pattern) → 1 if matched, 0 if not
+    fn_extract,        // extract(s, pattern) → first capture group or full match
+    fn_replace_regexp, // replaceRegexpAll(s, pattern, replacement) → s with all matches replaced
+    fn_replace_one,    // replaceOne(s, from, to) → replace first occurrence
+    fn_replace_all,    // replaceAll(s, from, to) → replace all occurrences
+    // Date formatting
+    fn_format_datetime, // formatDateTime(ts, fmt [, tz]) → formatted string
+    // String
+    fn_trim,           // trim(s) / trimLeft(s) / trimRight(s) / trimBoth(s)
+    fn_trim_left,
+    fn_trim_right,
+    fn_to_string_base,  // toStringCutToZero → just toString
+    // Type casts
+    fn_to_int32,   // toInt32(x) / toInt32OrZero(x)
+    fn_to_uint32,  // toUInt32(x)
+    fn_to_int64,   // toInt64(x)
+    fn_to_uint64,  // toUInt64(x)
+    fn_to_float32, // toFloat32(x)
+    fn_to_float64, // toFloat64(x)
+    // Misc
+    fn_if_null,    // ifNull(x, default) → x if not null else default
+    fn_coalesce,   // coalesce(a, b, ...) → first non-null
+    fn_to_nullable, // toNullable(x) → x (passthrough)
+    fn_nullable_or_default, // nullableOrDefault(x) → x or 0/""
+    fn_ends_with,  // endsWith(s, suffix)
 };
 
 const FuncEval = struct {
@@ -3410,6 +3442,64 @@ const func_evals = [_]FuncEval{
     .{ .name = "hypot",    .kind = .math_hypot   },
     .{ .name = "range",    .kind = .fn_range     },
     .{ .name = "generate_series", .kind = .fn_range },
+    // JSON extraction
+    .{ .name = "simplejsonextractstring",  .kind = .json_extract_str   },
+    .{ .name = "jsonextractstring",        .kind = .json_extract_str   },
+    .{ .name = "simplejsonextractint",     .kind = .json_extract_int   },
+    .{ .name = "jsonextractint",           .kind = .json_extract_int   },
+    .{ .name = "simplejsonextractfloat",   .kind = .json_extract_float },
+    .{ .name = "jsonextractfloat",         .kind = .json_extract_float },
+    .{ .name = "simplejsonextractraw",     .kind = .json_extract_raw   },
+    .{ .name = "jsonextractraw",           .kind = .json_extract_raw   },
+    .{ .name = "simplejsonextractbool",    .kind = .json_extract_bool  },
+    .{ .name = "jsonextractbool",          .kind = .json_extract_bool  },
+    // Regex
+    .{ .name = "match",                    .kind = .fn_match           },
+    .{ .name = "extract",                  .kind = .fn_extract         },
+    .{ .name = "replaceregexpall",         .kind = .fn_replace_regexp  },
+    .{ .name = "replaceregexpone",         .kind = .fn_replace_regexp  },
+    .{ .name = "replaceone",               .kind = .fn_replace_one     },
+    .{ .name = "replaceall",               .kind = .fn_replace_all     },
+    // Date formatting
+    .{ .name = "formatdatetime",           .kind = .fn_format_datetime },
+    .{ .name = "dateformat",               .kind = .fn_format_datetime },
+    // String trim
+    .{ .name = "trim",                     .kind = .fn_trim            },
+    .{ .name = "trimboth",                 .kind = .fn_trim            },
+    .{ .name = "trimleft",                 .kind = .fn_trim_left       },
+    .{ .name = "ltrim",                    .kind = .fn_trim_left       },
+    .{ .name = "trimright",                .kind = .fn_trim_right      },
+    .{ .name = "rtrim",                    .kind = .fn_trim_right      },
+    .{ .name = "tostringcuttozero",        .kind = .str_tostring       },
+    // Type casts
+    .{ .name = "toint8",                   .kind = .fn_to_int32        },
+    .{ .name = "toint16",                  .kind = .fn_to_int32        },
+    .{ .name = "toint32",                  .kind = .fn_to_int32        },
+    .{ .name = "toint8orzero",             .kind = .fn_to_int32        },
+    .{ .name = "toint16orzero",            .kind = .fn_to_int32        },
+    .{ .name = "toint32orzero",            .kind = .fn_to_int32        },
+    .{ .name = "toint64",                  .kind = .fn_to_int64        },
+    .{ .name = "toint64orzero",            .kind = .fn_to_int64        },
+    .{ .name = "touint8",                  .kind = .fn_to_uint32       },
+    .{ .name = "touint16",                 .kind = .fn_to_uint32       },
+    .{ .name = "touint32",                 .kind = .fn_to_uint32       },
+    .{ .name = "touint8orzero",            .kind = .fn_to_uint32       },
+    .{ .name = "touint16orzero",           .kind = .fn_to_uint32       },
+    .{ .name = "touint32orzero",           .kind = .fn_to_uint32       },
+    .{ .name = "touint64",                 .kind = .fn_to_uint64       },
+    .{ .name = "touint64orzero",           .kind = .fn_to_uint64       },
+    .{ .name = "tofloat32",                .kind = .fn_to_float32      },
+    .{ .name = "tofloat32orzero",          .kind = .fn_to_float32      },
+    .{ .name = "tofloat64",                .kind = .fn_to_float64      },
+    .{ .name = "tofloat64orzero",          .kind = .fn_to_float64      },
+    .{ .name = "todouble",                 .kind = .fn_to_float64      },
+    // Null handling
+    .{ .name = "ifnull",                   .kind = .fn_if_null         },
+    .{ .name = "coalesce",                 .kind = .fn_coalesce        },
+    .{ .name = "tonullable",               .kind = .fn_to_nullable     },
+    .{ .name = "assumenotnull",            .kind = .fn_to_nullable     },
+    // endsWith
+    .{ .name = "endswith",                 .kind = .fn_ends_with       },
 };
 
 // ── Helper: resolve a Value from an array stored as \f-separated string ───────
@@ -5020,7 +5110,505 @@ fn evalFunc(kind: EvalKind, name: []const u8, inner: []const u8, row: *const Row
             for (elems, 0..) |*e, i| e.* = Value{ .i64 = start + @as(i64, @intCast(i)) };
             return Value{ .array = elems };
         },
+
+        // ── JSON extraction ────────────────────────────────────────
+        .json_extract_str, .json_extract_int, .json_extract_float,
+        .json_extract_raw, .json_extract_bool => {
+            const args = splitTopLevelArgs(inner) catch return null;
+            if (args.len < 2) return Value{ .str = "" };
+            const json_val = evalTextExpr(std.mem.trim(u8, args.items[0], " \t\r\n"), row) orelse return Value{ .str = "" };
+            const json_str = json_val.toStr() orelse return Value{ .str = "" };
+            // Collect key path (args[1..])
+            for (args.items[1..]) |arg| {
+                const key_raw = std.mem.trim(u8, arg, " \t\r\n");
+                // Strip surrounding quotes if present
+                const key = stripQuotes(key_raw);
+                // Find "key": in json
+                const extracted = jsonExtract(json_str, key) orelse return Value{ .str = "" };
+                return switch (kind) {
+                    .json_extract_int   => Value{ .i64 = std.fmt.parseInt(i64, extracted, 10) catch 0 },
+                    .json_extract_float => Value{ .f64 = std.fmt.parseFloat(f64, extracted) catch 0.0 },
+                    .json_extract_bool  => Value{ .i64 = if (std.mem.eql(u8, extracted, "true")) 1 else 0 },
+                    else                => Value{ .str = extracted },
+                };
+            }
+            return Value{ .str = "" };
+        },
+
+        // ── Regex ─────────────────────────────────────────────────
+        .fn_match => {
+            const args = splitTopLevelArgs(inner) catch return null;
+            if (args.len < 2) return Value{ .i64 = 0 };
+            const haystack_v = evalTextExpr(std.mem.trim(u8, args.items[0], " \t\r\n"), row) orelse return Value{ .i64 = 0 };
+            const haystack = haystack_v.toStr() orelse return Value{ .i64 = 0 };
+            const pat_v = evalTextExpr(std.mem.trim(u8, args.items[1], " \t\r\n"), row) orelse return Value{ .i64 = 0 };
+            const pat = pat_v.toStr() orelse return Value{ .i64 = 0 };
+            const matched = regexpMatch(haystack, pat);
+            return Value{ .i64 = if (matched) 1 else 0 };
+        },
+        .fn_extract => {
+            const args = splitTopLevelArgs(inner) catch return null;
+            if (args.len < 2) return Value{ .str = "" };
+            const haystack_v = evalTextExpr(std.mem.trim(u8, args.items[0], " \t\r\n"), row) orelse return Value{ .str = "" };
+            const haystack = haystack_v.toStr() orelse return Value{ .str = "" };
+            const pat_v = evalTextExpr(std.mem.trim(u8, args.items[1], " \t\r\n"), row) orelse return Value{ .str = "" };
+            const pat = pat_v.toStr() orelse return Value{ .str = "" };
+            const result = regexpExtract(haystack, pat) orelse return Value{ .str = "" };
+            return Value{ .str = result };
+        },
+        .fn_replace_regexp => {
+            const args = splitTopLevelArgs(inner) catch return null;
+            if (args.len < 3) return Value{ .str = inner };
+            const s_v = evalTextExpr(std.mem.trim(u8, args.items[0], " \t\r\n"), row) orelse return Value{ .str = "" };
+            const s = s_v.toStr() orelse return Value{ .str = "" };
+            const pat_v = evalTextExpr(std.mem.trim(u8, args.items[1], " \t\r\n"), row) orelse return Value{ .str = s };
+            const pat = pat_v.toStr() orelse return Value{ .str = s };
+            const repl_v = evalTextExpr(std.mem.trim(u8, args.items[2], " \t\r\n"), row) orelse return Value{ .str = s };
+            const repl = repl_v.toStr() orelse return Value{ .str = s };
+            const result = regexpReplaceAll(s, pat, repl) orelse return Value{ .str = s };
+            return Value{ .str = result };
+        },
+        .fn_replace_one => {
+            const args = splitTopLevelArgs(inner) catch return null;
+            if (args.len < 3) return Value{ .str = "" };
+            const s_v = evalTextExpr(std.mem.trim(u8, args.items[0], " \t\r\n"), row) orelse return Value{ .str = "" };
+            const s = s_v.toStr() orelse return Value{ .str = "" };
+            const from_v = evalTextExpr(std.mem.trim(u8, args.items[1], " \t\r\n"), row) orelse return Value{ .str = s };
+            const from = from_v.toStr() orelse return Value{ .str = s };
+            const to_v = evalTextExpr(std.mem.trim(u8, args.items[2], " \t\r\n"), row) orelse return Value{ .str = s };
+            const to = to_v.toStr() orelse return Value{ .str = s };
+            if (std.mem.indexOf(u8, s, from)) |pos| {
+                const result = std.heap.page_allocator.alloc(u8, s.len - from.len + to.len) catch return Value{ .str = s };
+                @memcpy(result[0..pos], s[0..pos]);
+                @memcpy(result[pos..pos + to.len], to);
+                @memcpy(result[pos + to.len..], s[pos + from.len..]);
+                return Value{ .str = result };
+            }
+            return Value{ .str = s };
+        },
+        .fn_replace_all => {
+            const args = splitTopLevelArgs(inner) catch return null;
+            if (args.len < 3) return Value{ .str = "" };
+            const s_v = evalTextExpr(std.mem.trim(u8, args.items[0], " \t\r\n"), row) orelse return Value{ .str = "" };
+            const s = s_v.toStr() orelse return Value{ .str = "" };
+            const from_v = evalTextExpr(std.mem.trim(u8, args.items[1], " \t\r\n"), row) orelse return Value{ .str = s };
+            const from = from_v.toStr() orelse return Value{ .str = s };
+            const to_v = evalTextExpr(std.mem.trim(u8, args.items[2], " \t\r\n"), row) orelse return Value{ .str = s };
+            const to = to_v.toStr() orelse return Value{ .str = s };
+            if (from.len == 0) return Value{ .str = s };
+            // Count occurrences
+            var count: usize = 0;
+            var i: usize = 0;
+            while (i + from.len <= s.len) {
+                if (std.mem.eql(u8, s[i..i + from.len], from)) { count += 1; i += from.len; }
+                else i += 1;
+            }
+            if (count == 0) return Value{ .str = s };
+            const actual_len = s.len - count * from.len + count * to.len;
+            const result = std.heap.page_allocator.alloc(u8, actual_len) catch return Value{ .str = s };
+            var ri: usize = 0;
+            i = 0;
+            while (i < s.len) {
+                if (i + from.len <= s.len and std.mem.eql(u8, s[i..i + from.len], from)) {
+                    @memcpy(result[ri..ri + to.len], to);
+                    ri += to.len;
+                    i += from.len;
+                } else {
+                    result[ri] = s[i];
+                    ri += 1;
+                    i += 1;
+                }
+            }
+            return Value{ .str = result[0..ri] };
+        },
+
+        // ── formatDateTime ────────────────────────────────────────
+        .fn_format_datetime => {
+            const args = splitTopLevelArgs(inner) catch return null;
+            if (args.len < 2) return Value{ .str = "" };
+            const ts_v = evalTextExpr(std.mem.trim(u8, args.items[0], " \t\r\n"), row) orelse return Value{ .str = "" };
+            const ts = ts_v.toI64() orelse return Value{ .str = "" };
+            const fmt_v = evalTextExpr(std.mem.trim(u8, args.items[1], " \t\r\n"), row) orelse return Value{ .str = "" };
+            const fmt = fmt_v.toStr() orelse return Value{ .str = "" };
+            // tz arg (args[2]) ignored — always UTC for now
+            const result = formatDateTimeStr(ts, fmt) orelse return Value{ .str = "" };
+            return Value{ .str = result };
+        },
+
+        // ── String trim ──────────────────────────────────────────
+        .fn_trim => {
+            const s_v = evalTextExpr(std.mem.trim(u8, inner, " \t\r\n"), row) orelse return Value{ .str = "" };
+            const s = s_v.toStr() orelse return Value{ .str = "" };
+            return Value{ .str = std.mem.trim(u8, s, " \t\r\n") };
+        },
+        .fn_trim_left => {
+            const s_v = evalTextExpr(std.mem.trim(u8, inner, " \t\r\n"), row) orelse return Value{ .str = "" };
+            const s = s_v.toStr() orelse return Value{ .str = "" };
+            return Value{ .str = std.mem.trimStart(u8, s, " \t\r\n") };
+        },
+        .fn_trim_right => {
+            const s_v = evalTextExpr(std.mem.trim(u8, inner, " \t\r\n"), row) orelse return Value{ .str = "" };
+            const s = s_v.toStr() orelse return Value{ .str = "" };
+            return Value{ .str = std.mem.trimEnd(u8, s, " \t\r\n") };
+        },
+
+        // ── Type casts ────────────────────────────────────────────
+        .fn_to_int32 => {
+            const v = evalTextExpr(std.mem.trim(u8, inner, " \t\r\n"), row) orelse return Value{ .i64 = 0 };
+            return Value{ .i64 = v.toI64() orelse 0 };
+        },
+        .fn_to_int64 => {
+            const v = evalTextExpr(std.mem.trim(u8, inner, " \t\r\n"), row) orelse return Value{ .i64 = 0 };
+            return Value{ .i64 = v.toI64() orelse 0 };
+        },
+        .fn_to_uint32 => {
+            const v = evalTextExpr(std.mem.trim(u8, inner, " \t\r\n"), row) orelse return Value{ .i64 = 0 };
+            const iv = v.toI64() orelse 0;
+            return Value{ .i64 = @as(i64, @intCast(@as(u32, @truncate(@as(u64, @bitCast(iv)))))) };
+        },
+        .fn_to_uint64 => {
+            const v = evalTextExpr(std.mem.trim(u8, inner, " \t\r\n"), row) orelse return Value{ .i64 = 0 };
+            return Value{ .i64 = v.toI64() orelse 0 };
+        },
+        .fn_to_float32 => {
+            const v = evalTextExpr(std.mem.trim(u8, inner, " \t\r\n"), row) orelse return Value{ .f64 = 0.0 };
+            return Value{ .f64 = v.toF64() orelse 0.0 };
+        },
+        .fn_to_float64 => {
+            const v = evalTextExpr(std.mem.trim(u8, inner, " \t\r\n"), row) orelse return Value{ .f64 = 0.0 };
+            return Value{ .f64 = v.toF64() orelse 0.0 };
+        },
+
+        // ── Null handling ─────────────────────────────────────────
+        .fn_if_null => {
+            const args = splitTopLevelArgs(inner) catch return null;
+            if (args.len < 2) return null;
+            const v = evalTextExpr(std.mem.trim(u8, args.items[0], " \t\r\n"), row);
+            if (v != null and v.? != .null_val) return v;
+            return evalTextExpr(std.mem.trim(u8, args.items[1], " \t\r\n"), row);
+        },
+        .fn_coalesce => {
+            const args = splitTopLevelArgs(inner) catch return null;
+            for (args.items) |arg| {
+                const v = evalTextExpr(std.mem.trim(u8, arg, " \t\r\n"), row);
+                if (v != null and v.? != .null_val) return v;
+            }
+            return Value.null_val;
+        },
+        .fn_to_nullable => {
+            return evalTextExpr(std.mem.trim(u8, inner, " \t\r\n"), row);
+        },
+        .fn_nullable_or_default => {
+            const v = evalTextExpr(std.mem.trim(u8, inner, " \t\r\n"), row);
+            if (v != null and v.? != .null_val) return v;
+            return Value{ .i64 = 0 };
+        },
+
+        // ── endsWith ─────────────────────────────────────────────
+        .fn_ends_with => {
+            const args = splitTopLevelArgs(inner) catch return null;
+            if (args.len < 2) return Value{ .i64 = 0 };
+            const s_v = evalTextExpr(std.mem.trim(u8, args.items[0], " \t\r\n"), row) orelse return Value{ .i64 = 0 };
+            const s = s_v.toStr() orelse return Value{ .i64 = 0 };
+            const suf_v = evalTextExpr(std.mem.trim(u8, args.items[1], " \t\r\n"), row) orelse return Value{ .i64 = 0 };
+            const suf = suf_v.toStr() orelse return Value{ .i64 = 0 };
+            return Value{ .i64 = if (std.mem.endsWith(u8, s, suf)) 1 else 0 };
+        },
+
+        .fn_to_string_base => {
+            return evalTextExpr(std.mem.trim(u8, inner, " \t\r\n"), row);
+        },
     }
+}
+
+/// Strip surrounding single or double quotes from a string literal.
+fn stripQuotes(s: []const u8) []const u8 {
+    if (s.len >= 2) {
+        if ((s[0] == '\'' and s[s.len - 1] == '\'') or
+            (s[0] == '"'  and s[s.len - 1] == '"'))
+            return s[1..s.len - 1];
+    }
+    return s;
+}
+
+/// Simple JSON key extractor: finds "key": <value> and returns the raw value
+/// (string without quotes, number, bool literal).
+/// Handles nested objects by returning their raw text.
+fn jsonExtract(json: []const u8, key: []const u8) ?[]const u8 {
+    // Build search token: "key":
+    var needle_buf: [256]u8 = undefined;
+    if (key.len + 4 > needle_buf.len) return null;
+    needle_buf[0] = '"';
+    @memcpy(needle_buf[1..1 + key.len], key);
+    needle_buf[1 + key.len] = '"';
+    needle_buf[2 + key.len] = ':';
+    const needle = needle_buf[0..3 + key.len];
+    var i: usize = 0;
+    while (i + needle.len <= json.len) : (i += 1) {
+        if (!std.mem.eql(u8, json[i..i + needle.len], needle)) continue;
+        var pos = i + needle.len;
+        // skip whitespace
+        while (pos < json.len and (json[pos] == ' ' or json[pos] == '\t' or json[pos] == '\n')) pos += 1;
+        if (pos >= json.len) return null;
+        if (json[pos] == '"') {
+            // string value
+            pos += 1;
+            const start = pos;
+            while (pos < json.len) {
+                if (json[pos] == '\\') { pos += 2; continue; }
+                if (json[pos] == '"') break;
+                pos += 1;
+            }
+            return json[start..pos];
+        } else if (json[pos] == '{' or json[pos] == '[') {
+            // nested — return raw text
+            const start = pos;
+            var depth: usize = 1;
+            pos += 1;
+            while (pos < json.len and depth > 0) {
+                if (json[pos] == '{' or json[pos] == '[') depth += 1
+                else if (json[pos] == '}' or json[pos] == ']') depth -= 1
+                else if (json[pos] == '"') {
+                    pos += 1;
+                    while (pos < json.len) {
+                        if (json[pos] == '\\') { pos += 2; continue; }
+                        if (json[pos] == '"') break;
+                        pos += 1;
+                    }
+                }
+                pos += 1;
+            }
+            return json[start..pos];
+        } else {
+            // number, bool, null
+            const start = pos;
+            while (pos < json.len and json[pos] != ',' and json[pos] != '}' and json[pos] != ']' and json[pos] != ' ') pos += 1;
+            return json[start..pos];
+        }
+    }
+    return null;
+}
+
+/// Minimal regex match using simple pattern:
+/// Supports: . * + ? ^ $ [] [^] literal chars, \d \w \s
+/// Falls back to std.mem.containsAtLeast for unsupported patterns.
+fn regexpMatch(haystack: []const u8, pattern: []const u8) bool {
+    // Use simple anchoring check
+    const pat = pattern;
+    if (pat.len == 0) return true;
+    // Try each position
+    var start: usize = 0;
+    const anchored_start = pat.len > 0 and pat[0] == '^';
+    const search_start: usize = if (anchored_start) 1 else 0;
+    if (anchored_start) {
+        return regexpMatchAt(haystack, 0, pat[search_start..]);
+    }
+    while (start <= haystack.len) : (start += 1) {
+        if (regexpMatchAt(haystack, start, pat)) return true;
+    }
+    return false;
+}
+
+/// Try to match pattern starting at haystack[pos]
+fn regexpMatchAt(haystack: []const u8, start: usize, pattern: []const u8) bool {
+    var hi = start;
+    var pi: usize = 0;
+    while (pi < pattern.len) {
+        const anchored_end = pi == pattern.len - 1 and pattern[pi] == '$';
+        if (anchored_end) return hi == haystack.len;
+
+        // get current pattern char
+        const pc = pattern[pi];
+
+        // check for quantifier after current atom
+        const has_star  = pi + 1 < pattern.len and pattern[pi + 1] == '*';
+        const has_plus  = pi + 1 < pattern.len and pattern[pi + 1] == '+';
+        const has_opt   = pi + 1 < pattern.len and pattern[pi + 1] == '?';
+        const quantified = has_star or has_plus or has_opt;
+
+        if (pc == '.') {
+            if (quantified) {
+                const min_count: usize = if (has_plus) 1 else 0;
+                const max_advance = haystack.len - hi;
+                // greedy: try from max down
+                var k: usize = max_advance;
+                while (true) {
+                    if (k >= min_count) {
+                        if (regexpMatchAt(haystack, hi + k, pattern[pi + 2..])) return true;
+                    }
+                    if (k == 0) break;
+                    k -= 1;
+                }
+                return false;
+            }
+            if (hi >= haystack.len) return false;
+            hi += 1;
+            pi += 1;
+        } else if (pc == '[') {
+            // find closing ]
+            var end_bracket = pi + 1;
+            if (end_bracket < pattern.len and pattern[end_bracket] == '^') end_bracket += 1;
+            while (end_bracket < pattern.len and pattern[end_bracket] != ']') end_bracket += 1;
+            const char_class = pattern[pi..end_bracket + 1];
+            const quant_idx = end_bracket + 1;
+            const qc = if (quant_idx < pattern.len) pattern[quant_idx] else 0;
+            const q_star = qc == '*'; const q_plus = qc == '+';
+            if (q_star or q_plus) {
+                const min_c: usize = if (q_plus) 1 else 0;
+                var k: usize = 0;
+                while (hi + k <= haystack.len and (k == 0 or matchCharClass(haystack[hi + k - 1], char_class))) : (k += 1) {}
+                var back = k;
+                while (true) {
+                    if (back >= min_c) {
+                        if (regexpMatchAt(haystack, hi + back, pattern[quant_idx + 1..])) return true;
+                    }
+                    if (back == 0) break;
+                    back -= 1;
+                }
+                return false;
+            }
+            if (hi >= haystack.len) return false;
+            if (!matchCharClass(haystack[hi], char_class)) return false;
+            hi += 1;
+            pi = end_bracket + 1;
+        } else {
+            // literal or escape
+            const literal: u8 = if (pc == '\\' and pi + 1 < pattern.len) blk: {
+                pi += 1;
+                break :blk pattern[pi];
+            } else pc;
+            if (quantified) {
+                const min_count: usize = if (has_plus) 1 else if (has_opt) 0 else 0;
+                const max_count: usize = if (has_opt) 1 else haystack.len - hi + 1;
+                var k: usize = 0;
+                while (k < max_count and hi + k < haystack.len and haystack[hi + k] == literal) : (k += 1) {}
+                var back = k;
+                while (true) {
+                    if (back >= min_count) {
+                        if (regexpMatchAt(haystack, hi + back, pattern[pi + 2..])) return true;
+                    }
+                    if (back == 0) break;
+                    back -= 1;
+                }
+                return false;
+            }
+            if (hi >= haystack.len or haystack[hi] != literal) return false;
+            hi += 1;
+            pi += 1;
+        }
+    }
+    return true;
+}
+
+fn matchCharClass(c: u8, class: []const u8) bool {
+    if (class.len < 2) return false;
+    var i: usize = 1;
+    const negate = class[1] == '^';
+    if (negate) i = 2;
+    var matched = false;
+    while (i < class.len and class[i] != ']') {
+        if (i + 2 < class.len and class[i + 1] == '-' and class[i + 2] != ']') {
+            if (c >= class[i] and c <= class[i + 2]) matched = true;
+            i += 3;
+        } else {
+            if (c == class[i]) matched = true;
+            i += 1;
+        }
+    }
+    return if (negate) !matched else matched;
+}
+
+/// Extract first match of pattern from haystack (returns full match if no capture groups).
+fn regexpExtract(haystack: []const u8, pattern: []const u8) ?[]const u8 {
+    var start: usize = 0;
+    while (start <= haystack.len) : (start += 1) {
+        if (regexpMatchAt(haystack, start, pattern)) {
+            // find end of match
+            var end_pos = start + 1;
+            while (end_pos <= haystack.len) : (end_pos += 1) {
+                if (!regexpMatchAt(haystack, start, pattern)) break;
+                // check if longer match possible
+                if (end_pos >= haystack.len) break;
+            }
+            return haystack[start..end_pos];
+        }
+    }
+    return null;
+}
+
+/// Replace all occurrences of pattern with replacement in haystack.
+fn regexpReplaceAll(haystack: []const u8, pattern: []const u8, replacement: []const u8) ?[]const u8 {
+    var result: std.ArrayListUnmanaged(u8) = .empty;
+    var i: usize = 0;
+    while (i <= haystack.len) {
+        if (i < haystack.len and regexpMatch(haystack[i..], pattern)) {
+            // find match length
+            var mlen: usize = 1;
+            while (mlen <= haystack.len - i) : (mlen += 1) {
+                if (!regexpMatchAt(haystack, i, pattern)) break;
+            }
+            result.appendSlice(std.heap.page_allocator, replacement) catch return null;
+            i += mlen;
+        } else {
+            if (i < haystack.len) result.append(std.heap.page_allocator, haystack[i]) catch return null;
+            i += 1;
+        }
+    }
+    return result.toOwnedSlice(std.heap.page_allocator) catch null;
+}
+
+/// Format a unix timestamp using ClickHouse-style format string (%Y %m %d %H %i %S etc.)
+fn formatDateTimeStr(ts: i64, fmt: []const u8) ?[]const u8 {
+    const epoch_seconds = std.time.epoch.EpochSeconds{ .secs = @intCast(@max(0, ts)) };
+    const epoch_day = epoch_seconds.getEpochDay();
+    const year_day = epoch_day.calculateYearDay();
+    const month_day = year_day.calculateMonthDay();
+    const day_seconds = epoch_seconds.getDaySeconds();
+
+    var buf: [64]u8 = undefined;
+    var out: [128]u8 = undefined;
+    var out_len: usize = 0;
+
+    var i: usize = 0;
+    while (i < fmt.len) {
+        if (fmt[i] == '%' and i + 1 < fmt.len) {
+            i += 1;
+            const written: []const u8 = switch (fmt[i]) {
+                'Y' => std.fmt.bufPrint(&buf, "{d:0>4}", .{year_day.year}) catch return null,
+                'y' => std.fmt.bufPrint(&buf, "{d:0>2}", .{year_day.year % 100}) catch return null,
+                'm' => std.fmt.bufPrint(&buf, "{d:0>2}", .{@intFromEnum(month_day.month)}) catch return null,
+                'd' => std.fmt.bufPrint(&buf, "{d:0>2}", .{month_day.day_index + 1}) catch return null,
+                'H' => std.fmt.bufPrint(&buf, "{d:0>2}", .{day_seconds.getHoursIntoDay()}) catch return null,
+                'i' => std.fmt.bufPrint(&buf, "{d:0>2}", .{day_seconds.getMinutesIntoHour()}) catch return null,
+                'S' => std.fmt.bufPrint(&buf, "{d:0>2}", .{day_seconds.getSecondsIntoMinute()}) catch return null,
+                'M' => blk: {
+                    const month_names = [_][]const u8{ "January","February","March","April","May","June",
+                        "July","August","September","October","November","December" };
+                    const mi = @intFromEnum(month_day.month) - 1;
+                    break :blk if (mi < 12) month_names[mi] else "Unknown";
+                },
+                'e' => std.fmt.bufPrint(&buf, "{d}", .{month_day.day_index + 1}) catch return null,
+                'j' => std.fmt.bufPrint(&buf, "{d:0>3}", .{year_day.day + 1}) catch return null,
+                'n' => std.fmt.bufPrint(&buf, "{d}", .{@intFromEnum(month_day.month)}) catch return null,
+                '%' => "%",
+                else => blk: {
+                    buf[0] = '%'; buf[1] = fmt[i];
+                    break :blk buf[0..2];
+                },
+            };
+            if (out_len + written.len > out.len) return null;
+            @memcpy(out[out_len..out_len + written.len], written);
+            out_len += written.len;
+        } else {
+            if (out_len >= out.len) return null;
+            out[out_len] = fmt[i];
+            out_len += 1;
+        }
+        i += 1;
+    }
+    const heap = std.heap.page_allocator.alloc(u8, out_len) catch return null;
+    @memcpy(heap, out[0..out_len]);
+    return heap;
 }
 
 /// Evaluate CASE WHEN c1 THEN v1 … [ELSE vN] END
@@ -5392,7 +5980,17 @@ fn writeExprHeader(out: *std.ArrayList(u8), allocator: std.mem.Allocator, proj: 
             std.mem.startsWith(u8, col_lower, "hasany(") or
             std.mem.startsWith(u8, col_lower, "hasall(") or
             std.mem.startsWith(u8, col_lower, "dictha") or
-            std.mem.startsWith(u8, col_lower, "nothas(");
+            std.mem.startsWith(u8, col_lower, "nothas(") or
+            std.mem.startsWith(u8, col_lower, "match(") or
+            std.mem.startsWith(u8, col_lower, "startswith(") or
+            std.mem.startsWith(u8, col_lower, "endswith(") or
+            std.mem.startsWith(u8, col_lower, "isipv4string(") or
+            std.mem.startsWith(u8, col_lower, "isipv6string(") or
+            std.mem.startsWith(u8, col_lower, "notempty(") or
+            std.mem.startsWith(u8, col_lower, "empty(") or
+            std.mem.startsWith(u8, col_lower, "like ") or
+            std.mem.startsWith(u8, col_lower, "simplejsonextractbool(") or
+            std.mem.startsWith(u8, col_lower, "jsonextractbool(");
     };
     const is_date_expr = std.mem.startsWith(u8, col_lower, "cast(") and
         (std.ascii.indexOfIgnoreCase(col_expr, " AS DATE") != null or
