@@ -112,7 +112,7 @@ fn buildSelectPlan(allocator: Allocator, sel: ast.SelectStmt, ctes_from_parent: 
     var where_expr: ?*WhereNode = null;
     var where_text: ?[]const u8 = null;
     if (sel.where) |we| {
-        where_expr = buildWhereNode(allocator, we.*) catch null;
+        where_expr = buildWhereNode(allocator, we.*, all_ctes) catch null;
         where_text = try exprToText(allocator, we.*, all_ctes);
     }
 
@@ -133,7 +133,7 @@ fn buildSelectPlan(allocator: Allocator, sel: ast.SelectStmt, ctes_from_parent: 
     var having_expr: ?*WhereNode = null;
     var having_text: ?[]const u8 = null;
     if (sel.having) |he| {
-        having_expr = buildWhereNode(allocator, he.*) catch null;
+        having_expr = buildWhereNode(allocator, he.*, all_ctes) catch null;
         having_text = try exprToText(allocator, he.*, all_ctes);
     }
 
@@ -401,7 +401,7 @@ fn firstArgText(allocator: Allocator, args: []ast.Expr, ctes: []ast.Cte) BuildEr
 
 // ── WhereNode builder ─────────────────────────────────────────────────────────
 
-fn buildWhereNode(allocator: Allocator, e: ast.Expr) BuildError!*WhereNode {
+fn buildWhereNode(allocator: Allocator, e: ast.Expr, ctes: []ast.Cte) BuildError!*WhereNode {
     const node = try allocator.create(WhereNode);
     errdefer allocator.destroy(node);
 
@@ -411,14 +411,14 @@ fn buildWhereNode(allocator: Allocator, e: ast.Expr) BuildError!*WhereNode {
                 .and_ => {
                     // Flatten nested AND into children list
                     var children: std.ArrayListUnmanaged(*WhereNode) = .empty;
-                    try flattenAndOr(allocator, e, .and_, &children);
+                    try flattenAndOr(allocator, e, .and_, &children, ctes);
                     const owned = try children.toOwnedSlice(allocator);
                     node.* = .{ .and_ = owned };
                     return node;
                 },
                 .or_ => {
                     var children: std.ArrayListUnmanaged(*WhereNode) = .empty;
-                    try flattenAndOr(allocator, e, .or_, &children);
+                    try flattenAndOr(allocator, e, .or_, &children, ctes);
                     const owned = try children.toOwnedSlice(allocator);
                     node.* = .{ .or_ = owned };
                     return node;
@@ -433,18 +433,20 @@ fn buildWhereNode(allocator: Allocator, e: ast.Expr) BuildError!*WhereNode {
                         .gte => CmpOp.ge,
                         else => unreachable,
                     };
-                    if (bo.left == .col) {
-                        const col = try allocator.dupe(u8, bo.left.col);
-                        switch (bo.right) {
-                            .int => |v| { node.* = .{ .cmp_int = .{ .col = col, .op = cmp_op, .val = v } }; return node; },
-                            .uint => |v| { node.* = .{ .cmp_int = .{ .col = col, .op = cmp_op, .val = @intCast(v) } }; return node; },
-                            .str => |v| {
-                                const val = try allocator.dupe(u8, v);
-                                node.* = .{ .cmp_str = .{ .col = col, .op = cmp_op, .val = val } };
-                                return node;
-                            },
-                            else => { allocator.free(col); },
-                        }
+                    // Resolve LHS: plain column or any expression rendered as text.
+                    const col: []const u8 = if (bo.left == .col)
+                        try allocator.dupe(u8, bo.left.col)
+                    else
+                        exprToText(allocator, bo.left, ctes) catch return error.UnsupportedFeature;
+                    switch (bo.right) {
+                        .int  => |v| { node.* = .{ .cmp_int = .{ .col = col, .op = cmp_op, .val = v } }; return node; },
+                        .uint => |v| { node.* = .{ .cmp_int = .{ .col = col, .op = cmp_op, .val = @intCast(v) } }; return node; },
+                        .str  => |v| {
+                            const val = try allocator.dupe(u8, v);
+                            node.* = .{ .cmp_str = .{ .col = col, .op = cmp_op, .val = val } };
+                            return node;
+                        },
+                        else => { allocator.free(col); },
                     }
                     return error.UnsupportedFeature;
                 },
@@ -478,7 +480,7 @@ fn buildWhereNode(allocator: Allocator, e: ast.Expr) BuildError!*WhereNode {
     }
 }
 
-fn flattenAndOr(allocator: Allocator, e: ast.Expr, op: enum { and_, or_ }, out: *std.ArrayListUnmanaged(*WhereNode)) BuildError!void {
+fn flattenAndOr(allocator: Allocator, e: ast.Expr, op: enum { and_, or_ }, out: *std.ArrayListUnmanaged(*WhereNode), ctes: []ast.Cte) BuildError!void {
     if (e == .binop) {
         const bo = e.binop;
         const is_same = switch (op) {
@@ -486,12 +488,12 @@ fn flattenAndOr(allocator: Allocator, e: ast.Expr, op: enum { and_, or_ }, out: 
             .or_  => bo.op == .or_,
         };
         if (is_same) {
-            try flattenAndOr(allocator, bo.left, op, out);
-            try flattenAndOr(allocator, bo.right, op, out);
+            try flattenAndOr(allocator, bo.left, op, out, ctes);
+            try flattenAndOr(allocator, bo.right, op, out, ctes);
             return;
         }
     }
-    const child = buildWhereNode(allocator, e) catch return;
+    const child = buildWhereNode(allocator, e, ctes) catch return;
     try out.append(allocator, child);
 }
 

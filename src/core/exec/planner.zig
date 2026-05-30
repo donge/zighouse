@@ -484,7 +484,8 @@ pub fn plan_query(
                         try vcols_list.append(ctx.alloc, .{ .name = ai.alias, .idx = out_idx, .col_type = ai.out_type });
                         // Also register by canonical agg function name so HAVING COUNT(*) > N works
                         // even when the alias differs from the function text.
-                        if (aggCanonName(ai.expr)) |canon| {
+                        var canon_buf: [2][]const u8 = undefined;
+                        for (aggCanonNames(ai.expr, &canon_buf)) |canon| {
                             try vcols_list.append(ctx.alloc, .{ .name = canon, .idx = out_idx, .col_type = ai.out_type });
                         }
                     }
@@ -492,7 +493,8 @@ pub fn plan_query(
                 .scalar_agg => |sa| {
                     for (sa.aggs, 0..) |ai, i| {
                         try vcols_list.append(ctx.alloc, .{ .name = ai.alias, .idx = i, .col_type = ai.out_type });
-                        if (aggCanonName(ai.expr)) |canon| {
+                        var canon_buf: [2][]const u8 = undefined;
+                        for (aggCanonNames(ai.expr, &canon_buf)) |canon| {
                             try vcols_list.append(ctx.alloc, .{ .name = canon, .idx = i, .col_type = ai.out_type });
                         }
                     }
@@ -689,6 +691,24 @@ fn outputLen(node: *const PhysicalNode) usize {
 /// Return the canonical DuckDB exprToText form for a simple agg_call ProjectItem,
 /// e.g. count(*) → "count_star()", sum(col) → null (too variable).
 /// Used to register extra virtual_cols so HAVING COUNT(*) > N works regardless of alias.
+/// Returns a slice of up to 2 canonical name variants for the given aggregate expression.
+fn aggCanonNames(expr: plan.Expr, buf: *[2][]const u8) []const []const u8 {
+    if (expr != .agg_call) return buf[0..0];
+    const ac = expr.agg_call;
+    return switch (ac.kind) {
+        .count_star => blk: {
+            buf[0] = "count_star()";
+            buf[1] = "count(*)";
+            break :blk buf[0..2];
+        },
+        .count => blk: {
+            buf[0] = "count()";
+            break :blk buf[0..1];
+        },
+        else => buf[0..0],
+    };
+}
+
 fn aggCanonName(expr: plan.Expr) ?[]const u8 {
     if (expr != .agg_call) return null;
     const ac = expr.agg_call;
@@ -1525,8 +1545,18 @@ fn prattExpr(pctx: *ParseCtx, min_bp: u8) anyerror!?Expr {
                 _ = pctx.lex.next(); // consume '('
                 // Parse argument list
                 var args: std.ArrayListUnmanaged(Expr) = .empty;
-                // Check for zero-arg call
+                // Check for zero-arg call or count(*) star arg
                 const first_peek = pctx.lex.peek();
+                if (first_peek.kind == .star and std.ascii.eqlIgnoreCase(name, "count")) {
+                    // count(*) → treat as zero-arg call (will be recognized as count_star)
+                    _ = pctx.lex.next(); // consume '*'
+                    const close_star = pctx.lex.next();
+                    if (close_star.kind != .rparen) return null;
+                    const args_slice = try args.toOwnedSlice(pctx.arena);
+                    const fc = try pctx.arena.create(plan.FnCall);
+                    fc.* = .{ .name = "count_star", .args = args_slice };
+                    break :blk Expr{ .fn_call = fc };
+                }
                 if (first_peek.kind != .rparen) {
                     while (true) {
                         const arg = try prattExpr(pctx, 0) orelse return null;
