@@ -1,5 +1,8 @@
 const std = @import("std");
 const duckdb_parse = @import("duckdb_parse.zig");
+const build_options = @import("build_options");
+const sql_parser = @import("sql_parser");
+const plan_builder = @import("sql/plan_builder.zig");
 
 pub const AggregateFn = enum {
     column_ref, int_literal, float_literal,
@@ -150,13 +153,26 @@ pub const Plan = struct {
 };
 
 /// Parse `sql` into a Plan.  Tries the DuckDB-backed parser first (when DuckDB
-/// is linked); falls back to the legacy hand-written parser on failure.
+/// is linked); falls back to the native Zig parser on failure or when DuckDB
+/// is disabled.
 pub fn parse(allocator: std.mem.Allocator, sql: []const u8) !?Plan {
     // Normalize ClickHouse array-literal IN syntax: `col IN ['a','b']` → `col IN ('a','b')`
     // DuckDB cannot parse square brackets as IN lists; convert to parens first.
     const normalized = try normalizeInBrackets(allocator, sql);
     defer if (!std.mem.eql(u8, normalized, sql)) allocator.free(normalized);
-    return duckdb_parse.parse(allocator, normalized) catch null;
+
+    if (build_options.duckdb) {
+        const duckdb_result = duckdb_parse.parse(allocator, normalized) catch null;
+        if (duckdb_result) |plan| return plan;
+    }
+
+    // Native parser path (also used as fallback when DuckDB parse fails)
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    const arena_alloc = arena.allocator();
+    defer arena.deinit();
+    const stmt = sql_parser.parse(arena_alloc, normalized) orelse return null;
+    const plan = plan_builder.buildPlan(allocator, stmt, null) catch return null;
+    return plan;
 }
 
 /// Execute `sql` directly via DuckDB and return CSV (header + data rows).
