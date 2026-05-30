@@ -2968,6 +2968,11 @@ fn collectNeededColumns(
 const HavingPred = struct { proj_idx: usize, op: generic_sql.CmpOp, threshold: i64 };
 
 fn parseHavingPred(projections: []const generic_sql.Expr, having_text: []const u8) ?HavingPred {
+    // Strip outer parentheses wrapping the whole expression, e.g. "(count(*) > 2)" → "count(*) > 2"
+    var text = std.mem.trim(u8, having_text, " \t\r\n");
+    while (text.len >= 2 and text[0] == '(' and text[text.len - 1] == ')') {
+        text = std.mem.trim(u8, text[1 .. text.len - 1], " \t\r\n");
+    }
     const ops = [_]struct { text: []const u8, op: generic_sql.CmpOp }{
         .{ .text = ">=", .op = .ge },
         .{ .text = "<=", .op = .le },
@@ -2977,13 +2982,14 @@ fn parseHavingPred(projections: []const generic_sql.Expr, having_text: []const u
         .{ .text = "=",  .op = .eq },
     };
     for (ops) |candidate| {
-        const pos = std.mem.indexOf(u8, having_text, candidate.text) orelse continue;
-        const lhs = std.mem.trim(u8, having_text[0..pos], " \t\r\n");
-        const rhs = std.mem.trim(u8, having_text[pos + candidate.text.len ..], " \t\r\n");
+        const pos = std.mem.indexOf(u8, text, candidate.text) orelse continue;
+        const lhs = std.mem.trim(u8, text[0..pos], " \t\r\n");
+        const rhs = std.mem.trim(u8, text[pos + candidate.text.len ..], " \t\r\n");
         const threshold = std.fmt.parseInt(i64, rhs, 10) catch continue;
         // Match lhs to a projection: count_star name variants, alias, or column
         for (projections, 0..) |p, i| {
             if (std.ascii.eqlIgnoreCase(lhs, "COUNT(*)") or
+                std.ascii.eqlIgnoreCase(lhs, "count()") or
                 std.ascii.eqlIgnoreCase(lhs, "count_star()"))
             {
                 if (p.func == .count_star) return .{ .proj_idx = i, .op = candidate.op, .threshold = threshold };

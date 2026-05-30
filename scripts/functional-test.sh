@@ -8,6 +8,7 @@ REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 TESTS_DIR="$REPO_DIR/tests/functional"
 BINARY="$REPO_DIR/zig-out/bin/zighouse"
 PORT="${ZIGHOUSE_PORT:-9999}"
+HTTP_PORT=$((PORT + 1))   # TCP=PORT, HTTP=PORT+1 (zighouse convention)
 DATA_DIR="$(mktemp -d /tmp/zh-func-test-XXXXXX)"
 SERVER_PID=""
 CURL="curl -s --noproxy localhost"
@@ -40,7 +41,7 @@ echo "Server PID=$SERVER_PID, data=$DATA_DIR"
 
 # Wait for server to be ready.
 for i in $(seq 1 30); do
-    if $CURL "http://localhost:$PORT/?query=SELECT+1" >/dev/null 2>&1; then
+    if $CURL "http://localhost:$HTTP_PORT/?query=SELECT+1" >/dev/null 2>&1; then
         break
     fi
     sleep 0.2
@@ -82,13 +83,13 @@ for sql_file in "$TESTS_DIR"/*.sql; do
         if [[ "$upper" == SELECT* ]] || [[ "$upper" == WITH* ]]; then
             # GET with ?query= → TabSeparated (no header) output, matching ClickHouse behaviour.
             encoded="$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "$stmt")"
-            response="$($CURL "http://localhost:$PORT/?query=$encoded&default_format=TabSeparated")"
+            response="$($CURL "http://localhost:$HTTP_PORT/?query=$encoded&default_format=TabSeparated")"
             if [[ -n "$response" ]]; then
                 actual_output="${actual_output}${response}"$'\n'
             fi
         else
             # POST body for DDL/INSERT.
-            $CURL -X POST "http://localhost:$PORT/" --data-binary "$stmt" >/dev/null
+            $CURL -X POST "http://localhost:$HTTP_PORT/" --data-binary "$stmt" >/dev/null
         fi
     done < <(grep -v '^--' "$sql_file" | tr ';' '\n')
 

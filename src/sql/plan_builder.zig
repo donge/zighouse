@@ -161,8 +161,12 @@ fn buildSelectPlan(allocator: Allocator, sel: ast.SelectStmt, ctes_from_parent: 
         // Set fast-path aliases
         if (sel.order_by.len == 1) {
             const oi = sel.order_by[0];
-            // Check if it's ORDER BY COUNT(*) DESC
-            if (oi.expr == .func and std.mem.eql(u8, oi.expr.func.name, "count") and oi.expr.func.args.len == 1 and oi.expr.func.args[0] == .star) {
+            // Check if it's ORDER BY COUNT(*) / count() DESC
+            const is_count_order = oi.expr == .func and std.mem.eql(u8, oi.expr.func.name, "count") and
+                (oi.expr.func.args.len == 0 or
+                 (oi.expr.func.args.len == 1 and oi.expr.func.args[0] == .star) or
+                 (oi.expr.func.args.len == 1 and oi.expr.func.args[0] == .int));
+            if (is_count_order) {
                 order_by_count_desc = oi.desc;
             } else {
                 // Use alias or column text
@@ -228,8 +232,10 @@ fn buildExpr(allocator: Allocator, e: ast.Expr, alias: ?[]const u8, ctes: []ast.
 fn buildFuncExpr(allocator: Allocator, f: ast.FuncExpr, alias: ?[]const u8, ctes: []ast.Cte) BuildError!Expr {
     const name = f.name; // already lowercase
 
-    // COUNT(*) / COUNT(*)
-    if (std.mem.eql(u8, name, "count") and f.args.len == 1 and f.args[0] == .star) {
+    // COUNT(*) / count() / count(1)
+    if (std.mem.eql(u8, name, "count") and (f.args.len == 0 or
+        (f.args.len == 1 and f.args[0] == .star) or
+        (f.args.len == 1 and f.args[0] == .int))) {
         return Expr{ .func = .count_star, .alias = alias };
     }
     // COUNT(DISTINCT col)
@@ -526,8 +532,10 @@ pub fn exprToText(allocator: Allocator, e: ast.Expr, ctes: []ast.Cte) BuildError
             return buf.toOwnedSlice(allocator);
         },
         .func => |f| {
-            // count(*) special case
-            if (std.mem.eql(u8, f.name, "count") and f.args.len == 1 and f.args[0] == .star) {
+            // count(*) / count() / count(1) → always render as count(*)
+            if (std.mem.eql(u8, f.name, "count") and (f.args.len == 0 or
+                (f.args.len == 1 and f.args[0] == .star) or
+                (f.args.len == 1 and f.args[0] == .int))) {
                 return allocator.dupe(u8, "count(*)");
             }
             var buf: std.ArrayListUnmanaged(u8) = .empty;
