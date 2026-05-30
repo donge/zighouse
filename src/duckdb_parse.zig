@@ -72,6 +72,94 @@ fn registerMacros(con: c.duckdb_connection) void {
 
 // ── Public API ───────────────────────────────────────────────────────────────
 
+/// Execute `sql` directly via DuckDB and return CSV (header + data rows).
+/// Returns null when DuckDB is not linked or the query fails.
+/// Caller owns the returned slice.
+pub fn execCsv(allocator: std.mem.Allocator, sql: []const u8) !?[]u8 {
+    if (!build_options.duckdb) return null;
+    const con = getConn();
+    const query = try allocator.dupeZ(u8, sql);
+    defer allocator.free(query);
+
+    var result: c.duckdb_result = undefined;
+    if (c.duckdb_query(con, query.ptr, &result) != c.DuckDBSuccess) {
+        c.duckdb_destroy_result(&result);
+        return null;
+    }
+    defer c.duckdb_destroy_result(&result);
+
+    const ncols = c.duckdb_column_count(&result);
+    const nrows = c.duckdb_row_count(&result);
+
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+
+    // Determine column types
+    var col_types = try allocator.alloc(c.duckdb_type, ncols);
+    defer allocator.free(col_types);
+    for (0..ncols) |ci| {
+        col_types[ci] = c.duckdb_column_type(&result, ci);
+    }
+
+    // Header row — prefix bool columns with \x03U8: sentinel
+    for (0..ncols) |ci| {
+        if (ci > 0) try buf.append(allocator, ',');
+        var col_name_buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer col_name_buf.deinit(allocator);
+        if (col_types[ci] == c.DUCKDB_TYPE_BOOLEAN) {
+            try col_name_buf.appendSlice(allocator, "\x03U8:");
+        }
+        const name = c.duckdb_column_name(&result, ci);
+        const ns = std.mem.span(name);
+        try col_name_buf.appendSlice(allocator, ns);
+        const full = col_name_buf.items;
+        // Quote header field if it contains comma, newline, or double-quote
+        if (std.mem.indexOfAny(u8, full, ",\n\"") != null) {
+            try buf.append(allocator, '"');
+            for (full) |ch| {
+                if (ch == '"') try buf.append(allocator, '"');
+                try buf.append(allocator, ch);
+            }
+            try buf.append(allocator, '"');
+        } else {
+            try buf.appendSlice(allocator, full);
+        }
+    }
+    try buf.append(allocator, '\n');
+
+    // Data rows
+    for (0..nrows) |ri| {
+        for (0..ncols) |ci| {
+            if (ci > 0) try buf.append(allocator, ',');
+            if (col_types[ci] == c.DUCKDB_TYPE_BOOLEAN) {
+                // Emit 1 or 0 instead of "true"/"false"
+                const b = c.duckdb_value_boolean(&result, ci, ri);
+                try buf.append(allocator, if (b) '1' else '0');
+            } else {
+                const val = c.duckdb_value_varchar(&result, ci, ri);
+                if (val != null) {
+                    const vs = std.mem.span(val);
+                    // Quote if contains comma or newline
+                    if (std.mem.indexOfAny(u8, vs, ",\n\"") != null) {
+                        try buf.append(allocator, '"');
+                        for (vs) |ch| {
+                            if (ch == '"') try buf.append(allocator, '"');
+                            try buf.append(allocator, ch);
+                        }
+                        try buf.append(allocator, '"');
+                    } else {
+                        try buf.appendSlice(allocator, vs);
+                    }
+                    c.duckdb_free(val);
+                }
+            }
+        }
+        try buf.append(allocator, '\n');
+    }
+
+    return try buf.toOwnedSlice(allocator);
+}
+
 /// Parse `sql` using DuckDB's json_serialize_sql() and return a Plan.
 /// Returns null when parsing is not supported (DuckDB not linked, non-SELECT
 /// statement, or unsupported syntax).  Caller owns the returned Plan and must
@@ -1542,12 +1630,69 @@ fn translateExpr(allocator: std.mem.Allocator, val: std.json.Value) !?generic_sq
     return .{ .func = .column_ref, .column = text, .alias = alias };
 }
 
+// ── plan-to-SQL reconstruction ────────────────────────────────────────────────
+
+/// Reconstruct a basic SELECT SQL string from a Plan.
+/// Used to serialize subqueries back to SQL for NOT IN (SELECT ...) handling.
+fn planToSelectSql(allocator: std.mem.Allocator, plan: generic_sql.Plan) ![]u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    try buf.appendSlice(allocator, "SELECT ");
+    for (plan.projections, 0..) |proj, i| {
+        if (i > 0) try buf.appendSlice(allocator, ", ");
+        if (proj.column) |col| {
+            try buf.appendSlice(allocator, col);
+        } else {
+            try buf.appendSlice(allocator, "*");
+        }
+        if (proj.alias) |a| {
+            try buf.appendSlice(allocator, " AS ");
+            try buf.appendSlice(allocator, a);
+        }
+    }
+    if (plan.table.len > 0) {
+        try buf.appendSlice(allocator, " FROM ");
+        try buf.appendSlice(allocator, plan.table);
+    }
+    if (plan.where_text) |wt| {
+        try buf.appendSlice(allocator, " WHERE ");
+        try buf.appendSlice(allocator, wt);
+    }
+    return buf.toOwnedSlice(allocator);
+}
+
 // ── expr-to-text (for where_text / having_text / order_by_text) ──────────────
 
 fn exprToText(allocator: std.mem.Allocator, val: std.json.Value) !?[]const u8 {
     if (val == .null) return null;
     const obj = val.object;
     const class = obj.get("class").?.string;
+
+    // SUBQUERY: reconstruct as SQL for use in NOT IN (SELECT ...) etc.
+    if (std.mem.eql(u8, class, "SUBQUERY")) {
+        const subquery_val = obj.get("subquery") orelse return null;
+        const inner_node_val = subquery_val.object.get("node") orelse return null;
+        const inner_type = (inner_node_val.object.get("type") orelse return null).string;
+        const inner_sql = blk: {
+            if (std.mem.eql(u8, inner_type, "SELECT_NODE")) {
+                const inner_plan = try translateSelectNode(allocator, inner_node_val.object);
+                defer generic_sql.deinit(allocator, inner_plan);
+                break :blk try planToSelectSql(allocator, inner_plan);
+            }
+            return null;
+        };
+        errdefer allocator.free(inner_sql);
+        // Handle subquery_type = "ANY": reconstruct as "child IN (SELECT ...)"
+        const subquery_type = if (obj.get("subquery_type")) |st| st.string else "";
+        if (std.mem.eql(u8, subquery_type, "ANY") or std.mem.eql(u8, subquery_type, "ALL")) {
+            const child_val = obj.get("child") orelse return inner_sql;
+            const lhs = try exprToText(allocator, child_val) orelse return inner_sql;
+            defer allocator.free(lhs);
+            defer allocator.free(inner_sql);
+            return try std.fmt.allocPrint(allocator, "{s} IN ({s})", .{ lhs, inner_sql });
+        }
+        return inner_sql;
+    }
 
     if (std.mem.eql(u8, class, "COLUMN_REF")) {
         const names = obj.get("column_names").?.array;

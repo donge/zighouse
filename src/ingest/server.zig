@@ -61,6 +61,17 @@ pub const Config = struct {
     extra_schemas: ?*const schema_config.SchemaConfig = null,
 };
 
+/// When `port` is set, TCP listens on that port and HTTP listens on `port + 1`.
+/// Default: TCP=9000, HTTP=8123 (legacy behavior when port=8123).
+fn tcpPort(cfg: Config) u16 {
+    if (cfg.port == 8123) return 9000; // legacy default
+    return cfg.port;
+}
+fn httpPort(cfg: Config) u16 {
+    if (cfg.port == 8123) return 8123;
+    return cfg.port + 1;
+}
+
 pub const Server = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -149,11 +160,11 @@ pub const Server = struct {
         _ = tcp_thread; // detached; runs until process exit
 
         const net = std.Io.net;
-        const address = try net.IpAddress.parseIp4("127.0.0.1", self.config.port);
+        const address = try net.IpAddress.parseIp4("127.0.0.1", httpPort(self.config));
         var listener = try address.listen(self.io, .{});
         defer listener.deinit(self.io);
 
-        std.debug.print("zighouse serve listening on 127.0.0.1:{d}\n", .{self.config.port});
+        std.debug.print("zighouse serve listening on 127.0.0.1:{d}\n", .{httpPort(self.config)});
 
         while (true) {
             const stream = try listener.accept(self.io);
@@ -171,7 +182,7 @@ pub const Server = struct {
             .schemas    = &self.schemas,
             .seq        = &self.seq,
         };
-        tcp_server.listenAndServe(&ctx, 9000) catch |err| {
+        tcp_server.listenAndServe(&ctx, tcpPort(self.config)) catch |err| {
             std.debug.print("tcp: server exited: {s}\n", .{@errorName(err)});
         };
     }
@@ -1040,7 +1051,14 @@ pub const Server = struct {
 
         // Parse SQL into a Plan.
         const plan = (try generic_sql.parse(self.allocator, sql_clean)) orelse {
-            try sendResponse(request, out, .bad_request, "Cannot parse SELECT query\n");
+            // parse failed — try DuckDB direct execution for computed queries
+            const csv_fallback = try generic_sql.execCsv(self.allocator, sql_clean);
+            if (csv_fallback) |csv| {
+                defer self.allocator.free(csv);
+                try sendResponse(request, out, .ok, csv);
+            } else {
+                try sendResponse(request, out, .bad_request, "Cannot parse SELECT query\n");
+            }
             return;
         };
         defer generic_sql.deinit(self.allocator, plan);

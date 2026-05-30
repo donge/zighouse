@@ -304,8 +304,16 @@ const Value = union(enum) {
                 }
             },
             .str      => |s| {
-                // CSV-quote strings that contain commas, quotes, or newlines
-                const needs_quote = std.mem.indexOfAny(u8, s, ",\"\n\r") != null;
+                // CSV-quote strings that contain commas, quotes, newlines, OR
+                // look like plain integers/floats (to preserve string type in csvToResultSet).
+                const looks_numeric = s.len > 0 and blk: {
+                    _ = std.fmt.parseInt(i64, s, 10) catch {
+                        _ = std.fmt.parseFloat(f64, s) catch break :blk false;
+                        break :blk true;
+                    };
+                    break :blk true;
+                };
+                const needs_quote = looks_numeric or std.mem.indexOfAny(u8, s, ",\"\n\r") != null;
                 if (needs_quote) {
                     try out.append(allocator, '"');
                     for (s) |ch| {
@@ -318,7 +326,14 @@ const Value = union(enum) {
                 }
             },
             .str_owned => |s| {
-                const needs_quote = std.mem.indexOfAny(u8, s, ",\"\n\r") != null;
+                const looks_numeric = s.len > 0 and blk: {
+                    _ = std.fmt.parseInt(i64, s, 10) catch {
+                        _ = std.fmt.parseFloat(f64, s) catch break :blk false;
+                        break :blk true;
+                    };
+                    break :blk true;
+                };
+                const needs_quote = looks_numeric or std.mem.indexOfAny(u8, s, ",\"\n\r") != null;
                 if (needs_quote) {
                     try out.append(allocator, '"');
                     for (s) |ch| {
@@ -5213,9 +5228,13 @@ fn evalFunc(kind: EvalKind, name: []const u8, inner: []const u8, row: *const Row
             if (args.len < 2) return Value{ .str = "" };
             const json_val = evalTextExpr(std.mem.trim(u8, args.items[0], " \t\r\n"), row) orelse return Value{ .str = "" };
             const json_str = json_val.toStr() orelse return Value{ .str = "" };
-            // Collect key path (args[1..])
-            for (args.items[1..]) |arg| {
+            // Collect key path (args[1..]), but skip integer/numeric args
+            // (e.g. ClickHouse `JSONExtractString(json, 'key', 1)` — the trailing int is
+            // a "depth" hint in some drivers but not a real path segment).
+             for (args.items[1..]) |arg| {
                 const key_raw = std.mem.trim(u8, arg, " \t\r\n");
+                // Skip pure-integer arguments (not a JSON key)
+                if (std.fmt.parseInt(i64, key_raw, 10)) |_| continue else |_| {}
                 // Strip surrounding quotes if present
                 const key = stripQuotes(key_raw);
                 // Find "key": in json
@@ -5814,6 +5833,12 @@ fn evalTextBoolExpr(expr: []const u8, row: *const RowCtx) bool {
         return evalTextBoolExpr(trimmed[pos + 2 ..], row);
     }
 
+    // NOT (expr): logical negation of a parenthesized expression
+    if (trimmed.len > 4 and std.ascii.startsWithIgnoreCase(trimmed, "NOT ")) {
+        const after_not = std.mem.trim(u8, trimmed[4..], " \t");
+        return !evalTextBoolExpr(after_not, row);
+    }
+
     // isIPv4String / isIPv6String / dictHas / arrayExists:
     // These are evaluated by evalTextExpr (which returns 0 or 1), then truthy-checked below.
 
@@ -6077,6 +6102,8 @@ fn writeExprHeader(out: *std.ArrayList(u8), allocator: std.mem.Allocator, proj: 
         switch (proj.func) {
             .max, .min, .sum, .avg, .count_star, .count_distinct, .count_if,
             .uniq_exact, .uniq_exact_if, .group_uniq_array, .any_val => break :blk false,
+            // cmp_expr always returns a boolean (0 or 1 uint8)
+            .cmp_expr => break :blk true,
             else => {},
         }
         // Only mark as bool if the top-level expression IS a pure bool function call —
@@ -6139,7 +6166,22 @@ fn writeExprHeader(out: *std.ArrayList(u8), allocator: std.mem.Allocator, proj: 
         .group_uniq_array => try out.print(allocator, "groupUniqArray({s})", .{proj.column orelse ""}),
         .any_val => try out.print(allocator, "any({s})", .{proj.column orelse ""}),
         .case_when => try out.appendSlice(allocator, proj.alias orelse "case_when"),
-        .cmp_expr => try out.appendSlice(allocator, proj.alias orelse proj.column orelse "cmp_expr"),
+        .cmp_expr => {
+            const col_name = proj.alias orelse proj.column orelse "cmp_expr";
+            if (type_prefix.len > 0) {
+                // Must quote the field so the \x03 sentinel byte is at the start
+                // of the field content after unquoting, not mixed with the " delimiter.
+                try out.append(allocator, '"');
+                try out.appendSlice(allocator, type_prefix);
+                for (col_name) |c| {
+                    if (c == '"') try out.append(allocator, '"');
+                    try out.append(allocator, c);
+                }
+                try out.append(allocator, '"');
+            } else {
+                try writeColName(out, allocator, col_name);
+            }
+        },
         .min_if => try out.print(allocator, "minIf({s},...)", .{proj.column orelse ""}),
         .max_if => try out.print(allocator, "maxIf({s},...)", .{proj.column orelse ""}),
         .sum_array => try out.print(allocator, "sumArray({s})", .{proj.column orelse ""}),

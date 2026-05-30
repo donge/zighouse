@@ -357,7 +357,7 @@ pub const Part = struct {
                     std.mem.writeInt(i64, &buf, val.i64, .little);
                     try cw.appendFixed(&buf);
                 },
-                .text, .char => {
+                .text, .char, .low_card => {
                     try cw.appendStr(val.str);
                 },
             }

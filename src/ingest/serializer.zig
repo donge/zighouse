@@ -142,10 +142,13 @@ pub fn csvToResultSet(
     defer alloc.free(is_array);
     const has_neg  = try alloc.alloc(bool, num_cols);
     defer alloc.free(has_neg);
+    const was_quoted = try alloc.alloc(bool, num_cols); // true if any value in column was CSV-quoted
+    defer alloc.free(was_quoted);
     @memset(is_int,   true);
     @memset(is_float, true);
     @memset(is_array, false);
     @memset(has_neg,  false);
+    @memset(was_quoted, false);
 
     // Quoted field storage (owned strings for quoted cells)
     var cell_owned: std.ArrayListUnmanaged([]u8) = .empty;
@@ -165,11 +168,17 @@ pub fn csvToResultSet(
             const val: []const u8 = if (was < line.len and line[was] == '"') blk: {
                 const dup = try alloc.dupe(u8, raw);
                 try cell_owned.append(alloc, dup);
+                was_quoted[ci] = true; // mark column as string
                 break :blk @as([]const u8, dup);
             } else raw;
             cell_data[ci][ri] = val;
             if (val.len > 0 and val[0] == 0x01) {
                 is_array[ci] = true; is_int[ci] = false; is_float[ci] = false;
+                continue;
+            }
+            // If this cell was CSV-quoted, the column is a string — skip numeric inference.
+            if (was_quoted[ci]) {
+                is_int[ci] = false; is_float[ci] = false;
                 continue;
             }
             if (is_int[ci]) {
@@ -237,8 +246,13 @@ pub fn csvToResultSet(
                 ch_type_overrides[ci] = "UInt32";
             } else if (has_neg[ci]) {
                 col_types[ci] = .int64;
-            } else {
+            } else if (tbl == null) {
+                // No schema hint (pure heuristic): use uint64 for non-negative ints.
                 col_types[ci] = .uint64;
+            } else {
+                // Empty schema (computed query with fake_table): default to Int64
+                // so that Go *int64 scans work for expressions like length(), arraySize(), etc.
+                col_types[ci] = .int64;
             }
         } else if (is_float[ci]) {
             col_types[ci] = .float64;
@@ -608,11 +622,6 @@ pub fn toNativeBlock(alloc: std.mem.Allocator, rs: ResultSet) ![]u8 {
             },
         }
     }
-
-    // Empty terminator block
-    try putBlockInfo(&buf, alloc);
-    try putUVarInt(&buf, alloc, 0);
-    try putUVarInt(&buf, alloc, 0);
 
     return buf.toOwnedSlice(alloc);
 }

@@ -152,7 +152,86 @@ pub const Plan = struct {
 /// Parse `sql` into a Plan.  Tries the DuckDB-backed parser first (when DuckDB
 /// is linked); falls back to the legacy hand-written parser on failure.
 pub fn parse(allocator: std.mem.Allocator, sql: []const u8) !?Plan {
-    return duckdb_parse.parse(allocator, sql) catch null;
+    // Normalize ClickHouse array-literal IN syntax: `col IN ['a','b']` → `col IN ('a','b')`
+    // DuckDB cannot parse square brackets as IN lists; convert to parens first.
+    const normalized = try normalizeInBrackets(allocator, sql);
+    defer if (!std.mem.eql(u8, normalized, sql)) allocator.free(normalized);
+    return duckdb_parse.parse(allocator, normalized) catch null;
+}
+
+/// Execute `sql` directly via DuckDB and return CSV (header + data rows).
+/// Returns null when DuckDB is not available or the query fails.
+/// Caller owns the returned slice.
+pub fn execCsv(allocator: std.mem.Allocator, sql: []const u8) !?[]u8 {
+    const normalized = try normalizeInBrackets(allocator, sql);
+    defer if (!std.mem.eql(u8, normalized, sql)) allocator.free(normalized);
+    return duckdb_parse.execCsv(allocator, normalized);
+}
+
+/// Replace `IN [...]` / `NOT IN [...]` square brackets with parentheses.
+/// Handles top-level brackets only; respects single-quoted strings.
+fn normalizeInBrackets(allocator: std.mem.Allocator, sql: []const u8) ![]const u8 {
+    // Quick check: if no `[` present, return original (no allocation)
+    if (std.mem.indexOf(u8, sql, "[") == null) return sql;
+
+    var result: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer result.deinit(allocator);
+    var i: usize = 0;
+    while (i < sql.len) {
+        const c = sql[i];
+        // Skip single-quoted strings
+        if (c == '\'') {
+            try result.append(allocator, c);
+            i += 1;
+            while (i < sql.len) {
+                const ch = sql[i];
+                try result.append(allocator, ch);
+                i += 1;
+                if (ch == '\'') {
+                    // Handle escaped quote ''
+                    if (i < sql.len and sql[i] == '\'') {
+                        try result.append(allocator, '\'');
+                        i += 1;
+                    } else break;
+                }
+            }
+            continue;
+        }
+        // Detect `IN [` or `NOT IN [` patterns (case-insensitive)
+        // Replace `[` with `(` and matching `]` with `)`
+        if (c == '[') {
+            // Check if preceded by `IN ` (ignoring case, with optional spaces)
+            const prefix_end = i;
+            var j: usize = prefix_end;
+            // skip trailing spaces before `[`
+            while (j > 0 and (sql[j-1] == ' ' or sql[j-1] == '\t')) j -= 1;
+            const in_keyword_end = j;
+            // check for `IN` or `in` or `In`
+            if (in_keyword_end >= 2 and std.ascii.eqlIgnoreCase(sql[in_keyword_end-2..in_keyword_end], "IN")) {
+                // Matched `IN [` → emit `(` and find closing `]` to replace with `)`
+                try result.append(allocator, '(');
+                i += 1;
+                var depth: usize = 1;
+                while (i < sql.len and depth > 0) {
+                    const ch = sql[i];
+                    if (ch == '[') {
+                        depth += 1;
+                        try result.append(allocator, '(');
+                    } else if (ch == ']') {
+                        depth -= 1;
+                        try result.append(allocator, ')');
+                    } else {
+                        try result.append(allocator, ch);
+                    }
+                    i += 1;
+                }
+                continue;
+            }
+        }
+        try result.append(allocator, c);
+        i += 1;
+    }
+    return result.toOwnedSlice(allocator);
 }
 
 pub fn deinit(allocator: std.mem.Allocator, plan: Plan) void {

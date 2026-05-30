@@ -692,6 +692,10 @@ fn handleConn(ctx: *ServerCtx, stream: net.Stream) !void {
                 const trailing = rd.readByte() catch 0xFF;
                 if (trailing == CLIENT_DATA) {
                     _ = try readClientDataBlock(a, rd, null, null);
+                } else if (trailing != 0xFF) {
+                    // Unexpected byte — put it back by re-reading won't work,
+                    // log and continue (may cause stream desync)
+                    std.debug.print("tcp: WARNING unexpected trailing byte 0x{x:02}, stream may desync\n", .{trailing});
                 }
                 try dispatchQuery(ctx, a, w, sql, rd);
             },
@@ -998,14 +1002,28 @@ fn handleSelect(ctx: *ServerCtx, a: std.mem.Allocator, w: *Io.Writer, sql: []con
     generic_executor.udf_registry = null;
     const plan_opt = try generic_sql.parse(a, sql);
     if (plan_opt == null) {
-        // Unknown SQL — return empty result
-        var block_buf: std.ArrayListUnmanaged(u8) = .empty;
-        defer block_buf.deinit(a);
-        try writeBlockInfo(&block_buf, a);
-        try wuv(&block_buf, a, 0); try wuv(&block_buf, a, 0);
-        try sendData(a, w, block_buf.items);
-        try sendProfileInfo(a, w);
-        try sendEos(w);
+        // parse failed — try DuckDB direct execution for computed queries
+        const csv_fallback = try generic_sql.execCsv(a, sql);
+        if (csv_fallback) |csv| {
+            defer a.free(csv);
+            const fake_table = schema.Table{ .name = "", .columns = &.{} };
+            var rs = try serializer.csvToResultSet(a, csv, &fake_table);
+            defer rs.deinit();
+            const nb = try serializer.toNativeBlock(a, rs);
+            defer a.free(nb);
+            try sendData(a, w, nb);
+            try sendProfileInfo(a, w);
+            try sendEos(w);
+        } else {
+            // Unknown SQL — return empty result
+            var block_buf: std.ArrayListUnmanaged(u8) = .empty;
+            defer block_buf.deinit(a);
+            try writeBlockInfo(&block_buf, a);
+            try wuv(&block_buf, a, 0); try wuv(&block_buf, a, 0);
+            try sendData(a, w, block_buf.items);
+            try sendProfileInfo(a, w);
+            try sendEos(w);
+        }
         return;
     }
     const plan = plan_opt.?;
