@@ -1,7 +1,81 @@
 const std = @import("std");
 
-/// Link lz4 into `mod`. When `static` is true, adds the .a archive directly
-/// (no dylib at runtime). Otherwise links the system dynamic library.
+/// Build lz4 as a static library compiled from vendored C sources.
+/// Returns the compile step so callers can link against it.
+fn buildLz4(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Step.Compile {
+    const lz4_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+    });
+    lz4_mod.addIncludePath(b.path("vendor/lz4"));
+    lz4_mod.addCSourceFiles(.{
+        .root = b.path("vendor/lz4"),
+        .files = &.{ "lz4.c", "lz4hc.c", "lz4frame.c", "xxhash.c" },
+        .flags = &.{ "-O2", "-fPIC" },
+    });
+    lz4_mod.link_libc = true;
+    const lib = b.addLibrary(.{
+        .name = "lz4",
+        .root_module = lz4_mod,
+        .linkage = .static,
+    });
+    return lib;
+}
+
+/// Build zstd as a static library compiled from vendored C sources.
+fn buildZstd(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Step.Compile {
+    const zstd_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+    });
+    zstd_mod.addIncludePath(b.path("vendor/zstd"));
+    zstd_mod.addIncludePath(b.path("vendor/zstd/common"));
+    zstd_mod.addIncludePath(b.path("vendor/zstd/compress"));
+    zstd_mod.addIncludePath(b.path("vendor/zstd/decompress"));
+    const flags: []const []const u8 = &.{ "-O2", "-fPIC", "-DXXH_NAMESPACE=ZSTD_" };
+    zstd_mod.addCSourceFiles(.{
+        .root = b.path("vendor/zstd/common"),
+        .files = &.{
+            "debug.c", "entropy_common.c", "error_private.c",
+            "fse_decompress.c", "pool.c", "threading.c", "xxhash.c",
+            "zstd_common.c",
+        },
+        .flags = flags,
+    });
+    zstd_mod.addCSourceFiles(.{
+        .root = b.path("vendor/zstd/compress"),
+        .files = &.{
+            "fse_compress.c", "hist.c", "huf_compress.c",
+            "zstd_compress.c", "zstd_compress_literals.c",
+            "zstd_compress_sequences.c", "zstd_compress_superblock.c",
+            "zstd_double_fast.c", "zstd_fast.c", "zstd_lazy.c",
+            "zstd_ldm.c", "zstd_opt.c", "zstdmt_compress.c",
+            "zstd_preSplit.c",
+        },
+        .flags = flags,
+    });
+    zstd_mod.addCSourceFiles(.{
+        .root = b.path("vendor/zstd/decompress"),
+        .files = &.{
+            "huf_decompress.c", "zstd_ddict.c",
+            "zstd_decompress.c", "zstd_decompress_block.c",
+        },
+        .flags = flags,
+    });
+    // x86-64 assembly fast path for HUF decompression
+    zstd_mod.addAssemblyFile(b.path("vendor/zstd/decompress/huf_decompress_amd64.S"));
+    zstd_mod.link_libc = true;
+    const lib = b.addLibrary(.{
+        .name = "zstd",
+        .root_module = zstd_mod,
+        .linkage = .static,
+    });
+    return lib;
+}
+
+/// Link lz4 into `mod`. When `vendored_lib` is non-null, uses that pre-built
+/// static library (cross-compile compatible). When `static` is true without
+/// vendored lib, adds the host .a archive. Otherwise links the system dylib.
 fn linkLz4(mod: *std.Build.Module, include: []const u8, lib: []const u8, static_path: []const u8, static: bool) void {
     mod.addIncludePath(.{ .cwd_relative = include });
     if (static) {
@@ -11,6 +85,11 @@ fn linkLz4(mod: *std.Build.Module, include: []const u8, lib: []const u8, static_
         mod.addRPath(.{ .cwd_relative = lib });
         mod.linkSystemLibrary("lz4", .{});
     }
+}
+
+fn linkLz4Vendored(mod: *std.Build.Module, lz4_lib: *std.Build.Step.Compile) void {
+    mod.addIncludePath(lz4_lib.step.owner.path("vendor/lz4"));
+    mod.linkLibrary(lz4_lib);
 }
 
 /// Link zstd into `mod`. When `static` is true, adds the .a archive directly.
@@ -23,6 +102,11 @@ fn linkZstd(mod: *std.Build.Module, include: []const u8, lib: []const u8, static
         mod.addRPath(.{ .cwd_relative = lib });
         mod.linkSystemLibrary("zstd", .{});
     }
+}
+
+fn linkZstdVendored(mod: *std.Build.Module, zstd_lib: *std.Build.Step.Compile) void {
+    mod.addIncludePath(zstd_lib.step.owner.path("vendor/zstd"));
+    mod.linkLibrary(zstd_lib);
 }
 
 pub fn build(b: *std.Build) void {
@@ -45,9 +129,29 @@ pub fn build(b: *std.Build) void {
     // -Dstatic-libs=true: link lz4 and zstd as static archives instead of dylibs.
     // Default false to preserve current dev behaviour; set true for release builds.
     const static_libs = b.option(bool, "static-libs", "Statically link lz4 and zstd") orelse false;
+    // When targeting a non-native CPU, always use vendored C sources for lz4/zstd.
+    const is_cross = target.result.cpu.arch != @import("builtin").cpu.arch or
+                     target.result.os.tag != @import("builtin").os.tag;
+    const use_vendored = static_libs and is_cross;
     const zstd_prefix_early = b.option([]const u8, "zstd-prefix", "ZSTD installation prefix") orelse "/opt/homebrew/opt/zstd";
     const zstd_include_early = b.fmt("{s}/include", .{zstd_prefix_early});
     const zstd_lib_early = b.fmt("{s}/lib", .{zstd_prefix_early});
+
+    // Build vendored zstd early so unit_tests / generic_sql_tests can use it.
+    const vendored_zstd_early = if (use_vendored) buildZstd(b, target, optimize) else null;
+    const ZstdCtxType = struct {
+        zstd_include: []const u8, zstd_lib: []const u8, zstd_static_path: []const u8,
+        static_libs: bool, vendored: ?*std.Build.Step.Compile,
+        fn link(self: @This(), mod: *std.Build.Module) void {
+            if (self.vendored) |vl| { linkZstdVendored(mod, vl); }
+            else { linkZstd(mod, self.zstd_include, self.zstd_lib, self.zstd_static_path, self.static_libs); }
+        }
+    };
+    const zstdctx_early = ZstdCtxType{
+        .zstd_include = zstd_include_early, .zstd_lib = zstd_lib_early,
+        .zstd_static_path = b.fmt("{s}/lib/libzstd.a", .{zstd_prefix_early}),
+        .static_libs = static_libs, .vendored = vendored_zstd_early,
+    };
     const install_bench_tools = b.option(bool, "bench-tools", "Install benchmark helper executables") orelse true;
     const options = b.addOptions();
     options.addOption(bool, "duckdb", enable_duckdb);
@@ -113,7 +217,7 @@ pub fn build(b: *std.Build) void {
     });
     unit_tests.root_module.addImport("build_options", options_mod);
     unit_tests.root_module.link_libc = true;
-    linkZstd(unit_tests.root_module, zstd_include_early, zstd_lib_early, b.fmt("{s}/lib/libzstd.a", .{zstd_prefix_early}), static_libs);
+    zstdctx_early.link(unit_tests.root_module);
     if (enable_duckdb) {
         const duckdb_include = b.fmt("{s}/include", .{duckdb_prefix});
         const duckdb_lib = b.fmt("{s}/lib", .{duckdb_prefix});
@@ -178,7 +282,7 @@ pub fn build(b: *std.Build) void {
     });
     generic_sql_tests.root_module.addImport("build_options", options_mod);
     generic_sql_tests.root_module.link_libc = true;
-    linkZstd(generic_sql_tests.root_module, zstd_include_early, zstd_lib_early, b.fmt("{s}/lib/libzstd.a", .{zstd_prefix_early}), static_libs);
+    zstdctx_early.link(generic_sql_tests.root_module);
     if (enable_duckdb) {
         const duckdb_include = b.fmt("{s}/include", .{duckdb_prefix});
         const duckdb_lib = b.fmt("{s}/lib", .{duckdb_prefix});
@@ -301,6 +405,41 @@ pub fn build(b: *std.Build) void {
     const zstd_include = zstd_include_early;
     const zstd_lib = zstd_lib_early;
     const zstd_static_path = b.fmt("{s}/lib/libzstd.a", .{zstd_prefix_early});
+
+    // When cross-compiling with static-libs, build lz4/zstd from vendored C sources.
+    const vendored_lz4 = if (use_vendored) buildLz4(b, target, optimize) else null;
+    const vendored_zstd = if (use_vendored) buildZstd(b, target, optimize) else null;
+
+    // Dispatch helpers — use vendored libs when cross-compiling, else system path.
+    const lz4ctx = struct {
+        lz4_include: []const u8,
+        lz4_lib: []const u8,
+        lz4_static_path: []const u8,
+        static_libs: bool,
+        vendored: ?*std.Build.Step.Compile,
+        fn link(self: @This(), mod: *std.Build.Module) void {
+            if (self.vendored) |vl| {
+                linkLz4Vendored(mod, vl);
+            } else {
+                linkLz4(mod, self.lz4_include, self.lz4_lib, self.lz4_static_path, self.static_libs);
+            }
+        }
+    }{ .lz4_include = lz4_include, .lz4_lib = lz4_lib, .lz4_static_path = lz4_static_path, .static_libs = static_libs, .vendored = vendored_lz4 };
+
+    const zstdctx = struct {
+        zstd_include: []const u8,
+        zstd_lib: []const u8,
+        zstd_static_path: []const u8,
+        static_libs: bool,
+        vendored: ?*std.Build.Step.Compile,
+        fn link(self: @This(), mod: *std.Build.Module) void {
+            if (self.vendored) |vl| {
+                linkZstdVendored(mod, vl);
+            } else {
+                linkZstd(mod, self.zstd_include, self.zstd_lib, self.zstd_static_path, self.static_libs);
+            }
+        }
+    }{ .zstd_include = zstd_include, .zstd_lib = zstd_lib, .zstd_static_path = zstd_static_path, .static_libs = static_libs, .vendored = vendored_zstd };
     const ch_block_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/clickhouse_format/block.zig"),
@@ -309,8 +448,8 @@ pub fn build(b: *std.Build) void {
         }),
     });
     ch_block_tests.root_module.link_libc = true;
-    linkLz4(ch_block_tests.root_module, lz4_include, lz4_lib, lz4_static_path, static_libs);
-    linkZstd(ch_block_tests.root_module, zstd_include, zstd_lib, zstd_static_path, static_libs);
+    lz4ctx.link(ch_block_tests.root_module);
+    zstdctx.link(ch_block_tests.root_module);
     const ch_block_test_cmd = b.addRunArtifact(ch_block_tests);
 
     // types.zig — no lz4 dependency
@@ -378,8 +517,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     ch_checksums_mod.link_libc = true;
-    linkLz4(ch_checksums_mod, lz4_include, lz4_lib, lz4_static_path, static_libs);
-    linkZstd(ch_checksums_mod, zstd_include, zstd_lib, zstd_static_path, static_libs);
+    lz4ctx.link(ch_checksums_mod);
+    zstdctx.link(ch_checksums_mod);
     const ch_checksums_tests = b.addTest(.{
         .root_module = ch_checksums_mod,
     });
@@ -402,8 +541,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     ch_part_mod.link_libc = true;
-    linkLz4(ch_part_mod, lz4_include, lz4_lib, lz4_static_path, static_libs);
-    linkZstd(ch_part_mod, zstd_include, zstd_lib, zstd_static_path, static_libs);
+    lz4ctx.link(ch_part_mod);
+    zstdctx.link(ch_part_mod);
     ch_part_mod.addImport("schema", schema_mod);
     ch_part_mod.addImport("types", ch_types_mod);
     const ch_part_tests = b.addTest(.{
@@ -434,8 +573,8 @@ pub fn build(b: *std.Build) void {
     for (lz4_targets) |mod| {
         mod.addImport("schema", schema_mod);
         mod.addImport("ch_part", ch_part_mod);
-        linkLz4(mod, lz4_include, lz4_lib, lz4_static_path, static_libs);
-        linkZstd(mod, zstd_include, zstd_lib, zstd_static_path, static_libs);
+        lz4ctx.link(mod);
+        zstdctx.link(mod);
     }
     // Other test targets that use @import("schema") but not ch_part/lz4:
     generic_executor_tests.root_module.addImport("schema", schema_mod);
@@ -443,8 +582,8 @@ pub fn build(b: *std.Build) void {
     generic_executor_tests.root_module.addImport("generic_sql", generic_sql_mod);
     generic_executor_tests.root_module.addImport("parquet", parquet_mod);
     generic_executor_tests.root_module.addImport("csv", csv_mod);
-    linkLz4(generic_executor_tests.root_module, lz4_include, lz4_lib, lz4_static_path, static_libs);
-    linkZstd(generic_executor_tests.root_module, zstd_include, zstd_lib, zstd_static_path, static_libs);
+    lz4ctx.link(generic_executor_tests.root_module);
+    zstdctx.link(generic_executor_tests.root_module);
     schema_infer_tests.root_module.addImport("schema", schema_mod);
     schema_infer_tests.root_module.addImport("parquet", parquet_mod);
     generic_store_tests.root_module.addImport("schema", schema_mod);
@@ -477,7 +616,7 @@ pub fn build(b: *std.Build) void {
     part_writer_session_mod.addImport("ch_part", ch_part_mod);
     part_writer_session_mod.addImport("row_binary_decoder", row_binary_decoder_mod);
     part_writer_session_mod.link_libc = true;
-    linkLz4(part_writer_session_mod, lz4_include, lz4_lib, lz4_static_path, static_libs);
+    lz4ctx.link(part_writer_session_mod);
     const part_writer_session_tests = b.addTest(.{ .root_module = part_writer_session_mod });
     const part_writer_session_test_cmd = b.addRunArtifact(part_writer_session_tests);
 
@@ -491,7 +630,7 @@ pub fn build(b: *std.Build) void {
     tcp_server_mod.addImport("row_binary_decoder", row_binary_decoder_mod);
     tcp_server_mod.addImport("part_writer_session", part_writer_session_mod);
     tcp_server_mod.link_libc = true;
-    linkLz4(tcp_server_mod, lz4_include, lz4_lib, lz4_static_path, static_libs);
+    lz4ctx.link(tcp_server_mod);
 
     const schema_persist_mod = b.createModule(.{
         .root_source_file = b.path("src/ingest/schema_persist.zig"),
@@ -525,7 +664,7 @@ pub fn build(b: *std.Build) void {
     generic_executor_mod.addImport("ch_part", ch_part_mod);
     generic_executor_mod.addImport("generic_sql", generic_sql_mod);
     generic_executor_mod.addImport("parquet", parquet_mod);
-    linkLz4(generic_executor_mod, lz4_include, lz4_lib, lz4_static_path, static_libs);
+    lz4ctx.link(generic_executor_mod);
     if (enable_duckdb) {
         const duckdb_include_path = b.fmt("{s}/include", .{duckdb_prefix});
         const duckdb_lib_path = b.fmt("{s}/lib", .{duckdb_prefix});
@@ -591,7 +730,7 @@ pub fn build(b: *std.Build) void {
     ingest_server_mod.addImport("csv", csv_mod);
     ingest_server_mod.addImport("tcp_server", tcp_server_mod);
     ingest_server_mod.link_libc = true;
-    linkLz4(ingest_server_mod, lz4_include, lz4_lib, lz4_static_path, static_libs);
+    lz4ctx.link(ingest_server_mod);
     if (enable_duckdb) {
         const duckdb_include_path = b.fmt("{s}/include", .{duckdb_prefix});
         const duckdb_lib_path = b.fmt("{s}/lib", .{duckdb_prefix});
@@ -627,8 +766,8 @@ pub fn build(b: *std.Build) void {
     compactor_mod.addImport("mv_parse", mv_parse_mod);
     compactor_mod.addImport("mv_persist", mv_persist_mod);
     compactor_mod.link_libc = true;
-    linkLz4(compactor_mod, lz4_include, lz4_lib, lz4_static_path, static_libs);
-    linkZstd(compactor_mod, zstd_include, zstd_lib, zstd_static_path, static_libs);
+    lz4ctx.link(compactor_mod);
+    zstdctx.link(compactor_mod);
     exe.root_module.addImport("compactor", compactor_mod);
 
      unit_tests.root_module.addImport("ingest_server", ingest_server_mod);
@@ -671,7 +810,7 @@ pub fn build(b: *std.Build) void {
     part_scan_bridge_mod.addImport("core",   core_mod);
     part_scan_bridge_mod.addImport("part",   ch_part_mod);
     part_scan_bridge_mod.link_libc = true;
-    linkLz4(part_scan_bridge_mod, lz4_include, lz4_lib, lz4_static_path, static_libs);
+    lz4ctx.link(part_scan_bridge_mod);
 
     exe.root_module.addImport("ir_planner", ir_planner_mod);
     exe.root_module.addImport("core",       core_mod);
