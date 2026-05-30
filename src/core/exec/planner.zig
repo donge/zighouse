@@ -900,8 +900,9 @@ fn isAggregate(func: generic_sql.AggregateFn) bool {
 }
 
 fn buildProjectItems(ctx: *PlannerCtx, projs: []const generic_sql.Expr) !?[]ProjectItem {
-    // Check for SELECT * (single column_ref with null column).
-    if (projs.len == 1 and projs[0].func == .column_ref and projs[0].column == null) {
+    // Check for SELECT * (single column_ref with null column or column=="*").
+    if (projs.len == 1 and projs[0].func == .column_ref and
+        (projs[0].column == null or std.mem.eql(u8, projs[0].column orelse "", "*"))) {
         const tbl = ctx.tbl orelse return null;
         const ncols = tbl.columns.len;
         if (ncols == 0) return null;
@@ -2176,9 +2177,10 @@ fn aggExprToProjectItem(ctx: *PlannerCtx, p: generic_sql.Expr) !?ProjectItem {
         },
         .sum => {
             const col_type = schemaColType(ctx, col_name);
-            var arg_expr = resolveColExpr(ctx, col_name) orelse return null;
-            // Handle SUM(col + N) / SUM(col - N) via int_offset
-            if (p.int_offset != 0) {
+            var arg_expr = resolveColExpr(ctx, col_name) orelse
+                (try parseArithExpr(ctx, col_name)) orelse return null;
+            // Handle SUM(col + N) / SUM(col - N) via int_offset (legacy path)
+            if (p.int_offset != 0 and resolveColExpr(ctx, col_name) != null) {
                 const binop = try ctx.alloc.create(plan.BinOp);
                 binop.* = .{ .left = arg_expr, .right = .{ .lit_i64 = p.int_offset } };
                 arg_expr = if (p.int_offset > 0) Expr{ .add = binop } else Expr{ .sub = binop };

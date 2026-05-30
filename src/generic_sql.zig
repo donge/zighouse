@@ -158,8 +158,12 @@ pub const Plan = struct {
 pub fn parse(allocator: std.mem.Allocator, sql: []const u8) !?Plan {
     // Normalize ClickHouse array-literal IN syntax: `col IN ['a','b']` → `col IN ('a','b')`
     // DuckDB cannot parse square brackets as IN lists; convert to parens first.
-    const normalized = try normalizeInBrackets(allocator, sql);
-    defer if (!std.mem.eql(u8, normalized, sql)) allocator.free(normalized);
+    const norm1 = try normalizeInBrackets(allocator, sql);
+    defer if (!std.mem.eql(u8, norm1, sql)) allocator.free(norm1);
+
+    // Normalize EXTRACT(unit FROM col) → date_part('unit', col)
+    const normalized = try normalizeExtract(allocator, norm1);
+    defer if (!std.mem.eql(u8, normalized, norm1)) allocator.free(normalized);
 
     if (build_options.duckdb) {
         const duckdb_result = duckdb_parse.parse(allocator, normalized) catch null;
@@ -182,6 +186,83 @@ pub fn execCsv(allocator: std.mem.Allocator, sql: []const u8) !?[]u8 {
     const normalized = try normalizeInBrackets(allocator, sql);
     defer if (!std.mem.eql(u8, normalized, sql)) allocator.free(normalized);
     return duckdb_parse.execCsv(allocator, normalized);
+}
+
+/// Replace `EXTRACT(unit FROM col)` with `date_part('unit', col)`.
+/// Case-insensitive match on EXTRACT and FROM keywords.
+fn normalizeExtract(allocator: std.mem.Allocator, sql: []const u8) ![]const u8 {
+    // Quick check: no 'extract' (case-insensitive)
+    var has_extract = false;
+    var ci: usize = 0;
+    while (ci + 7 <= sql.len) : (ci += 1) {
+        if (std.ascii.eqlIgnoreCase(sql[ci .. ci + 7], "extract")) {
+            has_extract = true;
+            break;
+        }
+    }
+    if (!has_extract) return sql;
+
+    var result: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer result.deinit(allocator);
+    var i: usize = 0;
+    while (i < sql.len) {
+        // Skip strings
+        if (sql[i] == '\'') {
+            try result.append(allocator, sql[i]);
+            i += 1;
+            while (i < sql.len) {
+                try result.append(allocator, sql[i]);
+                if (sql[i] == '\'') { i += 1; break; }
+                i += 1;
+            }
+            continue;
+        }
+        // Check for EXTRACT keyword
+        if (i + 7 <= sql.len and std.ascii.eqlIgnoreCase(sql[i .. i + 7], "extract")) {
+            // Peek for opening paren (allowing spaces)
+            var j = i + 7;
+            while (j < sql.len and sql[j] == ' ') j += 1;
+            if (j < sql.len and sql[j] == '(') {
+                // Consume up to matching ')'
+                j += 1; // skip '('
+                // Read unit (identifier before FROM)
+                while (j < sql.len and sql[j] == ' ') j += 1;
+                const unit_start = j;
+                while (j < sql.len and sql[j] != ' ' and sql[j] != ')') j += 1;
+                const unit = sql[unit_start..j];
+                // Expect FROM
+                while (j < sql.len and sql[j] == ' ') j += 1;
+                if (j + 4 <= sql.len and std.ascii.eqlIgnoreCase(sql[j .. j + 4], "from")) {
+                    j += 4;
+                    while (j < sql.len and sql[j] == ' ') j += 1;
+                    // Read col expression until ')'
+                    const col_start = j;
+                    var depth: usize = 0;
+                    while (j < sql.len) {
+                        if (sql[j] == '(') depth += 1;
+                        if (sql[j] == ')') {
+                            if (depth == 0) break;
+                            depth -= 1;
+                        }
+                        j += 1;
+                    }
+                    const col = std.mem.trim(u8, sql[col_start..j], " ");
+                    if (j < sql.len and sql[j] == ')') j += 1; // skip ')'
+                    // Emit date_part('unit', col)
+                    try result.appendSlice(allocator, "date_part('");
+                    try result.appendSlice(allocator, unit);
+                    try result.appendSlice(allocator, "', ");
+                    try result.appendSlice(allocator, col);
+                    try result.append(allocator, ')');
+                    i = j;
+                    continue;
+                }
+            }
+        }
+        try result.append(allocator, sql[i]);
+        i += 1;
+    }
+    return result.toOwnedSlice(allocator);
 }
 
 /// Replace `IN [...]` / `NOT IN [...]` square brackets with parentheses.
