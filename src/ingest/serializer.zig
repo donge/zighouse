@@ -497,6 +497,15 @@ pub fn toNativeBlock(alloc: std.mem.Allocator, rs: ResultSet) ![]u8 {
     const num_cols = rs.metas.len;
     const num_rows = rs.num_rows;
 
+    if (num_cols == 0) {
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer buf.deinit(alloc);
+        try putBlockInfo(&buf, alloc);
+        try putUVarInt(&buf, alloc, 0);
+        try putUVarInt(&buf, alloc, 0);
+        return buf.toOwnedSlice(alloc);
+    }
+
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(alloc);
 
@@ -635,7 +644,7 @@ test "toNativeBlock empty ResultSet" {
     defer rs.deinit();
     const nb = try toNativeBlock(alloc, rs);
     defer alloc.free(nb);
-    try std.testing.expect(nb.len >= 18);
+    try std.testing.expect(nb.len >= 8); // block info (8 bytes) + num_cols + num_rows
 }
 
 test "toNativeBlock uint64 column" {

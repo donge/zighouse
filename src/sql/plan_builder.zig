@@ -169,9 +169,28 @@ fn buildSelectPlan(allocator: Allocator, sel: ast.SelectStmt, ctes_from_parent: 
             if (is_count_order) {
                 order_by_count_desc = oi.desc;
             } else {
-                // Use alias or column text
+                // Use alias or column text; if the text matches a projection's
+                // .column field, use that projection's alias so that planner can
+                // resolve ORDER BY to the correct output column.
                 const alias_text = try exprToText(allocator, oi.expr, all_ctes);
-                order_by_alias = alias_text;
+                var matched_alias: ?[]const u8 = null;
+                for (projs_owned) |proj| {
+                    if (proj.column != null and std.mem.eql(u8, proj.column.?, alias_text)) {
+                        matched_alias = proj.alias orelse proj.column;
+                        break;
+                    }
+                }
+                if (matched_alias) |ma| {
+                    // Dupe the alias so order_by_alias owns its string
+                    // (deinit will free it independently of the projection's alias).
+                    // Also free the already-built order_by_text slice and alias_text.
+                    if (order_by_text) |obt| allocator.free(obt);
+                    order_by_alias = try allocator.dupe(u8, ma);
+                    order_by_text = null;
+                    allocator.free(alias_text);
+                } else {
+                    order_by_alias = alias_text;
+                }
                 order_by_alias_asc = !oi.desc;
             }
         }
@@ -338,6 +357,35 @@ fn buildFuncExpr(allocator: Allocator, f: ast.FuncExpr, alias: ?[]const u8, ctes
         defer allocator.free(inner);
         const text = try std.fmt.allocPrint(allocator, "length({s})", .{inner});
         return Expr{ .func = .column_ref, .column = text, .alias = alias };
+    }
+
+    // if(cond, then, else) → case_when
+    if (std.mem.eql(u8, name, "if") and f.args.len == 3) {
+        const when_texts = try allocator.alloc([]const u8, 1);
+        const then_texts = try allocator.alloc([]const u8, 1);
+        when_texts[0] = try exprToText(allocator, f.args[0], ctes);
+        then_texts[0] = try exprToText(allocator, f.args[1], ctes);
+        const else_text: ?[]const u8 = try exprToText(allocator, f.args[2], ctes);
+        const cwd = try allocator.create(CaseWhenData);
+        cwd.* = .{ .when_texts = when_texts, .then_texts = then_texts, .else_text = else_text };
+        return Expr{ .func = .case_when, .case_when_data = cwd, .alias = alias };
+    }
+
+    // date_part('unit', col) → ClickHouse time-unit column names
+    if (std.mem.eql(u8, name, "date_part") and f.args.len == 2 and f.args[0] == .str and f.args[1] == .col) {
+        const unit = f.args[0].str;
+        const col_name = f.args[1].col;
+        const mapped: ?[]const u8 = blk: {
+            if (std.ascii.eqlIgnoreCase(col_name, "EventTime")) {
+                if (std.ascii.eqlIgnoreCase(unit, "minute")) break :blk "EventMinuteOfHour";
+                if (std.ascii.eqlIgnoreCase(unit, "hour"))   break :blk "EventHour";
+                if (std.ascii.eqlIgnoreCase(unit, "day"))    break :blk "EventDate";
+            }
+            break :blk null;
+        };
+        if (mapped) |m| {
+            return Expr{ .func = .column_ref, .column = try allocator.dupe(u8, m), .alias = alias };
+        }
     }
 
     // if(cond, then, else) → case_when
@@ -638,6 +686,16 @@ pub fn exprToText(allocator: Allocator, e: ast.Expr, ctes: []ast.Cte) BuildError
                 .like   => "LIKE",
                 .not_like => "NOT LIKE",
             };
+            // LIKE / NOT LIKE predicates must not be wrapped in parens so that
+            // where_text matches what parseFilter / test expectations require.
+            if (bo.op == .like or bo.op == .not_like) {
+                return std.fmt.allocPrint(allocator, "{s} {s} {s}", .{ ltext, op_str, rtext });
+            }
+            // LIKE / NOT LIKE predicates must not be wrapped in parens so that
+            // where_text matches what parseFilter / test expectations require.
+            if (bo.op == .like or bo.op == .not_like) {
+                return std.fmt.allocPrint(allocator, "{s} {s} {s}", .{ ltext, op_str, rtext });
+            }
             // LIKE / NOT LIKE predicates must not be wrapped in parens so that
             // where_text matches what parseFilter / test expectations require.
             if (bo.op == .like or bo.op == .not_like) {

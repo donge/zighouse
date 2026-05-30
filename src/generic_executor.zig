@@ -1037,7 +1037,7 @@ const Executor = struct {
     fn runScalarAgg(self: Executor) anyerror![]u8 {
         // Collect column names needed
         var needed: std.ArrayList([]const u8) = .empty;
-        defer needed.deinit(self.allocator);
+        defer { for (needed.items) |s| self.allocator.free(s); needed.deinit(self.allocator); }
         try collectNeededColumns(self.allocator, self.plan, &needed, self.table);
 
         var ctx = ScalarAggCtx.init(self.allocator, self.plan);
@@ -1050,7 +1050,7 @@ const Executor = struct {
 
     fn runGroupBy(self: Executor) anyerror![]u8 {
         var needed: std.ArrayList([]const u8) = .empty;
-        defer needed.deinit(self.allocator);
+        defer { for (needed.items) |s| self.allocator.free(s); needed.deinit(self.allocator); }
         try collectNeededColumns(self.allocator, self.plan, &needed, self.table);
 
         var ctx = GroupByCtx.init(self.allocator, self.plan);
@@ -1081,7 +1081,7 @@ const Executor = struct {
 
     fn runScan(self: Executor) anyerror![]u8 {
         var needed: std.ArrayList([]const u8) = .empty;
-        defer needed.deinit(self.allocator);
+        defer { for (needed.items) |s| self.allocator.free(s); needed.deinit(self.allocator); }
         try collectNeededColumns(self.allocator, self.plan, &needed, self.table);
 
         var ctx = ScanCtx.init(self.allocator, self.plan);
@@ -1880,6 +1880,9 @@ const ScalarAggCtx = struct {
         defer allocator.free(row_names);
         const row_values = try allocator.alloc(Value, n * 3);
         defer allocator.free(row_values);
+        var hdr_texts_buf: [64][]const u8 = undefined;
+        var hdr_texts_len: usize = 0;
+        defer { for (hdr_texts_buf[0..hdr_texts_len]) |ht| allocator.free(ht); }
         var n_entries: usize = 0;
 
         for (plan.projections, self.states) |proj, *state| {
@@ -1907,6 +1910,7 @@ const ScalarAggCtx = struct {
                         row_names[n_entries]  = hdr_text;
                         row_values[n_entries] = v;
                         n_entries += 1;
+                        if (hdr_texts_len < 64) { hdr_texts_buf[hdr_texts_len] = hdr_text; hdr_texts_len += 1; }
                     }
                 } else |_| {
                     hdr_buf.deinit(allocator);
@@ -2719,41 +2723,34 @@ fn collectWhereNodeColumns(
     needed: *std.ArrayList([]const u8),
     node: *const generic_sql.WhereNode,
     table: *const schema.Table,
+    add: *const AddFn,
 ) !void {
-    const add = struct {
-        fn f(alloc: std.mem.Allocator, s: *std.StringHashMap(void), lst: *std.ArrayList([]const u8), name: []const u8, tbl: *const schema.Table) !void {
-            if (s.contains(name)) return;
-            if (tbl.findColumn(name) == null) return;
-            try s.put(name, {});
-            try lst.append(alloc, name);
-        }
-    }.f;
     switch (node.*) {
         .cmp_int  => |c| {
             if (parseMapSubscript(c.col)) |sub| try add(allocator, seen, needed, sub.col, table)
             else if (std.mem.indexOfScalar(u8, c.col, '(') != null)
-                try addFuncColumns(allocator, seen, needed, c.col, table, &add)
+                try addFuncColumns(allocator, seen, needed, c.col, table, add)
             else try add(allocator, seen, needed, c.col, table);
         },
         .cmp_str  => |c| {
             if (parseMapSubscript(c.col)) |sub| try add(allocator, seen, needed, sub.col, table)
             else if (std.mem.indexOfScalar(u8, c.col, '(') != null or
                      std.mem.indexOfAny(u8, c.col, " \t><=!") != null)
-                try addFuncColumns(allocator, seen, needed, c.col, table, &add)
+                try addFuncColumns(allocator, seen, needed, c.col, table, add)
             else try add(allocator, seen, needed, c.col, table);
         },
         .like     => |l| {
             if (parseMapSubscript(l.col)) |sub| try add(allocator, seen, needed, sub.col, table)
             else if (std.mem.indexOfScalar(u8, l.col, '(') != null)
-                try addFuncColumns(allocator, seen, needed, l.col, table, &add)
+                try addFuncColumns(allocator, seen, needed, l.col, table, add)
             else try add(allocator, seen, needed, l.col, table);
         },
         .is_null, .is_not_null => |col| {
             if (parseMapSubscript(col)) |sub| try add(allocator, seen, needed, sub.col, table)
             else try add(allocator, seen, needed, col, table);
         },
-        .and_ => |children| for (children) |ch| try collectWhereNodeColumns(allocator, seen, needed, ch, table),
-        .or_  => |children| for (children) |ch| try collectWhereNodeColumns(allocator, seen, needed, ch, table),
+        .and_ => |children| for (children) |ch| try collectWhereNodeColumns(allocator, seen, needed, ch, table, add),
+        .or_  => |children| for (children) |ch| try collectWhereNodeColumns(allocator, seen, needed, ch, table, add),
     }
 }
 
@@ -2944,7 +2941,7 @@ fn collectNeededColumns(
         }
     }
     // Also collect columns referenced by where_expr so filter evaluation works.
-    if (plan.where_expr) |we| try collectWhereNodeColumns(allocator, &seen, needed, we, table);
+    if (plan.where_expr) |we| try collectWhereNodeColumns(allocator, &seen, needed, we, table, &add);
     // Also collect columns from where_text (when where_expr was not parseable).
     if (plan.where_expr == null) {
         if (plan.where_text) |wt| {
