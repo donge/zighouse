@@ -313,7 +313,7 @@ pub fn decodeFixedDictionaryPath(allocator: std.mem.Allocator, io: std.Io, path:
         2 => 8,
         else => return error.UnsupportedParquetType,
     };
-    if (col.codec != null and col.codec.? != 1 and col.codec.? != 0) return error.UnsupportedParquetCodec;
+    if (col.codec) |c| { if (c != 0 and c != 1 and c != 6) return error.UnsupportedParquetCodec; }
     const start_i64 = col.dictionary_page_offset orelse col.data_page_offset orelse return error.InvalidParquetMetadata;
     if (start_i64 < 0 or col.total_compressed_size < 0) return error.InvalidParquetMetadata;
     var offset: u64 = @intCast(start_i64);
@@ -486,7 +486,7 @@ pub fn decodeByteArrayPath(allocator: std.mem.Allocator, io: std.Io, path: []con
     const col = rg.columns[column_index];
     const type_ = col.type_ orelse return error.InvalidParquetMetadata;
     if (type_ != 6) return error.UnsupportedParquetType;
-    if (col.codec != null and col.codec.? != 1 and col.codec.? != 0) return error.UnsupportedParquetCodec;
+    if (col.codec) |c| { if (c != 0 and c != 1 and c != 6) return error.UnsupportedParquetCodec; }
     const start_i64 = col.dictionary_page_offset orelse col.data_page_offset orelse return error.InvalidParquetMetadata;
     if (start_i64 < 0 or col.total_compressed_size < 0) return error.InvalidParquetMetadata;
     var offset: u64 = @intCast(start_i64);
@@ -951,7 +951,7 @@ const FixedDictColumnIterator = struct {
     done: bool = false,
 
     fn init(allocator: std.mem.Allocator, io: std.Io, file: *std.Io.File, file_size: u64, col: ColumnMeta, width: usize, header_buf: []u8) !FixedDictColumnIterator {
-        if (col.codec != null and col.codec.? != 1 and col.codec.? != 0) return error.UnsupportedParquetCodec;
+        if (col.codec) |c| { if (c != 0 and c != 1 and c != 6) return error.UnsupportedParquetCodec; }
         const start_i64 = col.dictionary_page_offset orelse col.data_page_offset orelse return error.InvalidParquetMetadata;
         if (start_i64 < 0 or col.total_compressed_size < 0) return error.InvalidParquetMetadata;
         const offset: u64 = @intCast(start_i64);
@@ -1183,7 +1183,7 @@ const ByteArrayColumnIterator = struct {
     done: bool = false,
 
     fn init(allocator: std.mem.Allocator, io: std.Io, file: *std.Io.File, file_size: u64, col: ColumnMeta, header_buf: []u8) !ByteArrayColumnIterator {
-        if (col.codec != null and col.codec.? != 1 and col.codec.? != 0) return error.UnsupportedParquetCodec;
+        if (col.codec) |c| { if (c != 0 and c != 1 and c != 6) return error.UnsupportedParquetCodec; }
         const start_i64 = col.dictionary_page_offset orelse col.data_page_offset orelse return error.InvalidParquetMetadata;
         if (start_i64 < 0 or col.total_compressed_size < 0) return error.InvalidParquetMetadata;
         const offset: u64 = @intCast(start_i64);
@@ -1451,6 +1451,7 @@ fn readPage(allocator: std.mem.Allocator, io: std.Io, file: *std.Io.File, offset
     const payload = switch (codec) {
         0 => try allocator.dupe(u8, compressed),
         1 => try snappyDecompress(allocator, compressed, uncompressed_size),
+        6 => try zstdDecompress(allocator, compressed, uncompressed_size),
         else => return error.UnsupportedParquetCodec,
     };
     if (payload.len != uncompressed_size) return error.InvalidParquetMetadata;
@@ -1672,6 +1673,20 @@ const RleBitPackedDecoder = struct {
         for (0..count) |_| _ = try self.next();
     }
 };
+
+// ZSTD decompression via vendored libzstd (linked by the parent module).
+extern fn ZSTD_decompress(dst: [*]u8, dstCapacity: usize, src: [*]const u8, compressedSize: usize) usize;
+extern fn ZSTD_isError(code: usize) c_int;
+extern fn ZSTD_getErrorName(code: usize) [*:0]const u8;
+
+fn zstdDecompress(allocator: std.mem.Allocator, input: []const u8, expected_len: usize) ![]u8 {
+    const out = try allocator.alloc(u8, expected_len);
+    errdefer allocator.free(out);
+    const result = ZSTD_decompress(out.ptr, out.len, input.ptr, input.len);
+    if (ZSTD_isError(result) != 0) return error.ZstdDecompressError;
+    if (result != expected_len) return error.InvalidParquetMetadata;
+    return out;
+}
 
 fn snappyDecompress(allocator: std.mem.Allocator, input: []const u8, expected_len: usize) ![]u8 {
     var pos: usize = 0;

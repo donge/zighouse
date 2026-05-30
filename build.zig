@@ -309,6 +309,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    zstdctx_early.link(parquet_tests.root_module);
     const parquet_test_cmd = b.addRunArtifact(parquet_tests);
 
     const schema_tests = b.addTest(.{
@@ -366,6 +367,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    zstdctx_early.link(parquet_mod);
 
     // ── sql_parser module (native Zig SQL parser, no DuckDB dependency) ────────
     const sql_parser_mod = b.createModule(.{
