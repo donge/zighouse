@@ -927,7 +927,7 @@ fn scalarExprToProjectItem(ctx: *PlannerCtx, p: generic_sql.Expr) !?ProjectItem 
     const alias = p.alias orelse p.column orelse "?";
     const col_name = p.column orelse "";
     return switch (p.func) {
-        .column_ref => blk: {
+         .column_ref => blk: {
             const col_expr = resolveColExpr(ctx, col_name) orelse {
                 // col_name might be a function call like "lower(protocol)" — try to
                 // parse it as a known scalar fn and build an fn_call Expr.

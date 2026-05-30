@@ -1325,8 +1325,6 @@ fn executeHashAggChunked(
         try ht.StrAggHashTable.initWithCapacity(alloc, aggs.len, num_str_aggs, est_rows)
     else null;
     var use_str_agg_path: bool = false;
-    // Set to true when regexp_replace key path routes to ht_str_agg (e.g. Q29).
-    var rr_used_str_agg: bool = false;
 
     // PairCountHashTable fast path: exactly two col_ref keys (one i64, one string) + count(*).
     // Handles Q17/Q18 (GROUP BY UserID, SearchPhrase) and Q19 (3 keys — not handled here).
@@ -1672,7 +1670,7 @@ fn executeHashAggChunked(
                 }
             }
             } // end else (regular path)
-    } else if (use_str_agg_path or rr_used_str_agg) {
+    } else if (use_str_agg_path) {
             // ── String-key compact agg path (e.g. Q22/Q23 GROUP BY SearchPhrase) ──
             const col_idx = str_agg_col_idx.?;
             const ck      = compact_kinds.?;
@@ -1687,7 +1685,7 @@ fn executeHashAggChunked(
             // ── regexp_replace key fast path (e.g. Q29) ───────────────────────
             // Avoids per-row pattern string comparison in evalFnCall.
             const use_rr_str_agg = ht_str_agg != null and rr_descs.len == 1;
-            if (use_rr_str_agg) rr_used_str_agg = true;
+            if (use_rr_str_agg and !use_str_agg_path) use_str_agg_path = true;
             const ck = compact_kinds;
             for (0..c.num_rows) |r| {
                 for (refs) |j| {
