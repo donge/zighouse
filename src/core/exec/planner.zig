@@ -719,6 +719,23 @@ fn aggCanonName(expr: plan.Expr) ?[]const u8 {
     };
 }
 
+/// Parse "YYYY-MM-DD" string to days-since-epoch (i64), or null if not a date string.
+fn parseDateStrToI64(s: []const u8) ?i64 {
+    if (s.len < 10 or s[4] != '-' or s[7] != '-') return null;
+    const y = std.fmt.parseInt(i32, s[0..4], 10) catch return null;
+    const m = std.fmt.parseInt(u32, s[5..7], 10) catch return null;
+    const d = std.fmt.parseInt(u32, s[8..10], 10) catch return null;
+    var yr: i32 = y;
+    var mo: i32 = @intCast(m);
+    if (mo <= 2) { yr -= 1; mo += 9; } else { mo -= 3; }
+    const era: i32 = @divFloor(yr, 400);
+    const yoe: i32 = yr - era * 400;
+    const doy: i32 = @divFloor(153 * mo + 2, 5) + @as(i32, @intCast(d)) - 1;
+    const doe: i32 = yoe * 365 + @divFloor(yoe, 4) - @divFloor(yoe, 100) + doy;
+    const days: i32 = era * 146097 + doe - 719468;
+    return @as(i64, days);
+}
+
 fn whereNodeToExpr(ctx: *PlannerCtx, wn: *const generic_sql.WhereNode) ?Expr {
     switch (wn.*) {
         .cmp_int => |c| {
@@ -934,11 +951,13 @@ fn scalarExprToProjectItem(ctx: *PlannerCtx, p: generic_sql.Expr) !?ProjectItem 
                 // parse it as a known scalar fn and build an fn_call Expr.
                 const item = try tryParseFnCallItem(ctx, col_name, alias) orelse {
                     // Last resort: try parseArithExpr for multi-arg fns like date_part.
-                    const expr = try parseArithExpr(ctx, col_name) orelse break :blk null;
+                    const expr = try parseArithExpr(ctx, col_name) orelse {
+                        break :blk null;
+                    };
                     break :blk ProjectItem{
                         .expr     = expr,
                         .alias    = alias,
-                        .out_type = .int64,
+                        .out_type = .string,  // scalar fn may return string
                     };
                 };
                 break :blk item;

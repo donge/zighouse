@@ -285,7 +285,9 @@ pub const JoinHashTable = struct {
 /// Flat layout: no per-slot arena alloc, stores string slices (borrowed from
 /// column data which outlives the query).  ~2× faster than AggHashTable for
 /// high-cardinality string GROUP BY (Q34/Q35).
+/// Uses hash==0 as empty sentinel (no separate occupied[] array).
 pub const StrCountHashTable = struct {
+    const EMPTY: u64 = 0;
     const Slot = struct {
         hash:  u64,
         str:   []const u8,
@@ -293,7 +295,6 @@ pub const StrCountHashTable = struct {
     };
 
     slots:    []Slot,
-    occupied: []bool,
     capacity: usize,
     count:    usize,
     arena:    std.mem.Allocator,
@@ -303,10 +304,9 @@ pub const StrCountHashTable = struct {
             nextPow2(@as(usize, @intCast(@min(est_rows * 100 / 70 + 1, std.math.maxInt(u32)))))
         else
             64;
-        const slots    = try arena.alloc(Slot, cap);
-        const occupied = try arena.alloc(bool, cap);
-        @memset(occupied, false);
-        return .{ .slots = slots, .occupied = occupied, .capacity = cap, .count = 0, .arena = arena };
+        const slots = try arena.alloc(Slot, cap);
+        @memset(std.mem.sliceAsBytes(slots), 0); // zero hash = empty
+        return .{ .slots = slots, .capacity = cap, .count = 0, .arena = arena };
     }
 
     fn nextPow2(n: usize) usize {
@@ -316,18 +316,19 @@ pub const StrCountHashTable = struct {
         return p;
     }
 
+    fn tagHash(h: u64) u64 { return if (h == 0) 1 else h; }
+
     /// Increment count for the given string key, inserting with count=1 if new.
     pub fn increment(self: *StrCountHashTable, s: []const u8) !void {
         if (self.count + 1 > (self.capacity * 7) / 10) try self.grow();
 
         const mask = self.capacity - 1;
-        const h = hashStr(s);
+        const h = tagHash(hashStr(s));
         var slot = h & mask;
 
         while (true) : (slot = (slot + 1) & mask) {
-            if (!self.occupied[slot]) {
-                self.slots[slot]    = .{ .hash = h, .str = s, .count = 1 };
-                self.occupied[slot] = true;
+            if (self.slots[slot].hash == EMPTY) {
+                self.slots[slot] = .{ .hash = h, .str = s, .count = 1 };
                 self.count += 1;
                 return;
             }
@@ -341,26 +342,23 @@ pub const StrCountHashTable = struct {
     fn grow(self: *StrCountHashTable) !void {
         const new_cap  = self.capacity * 2;
         const new_mask = new_cap - 1;
-        const new_slots    = try self.arena.alloc(Slot, new_cap);
-        const new_occupied = try self.arena.alloc(bool, new_cap);
-        @memset(new_occupied, false);
+        const new_slots = try self.arena.alloc(Slot, new_cap);
+        @memset(std.mem.sliceAsBytes(new_slots), 0);
 
         for (0..self.capacity) |i| {
-            if (!self.occupied[i]) continue;
-            var sl = (self.slots[i].hash) & new_mask;
-            while (new_occupied[sl]) : (sl = (sl + 1) & new_mask) {}
-            new_slots[sl]    = self.slots[i];
-            new_occupied[sl] = true;
+            if (self.slots[i].hash == EMPTY) continue;
+            var sl = self.slots[i].hash & new_mask;
+            while (new_slots[sl].hash != EMPTY) : (sl = (sl + 1) & new_mask) {}
+            new_slots[sl] = self.slots[i];
         }
         self.slots    = new_slots;
-        self.occupied = new_occupied;
         self.capacity = new_cap;
     }
 
     /// Iterate all occupied entries. Callback receives (str, count).
     pub fn iterate(self: *const StrCountHashTable, ctx: anytype, comptime cb: fn (@TypeOf(ctx), []const u8, u64) void) void {
         for (0..self.capacity) |i| {
-            if (self.occupied[i]) cb(ctx, self.slots[i].str, self.slots[i].count);
+            if (self.slots[i].hash != EMPTY) cb(ctx, self.slots[i].str, self.slots[i].count);
         }
     }
 
@@ -373,7 +371,9 @@ pub const StrCountHashTable = struct {
 
 /// Specialized hash table for (i64, string) composite GROUP BY with count(*).
 /// Flat layout, no per-slot arena alloc.  Used by Q17/Q18.
+/// Uses hash==0 as empty sentinel (no separate occupied[] array).
 pub const PairCountHashTable = struct {
+    const EMPTY: u64 = 0;
     const Slot = struct {
         hash:  u64,
         i64_key: i64,
@@ -382,7 +382,6 @@ pub const PairCountHashTable = struct {
     };
 
     slots:    []Slot,
-    occupied: []bool,
     capacity: usize,
     count:    usize,
     arena:    std.mem.Allocator,
@@ -392,10 +391,9 @@ pub const PairCountHashTable = struct {
             nextPow2Pair(@as(usize, @intCast(@min(est_rows * 100 / 70 + 1, std.math.maxInt(u32)))))
         else
             64;
-        const slots    = try arena.alloc(Slot, cap);
-        const occupied = try arena.alloc(bool, cap);
-        @memset(occupied, false);
-        return .{ .slots = slots, .occupied = occupied, .capacity = cap, .count = 0, .arena = arena };
+        const slots = try arena.alloc(Slot, cap);
+        @memset(std.mem.sliceAsBytes(slots), 0); // zero hash = empty
+        return .{ .slots = slots, .capacity = cap, .count = 0, .arena = arena };
     }
 
     fn nextPow2Pair(n: usize) usize {
@@ -405,17 +403,18 @@ pub const PairCountHashTable = struct {
         return p;
     }
 
+    fn tagHash(h: u64) u64 { return if (h == 0) 1 else h; }
+
     pub fn increment(self: *PairCountHashTable, i64_key: i64, str_key: []const u8) !void {
         if (self.count + 1 > (self.capacity * 7) / 10) try self.grow();
 
         const mask = self.capacity - 1;
-        const h = hashPair(i64_key, str_key);
+        const h = tagHash(hashPair(i64_key, str_key));
         var slot = h & mask;
 
         while (true) : (slot = (slot + 1) & mask) {
-            if (!self.occupied[slot]) {
-                self.slots[slot]    = .{ .hash = h, .i64_key = i64_key, .str_key = str_key, .count = 1 };
-                self.occupied[slot] = true;
+            if (self.slots[slot].hash == EMPTY) {
+                self.slots[slot] = .{ .hash = h, .i64_key = i64_key, .str_key = str_key, .count = 1 };
                 self.count += 1;
                 return;
             }
@@ -432,24 +431,21 @@ pub const PairCountHashTable = struct {
     fn grow(self: *PairCountHashTable) !void {
         const new_cap  = self.capacity * 2;
         const new_mask = new_cap - 1;
-        const new_slots    = try self.arena.alloc(Slot, new_cap);
-        const new_occupied = try self.arena.alloc(bool, new_cap);
-        @memset(new_occupied, false);
+        const new_slots = try self.arena.alloc(Slot, new_cap);
+        @memset(std.mem.sliceAsBytes(new_slots), 0);
         for (0..self.capacity) |i| {
-            if (!self.occupied[i]) continue;
+            if (self.slots[i].hash == EMPTY) continue;
             var sl = self.slots[i].hash & new_mask;
-            while (new_occupied[sl]) : (sl = (sl + 1) & new_mask) {}
-            new_slots[sl]    = self.slots[i];
-            new_occupied[sl] = true;
+            while (new_slots[sl].hash != EMPTY) : (sl = (sl + 1) & new_mask) {}
+            new_slots[sl] = self.slots[i];
         }
         self.slots    = new_slots;
-        self.occupied = new_occupied;
         self.capacity = new_cap;
     }
 
     pub fn iterate(self: *const PairCountHashTable, ctx: anytype, comptime cb: fn (@TypeOf(ctx), i64, []const u8, u64) void) void {
         for (0..self.capacity) |i| {
-            if (self.occupied[i]) cb(ctx, self.slots[i].i64_key, self.slots[i].str_key, self.slots[i].count);
+            if (self.slots[i].hash != EMPTY) cb(ctx, self.slots[i].i64_key, self.slots[i].str_key, self.slots[i].count);
         }
     }
 
@@ -465,7 +461,9 @@ pub const PairCountHashTable = struct {
 
 /// Specialized hash table for (i64, i64, string) GROUP BY with count(*).
 /// Used for Q19: GROUP BY UserID, extract(minute FROM EventTime), SearchPhrase.
+/// Uses hash==0 as empty sentinel (no separate occupied[] array).
 pub const TripleCountHashTable = struct {
+    const EMPTY: u64 = 0;
     const Slot = struct {
         hash:    u64,
         n0:      i64,
@@ -475,7 +473,6 @@ pub const TripleCountHashTable = struct {
     };
 
     slots:    []Slot,
-    occupied: []bool,
     capacity: usize,
     count:    usize,
     arena:    std.mem.Allocator,
@@ -485,10 +482,9 @@ pub const TripleCountHashTable = struct {
             nextPow2Triple(@as(usize, @intCast(@min(est_rows * 100 / 70 + 1, std.math.maxInt(u32)))))
         else
             64;
-        const slots    = try arena.alloc(Slot, cap);
-        const occupied = try arena.alloc(bool, cap);
-        @memset(occupied, false);
-        return .{ .slots = slots, .occupied = occupied, .capacity = cap, .count = 0, .arena = arena };
+        const slots = try arena.alloc(Slot, cap);
+        @memset(std.mem.sliceAsBytes(slots), 0); // zero hash = empty
+        return .{ .slots = slots, .capacity = cap, .count = 0, .arena = arena };
     }
 
     fn nextPow2Triple(n: usize) usize {
@@ -498,17 +494,18 @@ pub const TripleCountHashTable = struct {
         return p;
     }
 
+    fn tagHash(h: u64) u64 { return if (h == 0) 1 else h; }
+
     pub fn increment(self: *TripleCountHashTable, n0: i64, n1: i64, str_key: []const u8) !void {
         if (self.count + 1 > (self.capacity * 7) / 10) try self.grow();
 
         const mask = self.capacity - 1;
-        const h = hashTriple(n0, n1, str_key);
+        const h = tagHash(hashTriple(n0, n1, str_key));
         var slot = h & mask;
 
         while (true) : (slot = (slot + 1) & mask) {
-            if (!self.occupied[slot]) {
-                self.slots[slot]    = .{ .hash = h, .n0 = n0, .n1 = n1, .str_key = str_key, .count = 1 };
-                self.occupied[slot] = true;
+            if (self.slots[slot].hash == EMPTY) {
+                self.slots[slot] = .{ .hash = h, .n0 = n0, .n1 = n1, .str_key = str_key, .count = 1 };
                 self.count += 1;
                 return;
             }
@@ -526,24 +523,21 @@ pub const TripleCountHashTable = struct {
     fn grow(self: *TripleCountHashTable) !void {
         const new_cap  = self.capacity * 2;
         const new_mask = new_cap - 1;
-        const new_slots    = try self.arena.alloc(Slot, new_cap);
-        const new_occupied = try self.arena.alloc(bool, new_cap);
-        @memset(new_occupied, false);
+        const new_slots = try self.arena.alloc(Slot, new_cap);
+        @memset(std.mem.sliceAsBytes(new_slots), 0);
         for (0..self.capacity) |i| {
-            if (!self.occupied[i]) continue;
+            if (self.slots[i].hash == EMPTY) continue;
             var sl = self.slots[i].hash & new_mask;
-            while (new_occupied[sl]) : (sl = (sl + 1) & new_mask) {}
-            new_slots[sl]    = self.slots[i];
-            new_occupied[sl] = true;
+            while (new_slots[sl].hash != EMPTY) : (sl = (sl + 1) & new_mask) {}
+            new_slots[sl] = self.slots[i];
         }
         self.slots    = new_slots;
-        self.occupied = new_occupied;
         self.capacity = new_cap;
     }
 
     pub fn iterate(self: *const TripleCountHashTable, ctx: anytype, comptime cb: fn (@TypeOf(ctx), i64, i64, []const u8, u64) void) void {
         for (0..self.capacity) |i| {
-            if (self.occupied[i]) cb(ctx, self.slots[i].n0, self.slots[i].n1, self.slots[i].str_key, self.slots[i].count);
+            if (self.slots[i].hash != EMPTY) cb(ctx, self.slots[i].n0, self.slots[i].n1, self.slots[i].str_key, self.slots[i].count);
         }
     }
 

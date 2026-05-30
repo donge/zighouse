@@ -100,6 +100,96 @@ pub const LikeGuard = struct {
     matcher: kernels.LikeMatcher,
 };
 
+/// A single int comparison extracted from a pure-AND predicate tree.
+/// Enables a fast vectorized filter path that avoids per-row kernels.evalExpr.
+pub const IntCmpCond = struct {
+    col_idx: usize,
+    op: enum(u8) { eq, neq, lt, lte, gt, gte, in2 },
+    val:  i64,
+    val2: i64 = 0,  // only used for in2
+};
+
+/// Parse "YYYY-MM-DD" string to days-since-epoch (i64), or null if not a date string.
+fn parseDateStrToI64(s: []const u8) ?i64 {
+    if (s.len < 10 or s[4] != '-' or s[7] != '-') return null;
+    const y = std.fmt.parseInt(i32, s[0..4], 10) catch return null;
+    const m = std.fmt.parseInt(u32, s[5..7], 10) catch return null;
+    const d = std.fmt.parseInt(u32, s[8..10], 10) catch return null;
+    var yr: i32 = y;
+    var mo: i32 = @intCast(m);
+    if (mo <= 2) { yr -= 1; mo += 9; } else { mo -= 3; }
+    const era: i32 = @divFloor(yr, 400);
+    const yoe: i32 = yr - era * 400;
+    const doy: i32 = @divFloor(153 * mo + 2, 5) + @as(i32, @intCast(d)) - 1;
+    const doe: i32 = yoe * 365 + @divFloor(yoe, 4) - @divFloor(yoe, 100) + doy;
+    const days: i32 = era * 146097 + doe - 719468;
+    return @as(i64, days);
+}
+
+/// Extract leaf int-comparison conditions from a pure-AND predicate tree.
+/// Returns false if the predicate contains any non-int or non-AND node.
+/// When `best_effort=true`, partial extraction is allowed; returns true with partial set.
+fn extractAndIntConds(
+    expr: plan.Expr,
+    out:  []IntCmpCond,
+    n:    *usize,
+    best_effort: bool,
+) bool {
+    switch (expr) {
+        .@"and" => |op| {
+            const l_ok = extractAndIntConds(op.left, out, n, best_effort);
+            const r_ok = extractAndIntConds(op.right, out, n, best_effort);
+            if (best_effort) return l_ok or r_ok;
+            return l_ok and r_ok;
+        },
+        .eq, .neq, .lt, .lte, .gt, .gte => {
+            const op: *plan.BinOp = switch (expr) {
+                .eq  => |o| o, .neq => |o| o, .lt => |o| o,
+                .lte => |o| o, .gt  => |o| o, .gte => |o| o,
+                else => unreachable,
+            };
+            if (op.left != .col_ref) return false;
+            const col_idx = op.left.col_ref.index;
+            const val: i64 = switch (op.right) {
+                .lit_i64 => |v| v,
+                .lit_u64 => |v| @bitCast(v),
+                else => return false,
+            };
+            const kind: @TypeOf(@as(IntCmpCond, undefined).op) = switch (expr) {
+                .eq  => .eq,  .neq => .neq, .lt => .lt,
+                .lte => .lte, .gt  => .gt,  .gte => .gte,
+                else => unreachable,
+            };
+            if (n.* >= out.len) return false;
+            out[n.*] = .{ .col_idx = col_idx, .op = kind, .val = val };
+            n.* += 1;
+            return true;
+        },
+        // a IN (b, c) → OR(a==b, a==c) — detect 2-value IN list on same column.
+        .@"or" => |op| {
+            const le = op.left;
+            const re = op.right;
+            if (le == .eq and re == .eq) {
+                const lop = le.eq;
+                const rop = re.eq;
+                if (lop.left == .col_ref and rop.left == .col_ref and
+                    lop.left.col_ref.index == rop.left.col_ref.index)
+                {
+                    const col_idx = lop.left.col_ref.index;
+                    const v1: i64 = switch (lop.right) { .lit_i64 => |v| v, .lit_u64 => |v| @bitCast(v), else => return false };
+                    const v2: i64 = switch (rop.right) { .lit_i64 => |v| v, .lit_u64 => |v| @bitCast(v), else => return false };
+                    if (n.* >= out.len) return false;
+                    out[n.*] = .{ .col_idx = col_idx, .op = .in2, .val = v1, .val2 = v2 };
+                    n.* += 1;
+                    return true;
+                }
+            }
+            return false;
+        },
+        else => return false,
+    }
+}
+
 pub const FilterState = struct {
     predicate: plan.Expr,
     /// Column indices referenced by the predicate; populated lazily on first apply().
@@ -116,6 +206,17 @@ pub const FilterState = struct {
     /// When true, the pure-LIKE fast path skips copyRow and just counts matching rows.
     /// Safe only when downstream only reads c.num_rows (e.g. COUNT(*) aggregation).
     count_only_mode: bool = false,
+
+    /// Vectorized integer condition fast path.
+    /// null = not yet initialized; empty slice = predicate is NOT a pure-AND int filter.
+    int_conds: ?[]IntCmpCond = null,
+    /// True if int_conds covers ALL filter conditions (can skip evalExpr entirely).
+    /// False means int_conds is only a partial pre-filter (evalExpr still runs after).
+    int_conds_complete: bool = false,
+
+    /// SIMD batch mask buffer reused across chunk calls (size = chunk_rows).
+    /// Used by the evalExprBatch fast path for predicates that don't decompose to IntCmpCond.
+    simd_mask_buf: ?[]i16 = null,
 
     pub fn apply(self: *FilterState, c: *DataChunk, ctx: *QueryContext) !void {
         const alloc = ctx.allocator();
@@ -146,10 +247,87 @@ pub const FilterState = struct {
             }
             self.like_guards = if (guards_ok) raw_guards else &.{};
             self.guards_verified = true;
+            // Try to extract pure-AND int conditions for vectorized fast path.
+            var ic_buf: [16]IntCmpCond = undefined;
+            var ic_n: usize = 0;
+            const ic_complete = extractAndIntConds(self.predicate, &ic_buf, &ic_n, false);
+            if (ic_complete and ic_n > 0) {
+                self.int_conds = try alloc.dupe(IntCmpCond, ic_buf[0..ic_n]);
+                self.int_conds_complete = true;
+            } else {
+                // Try partial extraction (best_effort=true): use as inline guard before evalExpr.
+                ic_n = 0;
+                _ = extractAndIntConds(self.predicate, &ic_buf, &ic_n, true);
+                if (ic_n > 0) {
+                    self.int_conds = try alloc.dupe(IntCmpCond, ic_buf[0..ic_n]);
+                    // int_conds_complete stays false: used as inline guard, not compaction.
+                } else {
+                    self.int_conds = &.{}; // mark as not applicable
+                }
+            }
+            // Allocate SIMD mask buffer for evalExprBatch fast path.
+            self.simd_mask_buf = try alloc.alloc(i16, c.num_rows);
         }
         const ref = self.ref_indices.?;
         const row = self.row_buf.?;
         const guards = self.like_guards.?;
+
+        // ── Vectorized int-only fast path ─────────────────────────────────────
+        // If predicate is a pure AND of integer comparisons, apply each condition
+        // as a tight loop without boxing rows into []?Value.
+        if (self.int_conds) |conds| {
+            if (conds.len > 0) {
+                // Verify all referenced columns are int64/uint64 (check on first call).
+                var all_int = true;
+                for (conds) |cond| {
+                    if (cond.col_idx >= c.columns.len) { all_int = false; break; }
+                    switch (c.columns[cond.col_idx].data) {
+                        .int64, .uint64, .date_u16, .datetime64_ms, .bool_u8 => {},
+                        else => { all_int = false; break; },
+                    }
+                }
+                if (all_int) {
+                    if (self.int_conds_complete) {
+                        // Complete fast path: skip evalExpr entirely.
+                        var write_pos: usize = 0;
+                        row_loop: for (0..c.num_rows) |r| {
+                            for (conds) |cond| {
+                                const col = c.columns[cond.col_idx];
+                                if (col.isRowNull(r)) continue :row_loop;
+                                const v: i64 = switch (col.data) {
+                                    .int64          => |a| a[r],
+                                    .uint64         => |a| @bitCast(a[r]),
+                                    .date_u16       => |a| @as(i64, a[r]),
+                                    .datetime64_ms  => |a| a[r],
+                                    .bool_u8        => |a| @as(i64, a[r]),
+                                    else            => continue :row_loop,
+                                };
+                                const pass = switch (cond.op) {
+                                    .eq  => v == cond.val,
+                                    .neq => v != cond.val,
+                                    .lt  => v <  cond.val,
+                                    .lte => v <= cond.val,
+                                    .gt  => v >  cond.val,
+                                    .gte => v >= cond.val,
+                                    .in2 => v == cond.val or v == cond.val2,
+                                };
+                                if (!pass) continue :row_loop;
+                            }
+                            if (write_pos != r) copyRow(c, r, write_pos);
+                            write_pos += 1;
+                        }
+                        c.num_rows = write_pos;
+                        for (c.columns) |*col2| col2.len = write_pos;
+                        return;
+                    } else {
+                        // Partial inline-guard path: check int conditions per-row inline
+                        // before calling evalExpr. No copyRow compaction here — we fall
+                        // through to the general evalExpr loop below, which handles the
+                        // actual row compaction. Int conds re-read via self.int_conds below.
+                    }
+                }
+            }
+        }
 
         // Pure-LIKE fast path: predicate is exactly col_ref LIKE/NOT_LIKE lit_str.
         if (guards.len == 1) {
@@ -261,8 +439,59 @@ pub const FilterState = struct {
             return;
         }
 
+        // evalExprBatch SIMD fast path: fires when no partial int guards and no LIKE guards.
+        // Evaluates the full predicate over all rows at once using SIMD mask, then compacts.
+        const has_partial_int_guards = if (self.int_conds) |ic| (!self.int_conds_complete and ic.len > 0) else false;
+        if (!has_partial_int_guards and guards.len == 0) batch_path: {
+            const mask_buf = self.simd_mask_buf orelse break :batch_path;
+            const mask = mask_buf[0..c.num_rows];
+            kernels.evalExprBatch(self.predicate, c.*, mask, alloc) catch break :batch_path;
+            var write_pos_b: usize = 0;
+            for (0..c.num_rows) |r| {
+                if (mask[r] != 0) {
+                    if (write_pos_b != r) copyRow(c, r, write_pos_b);
+                    write_pos_b += 1;
+                }
+            }
+            c.num_rows = write_pos_b;
+            for (c.columns) |*col| col.len = write_pos_b;
+            return;
+        }
+
         var write_pos: usize = 0;
-        for (0..c.num_rows) |r| {
+        // When int_conds is set but not complete (partial guards), check them inline
+        // before calling evalExpr to skip rows that definitely fail int conditions.
+        const partial_guards: []const IntCmpCond = if (self.int_conds) |ic|
+            (if (!self.int_conds_complete) ic else &.{})
+        else &.{};
+
+        outer: for (0..c.num_rows) |r| {
+            // Inline int guard check: skip evalExpr for rows that fail int conditions.
+            if (partial_guards.len > 0) {
+                for (partial_guards) |cond| {
+                    if (cond.col_idx >= c.columns.len) continue;
+                    const col = c.columns[cond.col_idx];
+                    if (col.isRowNull(r)) continue :outer;
+                    const v: i64 = switch (col.data) {
+                        .int64         => |a| a[r],
+                        .uint64        => |a| @bitCast(a[r]),
+                        .date_u16      => |a| @as(i64, a[r]),
+                        .datetime64_ms => |a| a[r],
+                        .bool_u8       => |a| @as(i64, a[r]),
+                        else           => continue,
+                    };
+                    const pass = switch (cond.op) {
+                        .eq  => v == cond.val,
+                        .neq => v != cond.val,
+                        .lt  => v <  cond.val,
+                        .lte => v <= cond.val,
+                        .gt  => v >  cond.val,
+                        .gte => v >= cond.val,
+                        .in2 => v == cond.val or v == cond.val2,
+                    };
+                    if (!pass) continue :outer;
+                }
+            }
             for (ref) |j| {
                 const col = c.columns[j];
                 row[j] = if (col.isRowNull(r)) null else col.data.get(r);

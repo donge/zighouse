@@ -202,9 +202,9 @@ pub fn filteredMinMaxNonZero(comptime T: type, predicate: []const i16, values: [
 
 fn lanesFor(comptime T: type) comptime_int {
     return switch (T) {
-        i16 => 32,
-        i32 => 16,
-        i64 => 8,
+        i16, u16 => 32,
+        i32, u32 => 16,
+        i64, u64 => 8,
         else => @compileError("unsupported SIMD type"),
     };
 }
@@ -238,6 +238,104 @@ fn popCountMask(mask: anytype) u64 {
 
 fn MinMax(comptime T: type) type {
     return struct { min: T, max: T };
+}
+
+// ── Batch comparison primitives ───────────────────────────────────────────────
+
+pub const CmpKind = enum { eq, neq, lt, lte, gt, gte };
+
+/// Vectorized comparison: writes 1 or 0 into `out[i]` for each element.
+/// `out` must be same length as `values`. Compatible with the predicate format
+/// expected by filteredSumNonZero / filteredMinMaxNonZero etc.
+pub fn cmpBatch(comptime T: type, values: []const T, comptime op: CmpKind, rhs: T, out: []i16) void {
+    std.debug.assert(out.len == values.len);
+    const lanes = lanesFor(T);
+    const VT = @Vector(lanes, T);
+    const VI = @Vector(lanes, i16);
+    const rhs_vec: VT = @splat(rhs);
+    const one_vec: VI = @splat(1);
+    const zero_vec: VI = @splat(0);
+    var i: usize = 0;
+    while (i + lanes <= values.len) : (i += lanes) {
+        const v: VT = values[i..][0..lanes].*;
+        const mask = switch (op) {
+            .eq  => v == rhs_vec,
+            .neq => v != rhs_vec,
+            .lt  => v < rhs_vec,
+            .lte => v <= rhs_vec,
+            .gt  => v > rhs_vec,
+            .gte => v >= rhs_vec,
+        };
+        out[i..][0..lanes].* = @select(i16, mask, one_vec, zero_vec);
+    }
+    while (i < values.len) : (i += 1) {
+        out[i] = switch (op) {
+            .eq  => if (values[i] == rhs) @as(i16, 1) else 0,
+            .neq => if (values[i] != rhs) @as(i16, 1) else 0,
+            .lt  => if (values[i] < rhs)  @as(i16, 1) else 0,
+            .lte => if (values[i] <= rhs) @as(i16, 1) else 0,
+            .gt  => if (values[i] > rhs)  @as(i16, 1) else 0,
+            .gte => if (values[i] >= rhs) @as(i16, 1) else 0,
+        };
+    }
+}
+
+/// Element-wise AND of two i16 predicate masks into `out`.
+pub fn andMasks(a: []const i16, b: []const i16, out: []i16) void {
+    std.debug.assert(a.len == b.len and out.len == a.len);
+    const LANES = 32;
+    const V = @Vector(LANES, i16);
+    const zero: V = @splat(0);
+    var i: usize = 0;
+    while (i + LANES <= a.len) : (i += LANES) {
+        const va: V = a[i..][0..LANES].*;
+        const vb: V = b[i..][0..LANES].*;
+        const ma = va != zero;
+        const mb = vb != zero;
+        // element-wise AND: select 1 where both true
+        const both = @select(i16, ma, @select(i16, mb, @as(V, @splat(1)), zero), zero);
+        out[i..][0..LANES].* = both;
+    }
+    while (i < a.len) : (i += 1) {
+        out[i] = if (a[i] != 0 and b[i] != 0) 1 else 0;
+    }
+}
+
+/// Element-wise OR of two i16 predicate masks into `out`.
+pub fn orMasks(a: []const i16, b: []const i16, out: []i16) void {
+    std.debug.assert(a.len == b.len and out.len == a.len);
+    const LANES = 32;
+    const V = @Vector(LANES, i16);
+    const zero: V = @splat(0);
+    const one: V = @splat(1);
+    var i: usize = 0;
+    while (i + LANES <= a.len) : (i += LANES) {
+        const va: V = a[i..][0..LANES].*;
+        const vb: V = b[i..][0..LANES].*;
+        const ma = va != zero;
+        const mb = vb != zero;
+        const either = @select(i16, ma, @as(V, @splat(1)), @select(i16, mb, one, zero));
+        out[i..][0..LANES].* = either;
+    }
+    while (i < a.len) : (i += 1) {
+        out[i] = if (a[i] != 0 or b[i] != 0) 1 else 0;
+    }
+}
+
+/// Negate a predicate mask in-place: 0→1, non-zero→0.
+pub fn notMask(mask: []i16) void {
+    const LANES = 32;
+    const V = @Vector(LANES, i16);
+    const zero: V = @splat(0);
+    const one: V = @splat(1);
+    var i: usize = 0;
+    while (i + LANES <= mask.len) : (i += LANES) {
+        const v: V = mask[i..][0..LANES].*;
+        mask[i..][0..LANES].* = @select(i16, v == zero, one, zero);
+    }
+    while (i < mask.len) : (i += 1) {
+        mask[i] = if (mask[i] == 0) 1 else 0;
+    }
 }
 
 fn sumAccumulator(comptime T: type) type {
@@ -476,4 +574,53 @@ test "countEq i64 matches scalar" {
     var data: [97]i64 = undefined;
     for (&data, 0..) |*v, i| v.* = if (i % 5 == 0) 42 else -@as(i64, @intCast(i + 1));
     try std.testing.expectEqual(@as(u64, 20), countEq(i64, &data, 42));
+}
+
+test "cmpBatch i32 eq matches scalar" {
+    var data: [257]i32 = undefined;
+    var out: [257]i16 = undefined;
+    var rng = std.Random.DefaultPrng.init(61);
+    for (&data) |*v| v.* = rng.random().intRangeLessThan(i32, -10, 10);
+    cmpBatch(i32, &data, .eq, 3, &out);
+    for (data, out) |v, o| {
+        const expected: i16 = if (v == 3) 1 else 0;
+        try std.testing.expectEqual(expected, o);
+    }
+}
+
+test "cmpBatch i64 lt matches scalar" {
+    var data: [257]i64 = undefined;
+    var out: [257]i16 = undefined;
+    var rng = std.Random.DefaultPrng.init(62);
+    for (&data) |*v| v.* = rng.random().intRangeLessThan(i64, -100, 100);
+    cmpBatch(i64, &data, .lt, 0, &out);
+    for (data, out) |v, o| {
+        const expected: i16 = if (v < 0) 1 else 0;
+        try std.testing.expectEqual(expected, o);
+    }
+}
+
+test "andMasks / orMasks / notMask match scalar" {
+    var a: [257]i16 = undefined;
+    var b: [257]i16 = undefined;
+    var out: [257]i16 = undefined;
+    var rng = std.Random.DefaultPrng.init(63);
+    for (&a) |*v| v.* = if (rng.random().boolean()) 1 else 0;
+    for (&b) |*v| v.* = if (rng.random().boolean()) 1 else 0;
+
+    andMasks(&a, &b, &out);
+    for (a, b, out) |ai, bi, oi| try std.testing.expectEqual(
+        if (ai != 0 and bi != 0) @as(i16, 1) else 0, oi,
+    );
+
+    orMasks(&a, &b, &out);
+    for (a, b, out) |ai, bi, oi| try std.testing.expectEqual(
+        if (ai != 0 or bi != 0) @as(i16, 1) else 0, oi,
+    );
+
+    var not_in = a;
+    notMask(&not_in);
+    for (a, not_in) |ai, ni| try std.testing.expectEqual(
+        if (ai == 0) @as(i16, 1) else 0, ni,
+    );
 }

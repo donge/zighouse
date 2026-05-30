@@ -948,4 +948,20 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| bench_hashmap_run.addArgs(args);
     const bench_hashmap_step = b.step("bench-hashmap", "Compare custom HashU64Count vs std.AutoHashMap on Q17 workload");
     bench_hashmap_step.dependOn(&bench_hashmap_run.step);
+
+    const bench_filter = b.addExecutable(.{
+        .name = "bench-filter",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench_filter.zig"),
+            .target   = target,
+            .optimize = optimize,
+        }),
+    });
+    bench_filter.root_module.addImport("core", core_mod);
+    b.installArtifact(bench_filter);
+    const bench_filter_run = b.addRunArtifact(bench_filter);
+    bench_filter_run.step.dependOn(b.getInstallStep());
+    if (b.args) |args| bench_filter_run.addArgs(args);
+    const bench_filter_step = b.step("bench-filter", "A.5 scalar evalExpr vs IntCmpCond vs evalExprBatch SIMD filter");
+    bench_filter_step.dependOn(&bench_filter_run.step);
 }

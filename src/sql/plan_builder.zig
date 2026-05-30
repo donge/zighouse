@@ -181,9 +181,13 @@ fn buildSelectPlan(allocator: Allocator, sel: ast.SelectStmt, ctes_from_parent: 
     const limit: ?usize = if (sel.limit) |l| @intCast(@max(0, l)) else null;
     const offset: ?usize = if (sel.offset) |o| @intCast(@max(0, o)) else null;
 
+    // Derive legacy Filter from where_text (mirrors duckdb_parse.zig behaviour).
+    const filter: ?generic_sql.Filter = if (where_text) |wt| generic_sql.parseFilter(wt) else null;
+
     return Plan{
         .table = table,
         .projections = projs_owned,
+        .filter = filter,
         .where_expr = where_expr,
         .where_text = where_text,
         .group_by = group_by,
@@ -334,6 +338,64 @@ fn buildFuncExpr(allocator: Allocator, f: ast.FuncExpr, alias: ?[]const u8, ctes
         defer allocator.free(inner);
         const text = try std.fmt.allocPrint(allocator, "length({s})", .{inner});
         return Expr{ .func = .column_ref, .column = text, .alias = alias };
+    }
+
+    // if(cond, then, else) → case_when
+    if (std.mem.eql(u8, name, "if") and f.args.len == 3) {
+        const when_texts = try allocator.alloc([]const u8, 1);
+        const then_texts = try allocator.alloc([]const u8, 1);
+        when_texts[0] = try exprToText(allocator, f.args[0], ctes);
+        then_texts[0] = try exprToText(allocator, f.args[1], ctes);
+        const else_text: ?[]const u8 = try exprToText(allocator, f.args[2], ctes);
+        const cwd = try allocator.create(CaseWhenData);
+        cwd.* = .{ .when_texts = when_texts, .then_texts = then_texts, .else_text = else_text };
+        return Expr{ .func = .case_when, .case_when_data = cwd, .alias = alias };
+    }
+
+    // date_part('unit', col) → ClickHouse time-unit column names
+    if (std.mem.eql(u8, name, "date_part") and f.args.len == 2 and f.args[0] == .str and f.args[1] == .col) {
+        const unit = f.args[0].str;
+        const col_name = f.args[1].col;
+        const mapped: ?[]const u8 = blk: {
+            if (std.ascii.eqlIgnoreCase(col_name, "EventTime")) {
+                if (std.ascii.eqlIgnoreCase(unit, "minute")) break :blk "EventMinuteOfHour";
+                if (std.ascii.eqlIgnoreCase(unit, "hour"))   break :blk "EventHour";
+                if (std.ascii.eqlIgnoreCase(unit, "day"))    break :blk "EventDate";
+            }
+            break :blk null;
+        };
+        if (mapped) |m| {
+            return Expr{ .func = .column_ref, .column = try allocator.dupe(u8, m), .alias = alias };
+        }
+    }
+
+    // if(cond, then, else) → case_when
+    if (std.mem.eql(u8, name, "if") and f.args.len == 3) {
+        const when_texts = try allocator.alloc([]const u8, 1);
+        const then_texts = try allocator.alloc([]const u8, 1);
+        when_texts[0] = try exprToText(allocator, f.args[0], ctes);
+        then_texts[0] = try exprToText(allocator, f.args[1], ctes);
+        const else_text: ?[]const u8 = try exprToText(allocator, f.args[2], ctes);
+        const cwd = try allocator.create(CaseWhenData);
+        cwd.* = .{ .when_texts = when_texts, .then_texts = then_texts, .else_text = else_text };
+        return Expr{ .func = .case_when, .case_when_data = cwd, .alias = alias };
+    }
+
+    // date_part('unit', col) → ClickHouse time-unit column names
+    if (std.mem.eql(u8, name, "date_part") and f.args.len == 2 and f.args[0] == .str and f.args[1] == .col) {
+        const unit = f.args[0].str;
+        const col_name = f.args[1].col;
+        const mapped: ?[]const u8 = blk: {
+            if (std.ascii.eqlIgnoreCase(col_name, "EventTime")) {
+                if (std.ascii.eqlIgnoreCase(unit, "minute")) break :blk "EventMinuteOfHour";
+                if (std.ascii.eqlIgnoreCase(unit, "hour"))   break :blk "EventHour";
+                if (std.ascii.eqlIgnoreCase(unit, "day"))    break :blk "EventDate";
+            }
+            break :blk null;
+        };
+        if (mapped) |m| {
+            return Expr{ .func = .column_ref, .column = try allocator.dupe(u8, m), .alias = alias };
+        }
     }
 
     // Everything else: render as text → column_ref
@@ -576,6 +638,16 @@ pub fn exprToText(allocator: Allocator, e: ast.Expr, ctes: []ast.Cte) BuildError
                 .like   => "LIKE",
                 .not_like => "NOT LIKE",
             };
+            // LIKE / NOT LIKE predicates must not be wrapped in parens so that
+            // where_text matches what parseFilter / test expectations require.
+            if (bo.op == .like or bo.op == .not_like) {
+                return std.fmt.allocPrint(allocator, "{s} {s} {s}", .{ ltext, op_str, rtext });
+            }
+            // LIKE / NOT LIKE predicates must not be wrapped in parens so that
+            // where_text matches what parseFilter / test expectations require.
+            if (bo.op == .like or bo.op == .not_like) {
+                return std.fmt.allocPrint(allocator, "{s} {s} {s}", .{ ltext, op_str, rtext });
+            }
             return std.fmt.allocPrint(allocator, "({s} {s} {s})", .{ ltext, op_str, rtext });
         },
         .not => |inner| {

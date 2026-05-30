@@ -625,10 +625,19 @@ fn rewriteTernary(allocator: std.mem.Allocator, sql: []const u8) ![]const u8 {
         if (close == 0) { try buf.append(allocator, ch); i += 1; continue; }
 
         const inner = sql[i + 1..close];
-        // Find '?' at depth 0 inside inner
+        // Find '?' at depth 0 inside inner, skipping string literals
         const q_pos = blk: {
             var depth: usize = 0;
-            for (inner, 0..) |c, idx| {
+            var idx: usize = 0;
+            while (idx < inner.len) : (idx += 1) {
+                const c = inner[idx];
+                if (c == '\'') {
+                    // Skip string literal
+                    idx += 1;
+                    while (idx < inner.len and inner[idx] != '\'') idx += 1;
+                    // idx now points at closing '\'' or end; loop increment will advance past it
+                    continue;
+                }
                 if (c == '(' or c == '[') depth += 1
                 else if (c == ')' or c == ']') { if (depth > 0) depth -= 1; }
                 else if (c == '?' and depth == 0) break :blk idx;
@@ -646,12 +655,17 @@ fn rewriteTernary(allocator: std.mem.Allocator, sql: []const u8) ![]const u8 {
         };
 
         const cond = std.mem.trim(u8, inner[0..q_pos], " \t");
-        // Find ':' at depth 0 after '?'
+        // Find ':' at depth 0 after '?', skipping string literals
         const colon_pos = blk: {
             var depth: usize = 0;
             var j = q_pos + 1;
             while (j < inner.len) : (j += 1) {
                 const c = inner[j];
+                if (c == '\'') {
+                    j += 1;
+                    while (j < inner.len and inner[j] != '\'') j += 1;
+                    continue;
+                }
                 if (c == '(' or c == '[') depth += 1
                 else if (c == ')' or c == ']') { if (depth > 0) depth -= 1; }
                 else if (c == ':' and depth == 0) break :blk j;

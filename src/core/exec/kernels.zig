@@ -10,11 +10,14 @@
 const std = @import("std");
 const types = @import("../types.zig");
 const plan  = @import("plan.zig");
+const chunk = @import("../chunk.zig");
+const simd  = @import("../simd_batch.zig");
 
 pub const Value      = types.Value;
 pub const AggAccum   = types.AggAccum;
 pub const ColumnType = types.ColumnType;
 pub const Expr       = plan.Expr;
+pub const DataChunk  = chunk.DataChunk;
 
 // ── Dict vtable (set by server before each IR query) ─────────────────────────
 
@@ -323,7 +326,7 @@ pub const LikeMatcher = struct {
                 if (n.len == 1) {
                     return std.mem.indexOfScalar(u8, s, n[0]) != null;
                 }
-                // Boyer-Moore-Horspool substring search with precomputed table.
+                // Boyer-Moore-Horspool substring search with precomputed skip table.
                 var i: usize = n.len - 1;
                 while (i < s.len) {
                     var j: usize = n.len - 1;
@@ -1092,6 +1095,16 @@ fn evalFnCall(fc: *const plan.FnCall, row: []const ?Value, lambda_val: ?Value, a
         const hour_ms: i64 = 3600 * 1000;
         return Value{ .datetime64_ms = @divTrunc(ms, hour_ms) * hour_ms };
     }
+    if (std.mem.eql(u8, name, "toStartOfMinute")) {
+        const v = args[0] orelse return null;
+        const ms: i64 = switch (v) {
+            .datetime64_ms => |m| m,
+            .int64         => |i| i * 1000,
+            else           => return null,
+        };
+        const minute_ms: i64 = 60 * 1000;
+        return Value{ .datetime64_ms = @divTrunc(ms, minute_ms) * minute_ms };
+    }
     if (std.mem.eql(u8, name, "toStartOfDay")) {
         const v = args[0] orelse return null;
         const ms: i64 = switch (v) {
@@ -1563,6 +1576,178 @@ fn evalDictCall(dc: *const plan.DictCall, row: []const ?Value, lambda_val: ?Valu
     // No result — return default or null.
     if (dc.default_expr) |de| return evalExpr(de, row, lambda_val, arena);
     return null;
+}
+
+// ── Batch predicate evaluation ────────────────────────────────────────────────
+
+/// Evaluate a boolean Expr over all rows in `dc`, writing 1/0 into `out`.
+///
+/// Fast path: a simple comparison (col op literal) on a fixed-width integer
+/// column is dispatched to SIMD kernels. All other shapes fall back to the
+/// scalar evalExpr path row-by-row.
+///
+/// `out` must be pre-allocated with length == dc.num_rows.
+/// Returns an error only if the scalar fallback path does.
+pub fn evalExprBatch(
+    expr:  Expr,
+    dc:    DataChunk,
+    out:   []i16,
+    arena: std.mem.Allocator,
+) anyerror!void {
+    std.debug.assert(out.len == dc.num_rows);
+    if (dc.num_rows == 0) return;
+
+    // Try to match a simple col_ref cmp literal pattern for SIMD fast path.
+    switch (expr) {
+        .eq, .neq, .lt, .lte, .gt, .gte => |binop| {
+            const cmp_kind: simd.CmpKind = switch (expr) {
+                .eq  => .eq,
+                .neq => .neq,
+                .lt  => .lt,
+                .lte => .lte,
+                .gt  => .gt,
+                .gte => .gte,
+                else => unreachable,
+            };
+            if (tryCmpBatch(binop, cmp_kind, dc, out)) return;
+        },
+        .@"and" => |binop| {
+            // Allocate two temporary masks and AND them.
+            const tmp_a = try arena.alloc(i16, dc.num_rows);
+            const tmp_b = try arena.alloc(i16, dc.num_rows);
+            try evalExprBatch(binop.left,  dc, tmp_a, arena);
+            try evalExprBatch(binop.right, dc, tmp_b, arena);
+            simd.andMasks(tmp_a, tmp_b, out);
+            return;
+        },
+        .@"or" => |binop| {
+            const tmp_a = try arena.alloc(i16, dc.num_rows);
+            const tmp_b = try arena.alloc(i16, dc.num_rows);
+            try evalExprBatch(binop.left,  dc, tmp_a, arena);
+            try evalExprBatch(binop.right, dc, tmp_b, arena);
+            simd.orMasks(tmp_a, tmp_b, out);
+            return;
+        },
+        .not => |unop| {
+            try evalExprBatch(unop.operand, dc, out, arena);
+            simd.notMask(out);
+            return;
+        },
+        else => {},
+    }
+
+    // Scalar fallback: evaluate row-by-row.
+    var row_arena = std.heap.ArenaAllocator.init(arena);
+    defer row_arena.deinit();
+    for (0..dc.num_rows) |i| {
+        _ = row_arena.reset(.retain_capacity);
+        const row = try dc.readRow(i, row_arena.allocator());
+        const val = try evalExpr(expr, row, null, row_arena.allocator());
+        out[i] = if (val) |v| switch (v) {
+            .bool_u8 => @intCast(v.bool_u8),
+            .int64   => if (v.int64  != 0) @as(i16, 1) else 0,
+            .uint64  => if (v.uint64 != 0) @as(i16, 1) else 0,
+            else     => 1,
+        } else 0;
+    }
+}
+
+/// Dispatch cmpBatch with a runtime CmpKind by switching to comptime variants.
+fn cmpBatchRuntime(comptime T: type, vals: []const T, op: simd.CmpKind, rhs: T, out: []i16) void {
+    switch (op) {
+        .eq  => simd.cmpBatch(T, vals, .eq,  rhs, out),
+        .neq => simd.cmpBatch(T, vals, .neq, rhs, out),
+        .lt  => simd.cmpBatch(T, vals, .lt,  rhs, out),
+        .lte => simd.cmpBatch(T, vals, .lte, rhs, out),
+        .gt  => simd.cmpBatch(T, vals, .gt,  rhs, out),
+        .gte => simd.cmpBatch(T, vals, .gte, rhs, out),
+    }
+}
+
+/// Attempt a SIMD comparison dispatch. Returns true if the fast path fired.
+fn tryCmpBatch(
+    binop:    *const plan.BinOp,
+    op:       simd.CmpKind,
+    dc:       DataChunk,
+    out:      []i16,
+) bool {
+    // Pattern: col_ref cmp lit  OR  lit cmp col_ref (flipped).
+    const Resolved = struct { col_idx: usize, lit_expr: plan.Expr, effective_op: simd.CmpKind };
+    const resolved: Resolved = switch (binop.left) {
+        .col_ref => |ref| .{ .col_idx = ref.index, .lit_expr = binop.right, .effective_op = op },
+        else => switch (binop.right) {
+            .col_ref => |ref| .{ .col_idx = ref.index, .lit_expr = binop.left, .effective_op = flipCmp(op) },
+            else => return false,
+        },
+    };
+    const col_idx      = resolved.col_idx;
+    const lit_expr     = resolved.lit_expr;
+    const effective_op = resolved.effective_op;
+
+    if (col_idx >= dc.columns.len) return false;
+    const col = dc.columns[col_idx];
+
+    switch (col.data) {
+        .int64 => |vals| {
+            const rhs: i64 = switch (lit_expr) {
+                .lit_i64 => |v| v,
+                .lit_u64 => |v| @as(i64, @bitCast(v)),
+                else     => return false,
+            };
+            cmpBatchRuntime(i64, vals, effective_op, rhs, out);
+            applyNullMask(col, out);
+            return true;
+        },
+        .datetime64_ms => |vals| {
+            const rhs: i64 = switch (lit_expr) {
+                .lit_i64 => |v| v,
+                .lit_u64 => |v| @as(i64, @bitCast(v)),
+                else     => return false,
+            };
+            cmpBatchRuntime(i64, vals, effective_op, rhs, out);
+            applyNullMask(col, out);
+            return true;
+        },
+        .uint64 => |vals| {
+            const rhs: u64 = switch (lit_expr) {
+                .lit_u64 => |v| v,
+                .lit_i64 => |v| if (v < 0) return false else @intCast(v),
+                else     => return false,
+            };
+            cmpBatchRuntime(u64, vals, effective_op, rhs, out);
+            applyNullMask(col, out);
+            return true;
+        },
+        .date_u16 => |vals| {
+            const rhs: u16 = switch (lit_expr) {
+                .lit_i64 => |v| if (v < 0 or v > 65535) return false else @intCast(v),
+                .lit_u64 => |v| if (v > 65535) return false else @intCast(v),
+                else     => return false,
+            };
+            cmpBatchRuntime(u16, vals, effective_op, rhs, out);
+            applyNullMask(col, out);
+            return true;
+        },
+        else => return false,
+    }
+}
+
+fn flipCmp(op: simd.CmpKind) simd.CmpKind {
+    return switch (op) {
+        .eq  => .eq,
+        .neq => .neq,
+        .lt  => .gt,
+        .lte => .gte,
+        .gt  => .lt,
+        .gte => .lte,
+    };
+}
+
+fn applyNullMask(col: chunk.Column, out: []i16) void {
+    if (chunk.allNonNull(col.null_mask)) return;
+    for (0..out.len) |i| {
+        if (chunk.isNull(col.null_mask, i)) out[i] = 0;
+    }
 }
 
 test "evalFnCall: IPv4StringToNumOrDefault" {
