@@ -931,6 +931,28 @@ pub const ColumnReader = struct {
         return count;
     }
 
+    /// Skip `n` rows of a string column without invoking any callback.
+    /// Advances internal cursors identically to readStrings but discards the data.
+    pub fn skipStrings(self: *ColumnReader, n: usize) !usize {
+        switch (self.col.ty) {
+            .text, .char, .low_card => {},
+            else => return error.NotAStringColumn,
+        }
+        const sd = self.size_data orelse return error.MissingSizeStream;
+        const remaining_rows = self.row_count - self.rows_read;
+        const count = @min(n, remaining_rows);
+        var skipped: usize = 0;
+        while (skipped < count) : (skipped += 1) {
+            if (self.size_cursor + 8 > sd.len) return error.UnexpectedEndOfData;
+            const len: usize = @intCast(std.mem.readInt(u64, sd[self.size_cursor..][0..8], .little));
+            self.size_cursor += 8;
+            if (self.cursor + len > self.data.len) return error.UnexpectedEndOfData;
+            self.cursor += len;
+        }
+        self.rows_read += count;
+        return count;
+    }
+
     /// Read `n` rows of an Array(String) column.
     ///
     /// On-disk format (written by ZigHouse's part writer via consumeNativeTextRows):
@@ -1011,6 +1033,27 @@ pub const ColumnReader = struct {
                 }
                 try callback(ctx, elems);
             }
+        }
+        self.rows_read += count;
+        return count;
+    }
+
+    /// Skip `n` rows of an Array(String) column without decoding element data.
+    pub fn skipArrayStrings(self: *ColumnReader, n: usize) !usize {
+        switch (self.col.ty) {
+            .text, .char => {},
+            else => return error.NotAStringColumn,
+        }
+        const sd = self.size_data orelse return error.MissingSizeStream;
+        const remaining_rows = self.row_count - self.rows_read;
+        const count = @min(n, remaining_rows);
+        var skipped: usize = 0;
+        while (skipped < count) : (skipped += 1) {
+            if (self.size_cursor + 8 > sd.len) return error.UnexpectedEndOfData;
+            const blob_len: usize = @intCast(std.mem.readInt(u64, sd[self.size_cursor..][0..8], .little));
+            self.size_cursor += 8;
+            if (self.cursor + blob_len > self.data.len) return error.UnexpectedEndOfData;
+            self.cursor += blob_len;
         }
         self.rows_read += count;
         return count;

@@ -949,9 +949,29 @@ fn scalarExprToProjectItem(ctx: *PlannerCtx, p: generic_sql.Expr) !?ProjectItem 
             const col_expr = resolveColExpr(ctx, col_name) orelse {
                 // col_name might be a function call like "lower(protocol)" — try to
                 // parse it as a known scalar fn and build an fn_call Expr.
-                const item = try tryParseFnCallItem(ctx, col_name, alias) orelse {
+                 const item = try tryParseFnCallItem(ctx, col_name, alias) orelse {
                     // Last resort: try parseArithExpr for multi-arg fns like date_part.
-                    const expr = try parseArithExpr(ctx, col_name) orelse {
+                    const expr = try parseArithExpr(ctx, col_name) orelse synth: {
+                        // Synthetic ClickBench columns: plan_builder maps
+                        // date_part('unit', EventTime) → EventMinuteOfHour / EventHour / EventDate.
+                        // When these are not physical schema columns, synthesize fn_call{date_part}.
+                        const unit_str: ?[]const u8 =
+                            if (std.mem.eql(u8, col_name, "EventMinuteOfHour")) "minute"
+                            else if (std.mem.eql(u8, col_name, "EventHour")) "hour"
+                            else if (std.mem.eql(u8, col_name, "EventDate")) "day"
+                            else null;
+                        if (unit_str) |unit| {
+                            // Resolve EventTime column in schema.
+                            const et_expr = resolveColExpr(ctx, "EventTime") orelse break :synth null;
+                            const fc = try ctx.alloc.create(plan.FnCall);
+                            const fc_args = try ctx.alloc.alloc(Expr, 2);
+                            fc_args[0] = Expr{ .lit_str = unit };
+                            fc_args[1] = et_expr;
+                            fc.* = .{ .name = "date_part", .args = fc_args };
+                            break :synth Expr{ .fn_call = fc };
+                        }
+                        break :synth null;
+                    } orelse {
                         break :blk null;
                     };
                     break :blk ProjectItem{

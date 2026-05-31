@@ -357,6 +357,12 @@ pub fn build(b: *std.Build) void {
     });
     generic_store_mod.addImport("schema", schema_mod);
 
+    const parallel_mod = b.createModule(.{
+        .root_source_file = b.path("src/parallel.zig"),
+        .target   = target,
+        .optimize = optimize,
+    });
+
     const generic_store_tests = b.addTest(.{ .root_module = generic_store_mod });
     generic_store_tests.root_module.link_libc = true;
     const generic_store_test_cmd = b.addRunArtifact(generic_store_tests);
@@ -584,6 +590,7 @@ pub fn build(b: *std.Build) void {
     generic_executor_tests.root_module.addImport("generic_sql", generic_sql_mod);
     generic_executor_tests.root_module.addImport("parquet", parquet_mod);
     generic_executor_tests.root_module.addImport("csv", csv_mod);
+    generic_executor_tests.root_module.addImport("parallel", parallel_mod);
     lz4ctx.link(generic_executor_tests.root_module);
     zstdctx.link(generic_executor_tests.root_module);
     schema_infer_tests.root_module.addImport("schema", schema_mod);
@@ -666,6 +673,7 @@ pub fn build(b: *std.Build) void {
     generic_executor_mod.addImport("ch_part", ch_part_mod);
     generic_executor_mod.addImport("generic_sql", generic_sql_mod);
     generic_executor_mod.addImport("parquet", parquet_mod);
+    generic_executor_mod.addImport("parallel", parallel_mod);
     lz4ctx.link(generic_executor_mod);
     if (enable_duckdb) {
         const duckdb_include_path = b.fmt("{s}/include", .{duckdb_prefix});
@@ -789,6 +797,9 @@ pub fn build(b: *std.Build) void {
     });
     const core_tests = b.addTest(.{ .root_module = core_mod });
     const core_test_cmd = b.addRunArtifact(core_tests);
+    generic_executor_tests.root_module.addImport("core", core_mod);
+    generic_executor_mod.addImport("core", core_mod);
+    unit_tests.root_module.addImport("parallel", parallel_mod);
 
     // ── ir_planner module (generic_sql.Plan → PhysicalNode IR) ───────────────
     const ir_planner_mod = b.createModule(.{
@@ -816,6 +827,7 @@ pub fn build(b: *std.Build) void {
 
     exe.root_module.addImport("ir_planner", ir_planner_mod);
     exe.root_module.addImport("core",       core_mod);
+    exe.root_module.addImport("parallel",   parallel_mod);
 
     // ── serializer module (ResultSet → Native block) ─────────────────────────
     const serializer_mod = b.createModule(.{

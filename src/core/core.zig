@@ -22,6 +22,8 @@ pub const exec = struct {
     pub const pipeline  = @import("exec/pipeline.zig");
 };
 
+pub const simd_batch = @import("simd_batch.zig");
+
 pub const source = struct {
     pub const mem_table   = @import("source/mem_table.zig");
     pub const chunk_source = @import("source/chunk_source.zig");

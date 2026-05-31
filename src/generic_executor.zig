@@ -30,6 +30,9 @@ const schema = @import("schema");
 const build_options = @import("build_options");
 const ch_part = @import("ch_part");
 const csv_mod = @import("csv");
+const core = @import("core");
+const simd_batch = core.simd_batch;
+const parallel = @import("parallel");
 
 extern fn erf(x: f64) f64;
 extern fn erfc(x: f64) f64;
@@ -553,6 +556,70 @@ fn evalPlanFilter(plan: generic_sql.Plan, row: *const RowCtx) bool {
     return true; // no filter: row passes
 }
 
+// ── SIMD integer predicate mask ───────────────────────────────────────────────
+//
+// Walks a WhereNode tree and writes a 1/0 mask over `row_count` rows for all
+// cmp_int leaves whose column is present in `fixed_descs`/`fixed_bufs`.
+// Compound nodes (and_/or_) are handled recursively and combined with
+// andMasks/orMasks. Returns true if any cmp_int condition was found and the
+// mask was populated; false if the WHERE tree has no integer conditions (caller
+// should not skip rows based on the uninitialised mask).
+
+fn applyIntMask(
+    node: *const generic_sql.WhereNode,
+    fixed_descs: []const ColDesc,
+    fixed_bufs: []const []i64,
+    mask: []i16,
+    tmp: []i16,
+    allocator: std.mem.Allocator,
+) bool {
+    switch (node.*) {
+        .cmp_int => |c| {
+            // Find the column in fixed_descs by name (case-insensitive)
+            for (fixed_descs, fixed_bufs) |desc, buf| {
+                if (!std.ascii.eqlIgnoreCase(desc.name, c.col)) continue;
+                switch (c.op) {
+                    .eq => simd_batch.cmpBatch(i64, buf[0..mask.len], .eq,  c.val, mask),
+                    .ne => simd_batch.cmpBatch(i64, buf[0..mask.len], .neq, c.val, mask),
+                    .lt => simd_batch.cmpBatch(i64, buf[0..mask.len], .lt,  c.val, mask),
+                    .le => simd_batch.cmpBatch(i64, buf[0..mask.len], .lte, c.val, mask),
+                    .gt => simd_batch.cmpBatch(i64, buf[0..mask.len], .gt,  c.val, mask),
+                    .ge => simd_batch.cmpBatch(i64, buf[0..mask.len], .gte, c.val, mask),
+                }
+                return true;
+            }
+            return false;
+        },
+        .and_ => |children| {
+            var first = true;
+            for (children) |ch| {
+                if (!applyIntMask(ch, fixed_descs, fixed_bufs, tmp, mask, allocator)) continue;
+                if (first) {
+                    @memcpy(mask, tmp);
+                    first = false;
+                } else {
+                    simd_batch.andMasks(mask, tmp, mask);
+                }
+            }
+            return !first;
+        },
+        .or_ => |children| {
+            var first = true;
+            for (children) |ch| {
+                if (!applyIntMask(ch, fixed_descs, fixed_bufs, tmp, mask, allocator)) continue;
+                if (first) {
+                    @memcpy(mask, tmp);
+                    first = false;
+                } else {
+                    simd_batch.orMasks(mask, tmp, mask);
+                }
+            }
+            return !first;
+        },
+        else => return false,
+    }
+}
+
 // ── Row context: a lightweight name→value map backed by parallel slices ──────
 
 const RowCtx = struct {
@@ -1040,10 +1107,41 @@ const Executor = struct {
         defer { for (needed.items) |s| self.allocator.free(s); needed.deinit(self.allocator); }
         try collectNeededColumns(self.allocator, self.plan, &needed, self.table);
 
+        // Parallel path: multiple parts → one ctx per thread
+        if (self.source == .ch_parts and self.source.ch_parts.len > 1) {
+            return self.runScalarAggParallel(&needed);
+        }
+
         var ctx = ScalarAggCtx.init(self.allocator, self.plan);
         defer ctx.deinit();
         try self.streamRows(&needed, &ctx, ScalarAggCtx.observe);
         return ctx.format(self.allocator, self.plan);
+    }
+
+    fn runScalarAggParallel(self: Executor, needed: *const std.ArrayList([]const u8)) anyerror![]u8 {
+        const parts = self.source.ch_parts;
+        const n_threads = @min(parallel.defaultThreads(), parts.len);
+        const ctxs = try self.allocator.alloc(ScalarAggParCtx, n_threads);
+        defer self.allocator.free(ctxs);
+        for (ctxs) |*c| {
+            c.* = .{
+                .exec = self,
+                .needed = needed,
+                .ctx = ScalarAggCtx.init(self.allocator, self.plan),
+                .err = null,
+            };
+        }
+        defer for (ctxs) |*c| c.ctx.deinit();
+
+        var src = parallel.MorselSource.init(parts.len, 1);
+        try parallel.parallelFor(self.allocator, ScalarAggParCtx, scalarAggWorker, ctxs, &src);
+
+        // Check worker errors
+        for (ctxs) |c| if (c.err) |e| return e;
+
+        // Merge all thread-local ctxs into ctxs[0]
+        for (ctxs[1..]) |*other| try ctxs[0].ctx.mergeFrom(&other.ctx);
+        return ctxs[0].ctx.format(self.allocator, self.plan);
     }
 
     // ── Group-by aggregate ────────────────────────────────────────────────────
@@ -1052,6 +1150,14 @@ const Executor = struct {
         var needed: std.ArrayList([]const u8) = .empty;
         defer { for (needed.items) |s| self.allocator.free(s); needed.deinit(self.allocator); }
         try collectNeededColumns(self.allocator, self.plan, &needed, self.table);
+
+        // Parallel path: multiple parts → one ctx per thread
+        if (self.source == .ch_parts and self.source.ch_parts.len > 1 and
+            self.plan.table.len > 0 and !std.mem.eql(u8, self.plan.table, "system.one") and
+            self.plan.numbers_count == null)
+        {
+            return self.runGroupByParallel(&needed);
+        }
 
         var ctx = GroupByCtx.init(self.allocator, self.plan);
         defer ctx.deinit(self.allocator);
@@ -1075,6 +1181,30 @@ const Executor = struct {
         }
         const gb_result = try ctx.format(self.allocator, self.plan);
         return gb_result;
+    }
+
+    fn runGroupByParallel(self: Executor, needed: *const std.ArrayList([]const u8)) anyerror![]u8 {
+        const parts = self.source.ch_parts;
+        const n_threads = @min(parallel.defaultThreads(), parts.len);
+        const ctxs = try self.allocator.alloc(GroupByParCtx, n_threads);
+        defer self.allocator.free(ctxs);
+        for (ctxs) |*c| {
+            c.* = .{
+                .exec = self,
+                .needed = needed,
+                .ctx = GroupByCtx.init(self.allocator, self.plan),
+                .err = null,
+            };
+        }
+        defer for (ctxs) |*c| c.ctx.deinit(self.allocator);
+
+        var src = parallel.MorselSource.init(parts.len, 1);
+        try parallel.parallelFor(self.allocator, GroupByParCtx, groupByWorker, ctxs, &src);
+
+        for (ctxs) |c| if (c.err) |e| return e;
+
+        for (ctxs[1..]) |*other| try ctxs[0].ctx.mergeFrom(&other.ctx);
+        return ctxs[0].ctx.format(self.allocator, self.plan);
     }
 
     // ── Scan / filtered projection ────────────────────────────────────────────
@@ -1149,6 +1279,11 @@ const Executor = struct {
             .parquet => |path| return self.streamRowsParquet(path, needed, context, callback),
             .ch_part => |part_dir| return self.streamRowsChPart(part_dir, needed, context, callback),
             .ch_parts => |part_dirs| {
+                // Try hot-column path first (single mmap over all rows, much faster).
+                if (part_dirs.len > 0) {
+                    const done = try self.streamRowsHotAll(part_dirs[0], needed, context, callback);
+                    if (done) return;
+                }
                 for (part_dirs) |part_dir| {
                     try self.streamRowsChPart(part_dir, needed, context, callback);
                 }
@@ -1402,6 +1537,20 @@ const Executor = struct {
             _ = try cr.readFixed(buf.*);
         }
 
+        // Build SIMD integer predicate mask if WHERE has cmp_int conditions.
+        // mask[i] == 0 means row i is already known to fail the integer predicates;
+        // we skip assembling the full RowCtx for those rows.
+        var int_mask: ?[]i16 = null;
+        if (row_count > 0) {
+            if (self.plan.where_expr) |we| {
+                const m = try str_alloc.alloc(i16, row_count);
+                const t = try str_alloc.alloc(i16, row_count);
+                if (applyIntMask(we, fixed_descs.items, fixed_bufs, m, t, str_alloc)) {
+                    int_mask = m;
+                }
+            }
+        }
+
         // Row names: fixed first, then string
         const total_cols = fixed_descs.items.len + str_descs.items.len;
         const all_names = try str_alloc.alloc([]const u8, total_cols);
@@ -1412,6 +1561,7 @@ const Executor = struct {
         defer self.allocator.free(vals);
 
         for (0..row_count) |row_idx| {
+            if (int_mask) |m| if (m[row_idx] == 0) continue;
             for (fixed_bufs, fixed_descs.items, 0..) |buf, desc, fi| {
                 vals[fi] = switch (desc.kind) {
                     .fixed_f32 => blk: {
@@ -1433,7 +1583,185 @@ const Executor = struct {
             try callback(context, &row);
         }
     }
+
+    // ── Hot-column fast path ──────────────────────────────────────────────────
+
+    /// Infer data_dir from a part path of the form `<data_dir>/parts/<part_name>`.
+    fn dataDir(part_path: []const u8) ?[]const u8 {
+        const parent = std.fs.path.dirname(part_path) orelse return null;
+        return std.fs.path.dirname(parent);
+    }
+
+    /// Hot-column file name for a given column name and ColKind.
+    /// Returns null for string/array_string columns (no hot file).
+    fn hotFileName(name: []const u8, kind: ColKind, buf: []u8) ?[]const u8 {
+        const ext: []const u8 = switch (kind) {
+            .fixed_i16 => "i16",
+            .fixed_i32, .fixed_date => "i32",
+            .fixed_i64, .fixed_timestamp => "i64",
+            else => return null,
+        };
+        return std.fmt.bufPrint(buf, "hot_{s}.{s}", .{ name, ext }) catch null;
+    }
+
+    /// Try to serve all needed columns from hot files in `data_dir`.
+    /// Returns true if successful (all rows emitted), false if hot files are
+    /// incomplete or absent (caller should fall back to ch_part scan).
+    fn streamRowsHotAll(
+        self: Executor,
+        any_part_dir: []const u8,
+        needed: *const std.ArrayList([]const u8),
+        context: anytype,
+        comptime callback: fn (@TypeOf(context), *const RowCtx) anyerror!void,
+    ) anyerror!bool {
+        const dir = dataDir(any_part_dir) orelse return false;
+
+        // Build ColDesc list for needed columns; skip strings (no hot file).
+        var descs: std.ArrayList(ColDesc) = .empty;
+        defer descs.deinit(self.allocator);
+        for (needed.items) |name| {
+            const desc = lookupColumn(self.table, name) orelse continue;
+            if (desc.kind == .string or desc.kind == .array_string) return false;
+            try descs.append(self.allocator, desc);
+        }
+        if (descs.items.len == 0) return false;
+
+        // Use arena for mmap tracking.
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const aa = arena.allocator();
+
+        const HotMapping = struct {
+            raw: []align(std.heap.page_size_min) const u8,
+            fn unmap(m: @This()) void { std.posix.munmap(m.raw); }
+        };
+        const mapped_list = try aa.alloc(HotMapping, descs.items.len);
+        var n_mapped: usize = 0;
+        defer for (mapped_list[0..n_mapped]) |m| m.unmap();
+
+        var fname_buf: [128]u8 = undefined;
+        var row_count: usize = 0;
+
+        for (descs.items, 0..) |desc, i| {
+            const fname = hotFileName(desc.name, desc.kind, &fname_buf) orelse return false;
+            const path = std.fs.path.join(aa, &.{ dir, fname }) catch return false;
+            // Open and mmap the file.
+            var file = std.Io.Dir.cwd().openFile(self.io, path, .{}) catch |err| switch (err) {
+                error.FileNotFound => return false,
+                else => return err,
+            };
+            defer file.close(self.io);
+            const len: usize = @intCast(try file.length(self.io));
+            if (len == 0) return false;
+            const elem_size: usize = switch (desc.kind) {
+                .fixed_i16 => 2,
+                .fixed_i32, .fixed_date => 4,
+                .fixed_i64, .fixed_timestamp => 8,
+                else => return false,
+            };
+            if (len % elem_size != 0) return false;
+            const count = len / elem_size;
+            if (i == 0) {
+                row_count = count;
+            } else if (count != row_count) return false;
+
+            const raw = try std.posix.mmap(null, len, .{ .READ = true }, .{ .TYPE = .PRIVATE }, file.handle, 0);
+            mapped_list[i] = .{ .raw = raw };
+            n_mapped += 1;
+        }
+
+        if (row_count == 0) return true; // empty table, nothing to emit
+
+        // Build per-row values from hot column slices.
+        const all_names = try aa.alloc([]const u8, descs.items.len);
+        for (descs.items, all_names) |d, *n| n.* = d.name;
+        const vals = try self.allocator.alloc(Value, descs.items.len);
+        defer self.allocator.free(vals);
+
+        // Build SIMD mask if WHERE has integer predicates.
+        var int_mask: ?[]i16 = null;
+        const fixed_bufs = try aa.alloc([]i64, descs.items.len);
+        for (descs.items, 0..) |desc, i| {
+            const raw = mapped_list[i].raw;
+            const elem_size: usize = switch (desc.kind) {
+                .fixed_i16 => 2,
+                .fixed_i32, .fixed_date => 4,
+                .fixed_i64, .fixed_timestamp => 8,
+                else => unreachable,
+            };
+            const buf = try aa.alloc(i64, row_count);
+            const elem_count = raw.len / elem_size;
+            switch (elem_size) {
+                2 => { const src: [*]const i16 = @ptrCast(@alignCast(raw.ptr)); for (buf[0..elem_count], 0..) |*b, j| b.* = src[j]; },
+                4 => { const src: [*]const i32 = @ptrCast(@alignCast(raw.ptr)); for (buf[0..elem_count], 0..) |*b, j| b.* = src[j]; },
+                8 => { const src: [*]const i64 = @ptrCast(@alignCast(raw.ptr)); @memcpy(buf[0..elem_count], src[0..elem_count]); },
+                else => unreachable,
+            }
+            fixed_bufs[i] = buf;
+        }
+
+        if (self.plan.where_expr) |we| {
+            const m = try aa.alloc(i16, row_count);
+            const t = try aa.alloc(i16, row_count);
+            if (applyIntMask(we, descs.items, fixed_bufs, m, t, aa)) {
+                int_mask = m;
+            }
+        }
+
+        for (0..row_count) |row_idx| {
+            if (int_mask) |m| if (m[row_idx] == 0) continue;
+            for (fixed_bufs, descs.items, 0..) |buf, desc, fi| {
+                vals[fi] = switch (desc.kind) {
+                    .fixed_date  => Value{ .date = @intCast(buf[row_idx]) },
+                    else         => Value{ .i64  = buf[row_idx] },
+                };
+            }
+            const row = RowCtx{ .names = all_names, .values = vals, .table = self.table };
+            try callback(context, &row);
+        }
+        return true;
+    }
 };
+
+// ── Parallel worker context types ────────────────────────────────────────────
+
+const ScalarAggParCtx = struct {
+    exec: Executor,
+    needed: *const std.ArrayList([]const u8),
+    ctx: ScalarAggCtx,
+    err: ?anyerror,
+};
+
+fn scalarAggWorker(c: *ScalarAggParCtx, src: *parallel.MorselSource) void {
+    const parts = c.exec.source.ch_parts;
+    while (src.next()) |m| {
+        for (parts[m.start..m.end]) |part_dir| {
+            c.exec.streamRowsChPart(part_dir, c.needed, &c.ctx, ScalarAggCtx.observe) catch |e| {
+                c.err = e;
+                return;
+            };
+        }
+    }
+}
+
+const GroupByParCtx = struct {
+    exec: Executor,
+    needed: *const std.ArrayList([]const u8),
+    ctx: GroupByCtx,
+    err: ?anyerror,
+};
+
+fn groupByWorker(c: *GroupByParCtx, src: *parallel.MorselSource) void {
+    const parts = c.exec.source.ch_parts;
+    while (src.next()) |m| {
+        for (parts[m.start..m.end]) |part_dir| {
+            c.exec.streamRowsChPart(part_dir, c.needed, &c.ctx, GroupByCtx.observe) catch |e| {
+                c.err = e;
+                return;
+            };
+        }
+    }
+}
 
 /// Stream rows from a materialized CSV (header + data lines).
 /// Parses header to get column names, then feeds each data row as a RowCtx.
@@ -1772,6 +2100,69 @@ const AggState = struct {
             self.first = null;
         }
     }
+
+    /// Merge `other` into `self`. Both must use `alloc`. `other` is left deinit-safe.
+    fn mergeFrom(self: *AggState, other: *AggState, alloc: std.mem.Allocator) !void {
+        self.count += other.count;
+        self.sum   += other.sum;
+        if (other.min) |om| {
+            if (self.min == null or Value.order(om, self.min.?) == .lt) {
+                if (self.min) |old| if (old == .str_owned) alloc.free(old.str_owned);
+                self.min = if (om == .str_owned)
+                    Value{ .str_owned = try alloc.dupe(u8, om.str_owned) }
+                else om;
+            }
+        }
+        if (other.max) |om| {
+            if (self.max == null or Value.order(om, self.max.?) == .gt) {
+                if (self.max) |old| if (old == .str_owned) alloc.free(old.str_owned);
+                self.max = if (om == .str_owned)
+                    Value{ .str_owned = try alloc.dupe(u8, om.str_owned) }
+                else om;
+            }
+        }
+        if (other.distinct) |od| {
+            if (self.distinct == null) {
+                const map = try alloc.create(std.HashMap(i64, void, std.hash_map.AutoContext(i64), 80));
+                map.* = std.HashMap(i64, void, std.hash_map.AutoContext(i64), 80).init(alloc);
+                self.distinct = map;
+            }
+            var it = od.keyIterator();
+            while (it.next()) |k| try self.distinct.?.put(k.*, {});
+        }
+        if (other.distinct_str) |od| {
+            if (self.distinct_str == null) {
+                const map = try alloc.create(std.StringHashMap(void));
+                map.* = std.StringHashMap(void).init(alloc);
+                self.distinct_str = map;
+            }
+            var it = od.keyIterator();
+            while (it.next()) |k| {
+                const r = try self.distinct_str.?.getOrPut(k.*);
+                if (r.found_existing) alloc.free(k.*);
+            }
+            od.clearRetainingCapacity();
+        }
+        if (other.array_vals) |olst| {
+            if (self.array_vals == null) {
+                const lst = try alloc.create(std.ArrayList([]const u8));
+                lst.* = .empty;
+                self.array_vals = lst;
+            }
+            for (olst.items) |s| {
+                var found = false;
+                for (self.array_vals.?.items) |existing| {
+                    if (std.mem.eql(u8, existing, s)) { found = true; break; }
+                }
+                if (!found) try self.array_vals.?.append(alloc, s) else alloc.free(s);
+            }
+            olst.clearRetainingCapacity();
+        }
+        if (self.first == null) {
+            self.first = other.first;
+            other.first = null;
+        }
+    }
 };
 
 /// Apply a post_fn template to an aggregate Value.
@@ -1848,6 +2239,12 @@ const ScalarAggCtx = struct {
     fn deinit(self: *ScalarAggCtx) void {
         for (self.states) |*s| s.deinit(self.allocator);
         self.allocator.free(self.states);
+    }
+
+    fn mergeFrom(self: *ScalarAggCtx, other: *ScalarAggCtx) !void {
+        for (self.states, other.states) |*dst, *src| {
+            try dst.mergeFrom(src, self.allocator);
+        }
     }
 
     fn observe(self: *ScalarAggCtx, row: *const RowCtx) anyerror!void {
@@ -2009,6 +2406,37 @@ const GroupByCtx = struct {
             for (self.group_exprs) |e| allocator.free(e.base_col);
             allocator.free(self.group_exprs);
         }
+    }
+
+    /// Merge thread-local `other` into `self`. `other` must use the same allocator.
+    /// After merge, `other` entries/map are cleared (but not freed — caller calls deinit).
+    fn mergeFrom(self: *GroupByCtx, other: *GroupByCtx) !void {
+        const alloc = self.allocator;
+        for (other.entries.items) |*oe| {
+            const gop = try self.map.getOrPut(oe.key);
+            if (!gop.found_existing) {
+                // New group: move entry ownership to self.
+                const idx = self.entries.items.len;
+                try self.entries.append(alloc, oe.*);
+                gop.value_ptr.* = idx;
+                oe.key = ""; // prevent double-free in other.deinit
+            } else {
+                // Existing group: merge states and free other's entry.
+                const dst = &self.entries.items[gop.value_ptr.*];
+                for (dst.states, oe.states) |*ds, *os| try ds.mergeFrom(os, alloc);
+                // Free other's entry (key, key_values, states)
+                alloc.free(oe.key);
+                oe.key = "";
+                for (oe.key_values) |v| if (v == .str) alloc.free(v.str);
+                alloc.free(oe.key_values);
+                oe.key_values = &.{};
+                for (oe.states) |*s| s.deinit(alloc);
+                alloc.free(oe.states);
+                oe.states = &.{};
+            }
+        }
+        other.entries.clearRetainingCapacity();
+        other.map.clearRetainingCapacity();
     }
 
     /// Evaluate a group key expression against a row.
