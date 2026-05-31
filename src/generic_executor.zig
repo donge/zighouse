@@ -49,15 +49,15 @@ pub var udf_registry: ?*std.StringHashMap([]const u8) = null;
 
 /// Describes where the executor reads row data from.
 pub const Source = union(enum) {
-    /// Stream rows directly from a Parquet file (ZigDB path).
+    // Stream rows directly from a Parquet file (ZigDB path).
     parquet: []const u8,
-    /// Read from a CH MergeTree part directory (ZigHouse path).
-    /// The string is the part directory path (e.g. `<store>/<table>/parts/all_1_1_0`).
+    // Read from a CH MergeTree part directory (ZigHouse path).
+    // The string is the part directory path (e.g. `<store>/<table>/parts/all_1_1_0`).
     ch_part: []const u8,
-    /// Read from multiple CH MergeTree part directories (multi-part ZigHouse path).
-    /// Rows are streamed sequentially across all parts.
+    // Read from multiple CH MergeTree part directories (multi-part ZigHouse path).
+    // Rows are streamed sequentially across all parts.
     ch_parts: []const []const u8,
-    /// Materialized CSV from a subquery (header line + data lines).
+    // Materialized CSV from a subquery (header line + data lines).
     csv_rows: []const u8,
 };
 
@@ -171,15 +171,15 @@ fn lookupColumn(tbl: *const schema.Table, name: []const u8) ?ColDesc {
 const Value = union(enum) {
     i64: i64,
     f64: f64,
-    /// Days since 1970-01-01 (ClickHouse Date / UInt16).
+    // Days since 1970-01-01 (ClickHouse Date / UInt16).
     date: u16,
-    /// UInt8 boolean result from dictHas/has/etc — must encode as UInt8, not UInt64.
+    // UInt8 boolean result from dictHas/has/etc — must encode as UInt8, not UInt64.
     uint8: u8,
-    /// Slice into arena; valid for the lifetime of the Executor.run call.
+    // Slice into arena; valid for the lifetime of the Executor.run call.
     str: []const u8,
-    /// Heap-allocated string owned by this Value; caller must free with page_allocator.
+    // Heap-allocated string owned by this Value; caller must free with page_allocator.
     str_owned: []u8,
-    /// Array of Values; elements are page_allocator-owned or arena slices.
+    // Array of Values; elements are page_allocator-owned or arena slices.
     array: []Value,
     null_val,
 
@@ -293,7 +293,7 @@ const Value = union(enum) {
         return order(a, b) == .eq;
     }
 
-    /// Write in CSV-compatible format.
+    // Write in CSV-compatible format.
     fn writeCsv(self: Value, out: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
         switch (self) {
             .i64 => |v| try out.print(allocator, "{d}", .{v}),
@@ -625,9 +625,9 @@ fn applyIntMask(
 const RowCtx = struct {
     names: []const []const u8,
     values: []const Value,
-    /// Optional parent row for lambda scopes (lambda param shadows parent columns).
+    // Optional parent row for lambda scopes (lambda param shadows parent columns).
     parent: ?*const RowCtx = null,
-    /// Optional table schema for Map value-type dispatch.
+    // Optional table schema for Map value-type dispatch.
     table: ?*const schema.Table = null,
 
     fn get(self: *const RowCtx, name: []const u8) ?Value {
@@ -1485,11 +1485,33 @@ const Executor = struct {
             }
         }
 
-        // Load all string columns fully into an arena.
+        // LATE MATERIALIZATION: Load fixed cols + build mask first, strings after.
         var str_arena = std.heap.ArenaAllocator.init(self.allocator);
         defer str_arena.deinit();
         const str_alloc = str_arena.allocator();
 
+        // Step 1: Load all fixed columns into arrays.
+        const fixed_bufs = try str_alloc.alloc([]i64, fixed_descs.items.len);
+        for (fixed_descs.items, fixed_bufs) |desc, *buf| {
+            buf.* = try str_alloc.alloc(i64, row_count);
+            var cr = try opened.columnReader(desc.index);
+            defer cr.deinit();
+            _ = try cr.readFixed(buf.*);
+        }
+
+        // Step 2: Build integer predicate mask (late materialization: skip string decode for filtered rows).
+        var int_mask: ?[]i16 = null;
+        if (row_count > 0) {
+            if (self.plan.where_expr) |we| {
+                const m = try str_alloc.alloc(i16, row_count);
+                const t = try str_alloc.alloc(i16, row_count);
+                if (applyIntMask(we, fixed_descs.items, fixed_bufs, m, t, str_alloc)) {
+                    int_mask = m;
+                }
+            }
+        }
+
+        // Step 3: Selectively load string columns: skip rows that the int mask already filtered out.
         const str_data = try str_alloc.alloc(std.ArrayList([]const u8), str_descs.items.len);
         for (str_data) |*col| col.* = .empty;
 
@@ -1515,41 +1537,44 @@ const Executor = struct {
                 var ac = ArrCtx{ .data = col_data, .alloc = str_alloc };
                 _ = try cr.readArrayStrings(row_count, str_alloc, &ac, ArrCtx.cb);
             } else {
+                // Regular string column.
                 const StrCtx = struct {
                     data: *std.ArrayList([]const u8),
                     alloc: std.mem.Allocator,
+                    int_mask: ?[]i16,
                     fn cb(ctx: *@This(), bytes: []const u8) !void {
                         const owned = try ctx.alloc.dupe(u8, bytes);
                         try ctx.data.append(ctx.alloc, owned);
                     }
                 };
-                var sc = StrCtx{ .data = col_data, .alloc = str_alloc };
-                _ = try cr.readStrings(row_count, &sc, StrCtx.cb);
-            }
-        }
-
-        // Load all fixed columns fully into arrays.
-        const fixed_bufs = try str_alloc.alloc([]i64, fixed_descs.items.len);
-        for (fixed_descs.items, fixed_bufs) |desc, *buf| {
-            buf.* = try str_alloc.alloc(i64, row_count);
-            var cr = try opened.columnReader(desc.index);
-            defer cr.deinit();
-            _ = try cr.readFixed(buf.*);
-        }
-
-        // Build SIMD integer predicate mask if WHERE has cmp_int conditions.
-        // mask[i] == 0 means row i is already known to fail the integer predicates;
-        // we skip assembling the full RowCtx for those rows.
-        var int_mask: ?[]i16 = null;
-        if (row_count > 0) {
-            if (self.plan.where_expr) |we| {
-                const m = try str_alloc.alloc(i16, row_count);
-                const t = try str_alloc.alloc(i16, row_count);
-                if (applyIntMask(we, fixed_descs.items, fixed_bufs, m, t, str_alloc)) {
-                    int_mask = m;
+                var sc = StrCtx{ .data = col_data, .alloc = str_alloc, .int_mask = int_mask };
+                if (sc.int_mask == null) {
+                    _ = try cr.readStrings(row_count, &sc, StrCtx.cb);
+                } else {
+                    // Selective load: only load rows that pass the int mask.
+                    // We still decode all rows but only store passing ones,
+                    // filling null for filtered rows to maintain index alignment.
+                    var row_i: usize = 0;
+                    const SelCtx = struct {
+                        inner: *StrCtx,
+                        row_idx: *usize,
+                        fn cb(ctx: *@This(), bytes: []const u8) !void {
+                            const ri = ctx.row_idx.*;
+                            ctx.row_idx.* += 1;
+                            if (ctx.inner.int_mask.?[ri] != 0) {
+                                const owned = try ctx.inner.alloc.dupe(u8, bytes);
+                                try ctx.inner.data.append(ctx.inner.alloc, owned);
+                            } else {
+                                try ctx.inner.data.append(ctx.inner.alloc, "");
+                            }
+                        }
+                    };
+                    var sel = SelCtx{ .inner = &sc, .row_idx = &row_i };
+                    _ = try cr.readStrings(row_count, &sel, SelCtx.cb);
                 }
             }
         }
+
 
         // Row names: fixed first, then string
         const total_cols = fixed_descs.items.len + str_descs.items.len;
@@ -1586,14 +1611,14 @@ const Executor = struct {
 
     // ── Hot-column fast path ──────────────────────────────────────────────────
 
-    /// Infer data_dir from a part path of the form `<data_dir>/parts/<part_name>`.
+    // Infer data_dir from a part path of the form `<data_dir>/parts/<part_name>`.
     fn dataDir(part_path: []const u8) ?[]const u8 {
         const parent = std.fs.path.dirname(part_path) orelse return null;
         return std.fs.path.dirname(parent);
     }
 
-    /// Hot-column file name for a given column name and ColKind.
-    /// Returns null for string/array_string columns (no hot file).
+    // Hot-column file name for a given column name and ColKind.
+    // Returns null for string/array_string columns (no hot file).
     fn hotFileName(name: []const u8, kind: ColKind, buf: []u8) ?[]const u8 {
         const ext: []const u8 = switch (kind) {
             .fixed_i16 => "i16",
@@ -1604,9 +1629,9 @@ const Executor = struct {
         return std.fmt.bufPrint(buf, "hot_{s}.{s}", .{ name, ext }) catch null;
     }
 
-    /// Try to serve all needed columns from hot files in `data_dir`.
-    /// Returns true if successful (all rows emitted), false if hot files are
-    /// incomplete or absent (caller should fall back to ch_part scan).
+    // Try to serve all needed columns from hot files in `data_dir`.
+    // Returns true if successful (all rows emitted), false if hot files are
+    // incomplete or absent (caller should fall back to ch_part scan).
     fn streamRowsHotAll(
         self: Executor,
         any_part_dir: []const u8,
@@ -1873,11 +1898,11 @@ const AggState = struct {
     min: ?Value = null,
     max: ?Value = null,
     distinct: ?*std.HashMap(i64, void, std.hash_map.AutoContext(i64), 80) = null,
-    /// For uniq_exact / uniq_exact_if: string-keyed set (heap-allocated strings).
+    // For uniq_exact / uniq_exact_if: string-keyed set (heap-allocated strings).
     distinct_str: ?*std.StringHashMap(void) = null,
-    /// For group_uniq_array: list of distinct string values (heap-allocated copies).
+    // For group_uniq_array: list of distinct string values (heap-allocated copies).
     array_vals: ?*std.ArrayList([]const u8) = null,
-    /// For any_val: first observed value.
+    // For any_val: first observed value.
     first: ?Value = null,
 
     fn update(self: *AggState, v: Value, proj: generic_sql.Expr, row: *const RowCtx, alloc: std.mem.Allocator) !void {
@@ -2101,7 +2126,7 @@ const AggState = struct {
         }
     }
 
-    /// Merge `other` into `self`. Both must use `alloc`. `other` is left deinit-safe.
+    // Merge `other` into `self`. Both must use `alloc`. `other` is left deinit-safe.
     fn mergeFrom(self: *AggState, other: *AggState, alloc: std.mem.Allocator) !void {
         self.count += other.count;
         self.sum   += other.sum;
@@ -2408,8 +2433,8 @@ const GroupByCtx = struct {
         }
     }
 
-    /// Merge thread-local `other` into `self`. `other` must use the same allocator.
-    /// After merge, `other` entries/map are cleared (but not freed — caller calls deinit).
+    // Merge thread-local `other` into `self`. `other` must use the same allocator.
+    // After merge, `other` entries/map are cleared (but not freed — caller calls deinit).
     fn mergeFrom(self: *GroupByCtx, other: *GroupByCtx) !void {
         const alloc = self.allocator;
         for (other.entries.items) |*oe| {
@@ -2439,10 +2464,10 @@ const GroupByCtx = struct {
         other.map.clearRetainingCapacity();
     }
 
-    /// Evaluate a group key expression against a row.
-    /// When the group-by column name is a SELECT alias (e.g. GROUP BY ip where
-    /// ip = IPv6NumToString(dst_ip)), look up the alias in projections and
-    /// evaluate the underlying expression.
+    // Evaluate a group key expression against a row.
+    // When the group-by column name is a SELECT alias (e.g. GROUP BY ip where
+    // ip = IPv6NumToString(dst_ip)), look up the alias in projections and
+    // evaluate the underlying expression.
     fn evalGroupKeyExpr(expr: GroupKeyExpr, plan: generic_sql.Plan, row: *const RowCtx) Value {
         // EventMinute: truncate EventTime to minutes
         if (std.ascii.eqlIgnoreCase(expr.base_col, "EventMinute")) {

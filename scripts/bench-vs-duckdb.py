@@ -20,9 +20,10 @@ Gate conditions (all must hold):
   3. no query > 3x       no single query more than 3x slower than DuckDB
 
 Methodology:
-  - DuckDB: one separate process per query, 3 runs, take min.
-    Both systems pay the same per-query startup / IO cost.
-  - ZigHouse: bench-ir (runs all queries sequentially, 3 runs each).
+  - DuckDB: single process, all queries via stdin with .timer on, N runs.
+    Per-query wall time parsed from "Run Time (s): real X.XXX" lines.
+    Takes min across runs (warm best). No per-process startup overhead.
+  - ZigHouse: bench-ir (runs all queries sequentially, N runs each).
     Per-query timing extracted from exec_ms log lines.
 """
 
@@ -76,33 +77,101 @@ def shutil_which(name):
     return shutil.which(name)
 
 
+def adapt_query_for_duckdb(q: str, parquet: str) -> str:
+    """
+    Adapt a ClickBench SQL query for DuckDB on a raw Parquet file where:
+      - EventDate is stored as UINT16 (days since 1970-01-01)
+      - EventTime is stored as INT64 (unix seconds)
+
+    Transformations applied:
+      1. FROM hits  →  FROM '<parquet>'
+      2. EventDate >= 'YYYY-MM-DD'  →  EventDate >= (DATE 'YYYY-MM-DD' - DATE '1970-01-01')
+      3. EXTRACT(unit FROM EventTime) / date_part('unit', EventTime)
+             →  date_part('unit', to_timestamp(EventTime))
+      4. DATE_TRUNC('unit', EventTime)  →  DATE_TRUNC('unit', to_timestamp(EventTime))
+    """
+    # 1. FROM hits → FROM parquet
+    q = re.sub(r'\bFROM\s+hits\b', f"FROM '{parquet}'", q, flags=re.IGNORECASE)
+
+    # 2. EventDate comparisons: string date literals → integer day offsets
+    #    Matches: EventDate >= '2013-07-01'  (with >=, <=, =, >, <, !=)
+    def replace_date_cmp(m):
+        col, op, date_str = m.group(1), m.group(2), m.group(3)
+        return f"{col} {op} (DATE '{date_str}' - DATE '1970-01-01')"
+    q = re.sub(
+        r'\b(EventDate)\s*(>=|<=|=|>|<|!=|<>)\s*\'(\d{4}-\d{2}-\d{2})\'',
+        replace_date_cmp,
+        q,
+    )
+
+    # 3. EXTRACT(unit FROM EventTime) → date_part('unit', to_timestamp(EventTime))
+    def replace_extract(m):
+        unit = m.group(1)
+        return f"date_part('{unit}', to_timestamp(EventTime))"
+    q = re.sub(
+        r'\bEXTRACT\s*\(\s*(\w+)\s+FROM\s+EventTime\s*\)',
+        replace_extract,
+        q,
+        flags=re.IGNORECASE,
+    )
+
+    # 4. date_part('unit', EventTime) → date_part('unit', to_timestamp(EventTime))
+    q = re.sub(
+        r"\bdate_part\s*\(\s*('[^']+'),\s*EventTime\s*\)",
+        r"date_part(\1, to_timestamp(EventTime))",
+        q,
+        flags=re.IGNORECASE,
+    )
+
+    # 5. DATE_TRUNC('unit', EventTime) → DATE_TRUNC('unit', to_timestamp(EventTime))
+    q = re.sub(
+        r"\bDATE_TRUNC\s*\(\s*('[^']+'),\s*EventTime\s*\)",
+        r"DATE_TRUNC(\1, to_timestamp(EventTime))",
+        q,
+        flags=re.IGNORECASE,
+    )
+
+    return q
+
+
 # ── DuckDB measurement ────────────────────────────────────────────────────────
 
 def run_duckdb(parquet: str, queries: List[str], runs: int) -> List[Optional[float]]:
     """
-    Run each query as a separate duckdb process, return min wall time (ms).
-    Substitutes FROM hits → FROM '<parquet>'.
+    Run all queries in a single duckdb process via stdin with .timer on.
+    Parses "Run Time (s): real X.XXX" for per-query timing.
+    Takes min across `runs` full passes (warm best).
+    Queries are adapted for DuckDB's type system (EventDate UINT16, EventTime INT64).
     """
-    results = []
-    for q in queries:
-        q_duck = re.sub(
-            r'\bFROM\s+hits\b',
-            f"FROM '{parquet}'",
-            q,
-            flags=re.IGNORECASE,
+    duck_queries = [adapt_query_for_duckdb(q, parquet) for q in queries]
+
+    all_runs: List[List[Optional[float]]] = []
+
+    for _ in range(runs):
+        script = ".timer on\n" + "\n".join(q + ";" for q in duck_queries) + "\n"
+        proc = subprocess.run(
+            ["duckdb"],
+            input=script,
+            capture_output=True,
+            text=True,
+            timeout=300,
         )
+        # Parse "Run Time (s): real X.XXX" lines in order
+        run_times = []
+        for m in re.finditer(r'Run Time \(s\): real\s+([0-9.]+)', proc.stdout + proc.stderr):
+            run_times.append(float(m.group(1)) * 1000.0)
+        all_runs.append(run_times)
+
+    # Take per-query min across runs (warm best)
+    n = len(queries)
+    results: List[Optional[float]] = []
+    for qi in range(n):
         best = None
-        for _ in range(runs):
-            t0 = time.perf_counter()
-            subprocess.run(
-                ["duckdb", "-c", q_duck],
-                capture_output=True,
-                text=True,
-                timeout=120,
-            )
-            elapsed = (time.perf_counter() - t0) * 1000.0
-            if best is None or elapsed < best:
-                best = elapsed
+        for run in all_runs:
+            if qi < len(run):
+                t = run[qi]
+                if best is None or t < best:
+                    best = t
         results.append(best)
     return results
 
@@ -259,7 +328,7 @@ def main():
     print(f"Loaded {len(queries)} queries from {args.queries}")
 
     # Run DuckDB
-    print(f"\nRunning DuckDB ({args.runs} runs/query, per-process) …")
+    print(f"\nRunning DuckDB ({args.runs} runs, single-process .timer on) …")
     t0 = time.perf_counter()
     duck_ms = run_duckdb(args.parquet, queries, args.runs)
     duck_wall = time.perf_counter() - t0
