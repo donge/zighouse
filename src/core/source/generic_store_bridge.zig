@@ -132,10 +132,16 @@ const ScanState = struct {
         // Build ColMeta array.
         const metas = try alloc.alloc(ColMeta, table.columns.len);
         for (table.columns, 0..) |col, i| {
+            const hash_col_name: ?[]const u8 = switch (col.physical) {
+                .lowcard_text => |lc| lc.hash_column,
+                .lazy_text    => |lt| lt.hash_column,
+                else          => null,
+            };
             metas[i] = .{
                 .name          = col.name,
                 .col_type      = toCoreColType(col.ty),
                 .is_narrow_int = (col.ty == .int8 or col.ty == .int16),
+                .hash_col_name = hash_col_name,
             };
         }
 
@@ -217,10 +223,14 @@ const ScanState = struct {
         if (@atomicLoad(bool, &self.loaded, .acquire)) return;
 
         for (self.table.columns, 0..) |col, ci| {
-            // Skip pruned columns.
-            if (self.needed_cols) |nc| {
-                if (!nc[ci]) continue;
-            }
+            // Skip columns not needed by either the static pruning mask OR the current
+            // runtime override (e.g. URLHash sidecar requested via setNeededCols).
+            // We load the UNION so that all subsequent fetchRange calls (including
+            // late-materialize scans that run after the override is cleared) have
+            // access to every column they need.
+            const in_needed = if (self.needed_cols) |nc| (ci < nc.len and nc[ci]) else true;
+            const in_override = self.override_active and ci < 256 and self.override_needed[ci];
+            if (!in_needed and !in_override) continue;
 
             if (col.ty == .text or col.ty == .char) {
                 // String column: mmap .str.bin

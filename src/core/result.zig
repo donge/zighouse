@@ -35,6 +35,9 @@ pub const ColMeta = struct {
     /// The core type is widened to int64, but this flag lets the executor detect
     /// low-cardinality key columns and avoid expensive two-phase aggregation.
     is_narrow_int: bool = false,
+    /// For string columns with a parallel int64 hash sidecar (e.g. URL → URLHash),
+    /// the name of the hash column. Enables hash-key GROUP BY with late string materialization.
+    hash_col_name: ?[]const u8 = null,
 };
 
 // ── ResultSet ─────────────────────────────────────────────────────────────────

@@ -313,6 +313,14 @@ const SimpleStrFilter = struct {
     is_neq:  bool,  // true = keep row when s != value; false = keep when s == value
 
     fn passes(self: SimpleStrFilter, col: chunk.Column, r: usize) bool {
+        // Fast path: when the source decoded this column as bool_u8 (1=non-empty, 0=empty)
+        // via setStringNonEmptyBool, we only support the eq/neq-empty pattern.
+        if (col.data == .bool_u8) {
+            const non_empty = col.data.bool_u8[r] != 0;
+            // is_neq=true, value="" → keep non-empty rows → pass when non_empty
+            // is_neq=false, value="" → keep empty rows → pass when !non_empty
+            return if (self.is_neq) non_empty else !non_empty;
+        }
         const s: []const u8 = if (col.isRowNull(r)) "" else col.data.string[r];
         return if (self.is_neq) !std.mem.eql(u8, s, self.value)
                else              std.mem.eql(u8, s, self.value);
@@ -4351,6 +4359,107 @@ fn executeHashAggParallelCompact(
 /// Parallel hash_agg for single string col_ref key + compact aggs (incl. str_min/str_max).
 /// Handles Q22/Q23-style: GROUP BY string_col + MIN(string_col) + COUNT(*).
 /// Each thread builds a local StrAggHashTable; then tables are merged serially.
+/// Hash-sidecar fast path for string GROUP BY with a parallel int64 hash column.
+/// Groups by the int64 hash (fast), then late-materializes the string for top-K output.
+/// Only called when str key column has hash_col_name set, no str aggs, no CASE WHEN.
+fn executeHashAggParallelStrKeyViaHash(
+    input:        *const plan.PhysicalNode,
+    keys:         []const plan.ProjectItem,
+    aggs:         []const plan.ProjectItem,
+    sort_keys:    []const plan.SortKey,
+    top_k:        usize,
+    ctx:          *QueryContext,
+    str_col_idx:  usize,  // original string column index
+    str_key_pos:  usize,  // position in keys[] of the string key
+    hash_col_idx: usize,  // int64 hash column index
+) !?RowList {
+    const alloc = ctx.allocator();
+    const total_rows = ctx.source.rowCount();
+    if (total_rows < 500_000) return null;
+    const n_threads = parallel.defaultThreads();
+    if (n_threads <= 1) return null;
+    const sm = ctx.source.schema();
+
+    // Build a synthetic keys array: replace the string col_ref with the hash col_ref.
+    const syn_keys = try alloc.alloc(plan.ProjectItem, keys.len);
+    defer alloc.free(syn_keys);
+    @memcpy(syn_keys, keys);
+    syn_keys[str_key_pos] = .{
+        .alias    = keys[str_key_pos].alias,
+        .expr     = .{ .col_ref = .{ .index = hash_col_idx, .name = sm[hash_col_idx].name } },
+        .out_type = .int64,
+    };
+
+    // Run compact int aggregation with hash keys.
+    const compact_rl = (try executeHashAggParallelCompactTopK(
+        input, syn_keys, aggs, sort_keys, top_k, ctx,
+    )) orelse return null;
+
+    // Late-materialize: replace int64 hash values with actual strings.
+    const out_rows = compact_rl.rows.items.len;
+    if (out_rows == 0) return compact_rl;
+
+    // Collect result hashes.
+    const result_hashes = try alloc.alloc(i64, out_rows);
+    defer alloc.free(result_hashes);
+    const result_strs  = try alloc.alloc([]const u8, out_rows);
+    defer alloc.free(result_strs);
+
+    for (compact_rl.rows.items, 0..) |row, r| {
+        result_hashes[r] = if (row[str_key_pos]) |v| v.toI64() orelse 0 else 0;
+        result_strs[r]   = "";
+    }
+
+    // Scan str + hash columns to reverse-map hash → string.
+    var morsel_src = parallel.MorselSource.init(total_rows, parallel.default_morsel_size);
+    var remaining: usize = out_rows;
+    scan_loop: while (morsel_src.next()) |m| {
+        var chunk_arena = std.heap.ArenaAllocator.init(alloc);
+        defer chunk_arena.deinit();
+        var c: DataChunk = undefined;
+        ctx.source.fetchRange(m.start, m.end - m.start, &c, chunk_arena.allocator()) catch continue;
+        if (str_col_idx >= c.columns.len or hash_col_idx >= c.columns.len) continue;
+        const scol = c.columns[str_col_idx];
+        const hcol = c.columns[hash_col_idx];
+        if (scol.data != .string) continue;
+
+        for (0..c.num_rows) |r| {
+            const h: i64 = switch (hcol.data) {
+                .int64  => |a| a[r],
+                .uint64 => |a| @bitCast(a[r]),
+                else    => continue,
+            };
+            for (result_hashes, 0..) |rh, ri| {
+                if (rh == h and result_strs[ri].len == 0) {
+                    result_strs[ri] = try alloc.dupe(u8, scol.data.string[r]);
+                    remaining -= 1;
+                    if (remaining == 0) break :scan_loop;
+                    break;
+                }
+            }
+        }
+    }
+
+    // Build final RowList replacing the hash column values with string values.
+    const out_metas = try alloc.alloc(result.ColMeta, compact_rl.metas.len);
+    @memcpy(out_metas, compact_rl.metas);
+    out_metas[str_key_pos] = .{
+        .name     = keys[str_key_pos].alias,
+        .col_type = .string,
+    };
+
+    var final_rl = RowList.init(out_metas);
+
+    for (compact_rl.rows.items, 0..) |old_row, r| {
+        const new_row = try alloc.alloc(?Value, compact_rl.metas.len);
+        @memcpy(new_row, old_row);
+        new_row[str_key_pos] = .{ .string = result_strs[r] };
+        try final_rl.append(alloc, new_row);
+    }
+
+    return final_rl;
+}
+
 fn executeHashAggParallelStrKey(
     input:     *const plan.PhysicalNode,
     keys:      []const plan.ProjectItem,
@@ -4374,13 +4483,21 @@ fn executeHashAggParallelStrKey(
     // Guard: for large unfiltered scans with multi-key (int+str), the parallel merge cost
     // dominates and causes high variance (millions of unique pairs exhaust L3).
     // Fall back to sequential executeHashAggChunked for better consistency.
+    // Exception: if all "extra" keys are lit_i64 constants (e.g. Q35: GROUP BY 1, URL),
+    // the hash-sidecar path reduces it to a single int key — no variance issue.
+    const has_filter_str: bool = switch (input.*) {
+        .filter  => true,
+        .project => |p| p.input.* == .filter,
+        else => false,
+    };
     {
-        const has_filter = switch (input.*) {
-            .filter  => true,
-            .project => |p| p.input.* == .filter,
-            else => false,
-        };
-        if (!has_filter and total_rows >= 3_000_000 and keys.len >= 2) return null;
+        if (!has_filter_str and total_rows >= 3_000_000 and keys.len >= 2) {
+            // Count non-constant keys. If only 1 non-constant key exists, hash-sidecar
+            // can reduce it to a single int aggregation — allow it through.
+            var non_const_count: usize = 0;
+            for (keys) |k| { if (k.expr != .lit_i64) non_const_count += 1; }
+            if (non_const_count >= 2) return null;
+        }
     }
     var cw_key: ?CaseWhenStrKey = null;
     var cw_key_pos: usize = 0;
@@ -4410,6 +4527,42 @@ fn executeHashAggParallelStrKey(
     // If there's also a CASE WHEN, it becomes the secondary string component.
     if (str_key_count != 1) return null;
     const key_col_idx = str_key_col_idx;
+
+    // ── Hash-sidecar fast path ───────────────────────────────────────────────
+    // If the string key has a parallel int64 hash column (e.g. URL → URLHash),
+    // aggregate by the int64 hash (much faster: no string hashing/comparison),
+    // then late-materialize the actual string for the top-K output rows.
+    // Only applies when there are no string aggs, no CASE WHEN key, and no filter
+    // (with filters, the StrCountHashTable path via executeHashAggChunked is better
+    // because the filter reduces cardinality and the existing path handles it efficiently).
+    if (cw_key == null and str_key_count == 1 and !has_filter_str) {
+        const str_meta = sm_pre[key_col_idx];
+        if (str_meta.hash_col_name) |hcn| {
+            // Find the hash column index.
+            var hash_ci: ?usize = null;
+            for (sm_pre, 0..) |m, i| {
+                if (std.mem.eql(u8, m.name, hcn)) { hash_ci = i; break; }
+            }
+            if (hash_ci) |hci| {
+                // Check no string aggs (str_min/str_max require actual string).
+                var has_str_agg = false;
+                for (aggs) |item| {
+                    if (item.expr == .agg_call) {
+                        const k = item.expr.agg_call.kind;
+                        if (k == .min or k == .max) {
+                            if (item.out_type == .string) { has_str_agg = true; break; }
+                        }
+                    }
+                }
+                if (!has_str_agg) {
+                    if (try executeHashAggParallelStrKeyViaHash(
+                        input, keys, aggs, sort_keys, top_k, ctx,
+                        key_col_idx, str_key_pos, hci,
+                    )) |rl| return rl;
+                }
+            }
+        }
+    }
 
     // Build compact_kinds; allow str_min/str_max.
     const compact_kinds = try alloc.alloc(ht.CompactAggKind, aggs.len);
@@ -5176,13 +5329,29 @@ fn executeHashAggParallelCompactTopK(
                 if (ci < src_schema.len and src_schema[ci].is_narrow_int) break :two_phase;
             }
         }
-        // If there's a filter, it must be a simple single-term col_ref eq/neq lit_str.
-        const str_filt: ?SimpleStrFilter = if (filter_pred) |fp|
-            tryExtractSimpleStrFilter(fp) orelse break :two_phase
-        else null;
+        // If there's a filter, try:
+        //   (a) simple single-term col_ref eq/neq lit_str (e.g. Q32: SearchPhrase <> '')
+        //   (b) pure int AND conditions (e.g. Q41: CounterID=62 AND TraficSourceID IN (-1,6) AND ...)
+        // Fall back to regular parallel compact if neither applies.
+        var str_filt: ?SimpleStrFilter = null;
+        var int_filt: ?[]const IntCmpCond = null;
+        if (filter_pred) |fp| {
+            if (tryExtractSimpleStrFilter(fp)) |sf| {
+                str_filt = sf;
+            } else {
+                var ic_buf: [16]IntCmpCond = undefined;
+                var ic_n: usize = 0;
+                const ic_complete = extractAndIntConds(fp, &ic_buf, &ic_n, false);
+                if (ic_complete and ic_n > 0) {
+                    int_filt = try alloc.dupe(IntCmpCond, ic_buf[0..ic_n]);
+                } else {
+                    break :two_phase;
+                }
+            }
+        }
         if (try executeTwoPhaseHashAgg(
             keys, aggs, compact_kinds, compact_init_vals,
-            total_rows, n_threads, alloc, ctx, sort_keys, top_k, str_filt,
+            total_rows, n_threads, alloc, ctx, sort_keys, top_k, str_filt, int_filt,
         )) |two_phase_rl| return two_phase_rl;
     }
 
@@ -5963,6 +6132,7 @@ fn executeTwoPhaseHashAgg(
     sort_keys:         []const plan.SortKey,
     top_k:             usize,
     str_filter:        ?SimpleStrFilter,
+    int_filter:        ?[]const IntCmpCond,
 ) !?RowList {
     const N_PARTS: usize = 64;
     // row_stride = 1 (stored hash) + n_keys + n_aggs
@@ -6005,6 +6175,7 @@ fn executeTwoPhaseHashAgg(
         agg_infos:    []const AggInfo,
         compact_kinds: []const ht.CompactAggKind,
         str_filter:   ?SimpleStrFilter,
+        int_filter:   ?[]const IntCmpCond,
         err:          ?anyerror = null,
 
         fn work(self: *@This(), _: *parallel.MorselSource) void {
@@ -6032,8 +6203,10 @@ fn executeTwoPhaseHashAgg(
                 const col1 = if (self.n_keys >= 2) c.columns[ci1] else c.columns[ci0]; // unused if n_keys==1
 
                 // Resolve str_filter column once per chunk (null if col not present or wrong type).
+                // Accept both .string (normal) and .bool_u8 (set by setStringNonEmptyBool).
                 const sf_col: ?chunk.Column = if (self.str_filter) |sf|
-                    if (sf.col_idx < c.columns.len and c.columns[sf.col_idx].data == .string)
+                    if (sf.col_idx < c.columns.len and
+                       (c.columns[sf.col_idx].data == .string or c.columns[sf.col_idx].data == .bool_u8))
                         c.columns[sf.col_idx]
                     else
                         null
@@ -6047,6 +6220,29 @@ fn executeTwoPhaseHashAgg(
                         if (sf_col) |sfc| {
                             if (!sf.passes(sfc, r)) continue;
                         }
+                    }
+                    // Inline int pre-filter (e.g. Q41: CounterID=62 AND TraficSourceID IN (-1,6) AND ...).
+                    if (self.int_filter) |ics| {
+                        var pass = true;
+                        for (ics) |cond| {
+                            if (cond.col_idx >= c.columns.len) { pass = false; break; }
+                            const col = c.columns[cond.col_idx];
+                            if (col.isRowNull(r)) { pass = false; break; }
+                            const v: i64 = switch (col.data) {
+                                .int64 => |a| a[r], .uint64 => |a| @bitCast(a[r]),
+                                .bool_u8 => |a| @as(i64, a[r]), .date_u16 => |a| @as(i64, a[r]),
+                                .datetime64_ms => |a| a[r],
+                                else => { pass = false; break; },
+                            };
+                            const ok = switch (cond.op) {
+                                .eq  => v == cond.val, .neq => v != cond.val,
+                                .lt  => v <  cond.val, .lte => v <= cond.val,
+                                .gt  => v >  cond.val, .gte => v >= cond.val,
+                                .in2 => v == cond.val or v == cond.val2,
+                            };
+                            if (!ok) { pass = false; break; }
+                        }
+                        if (!pass) continue;
                     }
                     if (col0.isRowNull(r)) continue;
                     const k0: i64 = switch (col0.data) {
@@ -6149,6 +6345,7 @@ fn executeTwoPhaseHashAgg(
             .agg_infos    = agg_infos,
             .compact_kinds = compact_kinds,
             .str_filter   = str_filter,
+            .int_filter   = int_filter,
         };
     }
     try parallel.parallelFor(alloc, ScatterCtx, ScatterCtx.work, scatter_ctxs, &morsel_src1);
