@@ -31,6 +31,10 @@ pub const ColMeta = struct {
     /// serializer to emit the exact ClickHouse type name instead of the
     /// canonical col_type name. Null means use col_type's default name.
     ch_type:   ?[]const u8 = null,
+    /// True if the underlying physical column is a narrow integer (int8/int16/uint8/uint16).
+    /// The core type is widened to int64, but this flag lets the executor detect
+    /// low-cardinality key columns and avoid expensive two-phase aggregation.
+    is_narrow_int: bool = false,
 };
 
 // ── ResultSet ─────────────────────────────────────────────────────────────────

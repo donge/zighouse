@@ -38,6 +38,8 @@ pub const ColumnBuffer = struct {
     str_vals: std.ArrayListUnmanaged([]const u8),
     /// Backing store for string bytes.
     str_bytes: std.ArrayListUnmanaged(u8),
+    /// Per-row null flags (1 = NULL, 0 = non-null). Empty if column is not Nullable.
+    null_flags: std.ArrayListUnmanaged(u8),
 
     fn init(col: schema.Column) ColumnBuffer {
         return .{
@@ -45,6 +47,7 @@ pub const ColumnBuffer = struct {
             .fixed_vals = .empty,
             .str_vals = .empty,
             .str_bytes = .empty,
+            .null_flags = .empty,
         };
     }
 
@@ -70,6 +73,7 @@ pub const ColumnBuffer = struct {
         self.fixed_vals.deinit(allocator);
         self.str_vals.deinit(allocator);
         self.str_bytes.deinit(allocator);
+        self.null_flags.deinit(allocator);
     }
 
     pub fn rowCount(self: *const ColumnBuffer) usize {

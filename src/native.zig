@@ -8291,15 +8291,18 @@ fn formatMobilePhoneModelDistinctUserIdTop(allocator: std.mem.Allocator, io: std
     const n_threads = parallel.defaultThreads();
     const total_set_words = cand_len * words_per_set;
 
-    // Pass 2 parallelization: each worker fills its own bitset block
-    // (cand_len * words_per_set u64). After all morsels processed, the
-    // OR-merge phase parallelizes across the words_per_set dimension so
-    // each merge thread owns disjoint output cache lines.
+    // Pass 2: single shared bitset per candidate, workers atomically OR bits.
+    // This eliminates per-thread copies (was 8×6MB=49MB) and the OR-merge phase.
+    // Working set = cand_len * words_per_set * 8 bytes ≈ 6MB, shared → L3.
+    const shared_bitsets = try allocator.alloc(u64, total_set_words);
+    defer allocator.free(shared_bitsets);
+    @memset(shared_bitsets, 0);
+
     const Pass2Ctx = struct {
         model_ids: []const u8,
         uid_ids: []const u32,
         slot_for_model: []const i8,
-        bitsets: []u64, // cand_len * words_per_set
+        bitsets: []u64, // shared: cand_len * words_per_set
         words_per_set: usize,
     };
     const pass2_workers = struct {
@@ -8312,7 +8315,9 @@ fn formatMobilePhoneModelDistinctUserIdTop(allocator: std.mem.Allocator, io: std
                     if (slot < 0) continue;
                     const uid = ctx.uid_ids[r];
                     const base = @as(usize, @intCast(slot)) * wps;
-                    ctx.bitsets[base + (uid >> 6)] |= @as(u64, 1) << @intCast(uid & 63);
+                    const word_ptr = &ctx.bitsets[base + (uid >> 6)];
+                    const bit = @as(u64, 1) << @intCast(uid & 63);
+                    _ = @atomicRmw(u64, word_ptr, .Or, bit, .monotonic);
                 }
             }
         }
@@ -8320,82 +8325,28 @@ fn formatMobilePhoneModelDistinctUserIdTop(allocator: std.mem.Allocator, io: std
 
     const ctxs = try allocator.alloc(Pass2Ctx, n_threads);
     defer allocator.free(ctxs);
-    // One bitset block per thread.
-    const all_bitsets = try allocator.alloc(u64, n_threads * total_set_words);
-    defer allocator.free(all_bitsets);
-    @memset(all_bitsets, 0);
-    for (ctxs, 0..) |*c, t| {
+    for (ctxs) |*c| {
         c.* = .{
             .model_ids = model_ids.values,
             .uid_ids = uid_ids.values,
             .slot_for_model = slot_for_model,
-            .bitsets = all_bitsets[t * total_set_words .. (t + 1) * total_set_words],
+            .bitsets = shared_bitsets,
             .words_per_set = words_per_set,
         };
     }
     var src: parallel.MorselSource = .init(n, parallel.default_morsel_size);
     try parallel.parallelFor(allocator, Pass2Ctx, pass2_workers.fill, ctxs, &src);
 
-    // OR-merge across threads directly into the popcount sum, no need
-    // to materialize a final merged bitset: each merge worker owns a
-    // disjoint set of slots, ORs all thread copies for its slots, and
-    // popcounts on the fly.
+    // Popcount directly from the shared bitset — no merge phase needed.
     const Row = struct { id: u8, distinct: u64 };
     const rows = try allocator.alloc(Row, cand_len);
     defer allocator.free(rows);
-    const MergeCtx = struct {
-        all_bitsets: []u64,
-        cand: []const Candidate,
-        rows: []Row,
-        n_threads: usize,
-        cand_len: usize,
-        words_per_set: usize,
-        n_workers: usize,
-    };
-    const merge_workers = struct {
-        fn run(ctx: *MergeCtx, worker_id: usize) void {
-            const wps = ctx.words_per_set;
-            const bw = ctx.cand_len * wps;
-            var s = worker_id;
-            while (s < ctx.cand_len) : (s += ctx.n_workers) {
-                // Stream-process slot s: read each thread's contiguous
-                // wps-word block in turn (good prefetch), accumulate
-                // into popcount sum at the end.
-                // Fold into a single accumulator block in registers
-                // is impractical (wps ~280k), so use a small chunked
-                // buffer that fits L1.
-                const chunk: usize = 1024; // 8 KB per chunk -> hot in L1
-                var w: usize = 0;
-                var sum: u64 = 0;
-                while (w < wps) {
-                    const lo = w;
-                    const hi = @min(w + chunk, wps);
-                    var local: [chunk]u64 = undefined;
-                    const out = local[0 .. hi - lo];
-                    // Init from thread 0's block.
-                    @memcpy(out, ctx.all_bitsets[s * wps + lo .. s * wps + hi]);
-                    var t: usize = 1;
-                    while (t < ctx.n_threads) : (t += 1) {
-                        const blk = ctx.all_bitsets[t * bw + s * wps + lo .. t * bw + s * wps + hi];
-                        for (out, blk) |*o, b| o.* |= b;
-                    }
-                    for (out) |v| sum += @popCount(v);
-                    w = hi;
-                }
-                ctx.rows[s] = .{ .id = ctx.cand[s].id, .distinct = sum };
-            }
-        }
-    };
-    var merge_ctx: MergeCtx = .{
-        .all_bitsets = all_bitsets,
-        .cand = cand[0..cand_len],
-        .rows = rows,
-        .n_threads = n_threads,
-        .cand_len = cand_len,
-        .words_per_set = words_per_set,
-        .n_workers = @min(n_threads, cand_len),
-    };
-    try parallel.parallelIndices(allocator, MergeCtx, merge_workers.run, &merge_ctx, merge_ctx.n_workers);
+    for (cand[0..cand_len], 0..) |c, ci| {
+        const base = ci * words_per_set;
+        var sum: u64 = 0;
+        for (shared_bitsets[base .. base + words_per_set]) |w| sum += @popCount(w);
+        rows[ci] = .{ .id = c.id, .distinct = sum };
+    }
 
     std.sort.pdq(Row, rows, {}, struct {
         fn lt(_: void, a: Row, b: Row) bool {
@@ -8557,30 +8508,21 @@ fn formatMobilePhoneDistinctUserIdTop(allocator: std.mem.Allocator, io: std.Io, 
 
     const words_per_set = (uid_dict_size + 63) / 64;
     const total_set_words = cand_len * words_per_set;
+    const n_threads = parallel.defaultThreads();
 
-    // Memory budget: per-thread bitset block = cand_len * words_per_set
-    // u64 bytes ≈ 140 MB at full size. Cap T so total stays under 1/4 of
-    // physical RAM to leave room for the OS and column mappings.
-    const default_t = parallel.defaultThreads();
-    const n_threads = blk: {
-        const per_thread_bytes = total_set_words * @sizeOf(u64);
-        if (parallel.availableMemoryMiB()) |mib| {
-            const budget_bytes = (mib * 1024 * 1024) / 4;
-            const max_t = @max(@as(usize, 1), budget_bytes / per_thread_bytes);
-            break :blk @min(default_t, max_t);
-        }
-        break :blk default_t;
-    };
+    // Pass 2: single shared bitset per candidate, workers atomically OR bits.
+    // Eliminates per-thread copies (was up to 140 MB × T) and the OR-merge phase.
+    // Working set = total_set_words * 8 bytes, shared → fits in L3.
+    const shared_bitsets = try allocator.alloc(u64, total_set_words);
+    defer allocator.free(shared_bitsets);
+    @memset(shared_bitsets, 0);
 
-    // Pass 2 parallel: each thread owns a private bitset block of
-    // total_set_words u64. Same template as Q11 but the per-thread block
-    // is ~4× larger (140 MB) due to 64 candidates vs 32.
     const Pass2Ctx = struct {
         mphone: []const i16,
         mmodel_ids: []const u8,
         uid_ids: []const u32,
         cand_idx: []const i8,
-        bitsets: []u64,
+        bitsets: []u64, // shared
         words_per_set: usize,
     };
     const pass2_workers = struct {
@@ -8595,7 +8537,9 @@ fn formatMobilePhoneDistinctUserIdTop(allocator: std.mem.Allocator, io: std.Io, 
                     if (slot < 0) continue;
                     const uid = ctx.uid_ids[r];
                     const base = @as(usize, @intCast(slot)) * wps;
-                    ctx.bitsets[base + (uid >> 6)] |= @as(u64, 1) << @intCast(uid & 63);
+                    const word_ptr = &ctx.bitsets[base + (uid >> 6)];
+                    const bit = @as(u64, 1) << @intCast(uid & 63);
+                    _ = @atomicRmw(u64, word_ptr, .Or, bit, .monotonic);
                 }
             }
         }
@@ -8603,73 +8547,29 @@ fn formatMobilePhoneDistinctUserIdTop(allocator: std.mem.Allocator, io: std.Io, 
 
     const ctxs = try allocator.alloc(Pass2Ctx, n_threads);
     defer allocator.free(ctxs);
-    const all_bitsets = try allocator.alloc(u64, n_threads * total_set_words);
-    defer allocator.free(all_bitsets);
-    @memset(all_bitsets, 0);
-    for (ctxs, 0..) |*c, t| {
+    for (ctxs) |*c| {
         c.* = .{
             .mphone = mphone.values,
             .mmodel_ids = mmodel_ids.values,
             .uid_ids = uid_ids.values,
             .cand_idx = cand_idx,
-            .bitsets = all_bitsets[t * total_set_words .. (t + 1) * total_set_words],
+            .bitsets = shared_bitsets,
             .words_per_set = words_per_set,
         };
     }
     var src: parallel.MorselSource = .init(n, parallel.default_morsel_size);
     try parallel.parallelFor(allocator, Pass2Ctx, pass2_workers.fill, ctxs, &src);
 
-    // Parallel OR-merge + popcount across slot dimension. Same chunked
-    // pattern as Q11 to keep the inner accumulator hot in L1.
+    // Popcount directly from the shared bitset — no merge phase needed.
     const Result = struct { phone: i16, model: u8, distinct: u64 };
     const results = try allocator.alloc(Result, cand_len);
     defer allocator.free(results);
-    const MergeCtx = struct {
-        all_bitsets: []u64,
-        cand: []const Candidate,
-        results: []Result,
-        n_threads: usize,
-        cand_len: usize,
-        words_per_set: usize,
-        n_workers: usize,
-    };
-    const merge_workers = struct {
-        fn run(ctx: *MergeCtx, worker_id: usize) void {
-            const wps = ctx.words_per_set;
-            const bw = ctx.cand_len * wps;
-            var s = worker_id;
-            while (s < ctx.cand_len) : (s += ctx.n_workers) {
-                const chunk: usize = 1024; // 8 KB per chunk -> hot in L1
-                var w: usize = 0;
-                var sum: u64 = 0;
-                while (w < wps) {
-                    const lo = w;
-                    const hi = @min(w + chunk, wps);
-                    var local: [chunk]u64 = undefined;
-                    const out = local[0 .. hi - lo];
-                    @memcpy(out, ctx.all_bitsets[s * wps + lo .. s * wps + hi]);
-                    var t: usize = 1;
-                    while (t < ctx.n_threads) : (t += 1) {
-                        const blk = ctx.all_bitsets[t * bw + s * wps + lo .. t * bw + s * wps + hi];
-                        for (out, blk) |*o, b| o.* |= b;
-                    }
-                    for (out) |v| sum += @popCount(v);
-                    w = hi;
-                }
-                ctx.results[s] = .{ .phone = ctx.cand[s].phone, .model = ctx.cand[s].model, .distinct = sum };
-            }
-        }
-    };
-    var merge_ctx: MergeCtx = .{
-        .all_bitsets = all_bitsets,
-        .cand = cand[0..cand_len],
-        .results = results,
-        .n_threads = n_threads,
-        .cand_len = cand_len,
-        .words_per_set = words_per_set,
-        .n_workers = @min(n_threads, cand_len),
-    };
-    try parallel.parallelIndices(allocator, MergeCtx, merge_workers.run, &merge_ctx, merge_ctx.n_workers);
+    for (cand[0..cand_len], 0..) |c, ci| {
+        const base = ci * words_per_set;
+        var sum: u64 = 0;
+        for (shared_bitsets[base .. base + words_per_set]) |w| sum += @popCount(w);
+        results[ci] = .{ .phone = c.phone, .model = c.model, .distinct = sum };
+    }
 
     std.sort.pdq(Result, results, {}, struct {
         fn lt(_: void, a: Result, b: Result) bool {

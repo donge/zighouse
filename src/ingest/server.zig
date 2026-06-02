@@ -306,8 +306,10 @@ pub const Server = struct {
                 std.ascii.startsWithIgnoreCase(trimmed, "DROP TABLE"))
             {
                 try self.handleDropTable(trimmed);
+            } else if (asciiStartsWith(trimmed, "ALTER TABLE")) {
+                try self.handleAlterTable(trimmed);
             }
-            // ALTER TABLE ... DROP PARTITION — no-op (silently succeed)
+            // Other DDL (SYSTEM, SET, DROP PARTITION, etc.) — no-op
             try sendResponse(request, out, .ok, "");
         } else {
             try sendResponse(request, out, .bad_request, "Only CREATE TABLE, INSERT and SELECT are supported\n");
@@ -804,6 +806,76 @@ pub const Server = struct {
         );
         defer self.allocator.free(table_path);
         cwd.deleteTree(self.io, table_path) catch {};
+    }
+
+    /// ALTER TABLE [db.]table ADD [COLUMN] col Type
+    /// ALTER TABLE [db.]table DROP [COLUMN] col
+    fn handleAlterTable(self: *Server, sql: []const u8) !void {
+        var it = std.mem.tokenizeAny(u8, sql, " \t\r\n");
+        _ = it.next(); // ALTER
+        _ = it.next(); // TABLE
+        const tbl_tok = it.next() orelse return;
+        const tbl = std.mem.trim(u8, tbl_tok, ";");
+
+        var db: []const u8 = "default";
+        var table_name: []const u8 = tbl;
+        if (std.mem.indexOfScalar(u8, tbl, '.')) |dot| {
+            db = tbl[0..dot];
+            table_name = tbl[dot + 1 ..];
+        }
+
+        const existing = self.schemas.find(db, table_name) orelse return;
+        const action_tok = it.next() orelse return;
+
+        if (std.ascii.eqlIgnoreCase(action_tok, "ADD")) {
+            const maybe_col = it.next() orelse return;
+            const col_name_raw = if (std.ascii.eqlIgnoreCase(maybe_col, "COLUMN"))
+                it.next() orelse return
+            else maybe_col;
+            const col_name = std.mem.trim(u8, col_name_raw, "`\"");
+            const type_tok = it.next() orelse "String";
+            const ch_type = std.mem.trim(u8, type_tok, " \t;");
+
+            const col_ty = ddl_parser.parseColumnTypePublic(ch_type) orelse .text;
+
+            const old_cols = existing.table.columns;
+            const new_cols = try self.allocator.alloc(schema.Column, old_cols.len + 1);
+            defer self.allocator.free(new_cols);
+            @memcpy(new_cols[0..old_cols.len], old_cols);
+            new_cols[old_cols.len] = .{ .name = col_name, .ty = col_ty, .ch_type = ch_type };
+
+            var updated = existing.*;
+            updated.table.columns = new_cols;
+            try self.schemas.addEntry(self.allocator, updated);
+
+        } else if (std.ascii.eqlIgnoreCase(action_tok, "DROP")) {
+            const maybe_col = it.next() orelse return;
+            const col_name_raw = if (std.ascii.eqlIgnoreCase(maybe_col, "COLUMN"))
+                it.next() orelse return
+            else maybe_col;
+            const col_name = std.mem.trim(u8, col_name_raw, "`\";");
+
+            const old_cols = existing.table.columns;
+            var new_cols = try self.allocator.alloc(schema.Column, old_cols.len);
+            defer self.allocator.free(new_cols);
+            var n: usize = 0;
+            for (old_cols) |col| {
+                if (!std.ascii.eqlIgnoreCase(col.name, col_name)) {
+                    new_cols[n] = col;
+                    n += 1;
+                }
+            }
+
+            var updated = existing.*;
+            updated.table.columns = new_cols[0..n];
+            try self.schemas.addEntry(self.allocator, updated);
+        }
+
+        if (self.schemas.find(db, table_name)) |stored| {
+            schema_persist.save(self.io, self.allocator, self.config.data_dir, stored.db, stored) catch |err| {
+                std.log.warn("http: ALTER TABLE schema_persist.save: {s}", .{@errorName(err)});
+            };
+        }
     }
 
 
@@ -1495,7 +1567,7 @@ pub const Server = struct {
         // Allocate one ColumnBuffer per schema column; accumulate ALL rows before writePart.
         const col_bufs = try self.allocator.alloc(row_binary_decoder.ColumnBuffer, entry.table.columns.len);
         for (col_bufs, entry.table.columns) |*buf, col| {
-            buf.* = .{ .col = col, .fixed_vals = .empty, .str_vals = .empty, .str_bytes = .empty };
+            buf.* = .{ .col = col, .fixed_vals = .empty, .str_vals = .empty, .str_bytes = .empty, .null_flags = .empty };
         }
         defer {
             for (col_bufs) |*buf| buf.deinit(self.allocator);
@@ -1648,7 +1720,7 @@ pub const Server = struct {
         // Parse TSV rows positionally into target table columns.
         const col_bufs = try self.allocator.alloc(row_binary_decoder.ColumnBuffer, entry.table.columns.len);
         for (col_bufs, entry.table.columns) |*buf, col| {
-            buf.* = .{ .col = col, .fixed_vals = .empty, .str_vals = .empty, .str_bytes = .empty };
+            buf.* = .{ .col = col, .fixed_vals = .empty, .str_vals = .empty, .str_bytes = .empty, .null_flags = .empty };
         }
         defer {
             for (col_bufs) |*buf| buf.deinit(self.allocator);

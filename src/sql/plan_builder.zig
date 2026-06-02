@@ -64,6 +64,7 @@ fn buildSelectPlan(allocator: Allocator, sel: ast.SelectStmt, ctes_from_parent: 
     var table: []const u8 = "__compute__";
     var subquery_source: ?*Plan = null;
     var numbers_count: ?u64 = null;
+    var join_spec_out: ?*generic_sql.JoinSpec = null;
 
     if (sel.from) |from| {
         switch (from) {
@@ -101,6 +102,27 @@ fn buildSelectPlan(allocator: Allocator, sel: ast.SelectStmt, ctes_from_parent: 
                     if (tf.args[0] == .int) numbers_count = @intCast(tf.args[0].int);
                 }
                 table = try allocator.dupe(u8, tf.name);
+            },
+            .join => |jc| {
+                var on_lefts: std.ArrayListUnmanaged([]const u8) = .empty;
+                var on_rights: std.ArrayListUnmanaged([]const u8) = .empty;
+                try extractEquiKeys(allocator, jc.on.*, &on_lefts, &on_rights);
+                const left_sub = try buildFromClause(allocator, jc.left.*, all_ctes);
+                const right_sub = try buildFromClause(allocator, jc.right.*, all_ctes);
+                const left_ptr = try allocator.create(Plan);
+                left_ptr.* = left_sub;
+                const right_ptr = try allocator.create(Plan);
+                right_ptr.* = right_sub;
+                const jspec = try allocator.create(generic_sql.JoinSpec);
+                jspec.* = .{
+                    .kind     = @enumFromInt(@intFromEnum(jc.kind)),
+                    .left     = left_ptr,
+                    .right    = right_ptr,
+                    .on_left  = try on_lefts.toOwnedSlice(allocator),
+                    .on_right = try on_rights.toOwnedSlice(allocator),
+                };
+                join_spec_out = jspec;
+                table = try allocator.dupe(u8, left_sub.table);
             },
         }
     } else {
@@ -221,6 +243,7 @@ fn buildSelectPlan(allocator: Allocator, sel: ast.SelectStmt, ctes_from_parent: 
         .subquery_source = subquery_source,
         .numbers_count = numbers_count,
         .distinct = sel.distinct,
+        .join = join_spec_out,
         .owned = true,
     };
 }
@@ -230,6 +253,91 @@ fn findCte(ctes: []ast.Cte, name: []const u8) ?*ast.Stmt {
         if (std.ascii.eqlIgnoreCase(cte.name, name)) return cte.stmt;
     }
     return null;
+}
+
+/// Build a minimal Plan from a single FromClause (used for JOIN sub-trees).
+/// For simple tables/CTEs only sets table; for join, recurses.
+fn buildFromClause(allocator: Allocator, from: ast.FromClause, ctes: []ast.Cte) BuildError!Plan {
+    switch (from) {
+        .table => |tr| {
+            var p = Plan{ .table = try allocator.dupe(u8, tr.name), .projections = &.{}, .owned = true };
+            if (findCte(ctes, tr.name)) |cte_stmt| {
+                const sub = try allocator.create(Plan);
+                sub.* = try buildPlan(allocator, cte_stmt, ctes);
+                p.subquery_source = sub;
+            }
+            return p;
+        },
+        .subquery => |sq| {
+            const sub = try allocator.create(Plan);
+            sub.* = try buildPlan(allocator, sq.stmt, ctes);
+            return Plan{ .table = try allocator.dupe(u8, sq.alias orelse "__subquery__"), .projections = &.{}, .subquery_source = sub, .owned = true };
+        },
+        .cte_ref => |name| {
+            var p = Plan{ .table = try allocator.dupe(u8, name), .projections = &.{}, .owned = true };
+            if (findCte(ctes, name)) |cte_stmt| {
+                const sub = try allocator.create(Plan);
+                sub.* = try buildPlan(allocator, cte_stmt, ctes);
+                p.subquery_source = sub;
+            }
+            return p;
+        },
+        .numbers => |n| {
+            return Plan{ .table = try allocator.dupe(u8, "numbers"), .projections = &.{}, .numbers_count = if (n >= 0) @intCast(n) else null, .owned = true };
+        },
+        .table_func => |tf| {
+            var nc: ?u64 = null;
+            if (std.ascii.eqlIgnoreCase(tf.name, "numbers") and tf.args.len == 1) {
+                if (tf.args[0] == .int) nc = @intCast(tf.args[0].int);
+            }
+            return Plan{ .table = try allocator.dupe(u8, tf.name), .projections = &.{}, .numbers_count = nc, .owned = true };
+        },
+        .join => |jc| {
+            var on_lefts: std.ArrayListUnmanaged([]const u8) = .empty;
+            var on_rights: std.ArrayListUnmanaged([]const u8) = .empty;
+            try extractEquiKeys(allocator, jc.on.*, &on_lefts, &on_rights);
+            const left_sub = try buildFromClause(allocator, jc.left.*, ctes);
+            const right_sub = try buildFromClause(allocator, jc.right.*, ctes);
+            const left_ptr = try allocator.create(Plan);
+            left_ptr.* = left_sub;
+            const right_ptr = try allocator.create(Plan);
+            right_ptr.* = right_sub;
+            const jspec = try allocator.create(generic_sql.JoinSpec);
+            jspec.* = .{
+                .kind     = @enumFromInt(@intFromEnum(jc.kind)),
+                .left     = left_ptr,
+                .right    = right_ptr,
+                .on_left  = try on_lefts.toOwnedSlice(allocator),
+                .on_right = try on_rights.toOwnedSlice(allocator),
+            };
+            return Plan{ .table = try allocator.dupe(u8, left_sub.table), .projections = &.{}, .join = jspec, .owned = true };
+        },
+    }
+}
+
+/// Walk ON expression and extract equi-join column name pairs.
+fn extractEquiKeys(
+    allocator: Allocator,
+    expr: ast.Expr,
+    lefts:  *std.ArrayListUnmanaged([]const u8),
+    rights: *std.ArrayListUnmanaged([]const u8),
+) BuildError!void {
+    switch (expr) {
+        .binop => |bo| {
+            if (bo.op == .and_) {
+                try extractEquiKeys(allocator, bo.left, lefts, rights);
+                try extractEquiKeys(allocator, bo.right, lefts, rights);
+                return;
+            }
+            if (bo.op == .eq and bo.left == .col and bo.right == .col) {
+                try lefts.append(allocator, try allocator.dupe(u8, bo.left.col));
+                try rights.append(allocator, try allocator.dupe(u8, bo.right.col));
+                return;
+            }
+            return error.UnsupportedFeature;
+        },
+        else => return error.UnsupportedFeature,
+    }
 }
 
 // ── Projection expression builder ─────────────────────────────────────────────
@@ -936,4 +1044,39 @@ test "plan_builder: UNION ALL" {
     try std.testing.expect(plan.union_other != null);
     try std.testing.expectEqualStrings("t1", plan.table);
     try std.testing.expectEqualStrings("t2", plan.union_other.?.table);
+}
+
+test "plan_builder: INNER JOIN equi-key extraction" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const stmt = sql_parser.parse(alloc,
+        "SELECT t1.a, t2.b FROM t1 JOIN t2 ON t1.id = t2.id LIMIT 10");
+    try std.testing.expect(stmt != null);
+    const plan = try buildPlan(alloc, stmt.?, &.{});
+    try std.testing.expect(plan.join != null);
+    const j = plan.join.?;
+    try std.testing.expectEqual(generic_sql.JoinKind.inner, j.kind);
+    try std.testing.expectEqualStrings("t1", j.left.table);
+    try std.testing.expectEqualStrings("t2", j.right.table);
+    try std.testing.expectEqual(@as(usize, 1), j.on_left.len);
+    try std.testing.expectEqualStrings("t1.id", j.on_left[0]);
+    try std.testing.expectEqualStrings("t2.id", j.on_right[0]);
+    try std.testing.expectEqual(@as(?usize, 10), plan.limit);
+}
+
+test "plan_builder: LEFT JOIN multi-key" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const stmt = sql_parser.parse(alloc,
+        "SELECT a FROM t1 LEFT JOIN t2 ON t1.x = t2.x AND t1.y = t2.y");
+    try std.testing.expect(stmt != null);
+    const plan = try buildPlan(alloc, stmt.?, &.{});
+    try std.testing.expect(plan.join != null);
+    const j = plan.join.?;
+    try std.testing.expectEqual(generic_sql.JoinKind.left, j.kind);
+    try std.testing.expectEqual(@as(usize, 2), j.on_left.len);
 }

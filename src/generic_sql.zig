@@ -100,6 +100,19 @@ pub fn freeWhereNode(allocator: std.mem.Allocator, node: *WhereNode) void {
     allocator.destroy(node);
 }
 
+pub const JoinKind = enum { inner, left, right, full };
+
+/// Equi-join specification: two Plans joined on equal column names.
+pub const JoinSpec = struct {
+    kind:      JoinKind,
+    left:      *Plan,
+    right:     *Plan,
+    /// Left-side column names for equi-join (parallel to on_right).
+    on_left:   []const []const u8,
+    /// Right-side column names for equi-join (parallel to on_left).
+    on_right:  []const []const u8,
+};
+
 pub const FilterOp = enum { equal, not_equal, greater, greater_equal, less, less_equal };
 
 pub const Predicate = struct {
@@ -144,6 +157,8 @@ pub const Plan = struct {
     /// When non-null, the FROM clause is a numbers(N) / system.numbers virtual table.
     /// The executor generates N rows with a single column `number` = 0..N-1.
     numbers_count: ?u64 = null,
+    /// JOIN specification. When set, `table` is the left table alias.
+    join: ?*JoinSpec = null,
     /// SELECT DISTINCT deduplication
     distinct: bool = false,
     /// When true, all string fields (table, where_text, group_by, having_text,
@@ -334,6 +349,13 @@ fn normalizeInBrackets(allocator: std.mem.Allocator, sql: []const u8) ![]const u
 pub fn deinit(allocator: std.mem.Allocator, plan: Plan) void {
     if (plan.subquery_source) |sq| { deinit(allocator, sq.*); allocator.destroy(sq); }
     if (plan.union_other) |uo| { deinit(allocator, uo.*); allocator.destroy(uo); }
+    if (plan.join) |j| {
+        deinit(allocator, j.left.*); allocator.destroy(j.left);
+        deinit(allocator, j.right.*); allocator.destroy(j.right);
+        allocator.free(j.on_left);
+        allocator.free(j.on_right);
+        allocator.destroy(j);
+    }
     if (plan.where_expr) |we| freeWhereNode(allocator, we);
     if (plan.having_expr) |he| freeWhereNode(allocator, he);
     // Always free cond expressions in projections (they are always heap-allocated).

@@ -111,7 +111,7 @@ const Parser = struct {
         // FROM clause
         var from: ?ast.FromClause = null;
         if (self.tok.eatKeyword("FROM")) {
-            from = try self.parseFrom();
+            from = try self.parseFromWithJoins();
         }
 
         // WHERE
@@ -217,6 +217,66 @@ const Parser = struct {
             if (std.ascii.eqlIgnoreCase(kw, c)) return true;
         }
         return false;
+    }
+
+    // ── FROM clause with JOIN ─────────────────────────────────────────────────
+
+    fn parseFromWithJoins(self: *Parser) ParseError!ast.FromClause {
+        var left = try self.parseFrom();
+
+        // Loop to handle left-associative chained JOINs.
+        while (true) {
+            const t = self.tok.peek();
+            if (t.kind != .keyword) break;
+
+            var kind: ast.JoinKind = undefined;
+
+            if (std.ascii.eqlIgnoreCase(t.text, "JOIN")) {
+                kind = .inner;
+                _ = self.tok.next();
+            } else if (std.ascii.eqlIgnoreCase(t.text, "INNER")) {
+                _ = self.tok.next();
+                if (!self.tok.eatKeyword("JOIN")) return error.UnexpectedToken;
+                kind = .inner;
+            } else if (std.ascii.eqlIgnoreCase(t.text, "LEFT")) {
+                _ = self.tok.next();
+                _ = self.tok.eatKeyword("OUTER"); // optional OUTER
+                if (!self.tok.eatKeyword("JOIN")) return error.UnexpectedToken;
+                kind = .left;
+            } else if (std.ascii.eqlIgnoreCase(t.text, "RIGHT")) {
+                _ = self.tok.next();
+                _ = self.tok.eatKeyword("OUTER");
+                if (!self.tok.eatKeyword("JOIN")) return error.UnexpectedToken;
+                kind = .right;
+            } else if (std.ascii.eqlIgnoreCase(t.text, "FULL")) {
+                _ = self.tok.next();
+                _ = self.tok.eatKeyword("OUTER");
+                if (!self.tok.eatKeyword("JOIN")) return error.UnexpectedToken;
+                kind = .full;
+            } else {
+                break;
+            }
+
+            const right = try self.parseFrom();
+            if (!self.tok.eatKeyword("ON")) return error.UnexpectedToken;
+            const on_expr = try self.parseExpr();
+
+            const left_ptr = try self.alloc(ast.FromClause);
+            left_ptr.* = left;
+            const right_ptr = try self.alloc(ast.FromClause);
+            right_ptr.* = right;
+            const on_ptr = try self.alloc(ast.Expr);
+            on_ptr.* = on_expr;
+
+            left = .{ .join = .{
+                .kind  = kind,
+                .left  = left_ptr,
+                .right = right_ptr,
+                .on    = on_ptr,
+            }};
+        }
+
+        return left;
     }
 
     // ── FROM clause ───────────────────────────────────────────────────────────

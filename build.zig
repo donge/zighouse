@@ -795,6 +795,7 @@ pub fn build(b: *std.Build) void {
         .target   = target,
         .optimize = optimize,
     });
+    core_mod.addImport("parallel", parallel_mod);
     const core_tests = b.addTest(.{ .root_module = core_mod });
     const core_test_cmd = b.addRunArtifact(core_tests);
     generic_executor_tests.root_module.addImport("core", core_mod);

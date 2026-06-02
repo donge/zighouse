@@ -40,12 +40,22 @@ pub const Projection = struct {
     alias: ?[]const u8, // may be null if no AS
 };
 
+pub const JoinKind = enum { inner, left, right, full };
+
+pub const JoinClause = struct {
+    kind:  JoinKind,
+    left:  *FromClause,
+    right: *FromClause,
+    on:    *Expr,
+};
+
 pub const FromClause = union(enum) {
     table: TableRef,         // FROM table_name or db.table_name
     subquery: SubqueryFrom,  // FROM (SELECT ...) AS alias
     cte_ref: []const u8,     // FROM cte_name (resolved during plan build)
     numbers: i64,            // FROM numbers(N) or system.numbers LIMIT N
     table_func: TableFunc,   // FROM func(args) AS alias
+    join: JoinClause,        // FROM t1 [INNER|LEFT|RIGHT|FULL] JOIN t2 ON ...
 };
 
 pub const TableRef = struct {

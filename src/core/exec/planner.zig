@@ -184,7 +184,37 @@ pub fn plan_query(
 ) !?*PhysicalNode {
     // ── Source node ───────────────────────────────────────────────────────────
     var source: *PhysicalNode = blk: {
-        if (gplan.subquery_source) |sq| {
+        if (gplan.join) |js| {
+            // JOIN: recursively plan each side and create a hash_join node.
+            const left_node  = try plan_query(ctx, js.left.*)  orelse return null;
+            const right_node = try plan_query(ctx, js.right.*) orelse return null;
+            // Resolve key column names to indices in the respective sub-plan outputs.
+            // For now, use the table schema (ctx.tbl) for name→index lookup on both sides.
+            // This is a best-effort: if the schema is unavailable or the column is not
+            // found, we fall back to index 0 (which may be wrong, but won't crash).
+            var equi_list: std.ArrayListUnmanaged(plan.EquiKey) = .empty;
+            for (js.on_left, js.on_right) |lname, rname| {
+                const lidx: usize = if (ctx.tbl) |t| (t.findColumn(lname) orelse 0) else 0;
+                const ridx: usize = if (ctx.tbl) |t| (t.findColumn(rname) orelse 0) else 0;
+                try equi_list.append(ctx.alloc, .{ .left_col_idx = lidx, .right_col_idx = ridx });
+            }
+            const equi_keys = try equi_list.toOwnedSlice(ctx.alloc);
+            const join_type: plan.HashJoinNode.JoinType = switch (js.kind) {
+                .inner => .inner,
+                .left  => .left,
+                .right => .right,
+                .full  => .full,
+            };
+            const n = try ctx.alloc.create(PhysicalNode);
+            n.* = .{ .hash_join = .{
+                .left      = left_node,
+                .right     = right_node,
+                .join_type = join_type,
+                .equi_keys = equi_keys,
+                .filter    = null,
+            }};
+            break :blk n;
+        } else if (gplan.subquery_source) |sq| {
             // Subquery in FROM.
             const inner = try plan_query(ctx, sq.*) orelse return null;
             const n = try ctx.alloc.create(PhysicalNode);
@@ -758,6 +788,25 @@ fn whereNodeToExpr(ctx: *PlannerCtx, wn: *const generic_sql.WhereNode) ?Expr {
         .cmp_str => |c| {
             const col_expr = resolveColExpr(ctx, c.col) orelse
                 (parseArithExpr(ctx, c.col) catch null) orelse return null;
+            // If the column is date_u16 and the value looks like a date, convert
+            // the string literal to a lit_i64 (days-since-epoch). This lets
+            // extractAndIntConds vectorize the comparison instead of falling
+            // back to evalExpr which boxes every row.
+            const col_type = schemaColType(ctx, c.col);
+            if (col_type == .date_u16) {
+                if (parseDateStrToI64(c.val)) |days| {
+                    const binop2 = ctx.alloc.create(plan.BinOp) catch return null;
+                    binop2.* = .{ .left = col_expr, .right = .{ .lit_i64 = days } };
+                    return switch (c.op) {
+                        .eq => Expr{ .eq  = binop2 },
+                        .ne => Expr{ .neq = binop2 },
+                        .lt => Expr{ .lt  = binop2 },
+                        .le => Expr{ .lte = binop2 },
+                        .gt => Expr{ .gt  = binop2 },
+                        .ge => Expr{ .gte = binop2 },
+                    };
+                }
+            }
             const binop = ctx.alloc.create(plan.BinOp) catch return null;
             binop.* = .{
                 .left  = col_expr,

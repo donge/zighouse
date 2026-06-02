@@ -6,7 +6,7 @@ Usage:
   python3 scripts/bench-vs-duckdb.py \
     --zighouse  <path-to-zighouse-binary>  \
     --store     <ir-store-dir>             \
-    --parquet   <hits_1m_snappy.parquet>   \
+    --parquet   <hits_Nm_snappy.parquet>   \
     --queries   <queries.sql>
 
 Exit codes:
@@ -20,11 +20,20 @@ Gate conditions (all must hold):
   3. no query > 3x       no single query more than 3x slower than DuckDB
 
 Methodology:
-  - DuckDB: single process, all queries via stdin with .timer on, N runs.
-    Per-query wall time parsed from "Run Time (s): real X.XXX" lines.
-    Takes min across runs (warm best). No per-process startup overhead.
-  - ZigHouse: bench-ir (runs all queries sequentially, N runs each).
-    Per-query timing extracted from exec_ms log lines.
+  Both systems use their own optimal pre-processed storage format:
+    - ZigHouse: MergeTree binary column files (pre-imported from Parquet)
+    - DuckDB:   native .db file (pre-imported from Parquet via CREATE TABLE AS SELECT)
+
+  Timing:
+    - Both run in a single process, all 43 queries repeated `runs` times.
+    - Round 0 is discarded (cold). Per-query best over rounds 1..N is the warm time.
+    - DuckDB: single duckdb CLI process, .timer on, parse "Run Time (s): real X.XXX".
+    - ZigHouse: bench-ir, per-query exec_ms from stderr log.
+
+  SQL adaptation for DuckDB (.db schema preserves original Parquet types):
+    - EventDate (UINT16 days since epoch): string comparisons → integer offsets
+    - EventTime (INT64 unix seconds): date_part/DATE_TRUNC → wrap with to_timestamp()
+    - EXTRACT(unit FROM EventTime) → date_part('unit', to_timestamp(EventTime))
 """
 
 from __future__ import annotations
@@ -38,19 +47,21 @@ import sys
 import time
 from typing import List, Optional, Tuple
 
-
 # ── Argument parsing ──────────────────────────────────────────────────────────
 
 def parse_args():
     p = argparse.ArgumentParser(description="ZigHouse vs DuckDB benchmark gate")
     p.add_argument("--zighouse", required=True, help="Path to zighouse binary")
     p.add_argument("--store",    required=True, help="ZigHouse IR store directory")
-    p.add_argument("--parquet",  required=True, help="Parquet file for DuckDB (hits_1m_snappy.parquet)")
+    p.add_argument("--parquet",  required=True, help="Parquet file (hits_Nm_snappy.parquet)")
     p.add_argument("--queries",  required=True, help="SQL queries file (one query per line)")
-    p.add_argument("--runs",     type=int, default=3, help="Runs per query (default 3)")
+    p.add_argument("--runs",     type=int, default=3, help="Rounds of all queries (default 3); round 0 is cold/discarded")
     p.add_argument("--max-ratio", type=float, default=3.0,
                    help="Max allowed per-query ratio zh/duck (default 3.0)")
     p.add_argument("--json-out", help="Optional: write results JSON to this file")
+    p.add_argument("--duckdb-db", default=None,
+                   help="Path for DuckDB .db file (auto-created from parquet if missing). "
+                        "Default: <parquet>.duckdb")
     return p.parse_args()
 
 
@@ -77,24 +88,39 @@ def shutil_which(name):
     return shutil.which(name)
 
 
-def adapt_query_for_duckdb(q: str, parquet: str) -> str:
+def ensure_duckdb_db(parquet: str, db_path: str) -> None:
     """
-    Adapt a ClickBench SQL query for DuckDB on a raw Parquet file where:
-      - EventDate is stored as UINT16 (days since 1970-01-01)
-      - EventTime is stored as INT64 (unix seconds)
+    Create a DuckDB .db file with a `hits` table imported from `parquet`.
+    Skips creation if the .db file already exists.
+    """
+    if os.path.isfile(db_path):
+        print(f"  DuckDB .db exists: {db_path}")
+        return
+    print(f"  Importing {parquet} → {db_path} ...")
+    sql = f"CREATE TABLE hits AS SELECT * FROM '{parquet}';"
+    r = subprocess.run(
+        ["duckdb", db_path, "-c", sql],
+        capture_output=True, text=True, timeout=600,
+    )
+    if r.returncode != 0:
+        print(f"ERROR importing parquet into DuckDB: {r.stderr[:400]}", file=sys.stderr)
+        sys.exit(2)
+    print(f"  Import done.")
+
+
+def adapt_query_for_duckdb(q: str) -> str:
+    """
+    Adapt a ClickBench SQL query for DuckDB where the hits table has:
+      - EventDate as UINT16 (days since 1970-01-01)
+      - EventTime as INT64 (unix seconds)
 
     Transformations applied:
-      1. FROM hits  →  FROM '<parquet>'
-      2. EventDate >= 'YYYY-MM-DD'  →  EventDate >= (DATE 'YYYY-MM-DD' - DATE '1970-01-01')
-      3. EXTRACT(unit FROM EventTime) / date_part('unit', EventTime)
-             →  date_part('unit', to_timestamp(EventTime))
-      4. DATE_TRUNC('unit', EventTime)  →  DATE_TRUNC('unit', to_timestamp(EventTime))
+      1. EventDate >= 'YYYY-MM-DD'  →  EventDate >= (DATE 'YYYY-MM-DD' - DATE '1970-01-01')
+      2. EXTRACT(unit FROM EventTime) → date_part('unit', to_timestamp(EventTime))
+      3. date_part('unit', EventTime) → date_part('unit', to_timestamp(EventTime))
+      4. DATE_TRUNC('unit', EventTime) → DATE_TRUNC('unit', to_timestamp(EventTime))
     """
-    # 1. FROM hits → FROM parquet
-    q = re.sub(r'\bFROM\s+hits\b', f"FROM '{parquet}'", q, flags=re.IGNORECASE)
-
-    # 2. EventDate comparisons: string date literals → integer day offsets
-    #    Matches: EventDate >= '2013-07-01'  (with >=, <=, =, >, <, !=)
+    # 1. EventDate comparisons with string date literals → integer day offsets
     def replace_date_cmp(m):
         col, op, date_str = m.group(1), m.group(2), m.group(3)
         return f"{col} {op} (DATE '{date_str}' - DATE '1970-01-01')"
@@ -104,18 +130,15 @@ def adapt_query_for_duckdb(q: str, parquet: str) -> str:
         q,
     )
 
-    # 3. EXTRACT(unit FROM EventTime) → date_part('unit', to_timestamp(EventTime))
-    def replace_extract(m):
-        unit = m.group(1)
-        return f"date_part('{unit}', to_timestamp(EventTime))"
+    # 2. EXTRACT(unit FROM EventTime) → date_part('unit', to_timestamp(EventTime))
     q = re.sub(
         r'\bEXTRACT\s*\(\s*(\w+)\s+FROM\s+EventTime\s*\)',
-        replace_extract,
+        lambda m: f"date_part('{m.group(1)}', to_timestamp(EventTime))",
         q,
         flags=re.IGNORECASE,
     )
 
-    # 4. date_part('unit', EventTime) → date_part('unit', to_timestamp(EventTime))
+    # 3. date_part('unit', EventTime) → date_part('unit', to_timestamp(EventTime))
     q = re.sub(
         r"\bdate_part\s*\(\s*('[^']+'),\s*EventTime\s*\)",
         r"date_part(\1, to_timestamp(EventTime))",
@@ -123,7 +146,7 @@ def adapt_query_for_duckdb(q: str, parquet: str) -> str:
         flags=re.IGNORECASE,
     )
 
-    # 5. DATE_TRUNC('unit', EventTime) → DATE_TRUNC('unit', to_timestamp(EventTime))
+    # 4. DATE_TRUNC('unit', EventTime) → DATE_TRUNC('unit', to_timestamp(EventTime))
     q = re.sub(
         r"\bDATE_TRUNC\s*\(\s*('[^']+'),\s*EventTime\s*\)",
         r"DATE_TRUNC(\1, to_timestamp(EventTime))",
@@ -136,42 +159,57 @@ def adapt_query_for_duckdb(q: str, parquet: str) -> str:
 
 # ── DuckDB measurement ────────────────────────────────────────────────────────
 
-def run_duckdb(parquet: str, queries: List[str], runs: int) -> List[Optional[float]]:
+def run_duckdb(db_path: str, queries: List[str], runs: int) -> List[Optional[float]]:
     """
-    Run all queries in a single duckdb process via stdin with .timer on.
-    Parses "Run Time (s): real X.XXX" for per-query timing.
-    Takes min across `runs` full passes (warm best).
+    Run all queries N rounds inside a SINGLE duckdb process against a pre-imported .db file.
+    Round 0 is cold (discarded if runs > 1); per-query warm best is min over rounds 1..N-1.
+    Parses "Run Time (s): real X.XXX" from duckdb .timer output.
     Queries are adapted for DuckDB's type system (EventDate UINT16, EventTime INT64).
     """
-    duck_queries = [adapt_query_for_duckdb(q, parquet) for q in queries]
+    duck_queries = [adapt_query_for_duckdb(q) for q in queries]
+    n = len(duck_queries)
 
-    all_runs: List[List[Optional[float]]] = []
-
+    # Build script: N rounds of all queries inside one process.
+    script = ".timer on\n"
     for _ in range(runs):
-        script = ".timer on\n" + "\n".join(q + ";" for q in duck_queries) + "\n"
-        proc = subprocess.run(
-            ["duckdb"],
-            input=script,
-            capture_output=True,
-            text=True,
-            timeout=300,
-        )
-        # Parse "Run Time (s): real X.XXX" lines in order
-        run_times = []
-        for m in re.finditer(r'Run Time \(s\): real\s+([0-9.]+)', proc.stdout + proc.stderr):
-            run_times.append(float(m.group(1)) * 1000.0)
-        all_runs.append(run_times)
+        script += "\n".join(q + ";" for q in duck_queries) + "\n"
 
-    # Take per-query min across runs (warm best)
-    n = len(queries)
+    proc = subprocess.run(
+        ["duckdb", db_path],
+        input=script,
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+
+    # Parse all "Run Time (s): real X.XXX" lines in order → runs*n values
+    all_times = [
+        float(m.group(1)) * 1000.0
+        for m in re.finditer(r'Run Time \(s\): real\s+([0-9.]+)', proc.stdout + proc.stderr)
+    ]
+
+    # Warn if we didn't get expected timer count (query errors produce no timer line)
+    if len(all_times) != runs * n:
+        print(f"  WARNING: expected {runs*n} timer lines, got {len(all_times)}", file=sys.stderr)
+        errs = [l for l in (proc.stdout + proc.stderr).splitlines() if 'Error' in l]
+        for e in errs[:5]:
+            print(f"  DuckDB error: {e}", file=sys.stderr)
+
+    # Take per-query min over warm rounds (skip round 0 if runs > 1)
+    warm_start = 1 if runs > 1 else 0
     results: List[Optional[float]] = []
     for qi in range(n):
         best = None
-        for run in all_runs:
-            if qi < len(run):
-                t = run[qi]
+        for r in range(warm_start, runs):
+            idx = r * n + qi
+            if idx < len(all_times):
+                t = all_times[idx]
                 if best is None or t < best:
                     best = t
+        if best is None:
+            # fallback: use cold round
+            if qi < len(all_times):
+                best = all_times[qi]
         results.append(best)
     return results
 
@@ -327,10 +365,15 @@ def main():
     ]
     print(f"Loaded {len(queries)} queries from {args.queries}")
 
+    # Ensure DuckDB .db file exists (pre-imported from parquet)
+    db_path = args.duckdb_db or (args.parquet + ".duckdb")
+    print(f"\nEnsuring DuckDB native .db ...")
+    ensure_duckdb_db(args.parquet, db_path)
+
     # Run DuckDB
-    print(f"\nRunning DuckDB ({args.runs} runs, single-process .timer on) …")
+    print(f"\nRunning DuckDB ({args.runs} rounds, single-process, warm best) …")
     t0 = time.perf_counter()
-    duck_ms = run_duckdb(args.parquet, queries, args.runs)
+    duck_ms = run_duckdb(db_path, queries, args.runs)
     duck_wall = time.perf_counter() - t0
     print(f"  Done in {duck_wall:.1f}s")
 

@@ -179,6 +179,7 @@ pub const AggHashTable = struct {
             if (self.occupied[i]) cb(ctx, self.keys[i], self.accums[i]);
         }
     }
+
 };
 
 // ── JoinHashTable ─────────────────────────────────────────────────────────────
@@ -804,9 +805,18 @@ pub const StrAggHashTable = struct {
         s:         []const u8,
         init_vals: []const u64,
     ) !InsertResult {
+        return self.getOrInsertH(s, hashStr(s), init_vals);
+    }
+
+    /// Same as getOrInsert but takes a precomputed hash (avoids recomputation during merge).
+    pub fn getOrInsertH(
+        self:      *StrAggHashTable,
+        s:         []const u8,
+        h:         u64,
+        init_vals: []const u64,
+    ) !InsertResult {
         if (self.count + 1 > (self.capacity * 7) / 10) try self.grow();
         const mask = self.capacity - 1;
-        const h    = hashStr(s);
         var   slot = h & mask;
         while (true) : (slot = (slot + 1) & mask) {
             const tag = self.tags[slot];
@@ -923,6 +933,70 @@ pub const StrAggHashTable = struct {
             }
         }
     }
+
+    /// Merge all entries from `other` into `self`, combining accumulators by kind.
+    /// String sidecar (str_min/str_max) is also merged.
+    /// `kinds` must match the agg layout used by both tables.
+    pub fn mergeFrom(
+        self:  *StrAggHashTable,
+        other: *const StrAggHashTable,
+        kinds: []const CompactAggKind,
+        init_vals: []const u64,
+    ) !void {
+        for (0..other.capacity) |i| {
+            if (other.tags[i] == EMPTY_TAG) continue;
+            const key = other.key_slots[i].str;
+            // Reuse the precomputed hash stored in tags to avoid rehashing.
+            const res = try self.getOrInsertH(key, other.tags[i], init_vals);
+            const src_vb = i * other.num_aggs;
+            for (kinds, 0..) |kind, ci| {
+                const src = other.vals_flat[src_vb + ci];
+                switch (kind) {
+                    .count, .i64_sum, .u64_sum => res.vals[ci] += src,
+                    .f64_sum => {
+                        const a: f64 = @bitCast(res.vals[ci]);
+                        const b: f64 = @bitCast(src);
+                        res.vals[ci] = @bitCast(a + b);
+                    },
+                    .i64_min => if (@as(i64, @bitCast(src)) < @as(i64, @bitCast(res.vals[ci]))) { res.vals[ci] = src; },
+                    .i64_max => if (@as(i64, @bitCast(src)) > @as(i64, @bitCast(res.vals[ci]))) { res.vals[ci] = src; },
+                    .u64_min => if (src < res.vals[ci]) { res.vals[ci] = src; },
+                    .u64_max => if (src > res.vals[ci]) { res.vals[ci] = src; },
+                    .f64_min => {
+                        const a: f64 = @bitCast(res.vals[ci]);
+                        const b: f64 = @bitCast(src);
+                        if (b < a) res.vals[ci] = src;
+                    },
+                    .f64_max => {
+                        const a: f64 = @bitCast(res.vals[ci]);
+                        const b: f64 = @bitCast(src);
+                        if (b > a) res.vals[ci] = src;
+                    },
+                    .str_min, .str_max => {
+                        // Sidecar merge.
+                    },
+                }
+            }
+            // Merge str sidecar entries.
+            if (other.num_str_aggs > 0 and self.num_str_aggs > 0) {
+                const src_sb = i * other.num_str_aggs;
+                for (0..@min(self.num_str_aggs, other.num_str_aggs)) |si| {
+                    const src_s = other.str_sidecar[src_sb + si] orelse continue;
+                    // Determine min vs max from kinds order (str_min/str_max).
+                    var sc_i: usize = 0;
+                    for (kinds) |kind| {
+                        if (kind == .str_min) {
+                            if (sc_i == si) { self.updateStrSidecar(res.slot, si, src_s, true); break; }
+                            sc_i += 1;
+                        } else if (kind == .str_max) {
+                            if (sc_i == si) { self.updateStrSidecar(res.slot, si, src_s, false); break; }
+                            sc_i += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
 };
 
 // ── CompactIntKeyHashTable ────────────────────────────────────────────────────
@@ -961,13 +1035,20 @@ pub const CompactIntKeyHashTable = struct {
     const EMPTY_TAG: u64 = 0;
     const INITIAL_CAP = 64;
 
-    keys_flat:  []i64,   // slot i → keys_flat[i*num_keys .. (i+1)*num_keys]
-    vals_flat:  []u64,   // slot i → vals_flat[i*num_aggs .. (i+1)*num_aggs]
-    tags:       []u64,   // 0=empty, else hash|bit63
+    /// Full AoS layout: entries[slot * entry_size] = tag (0=empty, else hash|bit63),
+    /// entries[slot * entry_size + 1 .. + 1 + num_keys] = keys (as u64, bitcast from i64),
+    /// entries[slot * entry_size + 1 + num_keys .. + entry_size] = vals.
+    ///
+    /// For Q33 (2 keys, 3 aggs): entry_size=6, 48B per slot ≤ 1 cache line (64B).
+    /// A single DRAM miss fetches tag + keys + vals, so key compare AND value
+    /// update after a tag hit are both "free" (already in the same cache line).
+    /// This halves DRAM misses compared to SoA (tag[], keys[], vals[] separate).
+    entries:    []u64,   // length = capacity * entry_size
     capacity:   usize,
     count:      usize,
     num_keys:   usize,
     num_aggs:   usize,
+    entry_size: usize,   // = num_keys + num_aggs + 1  (cached)
     arena:      std.mem.Allocator,
 
     pub fn initWithCapacity(
@@ -979,19 +1060,18 @@ pub const CompactIntKeyHashTable = struct {
         const cap = if (est_rows > 0)
             nextPow2I(@as(usize, @intCast(@min(est_rows * 100 / 70 + 1, std.math.maxInt(u32)))))
         else INITIAL_CAP;
-        const keys_flat = try arena.alloc(i64, cap * num_keys);
-        const vals_flat = try arena.alloc(u64, cap * num_aggs);
-        const tags      = try arena.alloc(u64, cap);
-        @memset(tags, EMPTY_TAG);
+        const es      = num_keys + num_aggs + 1;
+        const entries = try arena.alloc(u64, cap * es);
+        // Zero entire entries so every tag starts as EMPTY_TAG (0).
+        @memset(entries, 0);
         return .{
-            .keys_flat = keys_flat,
-            .vals_flat = vals_flat,
-            .tags      = tags,
-            .capacity  = cap,
-            .count     = 0,
-            .num_keys  = num_keys,
-            .num_aggs  = num_aggs,
-            .arena     = arena,
+            .entries    = entries,
+            .capacity   = cap,
+            .count      = 0,
+            .num_keys   = num_keys,
+            .num_aggs   = num_aggs,
+            .entry_size = es,
+            .arena      = arena,
         };
     }
 
@@ -1002,7 +1082,7 @@ pub const CompactIntKeyHashTable = struct {
         return p;
     }
 
-    fn hashI64s(keys: []const i64) u64 {
+    pub fn hashI64s(keys: []const i64) u64 {
         if (keys.len == 1) {
             var h: u64 = @bitCast(keys[0]);
             h ^= h >> 33; h *%= 0xff51afd7ed558ccd;
@@ -1024,64 +1104,108 @@ pub const CompactIntKeyHashTable = struct {
         return h.final() | (1 << 63);
     }
 
-    /// Returns a pointer to the vals_flat slice for the given key's slot,
+    /// Returns a pointer to the vals portion of the given key's slot,
     /// inserting with `init_vals` if not present.
     pub fn getOrInsert(
         self: *CompactIntKeyHashTable,
         key:       []const i64,
         init_vals: []const u64,
     ) ![]u64 {
+        return self.getOrInsertH(key, hashI64s(key), init_vals);
+    }
+
+    /// Prefetch the expected HT cache line for `key` without probing.
+    /// Call this PREFETCH_DIST iterations before getOrInsert to hide L3/DRAM latency.
+    pub inline fn prefetchForKeys(self: *const CompactIntKeyHashTable, key0: i64, key1: i64) void {
+        const k0: u64 = @bitCast(key0);
+        const k1: u64 = @bitCast(key1);
+        var h: u64 = k0 *% 0x9e3779b97f4a7c15 ^ k1 *% 0x6c62272e07bb0142;
+        h ^= h >> 30; h *%= 0xbf58476d1ce4e5b9;
+        h ^= h >> 27; h *%= 0x94d049bb133111eb;
+        h ^= h >> 31;
+        h |= (1 << 63);
+        const slot = h & (self.capacity - 1);
+        @prefetch(&self.entries[slot * self.entry_size], .{ .rw = .read, .locality = 1, .cache = .data });
+    }
+
+    /// Prefetch variant for single key (Q16, Q36, etc.).
+    pub inline fn prefetchForKey1(self: *const CompactIntKeyHashTable, key0: i64) void {
+        var h: u64 = @bitCast(key0);
+        h ^= h >> 33; h *%= 0xff51afd7ed558ccd;
+        h ^= h >> 33; h *%= 0xc4ceb9fe1a85ec53;
+        h ^= h >> 33;
+        h |= (1 << 63);
+        const slot = h & (self.capacity - 1);
+        @prefetch(&self.entries[slot * self.entry_size], .{ .rw = .read, .locality = 1, .cache = .data });
+    }
+
+    /// Same as getOrInsert but takes precomputed hash (avoids rehashing during merge).
+    pub fn getOrInsertH(
+        self: *CompactIntKeyHashTable,
+        key:       []const i64,
+        h:         u64,
+        init_vals: []const u64,
+    ) ![]u64 {
         if (self.count + 1 > (self.capacity * 7) / 10) try self.grow();
         const mask = self.capacity - 1;
-        const h    = hashI64s(key);
+        const es   = self.entry_size;
         var   slot = h & mask;
+        // Prefetch the next-in-line slot preemptively to hide collision chain latency.
+        @prefetch(&self.entries[((slot +% 1) & mask) * es], .{ .rw = .read, .locality = 1, .cache = .data });
         while (true) : (slot = (slot + 1) & mask) {
-            const tag = self.tags[slot];
+            const base = slot * es;
+            const tag  = self.entries[base];
             if (tag == EMPTY_TAG) {
-                const kb = slot * self.num_keys;
-                @memcpy(self.keys_flat[kb .. kb + self.num_keys], key);
-                const vb = slot * self.num_aggs;
-                @memcpy(self.vals_flat[vb .. vb + self.num_aggs], init_vals);
-                self.tags[slot] = h;
+                // Insert: write tag, keys, init vals — all contiguous in one cache line.
+                self.entries[base] = h;
+                const kb = base + 1;
+                for (key, 0..) |k, i| self.entries[kb + i] = @bitCast(k);
+                const vb = base + 1 + self.num_keys;
+                @memcpy(self.entries[vb .. vb + self.num_aggs], init_vals);
                 self.count += 1;
-                return self.vals_flat[vb .. vb + self.num_aggs];
+                return self.entries[vb .. vb + self.num_aggs];
             }
             if (tag == h) {
-                const kb = slot * self.num_keys;
-                if (std.mem.eql(i64, self.keys_flat[kb .. kb + self.num_keys], key)) {
-                    const vb = slot * self.num_aggs;
-                    return self.vals_flat[vb .. vb + self.num_aggs];
+                // Potential match: compare keys (same cache line as tag).
+                const kb = base + 1;
+                var match = true;
+                for (key, 0..) |k, i| {
+                    if (self.entries[kb + i] != @as(u64, @bitCast(k))) {
+                        match = false; break;
+                    }
+                }
+                if (match) {
+                    const vb = base + 1 + self.num_keys;
+                    return self.entries[vb .. vb + self.num_aggs];
                 }
             }
         }
     }
 
     fn grow(self: *CompactIntKeyHashTable) !void {
-        const new_cap  = self.capacity * 2;
-        const new_mask = new_cap - 1;
-        const new_keys = try self.arena.alloc(i64, new_cap * self.num_keys);
-        const new_vals = try self.arena.alloc(u64, new_cap * self.num_aggs);
-        const new_tags = try self.arena.alloc(u64, new_cap);
-        @memset(new_tags, EMPTY_TAG);
+        try self.growTo(self.capacity * 2);
+    }
+
+    /// Grow (or pre-size) to at least `new_cap` slots. No-op if already large enough.
+    pub fn growTo(self: *CompactIntKeyHashTable, new_cap: usize) !void {
+        if (new_cap <= self.capacity) return;
+        const actual_cap = nextPow2I(new_cap);
+        const new_mask   = actual_cap - 1;
+        const es         = self.entry_size;
+        const new_entries = try self.arena.alloc(u64, actual_cap * es);
+        @memset(new_entries, 0);
         for (0..self.capacity) |i| {
-            if (self.tags[i] == EMPTY_TAG) continue;
-            const h    = self.tags[i];
-            var   slot = h & new_mask;
-            while (new_tags[slot] != EMPTY_TAG) : (slot = (slot + 1) & new_mask) {}
-            const src_kb = i * self.num_keys;
-            const dst_kb = slot * self.num_keys;
-            @memcpy(new_keys[dst_kb .. dst_kb + self.num_keys],
-                    self.keys_flat[src_kb .. src_kb + self.num_keys]);
-            const src_vb = i * self.num_aggs;
-            const dst_vb = slot * self.num_aggs;
-            @memcpy(new_vals[dst_vb .. dst_vb + self.num_aggs],
-                    self.vals_flat[src_vb .. src_vb + self.num_aggs]);
-            new_tags[slot] = h;
+            const src_base = i * es;
+            const h = self.entries[src_base];
+            if (h == EMPTY_TAG) continue;
+            var slot = h & new_mask;
+            while (new_entries[slot * es] != EMPTY_TAG) : (slot = (slot + 1) & new_mask) {}
+            const dst_base = slot * es;
+            @memcpy(new_entries[dst_base .. dst_base + es],
+                    self.entries[src_base .. src_base + es]);
         }
-        self.keys_flat = new_keys;
-        self.vals_flat = new_vals;
-        self.tags      = new_tags;
-        self.capacity  = new_cap;
+        self.entries  = new_entries;
+        self.capacity = actual_cap;
     }
 
     pub fn iterate(
@@ -1089,12 +1213,152 @@ pub const CompactIntKeyHashTable = struct {
         ctx:  anytype,
         comptime cb: fn (@TypeOf(ctx), []const i64, []const u64) void,
     ) void {
+        const es = self.entry_size;
+        var key_buf: [16]i64 = undefined;
         for (0..self.capacity) |i| {
-            if (self.tags[i] != EMPTY_TAG) {
-                const kb = i * self.num_keys;
-                const vb = i * self.num_aggs;
-                cb(ctx, self.keys_flat[kb .. kb + self.num_keys],
-                        self.vals_flat[vb .. vb + self.num_aggs]);
+            const base = i * es;
+            if (self.entries[base] == EMPTY_TAG) continue;
+            const kb = base + 1;
+            for (0..self.num_keys) |ki| key_buf[ki] = @bitCast(self.entries[kb + ki]);
+            const vb = base + 1 + self.num_keys;
+            cb(ctx, key_buf[0..self.num_keys],
+                    self.entries[vb .. vb + self.num_aggs]);
+        }
+    }
+
+    /// Merge all entries from `self` into `master`, combining accumulators by kind.
+    /// Uses precomputed hashes from entries to avoid rehashing.
+    /// Uses software prefetch to hide DRAM latency during random master HT probes.
+    pub fn mergeInto(
+        self:      *const CompactIntKeyHashTable,
+        master:    *CompactIntKeyHashTable,
+        kinds:     []const CompactAggKind,
+        init_vals: []const u64,
+    ) !void {
+        const pf_dist: usize = 32;
+        const es      = self.entry_size;
+        const m_es    = master.entry_size;
+        const mask    = master.capacity - 1;
+        var key_buf: [16]i64 = undefined;
+        for (0..self.capacity) |i| {
+            // Prefetch master entry for a future source entry.
+            if (i + pf_dist < self.capacity) {
+                const h_pf = self.entries[(i + pf_dist) * es];
+                if (h_pf != EMPTY_TAG) {
+                    @prefetch(master.entries.ptr + (h_pf & mask) * m_es,
+                              .{ .rw = .read, .locality = 1, .cache = .data });
+                }
+            }
+            const base = i * es;
+            const h    = self.entries[base];
+            if (h == EMPTY_TAG) continue;
+            const kb = base + 1;
+            for (0..self.num_keys) |ki| key_buf[ki] = @bitCast(self.entries[kb + ki]);
+            const vb = base + 1 + self.num_keys;
+            const local_vals = self.entries[vb .. vb + self.num_aggs];
+            const master_vals = try master.getOrInsertH(key_buf[0..self.num_keys], h, init_vals);
+            for (kinds, 0..) |kind, ci| {
+                const src = local_vals[ci];
+                switch (kind) {
+                    .count, .u64_sum => master_vals[ci] += src,
+                    .i64_sum => {
+                        const a: i64 = @bitCast(master_vals[ci]);
+                        const b: i64 = @bitCast(src);
+                        master_vals[ci] = @bitCast(a + b);
+                    },
+                    .f64_sum => {
+                        const a: f64 = @bitCast(master_vals[ci]);
+                        const b: f64 = @bitCast(src);
+                        master_vals[ci] = @bitCast(a + b);
+                    },
+                    .i64_min => {
+                        const a: i64 = @bitCast(master_vals[ci]);
+                        const b: i64 = @bitCast(src);
+                        master_vals[ci] = @bitCast(@min(a, b));
+                    },
+                    .i64_max => {
+                        const a: i64 = @bitCast(master_vals[ci]);
+                        const b: i64 = @bitCast(src);
+                        master_vals[ci] = @bitCast(@max(a, b));
+                    },
+                    .u64_min => master_vals[ci] = @min(master_vals[ci], src),
+                    .u64_max => master_vals[ci] = @max(master_vals[ci], src),
+                    .f64_min => {
+                        const a: f64 = @bitCast(master_vals[ci]);
+                        const b: f64 = @bitCast(src);
+                        if (b < a) master_vals[ci] = src;
+                    },
+                    .f64_max => {
+                        const a: f64 = @bitCast(master_vals[ci]);
+                        const b: f64 = @bitCast(src);
+                        if (b > a) master_vals[ci] = src;
+                    },
+                    .str_min, .str_max => {},
+                }
+            }
+        }
+    }
+
+    /// Like mergeInto, but only processes entries where `(h & part_mask) == part_id`.
+    /// Used by partition-parallel merge to keep each partition HT L3-sized.
+    pub fn mergeIntoPartitioned(
+        self:      *const CompactIntKeyHashTable,
+        master:    *CompactIntKeyHashTable,
+        kinds:     []const CompactAggKind,
+        init_vals: []const u64,
+        part_id:   u64,
+        part_mask: u64,
+    ) !void {
+        const es = self.entry_size;
+        var key_buf: [16]i64 = undefined;
+        for (0..self.capacity) |i| {
+            const base = i * es;
+            const h    = self.entries[base];
+            if (h == EMPTY_TAG) continue;
+            if (h & part_mask != part_id) continue;
+            const kb = base + 1;
+            for (0..self.num_keys) |ki| key_buf[ki] = @bitCast(self.entries[kb + ki]);
+            const vb = base + 1 + self.num_keys;
+            const local_vals = self.entries[vb .. vb + self.num_aggs];
+            const master_vals = try master.getOrInsertH(key_buf[0..self.num_keys], h, init_vals);
+            for (kinds, 0..) |kind, ci| {
+                const src = local_vals[ci];
+                switch (kind) {
+                    .count, .u64_sum => master_vals[ci] += src,
+                    .i64_sum => {
+                        const a: i64 = @bitCast(master_vals[ci]);
+                        const b: i64 = @bitCast(src);
+                        master_vals[ci] = @bitCast(a + b);
+                    },
+                    .f64_sum => {
+                        const a: f64 = @bitCast(master_vals[ci]);
+                        const b: f64 = @bitCast(src);
+                        master_vals[ci] = @bitCast(a + b);
+                    },
+                    .i64_min => {
+                        const a: i64 = @bitCast(master_vals[ci]);
+                        const b: i64 = @bitCast(src);
+                        master_vals[ci] = @bitCast(@min(a, b));
+                    },
+                    .i64_max => {
+                        const a: i64 = @bitCast(master_vals[ci]);
+                        const b: i64 = @bitCast(src);
+                        master_vals[ci] = @bitCast(@max(a, b));
+                    },
+                    .u64_min => master_vals[ci] = @min(master_vals[ci], src),
+                    .u64_max => master_vals[ci] = @max(master_vals[ci], src),
+                    .f64_min => {
+                        const a: f64 = @bitCast(master_vals[ci]);
+                        const b: f64 = @bitCast(src);
+                        if (b < a) master_vals[ci] = src;
+                    },
+                    .f64_max => {
+                        const a: f64 = @bitCast(master_vals[ci]);
+                        const b: f64 = @bitCast(src);
+                        if (b > a) master_vals[ci] = src;
+                    },
+                    .str_min, .str_max => {},
+                }
             }
         }
     }

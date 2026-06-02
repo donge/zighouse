@@ -113,3 +113,153 @@ pub fn maxF64(values: []const f64) f64 {
     return total;
 }
 
+/// SIMD count of i64 elements where value != cmp_val (8-wide).
+pub fn countNeqI64(values: []const i64, cmp_val: i64) usize {
+    const LANES = 8;
+    const V = @Vector(LANES, i64);
+    const splat_val: V = @splat(cmp_val);
+    var acc: usize = 0;
+    var i: usize = 0;
+    while (i + LANES <= values.len) : (i += LANES) {
+        const v: V = values[i..][0..LANES].*;
+        const mask = v != splat_val;
+        acc += @popCount(@as(u8, @bitCast(mask)));
+    }
+    while (i < values.len) : (i += 1) {
+        if (values[i] != cmp_val) acc += 1;
+    }
+    return acc;
+}
+
+/// SIMD count of i64 elements where value == cmp_val.
+pub fn countEqI64(values: []const i64, cmp_val: i64) usize {
+    const LANES = 8;
+    const V = @Vector(LANES, i64);
+    const splat_val: V = @splat(cmp_val);
+    var acc: usize = 0;
+    var i: usize = 0;
+    while (i + LANES <= values.len) : (i += LANES) {
+        const v: V = values[i..][0..LANES].*;
+        const mask = v == splat_val;
+        acc += @popCount(@as(u8, @bitCast(mask)));
+    }
+    while (i < values.len) : (i += 1) {
+        if (values[i] == cmp_val) acc += 1;
+    }
+    return acc;
+}
+
+/// SIMD count of i64 elements where value > cmp_val.
+pub fn countGtI64(values: []const i64, cmp_val: i64) usize {
+    const LANES = 8;
+    const V = @Vector(LANES, i64);
+    const splat_val: V = @splat(cmp_val);
+    var acc: usize = 0;
+    var i: usize = 0;
+    while (i + LANES <= values.len) : (i += LANES) {
+        const v: V = values[i..][0..LANES].*;
+        const mask = v > splat_val;
+        acc += @popCount(@as(u8, @bitCast(mask)));
+    }
+    while (i < values.len) : (i += 1) {
+        if (values[i] > cmp_val) acc += 1;
+    }
+    return acc;
+}
+
+/// SIMD count of i64 elements where value >= cmp_val.
+pub fn countGteI64(values: []const i64, cmp_val: i64) usize {
+    const LANES = 8;
+    const V = @Vector(LANES, i64);
+    const splat_val: V = @splat(cmp_val);
+    var acc: usize = 0;
+    var i: usize = 0;
+    while (i + LANES <= values.len) : (i += LANES) {
+        const v: V = values[i..][0..LANES].*;
+        const mask = v >= splat_val;
+        acc += @popCount(@as(u8, @bitCast(mask)));
+    }
+    while (i < values.len) : (i += 1) {
+        if (values[i] >= cmp_val) acc += 1;
+    }
+    return acc;
+}
+
+/// SIMD count of i64 elements where value < cmp_val.
+pub fn countLtI64(values: []const i64, cmp_val: i64) usize {
+    const LANES = 8;
+    const V = @Vector(LANES, i64);
+    const splat_val: V = @splat(cmp_val);
+    var acc: usize = 0;
+    var i: usize = 0;
+    while (i + LANES <= values.len) : (i += LANES) {
+        const v: V = values[i..][0..LANES].*;
+        const mask = v < splat_val;
+        acc += @popCount(@as(u8, @bitCast(mask)));
+    }
+    while (i < values.len) : (i += 1) {
+        if (values[i] < cmp_val) acc += 1;
+    }
+    return acc;
+}
+
+/// SIMD count of i64 elements where value <= cmp_val.
+pub fn countLteI64(values: []const i64, cmp_val: i64) usize {
+    const LANES = 8;
+    const V = @Vector(LANES, i64);
+    const splat_val: V = @splat(cmp_val);
+    var acc: usize = 0;
+    var i: usize = 0;
+    while (i + LANES <= values.len) : (i += LANES) {
+        const v: V = values[i..][0..LANES].*;
+        const mask = v <= splat_val;
+        acc += @popCount(@as(u8, @bitCast(mask)));
+    }
+    while (i < values.len) : (i += 1) {
+        if (values[i] <= cmp_val) acc += 1;
+    }
+    return acc;
+}
+
+/// SIMD count where (v == val1 OR v == val2).
+pub fn countIn2I64(values: []const i64, val1: i64, val2: i64) usize {
+    const LANES = 8;
+    const V = @Vector(LANES, i64);
+    const sv1: V = @splat(val1);
+    const sv2: V = @splat(val2);
+    var acc: usize = 0;
+    var i: usize = 0;
+    while (i + LANES <= values.len) : (i += LANES) {
+        const v: V = values[i..][0..LANES].*;
+        const mask = (v == sv1) | (v == sv2);
+        acc += @popCount(@as(u8, @bitCast(mask)));
+    }
+    while (i < values.len) : (i += 1) {
+        if (values[i] == val1 or values[i] == val2) acc += 1;
+    }
+    return acc;
+}
+
+/// Apply a single int comparison to a i64 slice, writing passing indices into
+/// `out_indices`. Returns the number of passing rows.
+/// Used for late-materialisation: build a pass-set before decoding other columns.
+pub fn filterI64(
+    values:      []const i64,
+    op:          enum(u8) { eq, neq, lt, lte, gt, gte, in2 },
+    val:         i64,
+    val2:        i64,
+    out_indices: []u32,   // must have capacity >= values.len
+) usize {
+    var n: usize = 0;
+    switch (op) {
+        .neq => for (values, 0..) |v, i| { if (v != val) { out_indices[n] = @intCast(i); n += 1; } },
+        .eq  => for (values, 0..) |v, i| { if (v == val) { out_indices[n] = @intCast(i); n += 1; } },
+        .gt  => for (values, 0..) |v, i| { if (v >  val) { out_indices[n] = @intCast(i); n += 1; } },
+        .gte => for (values, 0..) |v, i| { if (v >= val) { out_indices[n] = @intCast(i); n += 1; } },
+        .lt  => for (values, 0..) |v, i| { if (v <  val) { out_indices[n] = @intCast(i); n += 1; } },
+        .lte => for (values, 0..) |v, i| { if (v <= val) { out_indices[n] = @intCast(i); n += 1; } },
+        .in2 => for (values, 0..) |v, i| { if (v == val or v == val2) { out_indices[n] = @intCast(i); n += 1; } },
+    }
+    return n;
+}
+

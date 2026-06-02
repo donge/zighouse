@@ -730,8 +730,12 @@ fn dispatchQuery(
     } else if (std.ascii.startsWithIgnoreCase(s, "CREATE TABLE") or
                std.ascii.startsWithIgnoreCase(s, "CREATE OR REPLACE TABLE")) {
         try handleCreateTable(ctx, a, w, s);
+    } else if (std.ascii.startsWithIgnoreCase(s, "DROP TABLE")) {
+        try handleDropTable(ctx, a, w, s);
+    } else if (std.ascii.startsWithIgnoreCase(s, "ALTER TABLE")) {
+        try handleAlterTable(ctx, a, w, s);
     } else {
-        // Other DDL (ALTER, DROP, etc.) — acknowledge with empty result
+        // Other DDL — acknowledge with empty result
         try sendEos(w);
     }
 }
@@ -1135,6 +1139,138 @@ fn handleCreateTable(ctx: *ServerCtx, a: std.mem.Allocator, w: *Io.Writer, sql: 
             };
         }
     }
+    try sendEos(w);
+}
+
+fn handleDropTable(ctx: *ServerCtx, a: std.mem.Allocator, w: *Io.Writer, sql: []const u8) !void {
+    // Parse: DROP TABLE [IF EXISTS] [[db.]table]
+    var rest = std.mem.trim(u8, sql[("DROP TABLE").len..], " \t");
+    const if_exists = std.ascii.startsWithIgnoreCase(rest, "IF EXISTS");
+    if (if_exists) rest = std.mem.trim(u8, rest[("IF EXISTS").len..], " \t");
+
+    // Strip trailing semicolon / whitespace
+    rest = std.mem.trim(u8, rest, " \t;\n\r");
+
+    if (rest.len == 0) {
+        try sendEos(w);
+        return;
+    }
+
+    // Split db.table or just table
+    var db: []const u8 = "default";
+    var table_name: []const u8 = rest;
+    if (std.mem.indexOfScalar(u8, rest, '.')) |dot| {
+        db = rest[0..dot];
+        table_name = rest[dot + 1 ..];
+    }
+
+    if (ctx.schemas.find(db, table_name) == null) {
+        if (if_exists) {
+            try sendEos(w);
+        } else {
+            try sendException(a, w, 60, "Table not found");
+        }
+        return;
+    }
+
+    ctx.schemas.removeEntry(db, table_name);
+
+    // Delete on-disk directory <data_dir>/<db>/<table>
+    const table_dir = try std.fmt.allocPrint(a, "{s}/{s}/{s}", .{ ctx.data_dir, db, table_name });
+    defer a.free(table_dir);
+    std.Io.Dir.cwd().deleteTree(ctx.io, table_dir) catch |err| {
+        std.debug.print("tcp: DROP TABLE deleteTree warning: {s}\n", .{@errorName(err)});
+    };
+
+    try sendEos(w);
+}
+
+/// ALTER TABLE [db.]table ADD COLUMN col_name Type
+/// ALTER TABLE [db.]table DROP COLUMN col_name
+fn handleAlterTable(ctx: *ServerCtx, a: std.mem.Allocator, w: *Io.Writer, sql: []const u8) !void {
+    // Tokenize: ALTER TABLE <table> ADD|DROP COLUMN <col> [<type>]
+    var it = std.mem.tokenizeAny(u8, sql, " \t\r\n");
+    _ = it.next(); // ALTER
+    _ = it.next(); // TABLE
+    const tbl_tok = it.next() orelse { try sendEos(w); return; };
+    const tbl = std.mem.trim(u8, tbl_tok, ";");
+
+    var db: []const u8 = "default";
+    var table_name: []const u8 = tbl;
+    if (std.mem.indexOfScalar(u8, tbl, '.')) |dot| {
+        db = tbl[0..dot];
+        table_name = tbl[dot + 1 ..];
+    }
+
+    const existing = ctx.schemas.find(db, table_name) orelse {
+        try sendEos(w); // unknown table — no-op
+        return;
+    };
+
+    const action_tok = it.next() orelse { try sendEos(w); return; };
+
+    if (std.ascii.eqlIgnoreCase(action_tok, "ADD")) {
+        // Consume optional COLUMN keyword
+        const maybe_col = it.next() orelse { try sendEos(w); return; };
+        const col_name_raw = if (std.ascii.eqlIgnoreCase(maybe_col, "COLUMN"))
+            it.next() orelse { try sendEos(w); return; }
+        else maybe_col;
+        const col_name = std.mem.trim(u8, col_name_raw, "`\"");
+        const type_tok = it.next() orelse "String";
+        const ch_type = std.mem.trim(u8, type_tok, " \t;");
+
+        // Map CH type → schema.ColumnType
+        const col_ty = ddl_parser.parseColumnTypePublic(ch_type) orelse schema.ColumnType.text;
+
+        // Build updated columns list: existing + new col
+        const old_cols = existing.table.columns;
+        const new_cols = try a.alloc(schema.Column, old_cols.len + 1);
+        defer a.free(new_cols);
+        @memcpy(new_cols[0..old_cols.len], old_cols);
+        new_cols[old_cols.len] = .{
+            .name = col_name,
+            .ty   = col_ty,
+            .ch_type = ch_type,
+        };
+
+        var updated = existing.*;
+        updated.table.columns = new_cols;
+        try ctx.schemas.addEntry(a, updated);
+
+    } else if (std.ascii.eqlIgnoreCase(action_tok, "DROP")) {
+        // Consume optional COLUMN keyword
+        const maybe_col = it.next() orelse { try sendEos(w); return; };
+        const col_name_raw = if (std.ascii.eqlIgnoreCase(maybe_col, "COLUMN"))
+            it.next() orelse { try sendEos(w); return; }
+        else maybe_col;
+        const col_name = std.mem.trim(u8, col_name_raw, "`\";");
+
+        // Build updated columns list: existing minus dropped col
+        const old_cols = existing.table.columns;
+        var new_cols = try a.alloc(schema.Column, old_cols.len);
+        defer a.free(new_cols);
+        var n: usize = 0;
+        for (old_cols) |col| {
+            if (!std.ascii.eqlIgnoreCase(col.name, col_name)) {
+                new_cols[n] = col;
+                n += 1;
+            }
+        }
+        new_cols = new_cols[0..n];
+
+        var updated = existing.*;
+        updated.table.columns = new_cols;
+        try ctx.schemas.addEntry(a, updated);
+    }
+    // Other ALTER operations (MODIFY, RENAME, etc.) — no-op
+
+    // Persist updated schema
+    if (ctx.schemas.find(db, table_name)) |stored| {
+        schema_persist.save(ctx.io, a, ctx.data_dir, stored.db, stored) catch |err| {
+            std.debug.print("tcp: ALTER TABLE schema_persist.save warning: {s}\n", .{@errorName(err)});
+        };
+    }
+
     try sendEos(w);
 }
 

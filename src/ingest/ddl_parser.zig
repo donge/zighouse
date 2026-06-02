@@ -269,6 +269,10 @@ pub fn parse(allocator: std.mem.Allocator, sql: []const u8) !ParseResult {
 
 // ── Type mapping ──────────────────────────────────────────────────────────────
 
+pub fn parseColumnTypePublic(s: []const u8) ?schema.ColumnType {
+    return parseColumnType(s);
+}
+
 fn parseColumnType(s: []const u8) ?schema.ColumnType {
     if (std.ascii.eqlIgnoreCase(s, "Int8"))  return .int8;
     if (std.ascii.eqlIgnoreCase(s, "Int16")) return .int16;

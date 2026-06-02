@@ -115,6 +115,10 @@ pub const Column = struct {
     null_mask: []u64,
     /// Number of rows in this column (== DataChunk.num_rows).
     len:       usize,
+    /// True if this column was pruned (not needed by query). Its data
+    /// buffer may point to a shared read-only zero buffer; copyRow must
+    /// not write to it.
+    pruned:    bool = false,
 
     /// Read value at row `i`, or null if masked.
     pub fn getOpt(self: Column, i: usize) ?Value {
