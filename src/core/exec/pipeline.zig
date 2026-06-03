@@ -1289,6 +1289,8 @@ fn executeScannableToSink(
             if (isScannable(ha.input)) {
                 // Try parallel compact int-key hash agg first.
                 if (try executeHashAggParallelCompact(ha.input, ha.keys, ha.aggs, ctx)) |rl| return rl;
+                // Try two-phase (i64, string) pair count (Q17/Q18).
+                if (try executeHashAggParallelPairCount(ha.input, ha.keys, ha.aggs, &.{}, 0, ctx)) |rl| return rl;
                 // Try parallel string-key hash agg (str_min/str_max support).
                 if (try executeHashAggParallelStrKey(ha.input, ha.keys, ha.aggs, &.{}, 0, ctx)) |rl| return rl;
                 return executeHashAggChunked(ha.input, ha.keys, ha.aggs, ctx);
@@ -1315,6 +1317,7 @@ fn executeScannableToSink(
              if (tk.input.* == .hash_agg and isScannable(tk.input.hash_agg.input)) {
                  const ha = tk.input.hash_agg;
                  if (try executeHashAggParallelCompactTopK(ha.input, ha.keys, ha.aggs, tk.keys, k, ctx)) |rl| return rl;
+                 if (try executeHashAggParallelPairCount(ha.input, ha.keys, ha.aggs, tk.keys, k, ctx)) |rl| return rl;
                  if (try executeHashAggParallelStrKey(ha.input, ha.keys, ha.aggs, tk.keys, k, ctx)) |rl| return rl;
              }
              const inner = try executeNode(tk.input, ctx);
@@ -4344,6 +4347,193 @@ test "executePlan: filter + limit" {
     try std.testing.expectEqual(Value{ .int64 = 3 }, rs.get(0, 0).?);
     try std.testing.expectEqual(Value{ .int64 = 4 }, rs.get(0, 1).?);
 }
+
+/// Parallel hash aggregation for (i64, string) + count(*) queries (Q17/Q18).
+/// Uses "ownership filter" partitioning: each thread scans its own morsel range but
+/// only inserts rows where hash(i64_key) % n_threads == thread_id. This keeps each
+/// thread's HT small (fits in L3) with no scatter buffers or string copies.
+/// Strings point directly into mmap data (valid for query lifetime).
+/// Returns null if unable to handle; falls back to sequential executeHashAggChunked.
+fn executeHashAggParallelPairCount(
+    input:     *const plan.PhysicalNode,
+    keys:      []const plan.ProjectItem,
+    aggs:      []const plan.ProjectItem,
+    sort_keys: []const plan.SortKey,
+    top_k:     usize,
+    ctx:       *QueryContext,
+) !?RowList {
+    if (!ctx.source.supportsRange()) return null;
+    const total_rows = ctx.source.rowCount();
+    if (total_rows < 2_000_000) return null;
+    const n_threads = parallel.defaultThreads();
+    if (n_threads <= 1) return null;
+    const alloc = ctx.allocator();
+
+    // Only handle unfiltered scans (no WHERE clause support yet in this path).
+    if (input.* != .part_scan and input.* != .mem_scan) return null;
+
+    // Guard: exactly 2 col_ref keys, exactly 1 agg (count(*)).
+    if (keys.len != 2) return null;
+    if (aggs.len != 1) return null;
+    if (aggs[0].expr != .agg_call) return null;
+    if (aggs[0].expr.agg_call.kind != .count_star) return null;
+    for (keys) |k| { if (k.expr != .col_ref) return null; }
+
+    // Identify i64 and string key column indices from schema.
+    const sm = ctx.source.schema();
+    const ci0 = keys[0].expr.col_ref.index;
+    const ci1 = keys[1].expr.col_ref.index;
+    if (ci0 >= sm.len or ci1 >= sm.len) return null;
+    const t0 = sm[ci0].col_type;
+    const t1 = sm[ci1].col_type;
+
+    const i64_ci: usize = blk: {
+        if ((t0 == .int64 or t0 == .uint64) and t1 == .string) break :blk ci0;
+        if ((t1 == .int64 or t1 == .uint64) and t0 == .string) break :blk ci1;
+        return null;
+    };
+    const str_ci: usize = if (i64_ci == ci0) ci1 else ci0;
+    const k0_is_i64 = (i64_ci == ci0);
+
+    // Narrow-int check: skip for low-cardinality int columns.
+    if (sm[i64_ci].is_narrow_int) return null;
+
+    // Restrict columns to only those needed.
+    const needed_names = [_][]const u8{ sm[i64_ci].name, sm[str_ci].name };
+    ctx.source.setNeededCols(&needed_names);
+    defer ctx.source.setNeededCols(null);
+
+    // Preload columns.
+    { var dummy: DataChunk = undefined; ctx.source.fetchRange(0, 0, &dummy, alloc) catch {}; }
+
+    const n_parts_mask = blk: {
+        var p: usize = 1;
+        while (p < n_threads and p < 64) p <<= 1;
+        break :blk p - 1; // mask for power-of-2
+    };
+    const n_parts = n_parts_mask + 1;
+
+    // Each worker gets an id and scans ALL rows, inserting only those it "owns".
+    // This avoids scatter buffers and string copies — strings point into mmap directly.
+    const Worker = struct {
+        thread_id:   usize,
+        n_parts:     usize,
+        parts_mask:  usize,
+        source:      SourceIface,
+        morsel_src:  *parallel.MorselSource,
+        parent_alloc: std.mem.Allocator,
+        i64_ci:      usize,
+        str_ci:      usize,
+        local_ht:    ht.PairCountHashTable,
+        err:         ?anyerror = null,
+
+        fn work(self: *@This(), _: *parallel.MorselSource) void {
+            self.runWork() catch |e| { self.err = e; };
+        }
+
+        fn runWork(self: *@This()) !void {
+            var thread_arena = std.heap.ArenaAllocator.init(self.parent_alloc);
+            defer thread_arena.deinit();
+            const talloc = thread_arena.allocator();
+
+            while (self.morsel_src.next()) |m| {
+                var chunk_arena = std.heap.ArenaAllocator.init(talloc);
+                defer chunk_arena.deinit();
+                var c: DataChunk = undefined;
+                try self.source.fetchRange(m.start, m.end - m.start, &c, chunk_arena.allocator());
+
+                if (self.i64_ci >= c.columns.len or self.str_ci >= c.columns.len) continue;
+                const strs = c.columns[self.str_ci].data.string;
+
+                switch (c.columns[self.i64_ci].data) {
+                    .int64 => |ints| {
+                        for (0..c.num_rows) |r| {
+                            const n = ints[r];
+                            const h = std.hash.Wyhash.hash(0, std.mem.asBytes(&n));
+                            if (h & self.parts_mask != self.thread_id) continue;
+                            try self.local_ht.increment(n, strs[r]);
+                        }
+                    },
+                    .uint64 => |ints| {
+                        for (0..c.num_rows) |r| {
+                            const n: i64 = @bitCast(ints[r]);
+                            const h = std.hash.Wyhash.hash(0, std.mem.asBytes(&n));
+                            if (h & self.parts_mask != self.thread_id) continue;
+                            try self.local_ht.increment(n, strs[r]);
+                        }
+                    },
+                    else => {},
+                }
+            }
+        }
+    };
+
+    // Estimate per-thread HT size: total / n_parts, with a floor.
+    const est_per_thread: u64 = @max(64, total_rows / @as(u64, n_parts));
+
+    // Each worker gets its own arena-backed HT.
+    const ht_arenas = try alloc.alloc(std.heap.ArenaAllocator, n_parts);
+    for (ht_arenas) |*a| a.* = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer for (ht_arenas) |*a| a.deinit();
+
+    const workers = try alloc.alloc(Worker, n_parts);
+    for (workers, 0..) |*w, t| {
+        w.* = .{
+            .thread_id    = t,
+            .n_parts      = n_parts,
+            .parts_mask   = n_parts_mask,
+            .source       = ctx.source,
+            .morsel_src   = undefined,
+            .parent_alloc = alloc,
+            .i64_ci       = i64_ci,
+            .str_ci       = str_ci,
+            .local_ht     = try ht.PairCountHashTable.initWithCapacity(ht_arenas[t].allocator(), est_per_thread),
+            .err          = null,
+        };
+    }
+
+    var morsel_src = parallel.MorselSource.init(total_rows, parallel.default_morsel_size);
+    for (workers) |*w| w.morsel_src = &morsel_src;
+    try parallel.parallelFor(alloc, Worker, Worker.work, workers, &morsel_src);
+    for (workers) |w| { if (w.err) |e| return e; }
+
+    // ── Collect results ──────────────────────────────────────────────────────
+    const metas = try alloc.alloc(result.ColMeta, 3);
+    metas[0] = if (k0_is_i64) result.ColMeta{ .name = keys[0].alias, .col_type = .int64 }
+               else            result.ColMeta{ .name = keys[0].alias, .col_type = .string };
+    metas[1] = if (k0_is_i64) result.ColMeta{ .name = keys[1].alias, .col_type = .string }
+               else            result.ColMeta{ .name = keys[1].alias, .col_type = .int64 };
+    metas[2] = result.ColMeta{ .name = aggs[0].alias, .col_type = .uint64 };
+    var rl = RowList.init(metas);
+
+    const EmitCtx = struct {
+        rl: *RowList, alloc: std.mem.Allocator, k0_is_i64: bool,
+    };
+    var emit_ctx = EmitCtx{ .rl = &rl, .alloc = alloc, .k0_is_i64 = k0_is_i64 };
+    for (workers) |*w| {
+        w.local_ht.iterate(&emit_ctx, struct {
+            fn cb(ec: *EmitCtx, n: i64, s: []const u8, count: u64) void {
+                const row = ec.alloc.alloc(?Value, 3) catch return;
+                if (ec.k0_is_i64) {
+                    row[0] = Value{ .int64 = n };
+                    row[1] = Value{ .string = s };
+                } else {
+                    row[0] = Value{ .string = s };
+                    row[1] = Value{ .int64 = n };
+                }
+                row[2] = Value{ .uint64 = count };
+                ec.rl.append(ec.alloc, row) catch {};
+            }
+        }.cb);
+    }
+
+    // Apply top_k if requested (Q17: ORDER BY count(*) DESC LIMIT 10).
+    if (top_k > 0 and sort_keys.len > 0 and rl.rows.items.len > top_k) {
+        return try executeTopK(rl, sort_keys, top_k, alloc);
+    }
+    return rl;
+}
+
 
 /// Parallel hash aggregation for integer-keyed queries with compact accumulators.
 /// Returns null if unable to handle (falls back to sequential executeHashAggChunked).
