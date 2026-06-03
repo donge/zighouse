@@ -5314,21 +5314,34 @@ fn executeHashAggParallelCompactTopK(
     // Also supports queries with a single col_ref eq/neq lit_str filter (e.g. Q32:
     // SearchPhrase <> '') — the filter is inlined in the scatter phase with no
     // per-row arena allocation.
-    two_phase: {
-        // Guard: only handles exactly 2 plain col_ref integer keys.
-        // 1-key queries (Q16) have smaller HTs that fit in L3 — two-phase adds scatter
-        // overhead without the DRAM-stall benefit, so we keep the prefetch path for them.
-        if (keys.len != 2) break :two_phase;
-        for (keys) |k| { if (k.expr != .col_ref) break :two_phase; }
-        // Guard: skip two-phase for low-cardinality keys (int16/bool etc.) — their HTs
-        // are L1-fitting already; scatter overhead exceeds the DRAM-stall benefit.
-        {
-            const src_schema = ctx.source.schema();
-            for (keys) |k| {
-                const ci = k.expr.col_ref.index;
-                if (ci < src_schema.len and src_schema[ci].is_narrow_int) break :two_phase;
-            }
-        }
+     two_phase: {
+         // Guard: exactly 2 keys, each either plain col_ref or col_ref ± lit_i64.
+         // 1-key queries (Q16) have smaller HTs that fit in L3 — two-phase adds scatter
+         // overhead without the DRAM-stall benefit, so we keep the prefetch path for them.
+         // 4-key queries (Q36) have high scatter overhead relative to the benefit.
+         if (keys.len != 2) break :two_phase;
+         for (keys) |k| {
+             switch (k.expr) {
+                 .col_ref => {},
+                 .sub => |op| { if (op.left != .col_ref or op.right != .lit_i64) break :two_phase; },
+                 .add => |op| { if (op.left != .col_ref or op.right != .lit_i64) break :two_phase; },
+                 else => break :two_phase,
+             }
+         }
+         // Guard: skip two-phase for low-cardinality keys (int16/bool etc.) — their HTs
+         // are L1-fitting already; scatter overhead exceeds the DRAM-stall benefit.
+         {
+             const src_schema = ctx.source.schema();
+             for (keys) |k| {
+                 const ci: usize = switch (k.expr) {
+                     .col_ref => |cr| cr.index,
+                     .sub     => |op| op.left.col_ref.index,
+                     .add     => |op| op.left.col_ref.index,
+                     else     => ~@as(usize, 0), // non-column expr — no narrow check
+                 };
+                 if (ci < src_schema.len and src_schema[ci].is_narrow_int) break :two_phase;
+             }
+         }
         // If there's a filter, try:
         //   (a) simple single-term col_ref eq/neq lit_str (e.g. Q32: SearchPhrase <> '')
         //   (b) pure int AND conditions (e.g. Q41: CounterID=62 AND TraficSourceID IN (-1,6) AND ...)
@@ -6140,11 +6153,18 @@ fn executeTwoPhaseHashAgg(
     const n_aggs = aggs.len;
     const row_stride = 1 + n_keys + n_aggs;
 
-    // Pre-extract key column indices (all must be col_ref, checked by caller).
-    const key_ci = [2]usize{
-        keys[0].expr.col_ref.index,
-        if (n_keys >= 2) keys[1].expr.col_ref.index else 0,
-    };
+     // Pre-extract key column indices and arithmetic offsets.
+     // Keys may be col_ref (offset=0) or col_ref ± lit_i64 (checked by caller).
+     var key_ci: [4]usize = [_]usize{0} ** 4;
+     var key_offs: [4]i64 = [_]i64{0} ** 4;
+     for (keys, 0..) |k, i| {
+         switch (k.expr) {
+             .col_ref => |cr| { key_ci[i] = cr.index; key_offs[i] = 0; },
+             .sub     => |op| { key_ci[i] = op.left.col_ref.index; key_offs[i] = -op.right.lit_i64; },
+             .add     => |op| { key_ci[i] = op.left.col_ref.index; key_offs[i] =  op.right.lit_i64; },
+             else     => unreachable,
+         }
+     }
 
     // Pre-extract agg info: (col_idx or ~0 for no-arg, kind).
     const AggInfo = struct { col_idx: usize, kind: ht.CompactAggKind };
@@ -6171,7 +6191,8 @@ fn executeTwoPhaseHashAgg(
         n_keys:       usize,
         n_aggs:       usize,
         row_stride:   usize,
-        key_ci:       [2]usize,
+        key_ci:       [4]usize,
+        key_offs:     [4]i64,
         agg_infos:    []const AggInfo,
         compact_kinds: []const ht.CompactAggKind,
         str_filter:   ?SimpleStrFilter,
@@ -6196,11 +6217,10 @@ fn executeTwoPhaseHashAgg(
                 try self.source.fetchRange(m.start, m.end - m.start, &c, chunk_arena.allocator());
 
                 const ci0 = self.key_ci[0];
-                const ci1 = self.key_ci[1];
                 if (ci0 >= c.columns.len) continue;
-                if (self.n_keys >= 2 and ci1 >= c.columns.len) continue;
-                const col0 = c.columns[ci0];
-                const col1 = if (self.n_keys >= 2) c.columns[ci1] else c.columns[ci0]; // unused if n_keys==1
+                for (1..self.n_keys) |ki| {
+                    if (self.key_ci[ki] >= c.columns.len) continue;
+                }
 
                 // Resolve str_filter column once per chunk (null if col not present or wrong type).
                 // Accept both .string (normal) and .bool_u8 (set by setStringNonEmptyBool).
@@ -6244,36 +6264,38 @@ fn executeTwoPhaseHashAgg(
                         }
                         if (!pass) continue;
                     }
-                    if (col0.isRowNull(r)) continue;
-                    const k0: i64 = switch (col0.data) {
-                        .int64    => |a| a[r],
-                        .uint64   => |a| @bitCast(a[r]),
-                        .date_u16 => |a| @as(i64, a[r]),
-                        .bool_u8  => |a| @as(i64, a[r]),
-                        else => continue,
-                    };
-                    const k1: i64 = if (self.n_keys >= 2) blk: {
-                        if (col1.isRowNull(r)) continue;
-                        break :blk switch (col1.data) {
+
+                    // Extract up to n_keys integer values (with arithmetic offsets).
+                    var kv: [4]i64 = undefined;
+                    var any_null = false;
+                    for (0..self.n_keys) |ki| {
+                        const col = c.columns[self.key_ci[ki]];
+                        if (col.isRowNull(r)) { any_null = true; break; }
+                        const base: i64 = switch (col.data) {
                             .int64    => |a| a[r],
                             .uint64   => |a| @bitCast(a[r]),
                             .date_u16 => |a| @as(i64, a[r]),
                             .bool_u8  => |a| @as(i64, a[r]),
-                            else => continue,
+                            else => { any_null = true; break; },
                         };
-                    } else 0;
+                        kv[ki] = base +% self.key_offs[ki];
+                    }
+                    if (any_null) continue;
 
-                    // Compute hash (same formula as CompactIntKeyHashTable.hashI64s).
-                    const h: u64 = if (self.n_keys == 1) blk: {
-                        var hh: u64 = @bitCast(k0);
-                        hh ^= hh >> 33; hh *%= 0xff51afd7ed558ccd;
-                        hh ^= hh >> 33; hh *%= 0xc4ceb9fe1a85ec53;
-                        hh ^= hh >> 33;
-                        break :blk hh | (1 << 63);
-                    } else blk: {
-                        const hk0: u64 = @bitCast(k0);
-                        const hk1: u64 = @bitCast(k1);
+                    // Compute hash over all N keys.
+                    const h: u64 = blk: {
+                        if (self.n_keys == 1) {
+                            var hh: u64 = @bitCast(kv[0]);
+                            hh ^= hh >> 33; hh *%= 0xff51afd7ed558ccd;
+                            hh ^= hh >> 33; hh *%= 0xc4ceb9fe1a85ec53;
+                            hh ^= hh >> 33;
+                            break :blk hh | (1 << 63);
+                        }
+                        const hk0: u64 = @bitCast(kv[0]);
+                        const hk1: u64 = if (self.n_keys >= 2) @bitCast(kv[1]) else 0;
                         var hh = hk0 *% 0x9e3779b97f4a7c15 ^ hk1 *% 0x6c62272e07bb0142;
+                        if (self.n_keys >= 3) hh ^= @as(u64, @bitCast(kv[2])) *% 0xd2a98b26625eee7b;
+                        if (self.n_keys >= 4) hh ^= @as(u64, @bitCast(kv[3])) *% 0xa0761d6478bd642f;
                         hh ^= hh >> 30; hh *%= 0xbf58476d1ce4e5b9;
                         hh ^= hh >> 27; hh *%= 0x94d049bb133111eb;
                         hh ^= hh >> 31;
@@ -6282,8 +6304,7 @@ fn executeTwoPhaseHashAgg(
 
                     const part_id = h & (N_PARTS - 1);
                     rec[0] = h;
-                    rec[1] = @bitCast(k0);
-                    if (self.n_keys >= 2) rec[2] = @bitCast(k1);
+                    for (0..self.n_keys) |ki| rec[1 + ki] = @bitCast(kv[ki]);
                     // Agg partial contributions.
                     for (self.agg_infos, 0..) |info, ai| {
                         const base_off = 1 + self.n_keys + ai;
@@ -6342,6 +6363,7 @@ fn executeTwoPhaseHashAgg(
             .n_aggs       = n_aggs,
             .row_stride   = row_stride,
             .key_ci       = key_ci,
+            .key_offs     = key_offs,
             .agg_infos    = agg_infos,
             .compact_kinds = compact_kinds,
             .str_filter   = str_filter,

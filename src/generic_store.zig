@@ -42,44 +42,62 @@ pub fn columnStrBinPath(allocator: std.mem.Allocator, part: []const u8, col_name
 }
 
 /// Writer: streams fixed-width column values directly to a .bin file.
+/// Write buffer size for ColumnBinWriter (64 KiB reduces syscall overhead).
+const col_buf_size: usize = 64 * 1024;
+
 pub const ColumnBinWriter = struct {
     io: std.Io,
     file: std.Io.File,
     count: u64,
+    buf: [col_buf_size]u8,
+    buf_len: usize,
 
     pub fn open(io: std.Io, path: []const u8) !ColumnBinWriter {
         const file = try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = true });
-        return .{ .io = io, .file = file, .count = 0 };
+        return .{ .io = io, .file = file, .count = 0, .buf = undefined, .buf_len = 0 };
+    }
+
+    inline fn append(self: *ColumnBinWriter, bytes: []const u8) !void {
+        if (self.buf_len + bytes.len > col_buf_size) try self.flush();
+        @memcpy(self.buf[self.buf_len..][0..bytes.len], bytes);
+        self.buf_len += bytes.len;
+    }
+
+    pub fn flush(self: *ColumnBinWriter) !void {
+        if (self.buf_len == 0) return;
+        try self.file.writeStreamingAll(self.io, self.buf[0..self.buf_len]);
+        self.buf_len = 0;
     }
 
     pub fn writeI8(self: *ColumnBinWriter, value: i8) !void {
-        const buf = [1]u8{@bitCast(value)};
-        try self.file.writeStreamingAll(self.io, &buf);
+        try self.append(&[1]u8{@bitCast(value)});
         self.count += 1;
     }
 
     pub fn writeI16(self: *ColumnBinWriter, value: i16) !void {
         var buf: [2]u8 = undefined;
         std.mem.writeInt(i16, &buf, value, .little);
-        try self.file.writeStreamingAll(self.io, &buf);
+        try self.append(&buf);
         self.count += 1;
     }
 
     pub fn writeI32(self: *ColumnBinWriter, value: i32) !void {
         var buf: [4]u8 = undefined;
         std.mem.writeInt(i32, &buf, value, .little);
-        try self.file.writeStreamingAll(self.io, &buf);
+        try self.append(&buf);
         self.count += 1;
     }
 
     pub fn writeI64(self: *ColumnBinWriter, value: i64) !void {
         var buf: [8]u8 = undefined;
         std.mem.writeInt(i64, &buf, value, .little);
-        try self.file.writeStreamingAll(self.io, &buf);
+        try self.append(&buf);
         self.count += 1;
     }
 
     pub fn close(self: *ColumnBinWriter) void {
+        // Flush remaining buffered data (best-effort; ignore errors on close).
+        self.flush() catch {};
         self.file.close(self.io);
     }
 };
