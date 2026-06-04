@@ -98,7 +98,7 @@ const ScanState = struct {
     rows_read:    u64,
     col_data:     []ColData,        // one per table column; loaded lazily
     metas:        []ColMeta,
-    needed_cols:  ?[]const bool,    // null = read all
+    needed_cols:  ?[]bool,          // null = read all
     /// Temporary column restriction set by setNeededCols() for late materialization.
     /// When active, overrides `needed_cols` for the duration of the scan phase.
     override_needed: [256]bool,
@@ -223,6 +223,10 @@ const ScanState = struct {
         if (@atomicLoad(bool, &self.loaded, .acquire)) return;
 
         for (self.table.columns, 0..) |col, ci| {
+            // Skip columns that were already mmap'd by a previous loadColumns call.
+            // This allows incremental loading: columns stay warm once loaded.
+            if (self.col_data[ci] != .none) continue;
+
             // Skip columns not needed by either the static pruning mask OR the current
             // runtime override (e.g. URLHash sidecar requested via setNeededCols).
             // We load the UNION so that all subsequent fetchRange calls (including
@@ -676,6 +680,36 @@ pub const GenericStoreBridge = struct {
     /// Must be called from the main thread before any fetchRange calls.
     pub fn preload(self: *GenericStoreBridge) !void {
         try self.state.loadColumns();
+    }
+
+    /// Prepare the bridge for the next query in a benchmark run.
+    /// Updates the needed-column set and clears the `loaded` flag so that
+    /// `loadColumns` will run again — but will skip columns already mmap'd
+    /// from previous queries.  This keeps column pages warm across queries.
+    pub fn resetForNewQuery(self: *GenericStoreBridge, pruned_cols: []const []const u8) void {
+        const s = self.state;
+        // Reset the per-query needed_cols mask.
+        if (pruned_cols.len == 0) {
+            // No pruning: load all columns.
+            if (s.needed_cols) |nc| { s.alloc.free(nc); }
+            s.needed_cols = null;
+        } else {
+            // Reuse or allocate the mask.
+            if (s.needed_cols == null) {
+                s.needed_cols = s.alloc.alloc(bool, s.table.columns.len) catch return;
+            }
+            @memset(s.needed_cols.?, false);
+            for (pruned_cols) |name| {
+                for (s.table.columns, 0..) |col, i| {
+                    if (std.mem.eql(u8, col.name, name)) { s.needed_cols.?[i] = true; break; }
+                }
+            }
+        }
+        // Clear the `loaded` flag so loadColumns runs again for any new columns.
+        @atomicStore(bool, &s.loaded, false, .release);
+        // Reset per-query pipeline state.
+        s.override_active = false;
+        @memset(&s.nonempty_bool, false);
     }
 
     pub fn source(self: *GenericStoreBridge) SourceIface {

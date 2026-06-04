@@ -353,6 +353,9 @@ fn runCommand(init: std.process.Init, allocator: std.mem.Allocator, args: *std.p
             io:        std.Io,
             part_dir:  []const u8,
             table:     schema.Table,
+            /// Shared bridge — kept alive across all queries so mmap'd column
+            /// pages remain warm in the OS page cache (mirrors DuckDB's buffer pool).
+            bridge:    *gsb.GenericStoreBridge,
 
             pub fn runQuery(self: *const @This(), query_text: []const u8) !?[]u8 {
                 // Parse SQL.
@@ -381,19 +384,14 @@ fn runCommand(init: std.process.Init, allocator: std.mem.Allocator, args: *std.p
                     return null;
                 }
 
-                // Build source bridge.
+                // Prepare the shared bridge for this query: update column set,
+                // reset scan cursor, and allow loadColumns to load any new columns
+                // (already-loaded columns stay warm and are not re-mapped).
                 const pruned_cols = ir_planner.findPrunedCols(node.?);
-                var bridge = gsb.GenericStoreBridge.init(
-                    self.alloc, self.io, self.part_dir, self.table, pruned_cols,
-                ) catch |err| {
-                    std.log.err("bench-ir bridge error: {}: {s}", .{err, query_text});
-                    arena.deinit();
-                    return null;
-                };
-                defer bridge.deinit();
+                self.bridge.resetForNewQuery(pruned_cols);
 
-                // Execute plan.
-                var qctx = core.exec.pipeline.QueryContext.init(self.alloc, bridge.source());
+                // Execute plan using the shared bridge (columns stay mmap'd and warm).
+                var qctx = core.exec.pipeline.QueryContext.init(self.alloc, self.bridge.source());
                 defer qctx.deinit();
                 const t_exec_start = std.Io.Clock.Timestamp.now(self.io, .awake);
                 var rs = core.exec.pipeline.executePlan(node.?, &qctx) catch |err| {
@@ -414,11 +412,20 @@ fn runCommand(init: std.process.Init, allocator: std.mem.Allocator, args: *std.p
             }
         };
 
+        // Create the shared bridge once — columns are loaded lazily per query and
+        // remain mmap'd across queries, keeping pages warm in the OS page cache
+        // (mirrors DuckDB's single-process buffer pool behaviour).
+        var shared_bridge = try gsb.GenericStoreBridge.init(
+            allocator, init.io, part_dir, table, &.{},
+        );
+        defer shared_bridge.deinit();
+
         const runner = IrRunner{
             .alloc    = allocator,
             .io       = init.io,
             .part_dir = part_dir,
             .table    = table,
+            .bridge   = &shared_bridge,
         };
         try duckdb.benchWithRunner(allocator, init.io, queries_path_ir, bench_range_ir, &runner);
     } else if (std.mem.eql(u8, command, "serve")) {

@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT=$(git rev-parse --show-toplevel)
 cd "$ROOT"
 
-PARQUET_PATH=${ZIGHOUSE_PERF_PARQUET:-data/hits_10m_snappy.parquet}
+PARQUET_PATH=${ZIGHOUSE_PERF_PARQUET:-data/hits_10m.parquet}
 BASELINE=${ZIGHOUSE_PERF_BASELINE:-perf/baselines/local-10m-ir.json}
 LIMIT_ROWS=${ZIGHOUSE_PERF_LIMIT_ROWS:-10000000}
 QUERY_PATH=${ZIGHOUSE_PERF_QUERY_PATH:-specialized}
