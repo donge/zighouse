@@ -1299,6 +1299,19 @@ const Executor = struct {
         context: anytype,
         comptime callback: fn (@TypeOf(context), *const RowCtx) anyerror!void,
     ) anyerror!void {
+        // Build a name→parquet-column-index map from the file metadata.
+        // This is needed because the schema table may have extra columns that
+        // don't exist in the parquet file (e.g. hash sidecars), so we cannot
+        // use the schema index directly as the parquet column index.
+        var meta = try parquet.readMetadataPath(self.allocator, self.io, parquet_path);
+        defer meta.deinit();
+        var parquet_col_index = std.StringHashMap(usize).init(self.allocator);
+        defer parquet_col_index.deinit();
+        // meta.meta.schema[0] is the root message; leaf columns start at [1].
+        for (meta.meta.schema[1..], 0..) |el, ci| {
+            if (el.name.len > 0) try parquet_col_index.put(el.name, ci);
+        }
+
         // Classify columns
         var fixed_descs: std.ArrayList(ColDesc) = .empty;
         defer fixed_descs.deinit(self.allocator);
@@ -1306,7 +1319,9 @@ const Executor = struct {
         defer str_descs.deinit(self.allocator);
 
         for (needed.items) |name| {
-            const desc = lookupColumn(self.table, name) orelse continue;
+            var desc = lookupColumn(self.table, name) orelse continue;
+            // Override the schema index with the actual parquet column index.
+            desc.index = parquet_col_index.get(desc.name) orelse continue;
             switch (desc.kind) {
                 .string => try str_descs.append(self.allocator, desc),
                 else    => try fixed_descs.append(self.allocator, desc),
