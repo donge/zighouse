@@ -4,6 +4,22 @@
 
 const std = @import("std");
 
+/// SIMD sum of i16 slice, sign-extended and returned as i64 (wrapping).
+/// Uses 16-wide vectors (256-bit with AVX2).
+pub fn sumI16(values: []const i16) i64 {
+    const LANES = 16;
+    const V = @Vector(LANES, i16);
+    var acc: V = @splat(0);
+    var i: usize = 0;
+    while (i + LANES <= values.len) : (i += LANES) {
+        const v: V = values[i..][0..LANES].*;
+        acc +%= v;
+    }
+    var total: i32 = @reduce(.Add, acc);
+    while (i < values.len) : (i += 1) total +%= values[i];
+    return @as(i64, total);
+}
+
 /// SIMD sum of i64 slice using 8-wide vectors.
 /// Returns i64 with wrapping arithmetic.
 pub fn sumI64(values: []const i64) i64 {

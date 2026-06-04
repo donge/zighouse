@@ -450,6 +450,31 @@ pub const PairCountHashTable = struct {
         }
     }
 
+    /// Merge all entries from `other` into `self`, summing counts.
+    pub fn mergeFrom(self: *PairCountHashTable, other: *const PairCountHashTable) !void {
+        for (0..other.capacity) |i| {
+            const s = other.slots[i];
+            if (s.hash == EMPTY) continue;
+            if (self.count + 1 > (self.capacity * 7) / 10) try self.grow();
+            const mask = self.capacity - 1;
+            var sl = s.hash & mask;
+            while (true) : (sl = (sl + 1) & mask) {
+                if (self.slots[sl].hash == EMPTY) {
+                    self.slots[sl] = s;
+                    self.count += 1;
+                    break;
+                }
+                if (self.slots[sl].hash == s.hash and
+                    self.slots[sl].i64_key == s.i64_key and
+                    std.mem.eql(u8, self.slots[sl].str_key, s.str_key))
+                {
+                    self.slots[sl].count += s.count;
+                    break;
+                }
+            }
+        }
+    }
+
     fn hashPair(n: i64, s: []const u8) u64 {
         var h = std.hash.Wyhash.init(0);
         h.update(std.mem.asBytes(&n));
@@ -953,7 +978,7 @@ pub const StrAggHashTable = struct {
                 const src = other.vals_flat[src_vb + ci];
                 switch (kind) {
                     .count, .i64_sum, .u64_sum => res.vals[ci] += src,
-                    .f64_sum => {
+                    .f64_sum, .f64_str_len_sum => {
                         const a: f64 = @bitCast(res.vals[ci]);
                         const b: f64 = @bitCast(src);
                         res.vals[ci] = @bitCast(a + b);
@@ -1007,7 +1032,8 @@ pub const CompactAggKind = enum {
     count,    // u64 ++
     i64_sum,  // i64 +=
     u64_sum,  // u64 +=
-    f64_sum,  // f64 += (also used for AVG)
+    f64_sum,  // f64 += (also used for AVG, with col_ref arg)
+    f64_str_len_sum, // f64 += (string length): AVG(length(col_ref))
     i64_min,  // i64 = min(cur, arg)
     i64_max,  // i64 = max(cur, arg)
     u64_min,  // u64 = min(cur, arg)
@@ -1266,7 +1292,7 @@ pub const CompactIntKeyHashTable = struct {
                         const b: i64 = @bitCast(src);
                         master_vals[ci] = @bitCast(a + b);
                     },
-                    .f64_sum => {
+                    .f64_sum, .f64_str_len_sum => {
                         const a: f64 = @bitCast(master_vals[ci]);
                         const b: f64 = @bitCast(src);
                         master_vals[ci] = @bitCast(a + b);
@@ -1330,7 +1356,7 @@ pub const CompactIntKeyHashTable = struct {
                         const b: i64 = @bitCast(src);
                         master_vals[ci] = @bitCast(a + b);
                     },
-                    .f64_sum => {
+                    .f64_sum, .f64_str_len_sum => {
                         const a: f64 = @bitCast(master_vals[ci]);
                         const b: f64 = @bitCast(src);
                         master_vals[ci] = @bitCast(a + b);

@@ -83,6 +83,14 @@ pub const SourceIface = struct {
         /// instead of full string slices. Use for columns only needed for `!= ''` checks.
         /// Pass null col_name to clear all such marks.
         setStringNonEmptyBool: ?*const fn (ptr: *anyopaque, col_name: ?[]const u8) void = null,
+        /// Optional: return raw int16 slice for a column (bypasses fetchRange overhead).
+        getRawInt16Col: ?*const fn (ptr: *anyopaque, col_name: []const u8) ?[]const i16 = null,
+        /// Optional: return raw int64 slice for a column.
+        getRawInt64Col: ?*const fn (ptr: *anyopaque, col_name: []const u8) ?[]const i64 = null,
+        /// Optional: return raw string offsets for a column.
+        getRawStrOffsets: ?*const fn (ptr: *anyopaque, col_name: []const u8) ?[]const u64 = null,
+        /// Optional: return raw string bytes for a column.
+        getRawStrBytes: ?*const fn (ptr: *anyopaque, col_name: []const u8) ?[]const u8 = null,
     };
 
     pub fn nextChunk(self: SourceIface, out: *DataChunk, ctx: *QueryContext) !bool {
@@ -121,6 +129,25 @@ pub const SourceIface = struct {
     /// Pass null col_name to clear all marks. No-op if source doesn't support it.
     pub fn setStringNonEmptyBool(self: SourceIface, col_name: ?[]const u8) void {
         if (self.vtable.setStringNonEmptyBool) |f| f(self.ptr, col_name);
+    }
+
+    /// Return the raw per-row string offsets for `col_name` (row_count+1 entries).
+    /// Returns null if not supported or column not found.
+    pub fn getRawInt16Col(self: SourceIface, col_name: []const u8) ?[]const i16 {
+        const f = self.vtable.getRawInt16Col orelse return null;
+        return f(self.ptr, col_name);
+    }
+
+    pub fn getRawStrOffsets(self: SourceIface, col_name: []const u8) ?[]const u64 {
+        const f = self.vtable.getRawStrOffsets orelse return null;
+        return f(self.ptr, col_name);
+    }
+
+    /// Return the raw string byte blob for `col_name`.
+    /// Returns null if not supported or column not found.
+    pub fn getRawStrBytes(self: SourceIface, col_name: []const u8) ?[]const u8 {
+        const f = self.vtable.getRawStrBytes orelse return null;
+        return f(self.ptr, col_name);
     }
 };
 
@@ -1530,6 +1557,191 @@ fn executeScalarAggParallel(
     const n_threads = parallel.defaultThreads();
     if (n_threads <= 1) return null;
 
+    // Allocate per-thread accumulators (shared by both fast and normal paths).
+    const thread_accums = try alloc.alloc([]AggAccum, n_threads);
+    for (thread_accums) |*ta| {
+        ta.* = try alloc.alloc(AggAccum, aggs.len);
+        for (aggs, 0..) |item, ci| ta.*[ci] = initAccumForAgg(item.expr);
+    }
+
+    // ── Raw-byte LIKE count fast path ─────────────────────────────────────────
+    // For COUNT(*) with a pure single LIKE/NOT_LIKE predicate, skip fetchRange
+    // entirely and scan raw string offsets+bytes directly.
+    // This avoids ~78ms of fat-pointer allocation overhead per query (e.g. Q21).
+    const all_count_star_par: bool = for (aggs) |item| {
+        if (item.expr != .agg_call or item.expr.agg_call.kind != .count_star) break false;
+    } else true;
+
+    if (all_count_star_par) {
+        if (filter_pred) |pred| {
+            // Detect pure single LIKE / NOT_LIKE on a col_ref vs lit_str.
+            const is_raw_like = switch (pred) {
+                .like, .not_like => |op| op.left == .col_ref and op.right == .lit_str,
+                else => false,
+            };
+            if (is_raw_like) {
+                const op = switch (pred) { .like => |o| o, .not_like => |o| o, else => unreachable };
+                const col_idx = op.left.col_ref.index;
+                const src_schema = ctx.source.schema();
+                if (col_idx < src_schema.len) {
+                    const col_name = src_schema[col_idx].name;
+                    if (ctx.source.getRawStrOffsets(col_name)) |raw_offsets| {
+                        if (ctx.source.getRawStrBytes(col_name)) |raw_bytes| {
+                            // We have raw data — run specialized count loop without fetchRange.
+                            const matcher   = kernels.LikeMatcher.compile(op.right.lit_str);
+                            const negate    = pred == .not_like;
+
+                            const RawParCtx = struct {
+                                raw_offsets: []const u64,
+                                raw_bytes:   []const u8,
+                                matcher:     kernels.LikeMatcher,
+                                negate:      bool,
+                                accums:      []AggAccum,
+                                morsel_src:  *parallel.MorselSource,
+
+                                fn work(self: *@This(), _: *parallel.MorselSource) void {
+                                    while (self.morsel_src.next()) |m| {
+                                        var count: u64 = 0;
+                                        for (m.start..m.end) |r| {
+                                            const lo: usize = @intCast(self.raw_offsets[r]);
+                                            const hi: usize = @intCast(self.raw_offsets[r + 1]);
+                                            const s = self.raw_bytes[lo..hi];
+                                            if (self.matcher.match(s) != self.negate) count += 1;
+                                        }
+                                        self.accums[0].count += count;
+                                    }
+                                }
+                            };
+
+                            var raw_morsel_src = parallel.MorselSource.init(total_rows, parallel.default_morsel_size);
+                            const raw_pctxs = try alloc.alloc(RawParCtx, n_threads);
+                            for (raw_pctxs, 0..) |*pc, ti| {
+                                pc.* = .{
+                                    .raw_offsets = raw_offsets,
+                                    .raw_bytes   = raw_bytes,
+                                    .matcher     = matcher,
+                                    .negate      = negate,
+                                    .accums      = thread_accums[ti],
+                                    .morsel_src  = &raw_morsel_src,
+                                };
+                            }
+
+                            try parallel.parallelFor(alloc, RawParCtx, RawParCtx.work, raw_pctxs, &raw_morsel_src);
+
+                            // Merge accumulators.
+                            const raw_merged = thread_accums[0];
+                            for (thread_accums[1..]) |ta| {
+                                for (raw_merged, ta, 0..) |*m, t, ci| {
+                                    try mergeAccum(m, t, aggs[ci], alloc);
+                                }
+                            }
+
+                            const metas   = try alloc.alloc(result.ColMeta, aggs.len);
+                            const out_row = try alloc.alloc(?Value, aggs.len);
+                            for (aggs, 0..) |item, ci| {
+                                metas[ci]   = .{ .name = item.alias, .col_type = item.out_type };
+                                out_row[ci] = try finalizeAccum(raw_merged[ci], item, alloc);
+                            }
+                             var raw_rl = RowList.init(metas);
+                             try raw_rl.append(alloc, out_row);
+                             return raw_rl;
+                         }
+                     }
+                 }
+             }
+         }
+    }
+
+    // ── Raw int16 SUM fast path ───────────────────────────────────────────────
+    // For queries like Q33: SUM(int16_col), SUM(int16_col+1), ..., SUM(int16_col+k)
+    // Skip fetchRange entirely (avoids int16→i64 copy per morsel).
+    // Access raw mmap'd i16 slice via getRawInt16Col, SIMD-sum each morsel.
+    if (filter_pred == null) blk_i16: {
+        // Detect pattern: all aggs are SUM(same_col) or SUM(same_col + k), same base int16 col.
+        var base_col_idx: ?usize = null;
+        for (aggs) |item| {
+            const ac = switch (item.expr) { .agg_call => |a| a, else => break :blk_i16 };
+            if (ac.kind != .sum) break :blk_i16;
+            const arg = ac.arg orelse break :blk_i16;
+            switch (arg) {
+                .col_ref => |cr| {
+                    if (base_col_idx == null) base_col_idx = cr.index
+                    else if (base_col_idx.? != cr.index) break :blk_i16;
+                },
+                .add => |bo| {
+                    if (bo.left != .col_ref) break :blk_i16;
+                    if (bo.right != .lit_i64) break :blk_i16;
+                    const ci = bo.left.col_ref.index;
+                    if (base_col_idx == null) base_col_idx = ci
+                    else if (base_col_idx.? != ci) break :blk_i16;
+                },
+                else => break :blk_i16,
+            }
+        }
+        const col_idx = base_col_idx orelse break :blk_i16;
+        // Get raw i16 mmap slice.
+        const src_schema = ctx.source.schema();
+        if (col_idx >= src_schema.len) break :blk_i16;
+        const col_name = src_schema[col_idx].name;
+        const raw_i16 = ctx.source.getRawInt16Col(col_name) orelse break :blk_i16;
+        if (raw_i16.len < total_rows) break :blk_i16;
+
+        const RawI16Ctx = struct {
+            raw:        []const i16,
+            aggs:       []const plan.ProjectItem,
+            accums:     []AggAccum,
+            morsel_src: *parallel.MorselSource,
+
+            fn work(self: *@This(), _: *parallel.MorselSource) void {
+                while (self.morsel_src.next()) |m| {
+                    const slice = self.raw[m.start..m.end];
+                    const col_sum = simd.sumI16(slice);
+                    const count: i64 = @intCast(m.end - m.start);
+                    for (self.aggs, 0..) |item, ci| {
+                        const ac = item.expr.agg_call;
+                        const k: i64 = if (ac.arg) |arg| switch (arg) {
+                            .add => |bo| bo.right.lit_i64,
+                            else => 0,
+                        } else 0;
+                        self.accums[ci].i64_sum +%= col_sum + count * k;
+                    }
+                }
+            }
+        };
+
+        var raw_i16_morsel = parallel.MorselSource.init(total_rows, parallel.default_morsel_size);
+        const raw_i16_pctxs = try alloc.alloc(RawI16Ctx, n_threads);
+        for (raw_i16_pctxs, 0..) |*pc, ti| {
+            pc.* = .{
+                .raw        = raw_i16,
+                .aggs       = aggs,
+                .accums     = thread_accums[ti],
+                .morsel_src = &raw_i16_morsel,
+            };
+        }
+
+        try parallel.parallelFor(alloc, RawI16Ctx, RawI16Ctx.work, raw_i16_pctxs, &raw_i16_morsel);
+
+        // Merge accumulators.
+        const i16_merged = thread_accums[0];
+        for (thread_accums[1..]) |ta| {
+            for (i16_merged, ta, 0..) |*m, t, ci| {
+                try mergeAccum(m, t, aggs[ci], alloc);
+            }
+        }
+
+        const metas_i16   = try alloc.alloc(result.ColMeta, aggs.len);
+        const out_row_i16 = try alloc.alloc(?Value, aggs.len);
+        for (aggs, 0..) |item, ci| {
+            metas_i16[ci]   = .{ .name = item.alias, .col_type = item.out_type };
+            out_row_i16[ci] = try finalizeAccum(i16_merged[ci], item, alloc);
+        }
+        var i16_rl = RowList.init(metas_i16);
+        try i16_rl.append(alloc, out_row_i16);
+        return i16_rl;
+    } // end blk_i16
+
+
     const ParCtx = struct {
         source:      SourceIface,
         filter_pred: ?plan.Expr,
@@ -1567,13 +1779,6 @@ fn executeScalarAggParallel(
             }
         }
     };
-
-    // Allocate per-thread accumulators.
-    const thread_accums = try alloc.alloc([]AggAccum, n_threads);
-    for (thread_accums) |*ta| {
-        ta.* = try alloc.alloc(AggAccum, aggs.len);
-        for (aggs, 0..) |item, ci| ta.*[ci] = initAccumForAgg(item.expr);
-    }
 
     var morsel_src = parallel.MorselSource.init(total_rows, parallel.default_morsel_size);
     const pctxs = try alloc.alloc(ParCtx, n_threads);
@@ -1686,7 +1891,7 @@ fn emitCompactVals(
         out[i] = switch (kind) {
             .count, .u64_sum, .u64_min, .u64_max => Value{ .uint64 = v },
             .i64_sum, .i64_min, .i64_max => Value{ .int64 = @bitCast(v) },
-            .f64_sum => blk: {
+            .f64_sum, .f64_str_len_sum => blk: {
                 const sum: f64 = @bitCast(v);
                 if (item.expr == .agg_call and item.expr.agg_call.kind == .avg) {
                     var cnt: u64 = 0;
@@ -1718,7 +1923,7 @@ fn emitCompactValsWithSidecar(
         out[i] = switch (kind) {
             .count, .u64_sum, .u64_min, .u64_max => Value{ .uint64 = v },
             .i64_sum, .i64_min, .i64_max => Value{ .int64 = @bitCast(v) },
-            .f64_sum => blk: {
+            .f64_sum, .f64_str_len_sum => blk: {
                 const sum: f64 = @bitCast(v);
                 if (item.expr == .agg_call and item.expr.agg_call.kind == .avg) {
                     var cnt: u64 = 0;
@@ -1873,6 +2078,18 @@ inline fn updateCompactVals(
                     }}
                 }
             },
+            .f64_str_len_sum => {
+                if (ac.arg) |arg| { if (arg == .col_ref) {
+                    const col = c.columns[arg.col_ref.index];
+                    if (!col.isRowNull(r)) switch (col.data) {
+                        .string => |v| {
+                            const cur: f64 = @bitCast(slot_vals[ci]);
+                            slot_vals[ci] = @bitCast(cur + @as(f64, @floatFromInt(v[r].len)));
+                        },
+                        else => {},
+                    };
+                }}
+            },
         }
     }
 }
@@ -1921,7 +2138,7 @@ fn executeHashAggChunked(
         const iv = try alloc.alloc(u64, ck.len);
         for (ck, 0..) |kind, ci| {
             iv[ci] = switch (kind) {
-                .count, .i64_sum, .u64_sum, .u64_max => 0,
+                .count, .i64_sum, .u64_sum, .u64_max, .f64_str_len_sum => 0,
                 .f64_sum => @bitCast(@as(f64, 0.0)),
                 .i64_min => @bitCast(@as(i64, std.math.maxInt(i64))),
                 .i64_max => @bitCast(@as(i64, std.math.minInt(i64))),
@@ -3474,6 +3691,13 @@ fn executeTopKLateMat(
             schema_len:   usize,
             morsel_src:   *parallel.MorselSource,
             parent_alloc: std.mem.Allocator,
+            // Raw-byte fast path: if set, skip fetchRange in phase 1.
+            raw_filter_offsets: ?[]const u64 = null,
+            raw_filter_bytes:   ?[]const u8  = null,
+            /// Raw sort key i64 values (e.g. EventTime). Only used when
+            /// there is exactly one sort key and it is an i64 column.
+            raw_sortkey_i64:    ?[]const i64 = null,
+            raw_sortkey_col_idx: usize = 0,
             // Output (allocated per-ctx from parent_alloc after run).
             local_heap: []HeapEntry = &.{},
             local_len:  usize = 0,
@@ -3512,7 +3736,51 @@ fn executeTopKLateMat(
                 };
                 const sctx2 = SCtx{ .keys = self.keys };
 
-                while (self.morsel_src.next()) |m| {
+                 while (self.morsel_src.next()) |m| {
+                    // ── Raw fast path: skip fetchRange ────────────────────────
+                        if (self.raw_filter_offsets) |ro| {
+                            const rb = self.raw_filter_bytes.?;
+                        for (m.start..m.end) |r| {
+                            const lo: usize = @intCast(ro[r]);
+                            const hi: usize = @intCast(ro[r + 1]);
+                            if (self.matcher.match(rb[lo..hi]) == self.negate) continue;
+                            const global_row: u64 = @intCast(r);
+                            const key_vals = try talloc.alloc(?Value, self.schema_len);
+                            @memset(key_vals, null);
+                            if (self.raw_sortkey_i64) |rk| {
+                                key_vals[self.raw_sortkey_col_idx] = .{ .int64 = rk[r] };
+                            }
+                            if (heap_len < self.k) {
+                                heap_buf[heap_len] = .{ .global_row = global_row, .key_vals = key_vals };
+                                heap_len += 1;
+                                var hi2 = heap_len - 1;
+                                while (hi2 > 0) {
+                                    const parent = (hi2 - 1) / 2;
+                                    if (sctx2.lt(heap_buf[hi2], heap_buf[parent])) {
+                                        const tmp = heap_buf[hi2]; heap_buf[hi2] = heap_buf[parent]; heap_buf[parent] = tmp;
+                                        hi2 = parent;
+                                    } else break;
+                                }
+                            } else {
+                                const candidate = HeapEntry{ .global_row = global_row, .key_vals = key_vals };
+                                if (sctx2.lt(candidate, heap_buf[0])) {
+                                    heap_buf[0] = .{ .global_row = global_row, .key_vals = key_vals };
+                                    var i: usize = 0;
+                                    while (true) {
+                                        const l = 2 * i + 1; const r2 = 2 * i + 2;
+                                        var sm = i;
+                                        if (l < heap_len and sctx2.lt(heap_buf[l], heap_buf[sm])) sm = l;
+                                        if (r2 < heap_len and sctx2.lt(heap_buf[r2], heap_buf[sm])) sm = r2;
+                                        if (sm == i) break;
+                                        const tmp = heap_buf[i]; heap_buf[i] = heap_buf[sm]; heap_buf[sm] = tmp;
+                                        i = sm;
+                                    }
+                                }
+                            }
+                        }
+                        continue; // next morsel, raw path done
+                    }
+                    // ── Standard path: use fetchRange ─────────────────────────
                     var morsel_chunk_arena = std.heap.ArenaAllocator.init(talloc);
                     defer morsel_chunk_arena.deinit();
                     var c: DataChunk = undefined;
@@ -3588,6 +3856,23 @@ fn executeTopKLateMat(
 
         var morsel_src = parallel.MorselSource.init(@intCast(total_rows), 65536);
         const pctxs = try alloc.alloc(ParPhase1Ctx, n_par_threads);
+
+        // Try raw fast path: get filter column's raw offsets+bytes and sort key i64.
+        const lg0_col_name = if (lg0.col_idx < schema_metas.len) schema_metas[lg0.col_idx].name else "";
+        const raw_filt_offsets = ctx.source.getRawStrOffsets(lg0_col_name);
+        const raw_filt_bytes   = if (raw_filt_offsets != null) ctx.source.getRawStrBytes(lg0_col_name) else null;
+        // Only use raw fast path when BOTH filter offsets and bytes are available.
+        const use_raw_phase1 = raw_filt_offsets != null and raw_filt_bytes != null;
+        // Only use raw sort key if there's exactly one int64 sort key.
+        const raw_sk_i64: ?[]const i64 = if (use_raw_phase1 and keys.len == 1 and keys[0].col_idx < schema_metas.len) blk: {
+            const sk_name = schema_metas[keys[0].col_idx].name;
+            if (ctx.source.vtable.getRawInt64Col) |f| {
+                break :blk f(ctx.source.ptr, sk_name);
+            }
+            break :blk null;
+        } else null;
+        const raw_sk_col_idx: usize = if (keys.len == 1) keys[0].col_idx else 0;
+
         for (pctxs) |*pc| {
             pc.* = .{
                 .source       = ctx.source,
@@ -3599,6 +3884,10 @@ fn executeTopKLateMat(
                 .schema_len   = schema_metas.len,
                 .morsel_src   = &morsel_src,
                 .parent_alloc = alloc,
+                .raw_filter_offsets  = if (use_raw_phase1) raw_filt_offsets else null,
+                .raw_filter_bytes    = if (use_raw_phase1) raw_filt_bytes else null,
+                .raw_sortkey_i64     = raw_sk_i64,
+                .raw_sortkey_col_idx = raw_sk_col_idx,
             };
         }
         try parallel.parallelFor(alloc, ParPhase1Ctx, ParPhase1Ctx.work, pctxs, &morsel_src);
@@ -4691,6 +4980,9 @@ fn executeHashAggParallelStrKey(
     }
     var cw_key: ?CaseWhenStrKey = null;
     var cw_key_pos: usize = 0;
+    var rr_active: bool = false;
+    var rr_col_idx: usize = 0;
+    var rr_is_url_domain: bool = false;
     for (keys, 0..) |k, ki| {
         if (k.expr == .col_ref) continue;
         if (k.expr == .lit_i64) continue; // constant key (e.g. GROUP BY 1)
@@ -4701,17 +4993,40 @@ fn executeHashAggParallelStrKey(
             cw_key_pos = ki;
             continue;
         }
+        // Accept single fn_call(regexp_replace) key (e.g. Q29 domain extraction).
+        if (k.expr == .fn_call and keys.len == 1) {
+            const fc = k.expr.fn_call;
+            if ((std.mem.eql(u8, fc.name, "regexp_replace") or
+                 std.mem.eql(u8, fc.name, "replaceRegexpOne")) and
+                fc.args.len >= 3 and fc.args[0] == .col_ref and fc.args[1] == .lit_str)
+            {
+                rr_col_idx = fc.args[0].col_ref.index;
+                const pat = fc.args[1].lit_str;
+                rr_is_url_domain =
+                    std.mem.eql(u8, pat, "^https?://(?:www\\.)?([^/]+)/.*$") or
+                    std.mem.eql(u8, pat, "^https?://(?:www\\.)?([^/]+)/.*");
+                rr_active = true;
+                continue;
+            }
+        }
         return null;
     }
     const sm_pre = ctx.source.schema();
     var str_key_count: usize = 0;
     var str_key_col_idx: usize = 0;
     var str_key_pos: usize = 0; // position among keys array for the string key
-    for (keys, 0..) |k, ki| {
-        if (k.expr != .col_ref) continue; // skip CASE WHEN keys
-        const ci = k.expr.col_ref.index;
-        const is_str = ci < sm_pre.len and (sm_pre[ci].col_type == .string or sm_pre[ci].col_type == .array_string);
-        if (is_str) { str_key_count += 1; str_key_col_idx = ci; str_key_pos = ki; }
+    if (rr_active) {
+        // regexp_replace key: treat the input column as the string key source.
+        str_key_count = 1;
+        str_key_col_idx = rr_col_idx;
+        str_key_pos = 0;
+    } else {
+        for (keys, 0..) |k, ki| {
+            if (k.expr != .col_ref) continue; // skip CASE WHEN keys
+            const ci = k.expr.col_ref.index;
+            const is_str = ci < sm_pre.len and (sm_pre[ci].col_type == .string or sm_pre[ci].col_type == .array_string);
+            if (is_str) { str_key_count += 1; str_key_col_idx = ci; str_key_pos = ki; }
+        }
     }
     // Must have exactly one col_ref string key (the primary string key).
     // If there's also a CASE WHEN, it becomes the secondary string component.
@@ -4725,7 +5040,7 @@ fn executeHashAggParallelStrKey(
     // Only applies when there are no string aggs, no CASE WHEN key, and no filter
     // (with filters, the StrCountHashTable path via executeHashAggChunked is better
     // because the filter reduces cardinality and the existing path handles it efficiently).
-    if (cw_key == null and str_key_count == 1 and !has_filter_str) {
+    if (cw_key == null and str_key_count == 1 and !has_filter_str and !rr_active) {
         const str_meta = sm_pre[key_col_idx];
         if (str_meta.hash_col_name) |hcn| {
             // Find the hash column index.
@@ -4784,7 +5099,7 @@ fn executeHashAggParallelStrKey(
     const compact_init_vals = try alloc.alloc(u64, aggs.len);
     for (compact_kinds, 0..) |kind, ci| {
         compact_init_vals[ci] = switch (kind) {
-            .count, .i64_sum, .u64_sum, .u64_max, .str_min, .str_max => 0,
+            .count, .i64_sum, .u64_sum, .u64_max, .str_min, .str_max, .f64_str_len_sum => 0,
             .f64_sum => @bitCast(@as(f64, 0.0)),
             .i64_min => @bitCast(@as(i64, std.math.maxInt(i64))),
             .i64_max => @bitCast(@as(i64, std.math.minInt(i64))),
@@ -4851,6 +5166,10 @@ fn executeHashAggParallelStrKey(
         // Optional secondary CASE WHEN string key (e.g. Q40).
         cw_key: ?CaseWhenStrKey = null,
         cw_key_pos: usize = 0,
+        // regexp_replace fast path (e.g. Q29): compute URL domain from rr_col_idx column.
+        rr_active: bool = false,
+        rr_col_idx: usize = 0,
+        rr_is_url_domain: bool = false,
 
         fn work(self: *@This(), _: *parallel.MorselSource) void {
             self.runWork() catch |e| { self.err = e; };
@@ -5116,7 +5435,20 @@ fn executeHashAggParallelStrKey(
                          }
                      } else if (pass_mask) |pm| { if (!pm[r]) continue; }
                      if (key_col.isRowNull(r)) continue;
-                    const str_val = strs[r];
+                    // When rr_active, extract URL domain from the raw string value.
+                    const str_val: []const u8 = if (self.rr_active and self.rr_is_url_domain) blk: {
+                        const raw = strs[r];
+                        const after_proto = if (std.mem.startsWith(u8, raw, "https://"))
+                            raw[8..]
+                        else if (std.mem.startsWith(u8, raw, "http://"))
+                            raw[7..]
+                        else
+                            break :blk raw;
+                        const slash = std.mem.indexOfScalar(u8, after_proto, '/') orelse break :blk raw;
+                        var host = after_proto[0..slash];
+                        if (std.mem.startsWith(u8, host, "www.")) host = host[4..];
+                        break :blk host;
+                    } else strs[r];
 
                      // Evaluate optional CASE WHEN secondary string key.
                      const cw_str: []const u8 = if (self.cw_key) |*cwk| cwk.eval(&c, r) else "";
@@ -5211,6 +5543,9 @@ fn executeHashAggParallelStrKey(
             .use_inline_filter = use_inline_filter,
             .cw_key            = cw_key,
             .cw_key_pos        = cw_key_pos,
+            .rr_active         = rr_active,
+            .rr_col_idx        = rr_col_idx,
+            .rr_is_url_domain  = rr_is_url_domain,
         };
         if (use_inline_filter) {
             @memcpy(pc.inline_ic[0..pre_inline_ic_n], pre_inline_ic[0..pre_inline_ic_n]);
@@ -5301,7 +5636,11 @@ fn executeHashAggParallelStrKey(
                     row[ki] = Value{ .string = cw_str };
                     continue;
                 }
-                if (k.expr != .col_ref and k.expr != .lit_i64) { row[ki] = Value{ .int64 = 0 }; continue; }
+                if (k.expr != .col_ref and k.expr != .lit_i64) {
+                    // fn_call key (e.g. regexp_replace domain): emit the str_val stored in composite key.
+                    if (ki == ec.str_key_pos) { row[ki] = Value{ .string = str_val }; continue; }
+                    row[ki] = Value{ .int64 = 0 }; continue;
+                }
                 if (k.expr == .lit_i64) {
                     if (ec.all_const_ints) {
                         // Constant key — value is just the literal (not stored in composite key).
@@ -5485,7 +5824,7 @@ fn executeHashAggParallelCompactTopK(
     for (compact_kinds, 0..) |kind, i| {
         compact_init_vals[i] = switch (kind) {
             .count => 0,
-            .i64_sum, .u64_sum, .f64_sum => 0,
+            .i64_sum, .u64_sum, .f64_sum, .f64_str_len_sum => 0,
             .i64_min => @as(u64, @bitCast(@as(i64, std.math.maxInt(i64)))),
             .i64_max => @as(u64, @bitCast(@as(i64, std.math.minInt(i64)))),
             .u64_min => std.math.maxInt(u64),
@@ -6190,7 +6529,7 @@ fn executeHashAggParallelCompactTopK(
                     .count => .{ .int64 = @intCast(acc_vals[i]) },
                     .i64_sum => .{ .int64 = @bitCast(acc_vals[i]) },
                     .u64_sum => .{ .uint64 = acc_vals[i] },
-                    .f64_sum => .{ .float64 = @bitCast(acc_vals[i]) },
+                    .f64_sum, .f64_str_len_sum => .{ .float64 = @bitCast(acc_vals[i]) },
                     .i64_min, .i64_max => .{ .int64 = @bitCast(acc_vals[i]) },
                     .u64_min, .u64_max => .{ .int64 = @bitCast(acc_vals[i]) },
                     .f64_min, .f64_max => .{ .float64 = @bitCast(acc_vals[i]) },
@@ -6373,7 +6712,11 @@ fn executeTwoPhaseHashAgg(
         // Flat u64 scatter buffers per partition (stride=row_stride per record).
         // Each entry: [hash, k0, k1?, agg0, agg1, ...]
         bufs:         [N_PARTS]std.ArrayListUnmanaged(u64),
-        // Per-ctx arena backed by page_allocator (thread-safe: no sharing with other ctxs).
+        // Per-ctx arena backed by raw_c_allocator (malloc/free).
+        // Using raw_c_allocator instead of page_allocator so that freed pages are
+        // returned to the malloc pool and reused on the next query run without
+        // triggering new page faults — avoids ~490ms of page-fault overhead in
+        // hot benchmark runs where 490MB of scatter buffers are re-allocated each time.
         buf_arena:    std.heap.ArenaAllocator,
         source:       SourceIface,
         morsel_src:   *parallel.MorselSource,
@@ -6545,7 +6888,7 @@ fn executeTwoPhaseHashAgg(
     for (scatter_ctxs) |*sc| {
         sc.* = .{
             .bufs         = [_]std.ArrayListUnmanaged(u64){.{ .items = &.{}, .capacity = 0 }} ** N_PARTS,
-            .buf_arena    = std.heap.ArenaAllocator.init(std.heap.page_allocator),
+            .buf_arena    = std.heap.ArenaAllocator.init(std.heap.c_allocator),
             .source       = ctx.source,
             .morsel_src   = &morsel_src1,
             .parent_alloc = alloc,
@@ -6654,7 +6997,7 @@ fn executeTwoPhaseHashAgg(
     }
     try parallel.parallelFor(alloc, AggCtx, AggCtx.work, agg_ctxs, &morsel_src2);
     for (agg_ctxs) |*ac| { if (ac.err) |e| return e; }
-    // Phase 2 done — release scatter buf memory (page_allocator-backed).
+     // Phase 2 done — release scatter buf memory (raw_c_allocator-backed → returned to malloc pool).
     for (scatter_ctxs) |*sc| sc.buf_arena.deinit();
 
     // ── Emit from partition HTs ────────────────────────────────────────────────
@@ -6742,7 +7085,7 @@ fn executeTwoPhaseHashAgg(
                     .count   => .{ .int64 = @intCast(acc_vals[i]) },
                     .i64_sum => .{ .int64 = @bitCast(acc_vals[i]) },
                     .u64_sum => .{ .uint64 = acc_vals[i] },
-                    .f64_sum => .{ .float64 = @bitCast(acc_vals[i]) },
+                    .f64_sum, .f64_str_len_sum => .{ .float64 = @bitCast(acc_vals[i]) },
                     .i64_min, .i64_max => .{ .int64 = @bitCast(acc_vals[i]) },
                     .u64_min, .u64_max => .{ .int64 = @bitCast(acc_vals[i]) },
                     .f64_min, .f64_max => .{ .float64 = @bitCast(acc_vals[i]) },

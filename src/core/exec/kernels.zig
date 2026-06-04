@@ -318,28 +318,25 @@ pub const LikeMatcher = struct {
         }
     }
 
-    pub inline fn match(self: *const LikeMatcher, s: []const u8) bool {
-        switch (self.kind) {
-            .contains => {
-                const n = self.needle;
-                if (s.len < n.len) return false;
-                if (n.len == 1) {
-                    return std.mem.indexOfScalar(u8, s, n[0]) != null;
-                }
-                // Boyer-Moore-Horspool substring search with precomputed skip table.
-                var i: usize = n.len - 1;
-                while (i < s.len) {
-                    var j: usize = n.len - 1;
-                    var k = i;
-                    while (j < n.len and s[k] == n[j]) {
-                        if (j == 0) return true;
-                        j -= 1;
-                        k -= 1;
-                    }
-                    i += self.bmh_skip[s[i]];
-                }
-                return false;
-            },
+     pub inline fn match(self: *const LikeMatcher, s: []const u8) bool {
+         switch (self.kind) {
+             .contains => {
+                 const n = self.needle;
+                 if (s.len < n.len) return false;
+                 // BMH search
+                 var i: usize = n.len - 1;
+                 while (i < s.len) {
+                     var j: usize = n.len - 1;
+                     var k: usize = i;
+                     while (j > 0 and s[k] == n[j]) {
+                         k -= 1;
+                         j -= 1;
+                     }
+                     if (s[k] == n[j]) return true;
+                     i += self.bmh_skip[s[i]];
+                 }
+                 return false;
+             },
             .prefix => return std.mem.startsWith(u8, s, self.needle),
             .suffix => return std.mem.endsWith(u8, s, self.needle),
             .generic => return likeMatch(s, self.pattern),

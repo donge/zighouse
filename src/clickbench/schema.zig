@@ -133,7 +133,8 @@ pub const hits_columns = [_]Column{
     fixed("IPNetworkID", .int32),
     fixed("TraficSourceID", .int16),
     fixed("SearchEngineID", .int16),
-    lowcardText("SearchPhrase", .medium, .medium_dict, .medium_dict, "hot_SearchPhrase.id", "SearchPhrase.id_offsets.bin", "SearchPhrase.id_phrases.bin", .{ .count_distinct = true, .group_count_top = true, .group_distinct_user_top = true, .group_with_fixed_key = true, .order_by_value = true, .order_by_time = true }),
+    lowcardTextWithHash("SearchPhrase", .medium, .medium_dict, "SearchPhraseHash", "hot_SearchPhrase.id", "SearchPhrase.id_offsets.bin", "SearchPhrase.id_phrases.bin", .{ .count_distinct = true, .group_count_top = true, .group_distinct_user_top = true, .group_with_fixed_key = true, .order_by_value = true, .order_by_time = true }),
+    fixed("SearchPhraseHash", .int64),
     fixed("AdvEngineID", .int16),
     fixed("IsArtifical", .int16),
     fixed("WindowClientWidth", .int16),
@@ -198,6 +199,7 @@ pub const hits_columns = [_]Column{
     fixed("HasGCLID", .int16),
     fixed("RefererHash", .int64),
     fixed("URLHash", .int64),
+    fixed("TitleHash", .int64),
     fixed("CLID", .int32),
 };
 
@@ -220,5 +222,5 @@ test "finds ClickBench columns case insensitively" {
 
 test "ClickBench column count" {
     const std = @import("std");
-    try std.testing.expectEqual(@as(usize, 105), hits.columns.len);
+    try std.testing.expectEqual(@as(usize, 107), hits.columns.len);
 }
