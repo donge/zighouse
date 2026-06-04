@@ -294,7 +294,7 @@ pub fn plan_query(
             if (all_resolved and sort_keys_list.items.len > 0) {
                 const sort_keys = try sort_keys_list.toOwnedSlice(ctx.alloc);
                 if (gplan.limit != null) {
-                    const k: u64 = @intCast(gplan.limit.?);
+                    const k: u64 = @intCast(gplan.limit.? + (gplan.offset orelse 0));
                     const topk = try ctx.alloc.create(PhysicalNode);
                     topk.* = .{ .top_k = .{ .input = source, .keys = sort_keys, .k = k } };
                     source = topk;
@@ -556,7 +556,7 @@ pub fn plan_query(
         const sort_keys = try ctx.alloc.alloc(SortKey, 1);
         sort_keys[0] = .{ .col_idx = sort_idx, .desc = true, .nulls_first = false };
         if (has_limit) {
-            const k: u64 = @intCast(gplan.limit.?);
+            const k: u64 = @intCast(gplan.limit.? + (gplan.offset orelse 0));
             const topk = try ctx.alloc.create(PhysicalNode);
             topk.* = .{ .top_k = .{ .input = source, .keys = sort_keys, .k = k } };
             source = topk;
@@ -573,7 +573,7 @@ pub fn plan_query(
             const sort_keys = try ctx.alloc.alloc(SortKey, 1);
             sort_keys[0] = .{ .col_idx = col_idx, .desc = !gplan.order_by_alias_asc, .nulls_first = false };
             if (has_limit) {
-                const k: u64 = @intCast(gplan.limit.?);
+                const k: u64 = @intCast(gplan.limit.? + (gplan.offset orelse 0));
                 const topk = try ctx.alloc.create(PhysicalNode);
                 topk.* = .{ .top_k = .{ .input = source, .keys = sort_keys, .k = k } };
                 source = topk;
@@ -630,7 +630,7 @@ pub fn plan_query(
             if (all_found and sort_keys_list.items.len > 0) {
                 const sort_keys = try sort_keys_list.toOwnedSlice(ctx.alloc);
                 if (has_limit) {
-                    const k: u64 = @intCast(gplan.limit.?);
+                    const k: u64 = @intCast(gplan.limit.? + (gplan.offset orelse 0));
                     const topk = try ctx.alloc.create(PhysicalNode);
                     topk.* = .{ .top_k = .{ .input = source, .keys = sort_keys, .k = k } };
                     source = topk;
@@ -1023,10 +1023,15 @@ fn scalarExprToProjectItem(ctx: *PlannerCtx, p: generic_sql.Expr) !?ProjectItem 
                     } orelse {
                         break :blk null;
                     };
+                    // date_part(minute/hour) → int64; date_trunc → datetime64_ms
+                    const synth_out_type: ColumnType = switch (expr) {
+                        .fn_call => |fc| if (std.mem.eql(u8, fc.name, "date_part")) .int64 else .datetime64_ms,
+                        else => .string,
+                    };
                     break :blk ProjectItem{
                         .expr     = expr,
                         .alias    = alias,
-                        .out_type = .string,  // scalar fn may return string
+                        .out_type = synth_out_type,
                     };
                 };
                 break :blk item;

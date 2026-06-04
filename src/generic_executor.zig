@@ -2492,6 +2492,13 @@ const GroupByCtx = struct {
             const truncated = @divFloor(ts, unit_us) * unit_us;
             return Value{ .i64 = truncated + expr.offset };
         }
+        // EventMinuteOfHour: extract minute (0-59) from EventTime seconds
+        if (std.ascii.eqlIgnoreCase(expr.base_col, "EventMinuteOfHour")) {
+            const ts_v = row.get("EventTime") orelse return Value{ .null_val = {} };
+            const ts = ts_v.toI64() orelse return Value{ .null_val = {} };
+            // EventTime is Unix seconds; extract minute-of-hour
+            return Value{ .i64 = @mod(@divFloor(ts, 60), 60) + expr.offset };
+        }
         // EventHour: truncate EventTime to hours
         if (std.ascii.eqlIgnoreCase(expr.base_col, "EventHour")) {
             const ts_v = row.get("EventTime") orelse return Value{ .null_val = {} };
@@ -3396,6 +3403,7 @@ fn collectNeededColumns(
         for (exprs) |e| {
             // EventMinute/EventHour/EventDay are derived from EventTime
             const real_col = if (std.ascii.eqlIgnoreCase(e.base_col, "EventMinute") or
+                std.ascii.eqlIgnoreCase(e.base_col, "EventMinuteOfHour") or
                 std.ascii.eqlIgnoreCase(e.base_col, "EventHour") or
                 std.ascii.eqlIgnoreCase(e.base_col, "EventDay")) "EventTime" else e.base_col;
             if (std.mem.indexOfScalar(u8, real_col, '(') != null or

@@ -469,7 +469,7 @@ fn runCommand(init: std.process.Init, allocator: std.mem.Allocator, args: *std.p
         var rs2 = try core2.exec.pipeline.executePlan(node2, &qctx2);
         defer rs2.deinit();
 
-        const csv2 = try serializer.toCsv(allocator, rs2);
+        const csv2 = try serializer.toCsvOffset(allocator, rs2, gplan2.offset orelse 0);
         defer allocator.free(csv2);
         try writeOut(init.io, csv2);
     } else if (std.mem.eql(u8, command, "serve")) {

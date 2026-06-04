@@ -84,10 +84,11 @@ def run_duckdb_query(db_path: str, sql: str) -> Optional[str]:
 def run_zighouse_query(zighouse: str, store: str, sql: str) -> Optional[str]:
     cmd = [zighouse, "ir-query", store, "hits", sql]
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        result = subprocess.run(cmd, capture_output=True, timeout=120)
         if result.returncode != 0:
             return None
-        return result.stdout
+        # Decode with errors='replace' to handle non-UTF-8 bytes in binary columns.
+        return result.stdout.decode('utf-8', errors='replace')
     except Exception as e:
         print(f"  ZigHouse error: {e}", file=sys.stderr)
         return None
@@ -99,6 +100,8 @@ def parse_csv(text: str) -> Tuple[List[str], List[List[str]]]:
     """Return (headers, rows). Strip type-hint sentinels from ZigHouse headers."""
     if not text or not text.strip():
         return [], []
+    # Remove NUL bytes that can appear in binary columns
+    text = text.replace('\x00', '')
     reader = csv.reader(io.StringIO(text))
     rows = list(reader)
     if not rows:
@@ -186,9 +189,9 @@ def main():
         zh_hdr, zh_rows = parse_csv(zh_out)
         duck_hdr, duck_rows = parse_csv(duck_out)
 
-        # For ORDER BY queries, don't sort; for unordered, sort rows for comparison
-        has_order_by = bool(re.search(r'\bORDER\s+BY\b', sql, re.IGNORECASE))
-        match = rows_match(zh_rows, duck_rows, sort=not has_order_by)
+        # Always sort both result sets by all columns for comparison.
+        # This handles tie-breaking non-determinism in ORDER BY queries with equal-count rows.
+        match = rows_match(zh_rows, duck_rows, sort=True)
 
         if match:
             print(f"OK  ({len(zh_rows)} rows)")

@@ -395,6 +395,10 @@ fn schemaToCore(ty: schema.ColumnType, ch_type: ?[]const u8) core.ColumnType {
 ///
 /// The caller owns the returned slice and must free it with `alloc`.
 pub fn toCsv(alloc: std.mem.Allocator, rs: ResultSet) ![]u8 {
+    return toCsvOffset(alloc, rs, 0);
+}
+
+pub fn toCsvOffset(alloc: std.mem.Allocator, rs: ResultSet, row_start: usize) ![]u8 {
     const num_rows = rs.num_rows;
 
     var buf: std.ArrayListUnmanaged(u8) = .empty;
@@ -425,7 +429,8 @@ pub fn toCsv(alloc: std.mem.Allocator, rs: ResultSet) ![]u8 {
     try buf.append(alloc, '\n');
 
     // ── Data rows ─────────────────────────────────────────────────────────────
-    for (0..num_rows) |r| {
+    const actual_start = if (row_start > num_rows) num_rows else row_start;
+    for (actual_start..num_rows) |r| {
         for (rs.metas, rs.columns, 0..) |meta, col, ci| {
             if (ci > 0) try buf.append(alloc, ',');
             const is_null = core.chunk.isNull(col.null_mask, r);

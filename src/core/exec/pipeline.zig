@@ -1269,13 +1269,31 @@ fn executeScannableToSink(
             if (isScannable(p.input)) {
                 return executeLimitChunked(node, ctx);
             }
-            // Detect: project → top_k → scannable  (e.g. SELECT * … ORDER BY col LIMIT k)
+            // Detect: project → top_k → scannable  (e.g. SELECT col … ORDER BY col LIMIT k)
             // Stream scannable input directly into heap to avoid materialising all rows.
+            // The top_k sort keys may use output-column indices (from findOutputColIdx in
+            // planner). Remap them to schema indices so HeapChunkLoop operates on raw rows.
             if (p.input.* == .top_k) {
                 const tk = p.input.top_k;
                 if (isScannable(tk.input)) {
-                    var proj_over_scan = plan.PhysicalNode{ .project = .{ .input = tk.input, .items = p.items } };
-                    return executeTopKFromScannable(&proj_over_scan, tk.keys, @intCast(tk.k), ctx);
+                    // Remap sort keys: output index → schema col_ref index.
+                    const remapped_keys = try alloc.dupe(plan.SortKey, tk.keys);
+                    var all_remapped = true;
+                    for (remapped_keys) |*rk| {
+                        if (rk.col_idx < p.items.len) {
+                            const expr = p.items[rk.col_idx].expr;
+                            if (expr == .col_ref) {
+                                rk.col_idx = expr.col_ref.index;
+                            } else {
+                                all_remapped = false;
+                                break;
+                            }
+                        }
+                    }
+                    if (all_remapped) {
+                        var proj_over_scan = plan.PhysicalNode{ .project = .{ .input = tk.input, .items = p.items } };
+                        return executeTopKFromScannable(&proj_over_scan, remapped_keys, @intCast(tk.k), ctx);
+                    }
                 }
             }
             const inner = try executeNode(p.input, ctx);
@@ -2132,11 +2150,17 @@ fn executeHashAggChunked(
     const compact_kinds: ?[]ht.CompactAggKind = blk: {
         const kinds = try alloc.alloc(ht.CompactAggKind, aggs.len);
         for (aggs, 0..) |item, ci| {
-            if (item.expr != .agg_call) break :blk null;
-            kinds[ci] = switch (item.expr.agg_call.kind) {
+             if (item.expr != .agg_call) break :blk null;
+             if (item.expr.agg_call.kind == .count and item.expr.agg_call.distinct) break :blk null;
+             kinds[ci] = switch (item.expr.agg_call.kind) {
                 .count_star, .count => .count,
                 .sum  => .i64_sum,   // type refined at runtime (int64/uint64/f64)
-                .avg  => .f64_sum,
+                .avg  => blk2: {
+                    // Non-col_ref arg (e.g. length(URL)) not supported by compact path.
+                    const avg_arg = item.expr.agg_call.arg orelse break :blk null;
+                    if (avg_arg != .col_ref) break :blk null;
+                    break :blk2 .f64_sum;
+                },
                 // min/max: string args use str_min/str_max (StrAggHashTable sidecar);
                 // numeric args use the appropriate numeric kind (refined at runtime).
                 .min  => if (item.out_type == .string) .str_min else .i64_min,
@@ -3165,9 +3189,12 @@ fn updateAccumsFromChunk(
                                 switch (col.data) {
                                     .int64 => |vals| {
                                         if (acc_ptr.* == .f64_avg) {
+                                            // simd.sumI64 can overflow for large int64 values (e.g. UserID).
+                                            // Accumulate directly as f64 to avoid overflow.
                                             if (chunk.allNonNull(col.null_mask)) {
-                                                // Fast path: no nulls — sum as i64 then cast once.
-                                                acc_ptr.f64_avg.sum += @floatFromInt(simd.sumI64(vals[0..c.num_rows]));
+                                                for (0..c.num_rows) |r| {
+                                                    acc_ptr.f64_avg.sum += @floatFromInt(vals[r]);
+                                                }
                                                 acc_ptr.f64_avg.count += c.num_rows;
                                             } else {
                                                 for (0..c.num_rows) |r| {
@@ -3180,22 +3207,26 @@ fn updateAccumsFromChunk(
                                             handled = true;
                                         }
                                     },
-                                    .uint64 => |vals| {
-                                        if (acc_ptr.* == .f64_avg) {
-                                            if (chunk.allNonNull(col.null_mask)) {
-                                                acc_ptr.f64_avg.sum += @floatFromInt(@as(u64, @bitCast(simd.sumU64(vals[0..c.num_rows]))));
-                                                acc_ptr.f64_avg.count += c.num_rows;
-                                            } else {
-                                                for (0..c.num_rows) |r| {
-                                                    if (!chunk.isNull(col.null_mask, r)) {
-                                                        acc_ptr.f64_avg.sum += @floatFromInt(vals[r]);
-                                                        acc_ptr.f64_avg.count += 1;
-                                                    }
-                                                }
-                                            }
-                                            handled = true;
-                                        }
-                                    },
+                                     .uint64 => |vals| {
+                                         if (acc_ptr.* == .f64_avg) {
+                                             // Cannot use simd.sumU64: sum of large uint64 values overflows.
+                                             // Accumulate directly as f64.
+                                             if (chunk.allNonNull(col.null_mask)) {
+                                                 for (0..c.num_rows) |r| {
+                                                     acc_ptr.f64_avg.sum += @floatFromInt(vals[r]);
+                                                 }
+                                                 acc_ptr.f64_avg.count += c.num_rows;
+                                             } else {
+                                                 for (0..c.num_rows) |r| {
+                                                     if (!chunk.isNull(col.null_mask, r)) {
+                                                         acc_ptr.f64_avg.sum += @floatFromInt(vals[r]);
+                                                         acc_ptr.f64_avg.count += 1;
+                                                     }
+                                                 }
+                                             }
+                                             handled = true;
+                                         }
+                                     },
                                     .float64 => |vals| {
                                         if (acc_ptr.* == .f64_avg) {
                                             if (chunk.allNonNull(col.null_mask)) {
@@ -3590,11 +3621,12 @@ fn executeTopK(inner: RowList, keys: []const plan.SortKey, k: usize, alloc: std.
         if (heap_len < k) {
             heap_buf[heap_len] = row;
             heap_len += 1;
-            // Sift up.
+            // Sift up: worst-at-root heap — parent is worse than or equal to children.
+            // If parent is better than child, child (worse) should move up toward root.
             var i = heap_len - 1;
             while (i > 0) {
                 const parent = (i - 1) / 2;
-                if (ctx.lessThan(heap_buf[i], heap_buf[parent])) {
+                if (ctx.lessThan(heap_buf[parent], heap_buf[i])) {
                     const tmp = heap_buf[i]; heap_buf[i] = heap_buf[parent]; heap_buf[parent] = tmp;
                     i = parent;
                 } else break;
@@ -3603,14 +3635,14 @@ fn executeTopK(inner: RowList, keys: []const plan.SortKey, k: usize, alloc: std.
             // If this row is better than the heap root (worst of current best), replace root.
             if (ctx.lessThan(row, heap_buf[0])) {
                 heap_buf[0] = row;
-                // Sift down.
+                // Sift down: find the worst child and swap to maintain worst-at-root.
                 var i: usize = 0;
                 while (true) {
                     const l = 2 * i + 1;
                     const r = 2 * i + 2;
                     var smallest = i;
-                    if (l < heap_len and ctx.lessThan(heap_buf[l], heap_buf[smallest])) smallest = l;
-                    if (r < heap_len and ctx.lessThan(heap_buf[r], heap_buf[smallest])) smallest = r;
+                    if (l < heap_len and ctx.lessThan(heap_buf[smallest], heap_buf[l])) smallest = l;
+                    if (r < heap_len and ctx.lessThan(heap_buf[smallest], heap_buf[r])) smallest = r;
                     if (smallest == i) break;
                     const tmp = heap_buf[i]; heap_buf[i] = heap_buf[smallest]; heap_buf[smallest] = tmp;
                     i = smallest;
@@ -4212,6 +4244,31 @@ fn executeTopKFromScannable(
 
     if (k == 0) return RowList.init(out_metas);
 
+    // Remap sort keys: if keys use output-column indices (e.g. from findOutputColIdx
+    // in the planner) but we sort raw schema rows, map output index → schema col_ref index.
+    // Only remap when project_items is present and all sort keys are simple col_refs.
+    const effective_keys: []const plan.SortKey = if (project_items) |items| blk: {
+        const remapped = try alloc.dupe(plan.SortKey, keys);
+        var all_remapped = true;
+        for (remapped) |*rk| {
+            if (rk.col_idx < items.len) {
+                const expr = items[rk.col_idx].expr;
+                if (expr == .col_ref) {
+                    // Only remap if the output index != schema index (avoids double-remap
+                    // when keys already carry schema indices from tbl.findColumn).
+                    // Heuristic: if col_idx < items.len AND items[col_idx].expr.col_ref.index
+                    // != col_idx, it's an output-relative index.
+                    rk.col_idx = expr.col_ref.index;
+                } else {
+                    all_remapped = false;
+                    break;
+                }
+            }
+        }
+        if (all_remapped) break :blk remapped;
+        break :blk keys; // fallback: use keys as-is
+    } else keys;
+
     // ── Late-materialization path ─────────────────────────────────────────────
     // For SELECT * with a filter, scan with only filter+sort columns (phase 1)
     // to avoid decoding all 100+ columns per row. Track the global row indices
@@ -4244,7 +4301,7 @@ fn executeTopKFromScannable(
             const pred = fs.predicate;
             collectColRefs(pred, needed_mask[0..@min(256, schema_metas.len)]);
         }
-        for (keys) |key| { if (key.col_idx < 256) needed_mask[key.col_idx] = true; }
+        for (effective_keys) |key| { if (key.col_idx < 256) needed_mask[key.col_idx] = true; }
         if (project_items) |items| {
             for (items) |item| {
                 collectColRefs(item.expr, needed_mask[0..@min(256, schema_metas.len)]);
@@ -4269,7 +4326,7 @@ fn executeTopKFromScannable(
 
     if (use_late_mat) {
         const result_opt = try executeTopKLateMat(
-            schema_metas, out_metas, filter_state.?.predicate, keys, k, ctx, alloc,
+            schema_metas, out_metas, filter_state.?.predicate, effective_keys, k, ctx, alloc,
         );
         if (result_opt) |rl| return rl;
         // If late_mat failed for any reason, fall through to standard path.
@@ -4292,7 +4349,7 @@ fn executeTopKFromScannable(
             return false;
         }
     };
-    const sctx = SortCtx{ .keys = keys };
+    const sctx = SortCtx{ .keys = effective_keys };
 
     // If narrow_scan was applied, restore all cols after the scan is done.
     defer if (narrow_scan_possible) ctx.source.setNeededCols(null);
@@ -4338,13 +4395,29 @@ fn executeTopKFromScannable(
             const a = qctx.allocator();
             for (0..c.num_rows) |r| {
                 if (heap_l.* < k2) {
-                    const row = try c.readRow(r, a);
+                    const row_raw = try c.readRow(r, a);
+                    // Deep-copy string content: readRow returns slices into DataChunk
+                    // column buffers which are in chunk_arena (reset each morsel).
+                    for (row_raw) |*v| {
+                        if (v.*) |val| switch (val) {
+                            .string => |s| v.* = .{ .string = try a.dupe(u8, s) },
+                            .array_string => |arr| {
+                                const arr2 = try a.alloc([]const u8, arr.len);
+                                for (arr, 0..) |s, i| arr2[i] = try a.dupe(u8, s);
+                                v.* = .{ .array_string = arr2 };
+                            },
+                            else => {},
+                        };
+                    }
+                    const row = row_raw;
                     heap_b[heap_l.*] = row;
                     heap_l.* += 1;
                     var i = heap_l.* - 1;
                     while (i > 0) {
                         const parent = (i - 1) / 2;
-                        if (sctx2.lessThan(heap_b[i], heap_b[parent])) {
+                        // MAX-heap: worse (larger for ASC) element bubbles to root.
+                        // Swap when parent is BETTER than i (i.e., i is WORSE → move i up).
+                        if (sctx2.lessThan(heap_b[parent], heap_b[i])) {
                             const tmp = heap_b[i]; heap_b[i] = heap_b[parent]; heap_b[parent] = tmp;
                             i = parent;
                         } else break;
@@ -4357,15 +4430,28 @@ fn executeTopKFromScannable(
                         }
                     }
                     if (sctx2.lessThan(kscratch, heap_b[0])) {
-                        const row = try c.readRow(r, a);
-                        heap_b[0] = row;
+                        const row_raw2 = try c.readRow(r, a);
+                        for (row_raw2) |*v| {
+                            if (v.*) |val| switch (val) {
+                                .string => |s| v.* = .{ .string = try a.dupe(u8, s) },
+                                .array_string => |arr| {
+                                    const arr2 = try a.alloc([]const u8, arr.len);
+                                    for (arr, 0..) |s, i| arr2[i] = try a.dupe(u8, s);
+                                    v.* = .{ .array_string = arr2 };
+                                },
+                                else => {},
+                            };
+                        }
+                        heap_b[0] = row_raw2;
                         var i: usize = 0;
                         while (true) {
                             const l = 2 * i + 1;
                             const r2 = 2 * i + 2;
                             var smallest = i;
-                            if (l < heap_b.len and sctx2.lessThan(heap_b[l], heap_b[smallest])) smallest = l;
-                            if (r2 < heap_b.len and sctx2.lessThan(heap_b[r2], heap_b[smallest])) smallest = r2;
+                            // MAX-heap sift-down: track the WORSE child to swap with.
+                            // "smallest" is misnamed — it's actually the WORSE (larger) index.
+                            if (l < heap_b.len and sctx2.lessThan(heap_b[smallest], heap_b[l])) smallest = l;
+                            if (r2 < heap_b.len and sctx2.lessThan(heap_b[smallest], heap_b[r2])) smallest = r2;
                             if (smallest == i) break;
                             const tmp = heap_b[i]; heap_b[i] = heap_b[smallest]; heap_b[smallest] = tmp;
                             i = smallest;
@@ -4392,14 +4478,14 @@ fn executeTopKFromScannable(
             _ = chunk_arena.reset(.retain_capacity);
             try ctx.source.fetchRange(pos, n, &c, chunk_arena.allocator());
             pos += n;
-            const done = try HeapChunkLoop.process(&c, heap_buf, &heap_len, k, keys, key_scratch, sctx, ls_ptr, fs_ptr, ctx);
+            const done = try HeapChunkLoop.process(&c, heap_buf, &heap_len, k, effective_keys, key_scratch, sctx, ls_ptr, fs_ptr, ctx);
             if (done) break;
         }
     } else {
         ctx.source.reset();
         var c: DataChunk = undefined;
         while (try ctx.source.nextChunk(&c, ctx)) {
-            const done = try HeapChunkLoop.process(&c, heap_buf, &heap_len, k, keys, key_scratch, sctx, ls_ptr, fs_ptr, ctx);
+            const done = try HeapChunkLoop.process(&c, heap_buf, &heap_len, k, effective_keys, key_scratch, sctx, ls_ptr, fs_ptr, ctx);
             if (done) break;
         }
     }
@@ -4764,21 +4850,13 @@ fn executeHashAggParallelPairCount(
     // Preload columns.
     { var dummy: DataChunk = undefined; ctx.source.fetchRange(0, 0, &dummy, alloc) catch {}; }
 
-    const n_parts_mask = blk: {
-        var p: usize = 1;
-        while (p < n_threads and p < 64) p <<= 1;
-        break :blk p - 1; // mask for power-of-2
-    };
-    const n_parts = n_parts_mask + 1;
-
-    // Each worker gets an id and scans ALL rows, inserting only those it "owns".
-    // This avoids scatter buffers and string copies — strings point into mmap directly.
+    // Each worker scans a morsel range and builds a local HT.
+    // After all workers finish, we merge the per-worker HTs serially.
+    // This is the correct parallel hash-agg pattern: divide rows by morsel,
+    // each worker aggregates its shard, then merge results by summing counts.
     const Worker = struct {
-        thread_id:   usize,
-        n_parts:     usize,
-        parts_mask:  usize,
         source:      SourceIface,
-        morsel_src:  *parallel.MorselSource,
+        morsel_src:  *parallel.MorselSource, // shared; each morsel assigned to one worker
         parent_alloc: std.mem.Allocator,
         i64_ci:      usize,
         str_ci:      usize,
@@ -4795,30 +4873,20 @@ fn executeHashAggParallelPairCount(
             const talloc = thread_arena.allocator();
 
             while (self.morsel_src.next()) |m| {
-                var chunk_arena = std.heap.ArenaAllocator.init(talloc);
-                defer chunk_arena.deinit();
+                // Use talloc (thread-level arena) so strings in local_ht remain valid
+                // for the entire thread lifetime (needed since local_ht stores raw slices).
                 var c: DataChunk = undefined;
-                try self.source.fetchRange(m.start, m.end - m.start, &c, chunk_arena.allocator());
+                try self.source.fetchRange(m.start, m.end - m.start, &c, talloc);
 
                 if (self.i64_ci >= c.columns.len or self.str_ci >= c.columns.len) continue;
                 const strs = c.columns[self.str_ci].data.string;
 
                 switch (c.columns[self.i64_ci].data) {
-                    .int64 => |ints| {
-                        for (0..c.num_rows) |r| {
-                            const n = ints[r];
-                            const h = std.hash.Wyhash.hash(0, std.mem.asBytes(&n));
-                            if (h & self.parts_mask != self.thread_id) continue;
-                            try self.local_ht.increment(n, strs[r]);
-                        }
+                    .int64  => |ints| {
+                        for (0..c.num_rows) |r| try self.local_ht.increment(ints[r], strs[r]);
                     },
                     .uint64 => |ints| {
-                        for (0..c.num_rows) |r| {
-                            const n: i64 = @bitCast(ints[r]);
-                            const h = std.hash.Wyhash.hash(0, std.mem.asBytes(&n));
-                            if (h & self.parts_mask != self.thread_id) continue;
-                            try self.local_ht.increment(n, strs[r]);
-                        }
+                        for (0..c.num_rows) |r| try self.local_ht.increment(@bitCast(ints[r]), strs[r]);
                     },
                     else => {},
                 }
@@ -4826,20 +4894,17 @@ fn executeHashAggParallelPairCount(
         }
     };
 
-    // Estimate per-thread HT size: total / n_parts, with a floor.
-    const est_per_thread: u64 = @max(64, total_rows / @as(u64, n_parts));
+    // Estimate per-thread HT size: total / n_threads (each thread processes ~1/n_threads rows).
+    const est_per_thread: u64 = @max(64, total_rows / @as(u64, n_threads));
 
     // Each worker gets its own arena-backed HT.
-    const ht_arenas = try alloc.alloc(std.heap.ArenaAllocator, n_parts);
+    const ht_arenas = try alloc.alloc(std.heap.ArenaAllocator, n_threads);
     for (ht_arenas) |*a| a.* = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer for (ht_arenas) |*a| a.deinit();
 
-    const workers = try alloc.alloc(Worker, n_parts);
+    const workers = try alloc.alloc(Worker, n_threads);
     for (workers, 0..) |*w, t| {
         w.* = .{
-            .thread_id    = t,
-            .n_parts      = n_parts,
-            .parts_mask   = n_parts_mask,
             .source       = ctx.source,
             .morsel_src   = undefined,
             .parent_alloc = alloc,
@@ -4855,6 +4920,12 @@ fn executeHashAggParallelPairCount(
     try parallel.parallelFor(alloc, Worker, Worker.work, workers, &morsel_src);
     for (workers) |w| { if (w.err) |e| return e; }
 
+    // ── Merge per-worker HTs into a single result HT ─────────────────────────
+    // Worker 0's HT becomes the master; all others are merged into it.
+    for (workers[1..]) |*w| {
+        try workers[0].local_ht.mergeFrom(&w.local_ht);
+    }
+
     // ── Collect results ──────────────────────────────────────────────────────
     const metas = try alloc.alloc(result.ColMeta, 3);
     metas[0] = if (k0_is_i64) result.ColMeta{ .name = keys[0].alias, .col_type = .int64 }
@@ -4868,22 +4939,20 @@ fn executeHashAggParallelPairCount(
         rl: *RowList, alloc: std.mem.Allocator, k0_is_i64: bool,
     };
     var emit_ctx = EmitCtx{ .rl = &rl, .alloc = alloc, .k0_is_i64 = k0_is_i64 };
-    for (workers) |*w| {
-        w.local_ht.iterate(&emit_ctx, struct {
-            fn cb(ec: *EmitCtx, n: i64, s: []const u8, count: u64) void {
-                const row = ec.alloc.alloc(?Value, 3) catch return;
-                if (ec.k0_is_i64) {
-                    row[0] = Value{ .int64 = n };
-                    row[1] = Value{ .string = s };
-                } else {
-                    row[0] = Value{ .string = s };
-                    row[1] = Value{ .int64 = n };
-                }
-                row[2] = Value{ .uint64 = count };
-                ec.rl.append(ec.alloc, row) catch {};
+    workers[0].local_ht.iterate(&emit_ctx, struct {
+        fn cb(ec: *EmitCtx, n: i64, s: []const u8, count: u64) void {
+            const row = ec.alloc.alloc(?Value, 3) catch return;
+            if (ec.k0_is_i64) {
+                row[0] = Value{ .int64 = n };
+                row[1] = Value{ .string = s };
+            } else {
+                row[0] = Value{ .string = s };
+                row[1] = Value{ .int64 = n };
             }
-        }.cb);
-    }
+            row[2] = Value{ .uint64 = count };
+            ec.rl.append(ec.alloc, row) catch {};
+        }
+    }.cb);
 
     // Apply top_k if requested (Q17: ORDER BY count(*) DESC LIMIT 10).
     if (top_k > 0 and sort_keys.len > 0 and rl.rows.items.len > top_k) {
@@ -5142,10 +5211,11 @@ fn executeHashAggParallelStrKey(
     const compact_kinds = try alloc.alloc(ht.CompactAggKind, aggs.len);
     for (aggs, 0..) |item, ci| {
         if (item.expr != .agg_call) return null;
+        if (item.expr.agg_call.kind == .count and item.expr.agg_call.distinct) return null;
         compact_kinds[ci] = switch (item.expr.agg_call.kind) {
             .count_star, .count => .count,
             .sum  => .i64_sum,
-            .avg  => .f64_sum,
+            .avg  => if (item.expr.agg_call.arg == null or item.expr.agg_call.arg.? != .col_ref) return null else .f64_sum,
             .min  => if (item.out_type == .string) .str_min else .i64_min,
             .max  => if (item.out_type == .string) .str_max else .i64_max,
             else  => return null,
@@ -5817,10 +5887,11 @@ fn executeHashAggParallelCompactTopK(
     const compact_kinds = try alloc.alloc(ht.CompactAggKind, aggs.len);
     for (aggs, 0..) |item, ci| {
         if (item.expr != .agg_call) return null;
+        if (item.expr.agg_call.kind == .count and item.expr.agg_call.distinct) return null;
         compact_kinds[ci] = switch (item.expr.agg_call.kind) {
             .count_star, .count => .count,
             .sum  => .i64_sum,
-            .avg  => .f64_sum,
+            .avg  => if (item.expr.agg_call.arg == null or item.expr.agg_call.arg.? != .col_ref) return null else .f64_sum,
             .min  => if (item.out_type == .string) return null else .i64_min,
             .max  => if (item.out_type == .string) return null else .i64_max,
             else  => return null,
@@ -6152,6 +6223,16 @@ fn executeHashAggParallelCompactTopK(
                                     if (!col.isRowNull(r)) switch (col.data) {
                                         .int64  => |v| { var s: i64 = @bitCast(slot_vals[ci]); s += v[r]; slot_vals[ci] = @bitCast(s); },
                                         .uint64 => |v| { var s: i64 = @bitCast(slot_vals[ci]); s += @as(i64, @bitCast(v[r])); slot_vals[ci] = @bitCast(s); },
+                                        else => {},
+                                    };
+                                }},
+                                .f64_sum => if (ac.arg) |arg| { if (arg == .col_ref) {
+                                    const col = c.columns[arg.col_ref.index];
+                                    if (!col.isRowNull(r)) switch (col.data) {
+                                        .int64  => |v| { var s: f64 = @bitCast(slot_vals[ci]); s += @floatFromInt(v[r]); slot_vals[ci] = @bitCast(s); },
+                                        .uint64 => |v| { var s: f64 = @bitCast(slot_vals[ci]); s += @floatFromInt(v[r]); slot_vals[ci] = @bitCast(s); },
+                                        .bool_u8 => |v| { var s: f64 = @bitCast(slot_vals[ci]); s += @floatFromInt(v[r]); slot_vals[ci] = @bitCast(s); },
+                                        .float64 => |v| { var s: f64 = @bitCast(slot_vals[ci]); s += v[r]; slot_vals[ci] = @bitCast(s); },
                                         else => {},
                                     };
                                 }},
@@ -6517,6 +6598,7 @@ fn executeHashAggParallelCompactTopK(
         keys_n: usize,
         aggs_n: usize,
         compact_kinds: []const ht.CompactAggKind,
+        aggs: []const plan.ProjectItem,
         rl: *RowList,
         alloc: std.mem.Allocator,
         err: ?anyerror = null,
@@ -6598,7 +6680,22 @@ fn executeHashAggParallelCompactTopK(
                     .count => .{ .int64 = @intCast(acc_vals[i]) },
                     .i64_sum => .{ .int64 = @bitCast(acc_vals[i]) },
                     .u64_sum => .{ .uint64 = acc_vals[i] },
-                    .f64_sum, .f64_str_len_sum => .{ .float64 = @bitCast(acc_vals[i]) },
+                    .f64_sum, .f64_str_len_sum => blk: {
+                        const sum: f64 = @bitCast(acc_vals[i]);
+                        // If the agg is AVG, finalize by dividing sum by count.
+                        if (i < self.aggs.len and self.aggs[i].expr == .agg_call and
+                            self.aggs[i].expr.agg_call.kind == .avg)
+                        {
+                            for (self.compact_kinds, 0..) |ck, j| {
+                                if (ck == .count) {
+                                    const cnt = acc_vals[j];
+                                    if (cnt > 0) break :blk Value{ .float64 = sum / @as(f64, @floatFromInt(cnt)) };
+                                    break;
+                                }
+                            }
+                        }
+                        break :blk Value{ .float64 = sum };
+                    },
                     .i64_min, .i64_max => .{ .int64 = @bitCast(acc_vals[i]) },
                     .u64_min, .u64_max => .{ .int64 = @bitCast(acc_vals[i]) },
                     .f64_min, .f64_max => .{ .float64 = @bitCast(acc_vals[i]) },
@@ -6645,7 +6742,7 @@ fn executeHashAggParallelCompactTopK(
                     self.heap_len += 1;
                     self.heapSiftUp(self.heap_len - 1);
                     self.updateHeapMinCache();
-                } else if (@This().rowLessThan(self.sort_keys, heap[0], row)) {
+                } else if (@This().rowLessThan(self.sort_keys, row, heap[0])) {
                     heap[0] = row;
                     self.heapSiftDown(0);
                     self.updateHeapMinCache();
@@ -6658,9 +6755,9 @@ fn executeHashAggParallelCompactTopK(
     };
     const use_heap = top_k > 0 and sort_keys.len > 0;
     const heap_buf: ?[][]?Value = if (use_heap) try alloc.alloc([]?Value, top_k) else null;
-    var emit_ctx = MCtx{
+     var emit_ctx = MCtx{
         .keys_n = keys.len, .aggs_n = aggs.len,
-        .compact_kinds = compact_kinds, .rl = &rl, .alloc = alloc,
+        .compact_kinds = compact_kinds, .aggs = aggs, .rl = &rl, .alloc = alloc,
         .heap = heap_buf, .heap_len = 0, .heap_k = top_k, .sort_keys = sort_keys,
         .key_out_types = key_out_types_buf,
     };
@@ -7078,10 +7175,11 @@ fn executeTwoPhaseHashAgg(
     for (aggs, 0..) |a, i| out_metas[n_keys + i] = .{ .name = a.alias, .col_type = a.out_type };
 
     var rl = RowList.init(out_metas);
-    const EmitCtx = struct {
+     const EmitCtx = struct {
         keys_n:         usize,
         aggs_n:         usize,
         compact_kinds:  []const ht.CompactAggKind,
+        aggs:           []const plan.ProjectItem,
         rl:             *RowList,
         alloc:          std.mem.Allocator,
         key_out_types:  []const ColumnType,
@@ -7154,7 +7252,21 @@ fn executeTwoPhaseHashAgg(
                     .count   => .{ .int64 = @intCast(acc_vals[i]) },
                     .i64_sum => .{ .int64 = @bitCast(acc_vals[i]) },
                     .u64_sum => .{ .uint64 = acc_vals[i] },
-                    .f64_sum, .f64_str_len_sum => .{ .float64 = @bitCast(acc_vals[i]) },
+                    .f64_sum, .f64_str_len_sum => blk: {
+                        const sum: f64 = @bitCast(acc_vals[i]);
+                        if (i < self.aggs.len and self.aggs[i].expr == .agg_call and
+                            self.aggs[i].expr.agg_call.kind == .avg)
+                        {
+                            for (self.compact_kinds, 0..) |ck, j| {
+                                if (ck == .count) {
+                                    const cnt = acc_vals[j];
+                                    if (cnt > 0) break :blk Value{ .float64 = sum / @as(f64, @floatFromInt(cnt)) };
+                                    break;
+                                }
+                            }
+                        }
+                        break :blk Value{ .float64 = sum };
+                    },
                     .i64_min, .i64_max => .{ .int64 = @bitCast(acc_vals[i]) },
                     .u64_min, .u64_max => .{ .int64 = @bitCast(acc_vals[i]) },
                     .f64_min, .f64_max => .{ .float64 = @bitCast(acc_vals[i]) },
@@ -7189,7 +7301,7 @@ fn executeTwoPhaseHashAgg(
                     self.heap_len += 1;
                     self.heapSiftUp(self.heap_len - 1);
                     self.updateHeapMinCache();
-                } else if (@This().rowLessThan(self.sort_keys, heap[0], row)) {
+                } else if (@This().rowLessThan(self.sort_keys, row, heap[0])) {
                     heap[0] = row;
                     self.heapSiftDown(0);
                     self.updateHeapMinCache();
@@ -7203,9 +7315,9 @@ fn executeTwoPhaseHashAgg(
 
     const use_heap = top_k > 0 and sort_keys.len > 0;
     const heap_buf: ?[][]?Value = if (use_heap) try alloc.alloc([]?Value, top_k) else null;
-    var emit_ctx = EmitCtx{
+     var emit_ctx = EmitCtx{
         .keys_n = n_keys, .aggs_n = n_aggs,
-        .compact_kinds = compact_kinds, .rl = &rl, .alloc = alloc,
+        .compact_kinds = compact_kinds, .aggs = aggs, .rl = &rl, .alloc = alloc,
         .key_out_types = key_out_types_buf,
         .heap = heap_buf, .heap_len = 0, .heap_k = top_k, .sort_keys = sort_keys,
     };
