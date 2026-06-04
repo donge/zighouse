@@ -37,17 +37,22 @@ const PT_DOUBLE: i32 = 5;
 const PT_BYTE_ARRAY: i32 = 6;
 const PT_FIXED_LEN_BYTE_ARRAY: i32 = 7;
 
-// Parquet converted type constants (LogicalType / ConvertedType)
+// Parquet converted type constants (ConvertedType Thrift enum)
+// https://github.com/apache/parquet-format/blob/master/src/main/thrift/parquet.thrift
 const CT_UTF8: i32 = 0;
-const CT_DATE: i32 = 2;
-const CT_TIME_MILLIS: i32 = 3;
-const CT_TIME_MICROS: i32 = 4;
-const CT_TIMESTAMP_MILLIS: i32 = 5;
-const CT_TIMESTAMP_MICROS: i32 = 6;
-const CT_INT_8: i32 = 10;
-const CT_INT_16: i32 = 11;
-const CT_INT_32: i32 = 12;
-const CT_INT_64: i32 = 13;
+// 1 = MAP, 2 = MAP_KEY_VALUE, 3 = LIST, 4 = ENUM, 5 = DECIMAL
+const CT_DATE: i32 = 6;
+const CT_TIME_MILLIS: i32 = 7;
+const CT_TIME_MICROS: i32 = 8;
+const CT_TIMESTAMP_MILLIS: i32 = 9;
+const CT_TIMESTAMP_MICROS: i32 = 10;
+const CT_UINT_8: i32 = 11;
+const CT_UINT_16: i32 = 12;
+// 13 = UINT_32, 14 = UINT_64
+const CT_INT_8: i32 = 15;
+const CT_INT_16: i32 = 16;
+const CT_INT_32: i32 = 17;
+const CT_INT_64: i32 = 18;
 
 /// Result of schema inference.  Free with `freeInferredSchema`.
 pub const InferredSchema = struct {
@@ -132,8 +137,8 @@ fn inferColumn(name: []const u8, parquet_idx: usize, pt: i32, ct: ?i32) schema.C
     const col_type: schema.ColumnType = blk: {
         if (pt == PT_INT32) {
             if (ct) |c| switch (c) {
-                CT_DATE => break :blk .date,
-                CT_INT_8, CT_INT_16 => break :blk .int16,
+                CT_DATE, CT_UINT_16 => break :blk .date,
+                CT_INT_8, CT_INT_16, CT_UINT_8 => break :blk .int16,
                 CT_INT_32 => break :blk .int32,
                 else => {},
             };
@@ -169,6 +174,99 @@ fn inferColumn(name: []const u8, parquet_idx: usize, pt: i32, ct: ?i32) schema.C
             else => .fixed_eager,
         },
         .physical = physical,
+    };
+}
+
+// ── Schema loading from columns.txt ──────────────────────────────────────────
+
+/// Parse a ColumnType from a string as written by ColumnBinWriter / generic_store.
+/// Returns null for unrecognised type strings.
+fn parseColType(s: []const u8) ?schema.ColumnType {
+    if (std.mem.eql(u8, s, "int8"))      return .int8;
+    if (std.mem.eql(u8, s, "int16"))     return .int16;
+    if (std.mem.eql(u8, s, "int32"))     return .int32;
+    if (std.mem.eql(u8, s, "int64"))     return .int64;
+    if (std.mem.eql(u8, s, "date"))      return .date;
+    if (std.mem.eql(u8, s, "timestamp")) return .timestamp;
+    if (std.mem.eql(u8, s, "float32"))   return .float32;
+    if (std.mem.eql(u8, s, "float64"))   return .float64;
+    if (std.mem.eql(u8, s, "text"))      return .text;
+    if (std.mem.eql(u8, s, "char"))      return .char;
+    if (std.mem.eql(u8, s, "low_card"))  return .low_card;
+    return null;
+}
+
+/// Load a schema.Table from a `columns.txt` file produced by the generic store.
+/// Format: one `<name>\t<type>\n` line per column.
+/// Returns an InferredSchema; caller frees with `result.deinit()`.
+pub fn loadSchemaFromColumnsTxt(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    columns_txt_path: []const u8,
+    table_name: []const u8,
+) !InferredSchema {
+    var file = if (std.fs.path.isAbsolute(columns_txt_path))
+        try std.Io.Dir.openFileAbsolute(io, columns_txt_path, .{})
+    else
+        try std.Io.Dir.cwd().openFile(io, columns_txt_path, .{});
+    defer file.close(io);
+    const stat = try file.stat(io);
+    const buf = try allocator.alloc(u8, stat.size);
+    defer allocator.free(buf);
+    _ = try file.readPositionalAll(io, buf, 0);
+
+    // Count lines to pre-allocate.
+    var line_count: usize = 0;
+    var it = std.mem.splitScalar(u8, buf, '\n');
+    while (it.next()) |line| {
+        if (line.len > 0) line_count += 1;
+    }
+
+    const columns = try allocator.alloc(schema.Column, line_count);
+    errdefer allocator.free(columns);
+    const names = try allocator.alloc([]u8, line_count);
+    errdefer allocator.free(names);
+    var n_init: usize = 0;
+    errdefer for (names[0..n_init]) |nm| allocator.free(nm);
+
+    var ci: usize = 0;
+    var it2 = std.mem.splitScalar(u8, buf, '\n');
+    while (it2.next()) |line| {
+        if (line.len == 0) continue;
+        const tab = std.mem.indexOfScalar(u8, line, '\t') orelse continue;
+        const col_name = line[0..tab];
+        const type_str = std.mem.trimEnd(u8, line[tab + 1 ..], "\r \n");
+        const col_type = parseColType(type_str) orelse .text;
+
+        const name_copy = try allocator.dupe(u8, col_name);
+        names[n_init] = name_copy;
+        n_init += 1;
+
+        const physical: schema.PhysicalColumn = switch (col_type) {
+            .text, .char => .{ .lazy_text = .{ .source_column = name_copy } },
+            else => .{ .fixed = .{ .path_name = name_copy, .ty = col_type } },
+        };
+        columns[ci] = .{
+            .name = name_copy,
+            .ty = col_type,
+            .storage = switch (col_type) {
+                .text, .char => .lazy_source,
+                else => .fixed_eager,
+            },
+            .physical = physical,
+        };
+        ci += 1;
+    }
+
+    // Trim to actual count (in case of blank lines).
+    const final_columns = columns[0..ci];
+    const final_names   = names[0..n_init];
+
+    return .{
+        .table     = .{ .name = table_name, .columns = final_columns },
+        .allocator = allocator,
+        .columns   = columns,
+        .names     = final_names,
     };
 }
 

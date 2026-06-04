@@ -338,11 +338,12 @@ fn runCommand(init: std.process.Init, allocator: std.mem.Allocator, args: *std.p
         const queries_path_ir = args.next() orelse return error.MissingQueriesPath;
         const bench_range_ir: QueryRange = .{};
 
-        // Resolve table schema from clickbench schema.
-        const table: schema.Table = blk: {
-            if (std.mem.eql(u8, table_name, "hits")) break :blk clickbench_schema.hits;
-            return error.UnknownTableName;
-        };
+        // Resolve table schema from the store's columns.txt so byte widths match.
+        const columns_txt = try std.fmt.allocPrint(allocator, "{s}/{s}/parts/all_1_1_0/columns.txt", .{ store_dir, table_name });
+        defer allocator.free(columns_txt);
+        var inferred_schema = try schema_infer.loadSchemaFromColumnsTxt(allocator, init.io, columns_txt, table_name);
+        defer inferred_schema.deinit();
+        const table: schema.Table = inferred_schema.table;
 
         const part_dir = try std.fmt.allocPrint(allocator, "{s}/{s}/parts/all_1_1_0", .{ store_dir, table_name });
         defer allocator.free(part_dir);
@@ -428,6 +429,49 @@ fn runCommand(init: std.process.Init, allocator: std.mem.Allocator, args: *std.p
             .bridge   = &shared_bridge,
         };
         try duckdb.benchWithRunner(allocator, init.io, queries_path_ir, bench_range_ir, &runner);
+    } else if (std.mem.eql(u8, command, "ir-query")) {
+        // Run a single SQL query through the IR pipeline and emit CSV to stdout.
+        // Usage: zighouse ir-query <store_dir> <table_name> <sql>
+        const ir_planner2 = @import("ir_planner");
+        const core2 = @import("core");
+        const gsb2 = @import("core/source/generic_store_bridge.zig");
+        const serializer = @import("serializer");
+
+        const store_dir2   = args.next() orelse return error.MissingStoreDir;
+        const table_name2  = args.next() orelse return error.MissingTableName;
+        const query_text2  = args.next() orelse return error.MissingQuery;
+
+        const columns_txt2 = try std.fmt.allocPrint(allocator, "{s}/{s}/parts/all_1_1_0/columns.txt", .{ store_dir2, table_name2 });
+        defer allocator.free(columns_txt2);
+        var inferred_schema2 = try schema_infer.loadSchemaFromColumnsTxt(allocator, init.io, columns_txt2, table_name2);
+        defer inferred_schema2.deinit();
+        const table2: schema.Table = inferred_schema2.table;
+
+        const part_dir2 = try std.fmt.allocPrint(allocator, "{s}/{s}/parts/all_1_1_0", .{ store_dir2, table_name2 });
+        defer allocator.free(part_dir2);
+
+        // Parse SQL.
+        const gplan2 = (try generic_sql.parse(allocator, query_text2)) orelse return error.ParseFailed;
+        defer generic_sql.deinit(allocator, gplan2);
+
+        // Plan to IR.
+        var arena2 = std.heap.ArenaAllocator.init(allocator);
+        defer arena2.deinit();
+        var pctx2 = ir_planner2.PlannerCtx.init(arena2.allocator(), table2);
+        const node2 = (try ir_planner2.plan_query(&pctx2, gplan2)) orelse return error.PlanFailed;
+
+        const pruned2 = ir_planner2.findPrunedCols(node2);
+        var bridge2 = try gsb2.GenericStoreBridge.init(allocator, init.io, part_dir2, table2, pruned2);
+        defer bridge2.deinit();
+
+        var qctx2 = core2.exec.pipeline.QueryContext.init(allocator, bridge2.source());
+        defer qctx2.deinit();
+        var rs2 = try core2.exec.pipeline.executePlan(node2, &qctx2);
+        defer rs2.deinit();
+
+        const csv2 = try serializer.toCsv(allocator, rs2);
+        defer allocator.free(csv2);
+        try writeOut(init.io, csv2);
     } else if (std.mem.eql(u8, command, "serve")) {
         // HTTP RowBinary ingest + query server.
         // Usage: zighouse serve --data-dir=<dir> [--schemas=<schemas.json>] [--port=<port>]

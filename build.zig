@@ -826,9 +826,9 @@ pub fn build(b: *std.Build) void {
     part_scan_bridge_mod.link_libc = true;
     lz4ctx.link(part_scan_bridge_mod);
 
-    exe.root_module.addImport("ir_planner", ir_planner_mod);
-    exe.root_module.addImport("core",       core_mod);
-    exe.root_module.addImport("parallel",   parallel_mod);
+     exe.root_module.addImport("ir_planner", ir_planner_mod);
+     exe.root_module.addImport("core",       core_mod);
+     exe.root_module.addImport("parallel",   parallel_mod);
 
     // ── serializer module (ResultSet → Native block) ─────────────────────────
     const serializer_mod = b.createModule(.{
@@ -854,6 +854,8 @@ pub fn build(b: *std.Build) void {
     ingest_server_mod.addImport("serializer", serializer_mod);
     ingest_server_mod.addImport("ir_planner", ir_planner_mod);
     ingest_server_mod.addImport("part_scan_bridge", part_scan_bridge_mod);
+
+    exe.root_module.addImport("serializer", serializer_mod);
 
     // Wire query engine into compactor (for MV apply)
     compactor_mod.addImport("generic_sql", generic_sql_mod);

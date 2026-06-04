@@ -1412,6 +1412,7 @@ pub fn updateAccum(accum: *AggAccum, v: ?Value, arena: std.mem.Allocator) !void 
         .i64_sum   => if (v) |val| { if (val.toI64()) |i| accum.i64_sum +%= i; },
         .u64_sum   => if (v) |val| { if (val.toU64()) |u| accum.u64_sum +%= u; },
         .f64_sum   => if (v) |val| { if (val.toF64()) |f| accum.f64_sum += f; },
+        .f64_avg   => if (v) |val| { if (val.toF64()) |f| { accum.f64_avg.sum += f; accum.f64_avg.count += 1; } },
         .i64_min   => if (v) |val| { if (val.toI64()) |i| { if (i < accum.i64_min) accum.i64_min = i; } },
         .i64_max   => if (v) |val| { if (val.toI64()) |i| { if (i > accum.i64_max) accum.i64_max = i; } },
         .u64_min   => if (v) |val| { if (val.toU64()) |u| { if (u < accum.u64_min) accum.u64_min = u; } },
@@ -1434,6 +1435,20 @@ pub fn updateAccum(accum: *AggAccum, v: ?Value, arena: std.mem.Allocator) !void 
             try accum.uniq_strs.put(arena, owned, {});
         }},
         .any_val   => if (accum.any_val == null) { accum.any_val = v; },
+        .distinct_u64 => if (v) |val| {
+            // Hash the value to a u64 key for distinct tracking.
+            // For numeric types, use the raw bits; for strings, use Wyhash.
+            // IMPORTANT: use c_allocator (not the arena) so that the hashmap
+            // backing storage outlives any arena deinit in the parallel path.
+            const key: u64 = switch (val) {
+                .int64   => |i| @bitCast(i),
+                .uint64  => |u| u,
+                .float64 => |f| @bitCast(f),
+                .string  => |s| std.hash.Wyhash.hash(0, s),
+                else     => 0,
+            };
+            try accum.distinct_u64.put(std.heap.c_allocator, key, {});
+        },
     }
 }
 

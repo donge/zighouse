@@ -234,6 +234,8 @@ pub const AggAccum = union(enum) {
     i64_sum:   i64,
     u64_sum:   u64,
     f64_sum:   f64,
+    /// avg accumulator: tracks both sum and count for correct AVG finalization
+    f64_avg:   struct { sum: f64, count: u64 },
     /// count(*) / count(col)
     count:     u64,
     /// min / max — track current extremum
@@ -247,6 +249,8 @@ pub const AggAccum = union(enum) {
     str_max:   ?[]const u8,
     /// groupUniqArray — collect unique strings
     uniq_strs: std.StringHashMapUnmanaged(void),
+    /// count(distinct col) — track unique values via u64 hash set
+    distinct_u64: std.AutoHashMapUnmanaged(u64, void),
     /// any() — first non-null value seen
     any_val: ?Value,
 
@@ -257,6 +261,7 @@ pub const AggAccum = union(enum) {
             .i64_sum   => |v| .{ .int64   = v },
             .u64_sum   => |v| .{ .uint64  = v },
             .f64_sum   => |v| .{ .float64 = v },
+            .f64_avg   => |v| .{ .float64 = if (v.count > 0) v.sum / @as(f64, @floatFromInt(v.count)) else 0.0 },
             .count     => |v| .{ .uint64  = v },
             .i64_min   => |v| .{ .int64   = v },
             .i64_max   => |v| .{ .int64   = v },
@@ -267,6 +272,7 @@ pub const AggAccum = union(enum) {
             .str_min   => |v| .{ .string  = v orelse "" },
             .str_max   => |v| .{ .string  = v orelse "" },
             .uniq_strs => return error.UseToArrayValue,
+            .distinct_u64 => |m| .{ .uint64 = m.count() },
             .any_val   => |v| if (v) |val| blk: {
                 // If the stored value is an array, direct callers to toArrayValue.
                 if (val == .array_string) return error.UseToArrayValue;

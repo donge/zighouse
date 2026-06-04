@@ -1520,6 +1520,7 @@ fn executeScalarAggChunked(
     for (aggs, 0..) |item, ci| {
         metas[ci]   = .{ .name = item.alias, .col_type = item.out_type };
         out_row[ci] = try finalizeAccum(accums[ci], item, alloc);
+        deinitAccum(&accums[ci]);
     }
     var rl = RowList.init(metas);
     try rl.append(alloc, out_row);
@@ -1559,9 +1560,15 @@ fn executeScalarAggParallel(
 
     // Allocate per-thread accumulators (shared by both fast and normal paths).
     const thread_accums = try alloc.alloc([]AggAccum, n_threads);
+    const rows_per_thread: u32 = @intCast(@min(total_rows / n_threads + 1, 2_000_000));
     for (thread_accums) |*ta| {
         ta.* = try alloc.alloc(AggAccum, aggs.len);
-        for (aggs, 0..) |item, ci| ta.*[ci] = initAccumForAgg(item.expr);
+        for (aggs, 0..) |item, ci| {
+            ta.*[ci] = initAccumForAgg(item.expr);
+            // Pre-allocate distinct_u64 hashmap to avoid repeated resizes.
+            if (ta.*[ci] == .distinct_u64)
+                try ta.*[ci].distinct_u64.ensureTotalCapacity(std.heap.c_allocator, rows_per_thread);
+        }
     }
 
     // ── Raw-byte LIKE count fast path ─────────────────────────────────────────
@@ -1814,6 +1821,7 @@ fn executeScalarAggParallel(
     for (aggs, 0..) |item, ci| {
         metas[ci]   = .{ .name = item.alias, .col_type = item.out_type };
         out_row[ci] = try finalizeAccum(merged[ci], item, alloc);
+        deinitAccum(&merged[ci]);
     }
     var rl = RowList.init(metas);
     try rl.append(alloc, out_row);
@@ -1829,6 +1837,7 @@ fn mergeAccum(dst: *AggAccum, src: AggAccum, item: plan.ProjectItem, alloc: std.
         .i64_sum   => dst.i64_sum   +%= src.i64_sum,
         .u64_sum   => dst.u64_sum   +%= src.u64_sum,
         .f64_sum   => dst.f64_sum   += src.f64_sum,
+        .f64_avg   => { dst.f64_avg.sum += src.f64_avg.sum; dst.f64_avg.count += src.f64_avg.count; },
         .i64_min   => dst.i64_min   = @min(dst.i64_min, src.i64_min),
         .i64_max   => dst.i64_max   = @max(dst.i64_max, src.i64_max),
         .u64_min   => dst.u64_min   = @min(dst.u64_min, src.u64_min),
@@ -1854,6 +1863,10 @@ fn mergeAccum(dst: *AggAccum, src: AggAccum, item: plan.ProjectItem, alloc: std.
         },
         // For uniq_strs (count_distinct), parallel merge is complex; skip.
         .uniq_strs => {},
+        .distinct_u64 => {
+            var it = src.distinct_u64.keyIterator();
+            while (it.next()) |k| try dst.distinct_u64.put(std.heap.c_allocator, k.*, {});
+        },
     }
 }
 /// a necessary (but not sufficient) condition for the int-key fast path.
@@ -3043,10 +3056,40 @@ fn updateAccumsFromChunk(
                             switch (arg) {
                                 .col_ref => |cr| {
                                     const col = c.columns[cr.index];
-                                    for (0..c.num_rows) |r| {
-                                        if (!chunk.isNull(col.null_mask, r)) acc_ptr.count += 1;
+                                    if (acc_ptr.* == .distinct_u64) {
+                                        // Fast path for COUNT(DISTINCT col): insert raw values.
+                                        switch (col.data) {
+                                            .int64 => |vals| {
+                                                for (0..c.num_rows) |r| {
+                                                    if (!chunk.isNull(col.null_mask, r))
+                                                        try acc_ptr.distinct_u64.put(std.heap.c_allocator, @as(u64, @bitCast(vals[r])), {});
+                                                }
+                                                handled = true;
+                                            },
+                                            .uint64 => |vals| {
+                                                for (0..c.num_rows) |r| {
+                                                    if (!chunk.isNull(col.null_mask, r))
+                                                        try acc_ptr.distinct_u64.put(std.heap.c_allocator, vals[r], {});
+                                                }
+                                                handled = true;
+                                            },
+                                            .string => |vals| {
+                                                for (0..c.num_rows) |r| {
+                                                    if (!chunk.isNull(col.null_mask, r)) {
+                                                        const h = std.hash.Wyhash.hash(0, vals[r]);
+                                                        try acc_ptr.distinct_u64.put(std.heap.c_allocator, h, {});
+                                                    }
+                                                }
+                                                handled = true;
+                                            },
+                                            else => {},
+                                        }
+                                    } else {
+                                        for (0..c.num_rows) |r| {
+                                            if (!chunk.isNull(col.null_mask, r)) acc_ptr.count += 1;
+                                        }
+                                        handled = true;
                                     }
-                                    handled = true;
                                 },
                                 else => {},
                             }
@@ -3115,41 +3158,57 @@ fn updateAccumsFromChunk(
                          }
                     },
                     .avg => {
-                        // AVG accumulates into f64_sum (finalization divides by count elsewhere).
+                        // AVG accumulates into f64_avg (sum + count for correct finalization).
                         if (ac.arg) |arg| {
                             if (arg == .col_ref) {
                                 const col = c.columns[arg.col_ref.index];
                                 switch (col.data) {
                                     .int64 => |vals| {
-                                        if (acc_ptr.* == .f64_sum) {
+                                        if (acc_ptr.* == .f64_avg) {
                                             if (chunk.allNonNull(col.null_mask)) {
                                                 // Fast path: no nulls — sum as i64 then cast once.
-                                                acc_ptr.f64_sum += @floatFromInt(simd.sumI64(vals[0..c.num_rows]));
+                                                acc_ptr.f64_avg.sum += @floatFromInt(simd.sumI64(vals[0..c.num_rows]));
+                                                acc_ptr.f64_avg.count += c.num_rows;
                                             } else {
                                                 for (0..c.num_rows) |r| {
-                                                    if (!chunk.isNull(col.null_mask, r))
-                                                        acc_ptr.f64_sum += @floatFromInt(vals[r]);
+                                                    if (!chunk.isNull(col.null_mask, r)) {
+                                                        acc_ptr.f64_avg.sum += @floatFromInt(vals[r]);
+                                                        acc_ptr.f64_avg.count += 1;
+                                                    }
                                                 }
                                             }
                                             handled = true;
                                         }
                                     },
                                     .uint64 => |vals| {
-                                        if (acc_ptr.* == .f64_sum) {
+                                        if (acc_ptr.* == .f64_avg) {
                                             if (chunk.allNonNull(col.null_mask)) {
-                                                acc_ptr.f64_sum += @floatFromInt(@as(u64, @bitCast(simd.sumU64(vals[0..c.num_rows]))));
+                                                acc_ptr.f64_avg.sum += @floatFromInt(@as(u64, @bitCast(simd.sumU64(vals[0..c.num_rows]))));
+                                                acc_ptr.f64_avg.count += c.num_rows;
                                             } else {
                                                 for (0..c.num_rows) |r| {
-                                                    if (!chunk.isNull(col.null_mask, r))
-                                                        acc_ptr.f64_sum += @floatFromInt(vals[r]);
+                                                    if (!chunk.isNull(col.null_mask, r)) {
+                                                        acc_ptr.f64_avg.sum += @floatFromInt(vals[r]);
+                                                        acc_ptr.f64_avg.count += 1;
+                                                    }
                                                 }
                                             }
                                             handled = true;
                                         }
                                     },
                                     .float64 => |vals| {
-                                        if (acc_ptr.* == .f64_sum) {
-                                            acc_ptr.f64_sum += simd.sumF64(vals[0..c.num_rows]);
+                                        if (acc_ptr.* == .f64_avg) {
+                                            if (chunk.allNonNull(col.null_mask)) {
+                                                acc_ptr.f64_avg.sum += simd.sumF64(vals[0..c.num_rows]);
+                                                acc_ptr.f64_avg.count += c.num_rows;
+                                            } else {
+                                                for (0..c.num_rows) |r| {
+                                                    if (!chunk.isNull(col.null_mask, r)) {
+                                                        acc_ptr.f64_avg.sum += vals[r];
+                                                        acc_ptr.f64_avg.count += 1;
+                                                    }
+                                                }
+                                            }
                                             handled = true;
                                         }
                                     },
@@ -4482,12 +4541,22 @@ fn finalizeAccum(acc: AggAccum, item: plan.ProjectItem, alloc: std.mem.Allocator
     return acc.toValue() catch (try acc.toArrayValue(alloc));
 }
 
+/// Free any heap resources owned by an accumulator.
+/// Call after finalizeAccum when the accumulator is no longer needed.
+fn deinitAccum(acc: *AggAccum) void {
+    switch (acc.*) {
+        .distinct_u64 => |*m| m.deinit(std.heap.c_allocator),
+        else => {},
+    }
+}
+
 fn initAccumForAgg(expr: plan.Expr) AggAccum {
     return switch (expr) {
         .agg_call => |ac| switch (ac.kind) {
-            .count_star, .count => .{ .count = 0 },
+            .count_star => .{ .count = 0 },
+            .count => if (ac.distinct) .{ .distinct_u64 = .{} } else .{ .count = 0 },
             .sum  => .{ .i64_sum = 0 },
-            .avg  => .{ .f64_sum = 0.0 },
+            .avg  => .{ .f64_avg = .{ .sum = 0.0, .count = 0 } },
             .min  => .{ .i64_min = std.math.maxInt(i64) },
             .max  => .{ .i64_max = std.math.minInt(i64) },
             .group_uniq_array => .{ .uniq_strs = .{} },
