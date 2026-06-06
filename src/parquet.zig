@@ -1480,27 +1480,28 @@ fn decodePlainFixedDict(allocator: std.mem.Allocator, payload: []const u8, raw_c
 /// dict-index bit_width byte starts.
 ///
 /// Parquet DATA_PAGE (v1) payload layout:
-///   [4-byte rep-level byte count][rep-level RLE/BP data]   (OPTIONAL/REPEATED only)
-///   [4-byte def-level byte count][def-level RLE/BP data]   (OPTIONAL/REPEATED only)
+///   [4-byte rep-level byte count][rep-level RLE/BP data]   (REPEATED only)
+///   [4-byte def-level byte count][def-level RLE/BP data]   (OPTIONAL or REPEATED)
 ///   [1-byte bit_width][dict-index RLE/BP data]
 ///
 /// For REQUIRED columns (is_optional=false) both level sections are absent and
 /// the payload starts directly with the bit_width byte.  We must NOT apply the
 /// heuristic in that case because the bit_width byte can be misread as a valid
 /// section_len.
+///
+/// For OPTIONAL (non-REPEATED) columns — which is the only case in flat columnar
+/// schemas like ClickBench — there is exactly ONE level section (definition levels).
+/// Skip exactly 1 section; skipping 2 would misread dict-index data as a section.
 fn dictIdsStart(payload: []const u8, is_optional: bool) usize {
     if (!is_optional) return 0;
     var pos: usize = 0;
-    // Skip up to two level sections (rep then def).
-    var sections: usize = 0;
-    while (sections < 2 and pos + 4 <= payload.len) : (sections += 1) {
+    // Skip exactly one level section (definition levels for OPTIONAL columns).
+    if (pos + 4 <= payload.len) {
         const section_len = std.mem.readInt(u32, payload[pos..][0..4], .little);
         // Sanity: section_len must leave room for bit_width byte after it.
-        if (section_len + 4 + 1 > payload.len - pos) break;
-        // Sanity: bit_width candidate after this section must be <= 32.
-        const candidate_bw = payload[pos + 4 + @as(usize, section_len)];
-        if (candidate_bw > 32) break;
-        pos += 4 + @as(usize, section_len);
+        if (section_len + 4 + 1 <= payload.len - pos) {
+            pos += 4 + @as(usize, section_len);
+        }
     }
     return pos;
 }

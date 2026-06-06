@@ -1,6 +1,3 @@
-/// Re-export so consumers that import schema as a named module can access
-/// the ClickBench hits schema without a separate @import.
-pub const clickbench = @import("clickbench/schema.zig");
 
 pub const ColumnType = enum {
     int8,
@@ -335,34 +332,4 @@ test "capabilityTag derives from physical/ty" {
     try std.testing.expectEqual(CapabilityTag.derived, capabilityTag(derived_col));
 }
 
-test "capabilityTag covers ClickBench hits 105 columns without panic" {
-    const std = @import("std");
-    const hits_schema = clickbench;
 
-    var counts = [_]usize{0} ** @typeInfo(CapabilityTag).@"enum".fields.len;
-
-    for (hits_schema.hits.columns) |col| {
-        const tag = capabilityTag(col);
-        counts[@intFromEnum(tag)] += 1;
-    }
-
-    // Sanity: total columns processed equals hits column count.
-    var total: usize = 0;
-    for (counts) |c| total += c;
-    try std.testing.expectEqual(hits_schema.hits.columns.len, total);
-
-    // Distribution sanity (per Explore C report, updated PR-A4):
-    //   fixed_*: ~77, lowcard_text: 4 (SearchPhrase, MobilePhoneModel, URL,
-    //     Title — URL/Title now lowcard_text with hash_sidecar capability),
-    //   hash_text: 0 (no pure hash-only columns left), lazy_text: 1 (Referer),
-    //   derived: 0
-    // We assert non-zero counts on expected non-empty buckets.
-    const fixed_total = counts[@intFromEnum(CapabilityTag.fixed_i16)] +
-        counts[@intFromEnum(CapabilityTag.fixed_i32)] +
-        counts[@intFromEnum(CapabilityTag.fixed_i64)] +
-        counts[@intFromEnum(CapabilityTag.fixed_date)] +
-        counts[@intFromEnum(CapabilityTag.fixed_timestamp)];
-    try std.testing.expect(fixed_total > 0);
-    try std.testing.expect(counts[@intFromEnum(CapabilityTag.lowcard_text)] >= 4);
-    try std.testing.expect(counts[@intFromEnum(CapabilityTag.lazy_text)] >= 1);
-}

@@ -814,7 +814,7 @@ pub const StrAggHashTable = struct {
         return p;
     }
 
-    fn hashStr(s: []const u8) u64 {
+    pub fn hashStr(s: []const u8) u64 {
         return std.hash.Wyhash.hash(0, s) | (1 << 63);
     }
 
@@ -977,7 +977,7 @@ pub const StrAggHashTable = struct {
             for (kinds, 0..) |kind, ci| {
                 const src = other.vals_flat[src_vb + ci];
                 switch (kind) {
-                    .count, .i64_sum, .u64_sum => res.vals[ci] += src,
+                    .count, .i64_sum, .u64_sum, .count_distinct_u64 => res.vals[ci] += src,
                     .f64_sum, .f64_str_len_sum => {
                         const a: f64 = @bitCast(res.vals[ci]);
                         const b: f64 = @bitCast(src);
@@ -1045,6 +1045,11 @@ pub const CompactAggKind = enum {
     str_min,
     /// String max: same as str_min but uses max comparison.
     str_max,
+    /// COUNT(DISTINCT int_col): slot stores the running distinct count (u64).
+    /// Deduplication is handled by a global flat pair-set in the caller;
+    /// merge ops treat this identically to .count (summing counts is correct
+    /// only in the sequential path where the pair-set guarantees uniqueness).
+    count_distinct_u64,
 };
 
 /// Like IntKeyHashTable but stores accumulators as raw u64 (8B) instead of
@@ -1286,7 +1291,7 @@ pub const CompactIntKeyHashTable = struct {
             for (kinds, 0..) |kind, ci| {
                 const src = local_vals[ci];
                 switch (kind) {
-                    .count, .u64_sum => master_vals[ci] += src,
+                    .count, .u64_sum, .count_distinct_u64 => master_vals[ci] += src,
                     .i64_sum => {
                         const a: i64 = @bitCast(master_vals[ci]);
                         const b: i64 = @bitCast(src);
@@ -1350,7 +1355,7 @@ pub const CompactIntKeyHashTable = struct {
             for (kinds, 0..) |kind, ci| {
                 const src = local_vals[ci];
                 switch (kind) {
-                    .count, .u64_sum => master_vals[ci] += src,
+                    .count, .u64_sum, .count_distinct_u64 => master_vals[ci] += src,
                     .i64_sum => {
                         const a: i64 = @bitCast(master_vals[ci]);
                         const b: i64 = @bitCast(src);

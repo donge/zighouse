@@ -68,7 +68,7 @@ fi
 
 for i in $(seq 1 "$BENCH_REPEATS"); do
   "${TIME_CMD[@]}" sh -c "env ZIGHOUSE_CLICKBENCH_SUBMIT=1 ZIGHOUSE_QUERY_PATH='$QUERY_PATH' \
-    '$ZIGHOUSE' bench-ir '$STORE_DIR' hits clickbench-submit/zighouse/queries.sql 2>/dev/null" \
+    '$ZIGHOUSE' bench '$STORE_DIR' hits clickbench-submit/zighouse/queries.sql 2>/dev/null" \
     > "$TMP_BENCH/bench-${i}.log" 2>&1
 done
 

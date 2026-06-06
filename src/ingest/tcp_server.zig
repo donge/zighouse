@@ -13,7 +13,9 @@ const part_writer_session = @import("part_writer_session");
 const ddl_parser = @import("ddl_parser");
 const schema_persist = @import("schema_persist");
 const generic_sql = @import("generic_sql");
-const generic_executor = @import("generic_executor");
+const ir_planner = @import("ir_planner");
+const core = @import("core");
+const part_scan_bridge = @import("part_scan_bridge");
 const serializer = @import("serializer");
 const part_scanner = @import("part_scanner");
 
@@ -1002,8 +1004,7 @@ fn handleSelect(ctx: *ServerCtx, a: std.mem.Allocator, w: *Io.Writer, sql: []con
         return;
     }
 
-    // ── Default: execute against real table data ──────────────────────────
-    generic_executor.udf_registry = null;
+    // ── Default: execute against real table data via IR pipeline ─────────────
     const plan_opt = try generic_sql.parse(a, sql);
     if (plan_opt == null) {
         // parse failed — try DuckDB direct execution for computed queries
@@ -1033,44 +1034,59 @@ fn handleSelect(ctx: *ServerCtx, a: std.mem.Allocator, w: *Io.Writer, sql: []con
     const plan = plan_opt.?;
     defer generic_sql.deinit(a, plan);
 
-    // ── Subquery: SELECT … FROM (SELECT …) ───────────────────────────────
-    if (plan.subquery_source) |inner_plan| {
-        const inner_db_table = splitDbTable(inner_plan.table);
-        const inner_entry_opt = ctx.schemas.find(inner_db_table.db, inner_db_table.table);
-        const fake_inner_table = schema.Table{ .name = "", .columns = &.{} };
-        const inner_table: *const schema.Table = if (inner_entry_opt) |e| &e.table else &fake_inner_table;
+    // ── Subquery / UNION ALL: not yet supported — return empty result ─────────
+    if (plan.subquery_source != null or plan.union_other != null) {
+        var block_buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer block_buf.deinit(a);
+        try writeBlockInfo(&block_buf, a); try wuv(&block_buf, a, 0); try wuv(&block_buf, a, 0);
+        try sendData(a, w, block_buf.items); try sendProfileInfo(a, w); try sendEos(w);
+        return;
+    }
 
-        var inner_parts = try part_scanner.scan(a, ctx.io, ctx.data_dir, inner_db_table.db, inner_db_table.table);
-        defer inner_parts.deinit();
+    const db_table = splitDbTable(plan.table);
+    const entry_opt = ctx.schemas.find(db_table.db, db_table.table);
+    const table: *const schema.Table = if (entry_opt) |e| &e.table else
+        return sendEmptyBlock(a, w);
 
-        const inner_csv = generic_executor.runWithSource(
-            a, ctx.io, inner_plan.*,
-            .{ .ch_parts = if (inner_entry_opt != null) inner_parts.dirs() else &.{} },
-            inner_table,
+    var parts = try part_scanner.scan(a, ctx.io, ctx.data_dir, db_table.db, db_table.table);
+    defer parts.deinit();
+
+    // ── IR execution path ─────────────────────────────────────────────────────
+    const ir_result = ir_exec: {
+        var arena = std.heap.ArenaAllocator.init(a);
+        errdefer arena.deinit();
+        var pctx = ir_planner.PlannerCtx.init(arena.allocator(), table.*);
+        const node = ir_planner.plan_query(&pctx, plan) catch |err| {
+            std.log.warn("tcp ir_planner error: {}", .{err});
+            arena.deinit();
+            break :ir_exec null;
+        };
+        if (node == null) {
+            arena.deinit();
+            break :ir_exec null;
+        }
+        const pruned_cols = ir_planner.findPrunedCols(node.?);
+        var bridge = part_scan_bridge.PartScanBridge.init(
+            a, ctx.io, table.*, parts.dirs(), pruned_cols,
         ) catch |err| {
-            std.log.warn("tcp subquery inner executor error: {}", .{err});
-            var block_buf: std.ArrayListUnmanaged(u8) = .empty;
-            defer block_buf.deinit(a);
-            try writeBlockInfo(&block_buf, a); try wuv(&block_buf, a, 0); try wuv(&block_buf, a, 0);
-            try sendData(a, w, block_buf.items); try sendProfileInfo(a, w); try sendEos(w);
-            return;
+            std.log.warn("tcp part_scan_bridge error: {}", .{err});
+            arena.deinit();
+            break :ir_exec null;
         };
-        defer a.free(inner_csv);
-
-        const outer_result = generic_executor.runOverCsv(a, plan, inner_csv, inner_table) catch |err| {
-            std.log.warn("tcp subquery outer executor error: {}", .{err});
-            var block_buf: std.ArrayListUnmanaged(u8) = .empty;
-            defer block_buf.deinit(a);
-            try writeBlockInfo(&block_buf, a); try wuv(&block_buf, a, 0); try wuv(&block_buf, a, 0);
-            try sendData(a, w, block_buf.items); try sendProfileInfo(a, w); try sendEos(w);
-            return;
+        defer bridge.deinit();
+        var qctx = core.exec.pipeline.QueryContext.init(a, bridge.source());
+        defer qctx.deinit();
+        const rs = core.exec.pipeline.executePlan(node.?, &qctx) catch |err| {
+            std.log.warn("tcp pipeline error: {}", .{err});
+            arena.deinit();
+            break :ir_exec null;
         };
-        defer a.free(outer_result);
+        arena.deinit();
+        break :ir_exec rs;
+    };
 
-        // Use null schema for outer result so that heuristic type inference is used.
-        // The outer columns (e.g. `ts` alias from toUnixTimestamp) don't match the
-        // inner table's schema column names and types, leading to mismatches.
-        var rs = try serializer.csvToResultSet(a, outer_result, null);
+    if (ir_result) |rs_val| {
+        var rs = rs_val;
         defer rs.deinit();
         const nb = try serializer.toNativeBlock(a, rs);
         defer a.free(nb);
@@ -1080,36 +1096,16 @@ fn handleSelect(ctx: *ServerCtx, a: std.mem.Allocator, w: *Io.Writer, sql: []con
         return;
     }
 
-    const db_table = splitDbTable(plan.table);
-    const entry_opt = ctx.schemas.find(db_table.db, db_table.table);
-    const fake_table = schema.Table{ .name = "", .columns = &.{} };
-    const table: *const schema.Table = if (entry_opt) |e| &e.table else &fake_table;
+    // IR returned null — unsupported shape, return empty result.
+    try sendEmptyBlock(a, w);
+}
 
-    var parts = try part_scanner.scan(a, ctx.io, ctx.data_dir, db_table.db, db_table.table);
-    defer parts.deinit();
-
-    const csv_result = generic_executor.runWithSource(
-        a, ctx.io, plan,
-        .{ .ch_parts = if (entry_opt != null) parts.dirs() else &.{} },
-        table,
-    ) catch |err| {
-        std.log.warn("tcp_server: generic_executor error: {}", .{err});
-        var block_buf: std.ArrayListUnmanaged(u8) = .empty;
-        defer block_buf.deinit(a);
-        try writeBlockInfo(&block_buf, a);
-        try wuv(&block_buf, a, 0); try wuv(&block_buf, a, 0);
-        try sendData(a, w, block_buf.items);
-        try sendProfileInfo(a, w);
-        try sendEos(w);
-        return;
-    };
-    defer a.free(csv_result);
-
-    var rs = try serializer.csvToResultSet(a, csv_result, table);
-    defer rs.deinit();
-    const nb = try serializer.toNativeBlock(a, rs);
-    defer a.free(nb);
-    try sendData(a, w, nb);
+fn sendEmptyBlock(a: std.mem.Allocator, w: *Io.Writer) !void {
+    var block_buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer block_buf.deinit(a);
+    try writeBlockInfo(&block_buf, a);
+    try wuv(&block_buf, a, 0); try wuv(&block_buf, a, 0);
+    try sendData(a, w, block_buf.items);
     try sendProfileInfo(a, w);
     try sendEos(w);
 }

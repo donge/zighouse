@@ -40,7 +40,6 @@ const schema_persist = @import("schema_persist");
 const part_scanner = @import("part_scanner");
 const row_binary_decoder = @import("row_binary_decoder");
 const part_writer_session = @import("part_writer_session");
-const generic_executor = @import("generic_executor");
 const generic_sql = @import("generic_sql");
 const ddl_parser = @import("ddl_parser");
 const mv_parse = @import("mv_parse");
@@ -885,15 +884,15 @@ pub const Server = struct {
     }
 
     /// Try to execute `gplan` via the IR planner + pipeline.
-    /// Returns an owned native-block []u8 on success, or null if the plan
-    /// shape is not yet supported (caller should fall back to generic_executor).
+    /// Returns an owned ResultSet on success (caller must call rs.deinit()), or null
+    /// if the plan shape is not yet supported by the IR planner.
     fn tryIrExecute(
         self: *Server,
         gplan: generic_sql.Plan,
         table: *const schema.Table,
         part_dirs: []const []const u8,
         orig_sql: []const u8,
-    ) !?[]u8 {
+    ) !?serializer.ResultSet {
         // ── 1. Build PlannerCtx & translate ──────────────────────────────────
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         errdefer arena.deinit();
@@ -901,20 +900,17 @@ pub const Server = struct {
 
         var pctx = ir_planner.PlannerCtx.init(alloc, table.*);
         const node = ir_planner.plan_query(&pctx, gplan) catch |err| {
-            // Unexpected planner error — log and fall back.
             std.log.warn("ir_planner error: {}", .{err});
             arena.deinit();
             return null;
         };
         if (node == null) {
-            // plan_query returned null → unsupported shape, use fallback.
-            std.log.warn("IR fallback: {s}", .{orig_sql});
+            std.log.warn("IR unsupported: {s}", .{orig_sql});
             arena.deinit();
             return null;
         }
 
         // ── 2. Build SourceIface via PartScanBridge ───────────────────────────
-        // Extract pruned column list from the scan node (empty = read all).
         const pruned_cols: []const []const u8 = findPrunedCols(node.?);
         var bridge = part_scan_bridge.PartScanBridge.init(
             self.allocator, self.io, table.*, part_dirs, pruned_cols,
@@ -929,17 +925,13 @@ pub const Server = struct {
         var qctx = core.exec.pipeline.QueryContext.init(self.allocator, bridge.source());
         defer qctx.deinit();
 
-        var rs = core.exec.pipeline.executePlan(node.?, &qctx) catch |err| {
+        const rs = core.exec.pipeline.executePlan(node.?, &qctx) catch |err| {
             std.log.warn("pipeline executePlan error: {}", .{err});
             arena.deinit();
             return null;
         };
-        defer rs.deinit();
         arena.deinit(); // free planner IR allocations
-
-        // ── 4. Serialize ResultSet → native block ─────────────────────────────
-        const nb = try serializer.toNativeBlock(self.allocator, rs);
-        return nb;
+        return rs;      // caller owns ResultSet; must call rs.deinit()
     }
 
     /// DESCRIBE TABLE handler for body-SQL mode.
@@ -1014,9 +1006,6 @@ pub const Server = struct {
     }
 
     fn handleSelectNoDrainEx(self: *Server, request: *std.http.Server.Request, out: *std.Io.Writer, sql: []const u8, want_tsv: bool, skip_header: bool) !void {
-        // Make user-defined functions available to the executor.
-        generic_executor.udf_registry = &self.functions;
-
         // Detect and strip FORMAT JSON — switch to JSON output mode.
         const want_json = std.ascii.indexOfIgnoreCase(sql, "FORMAT JSON") != null or
             std.ascii.indexOfIgnoreCase(sql, "FORMAT JSONCompact") != null or
@@ -1161,89 +1150,26 @@ pub const Server = struct {
             }
         }
 
-        // Subquery: materialize inner, run outer, return result.
-        if (plan.subquery_source) |inner_plan| {
-            const inner_db_table = splitDbTable(inner_plan.table);
-            const inner_entry_opt = self.schemas.find(inner_db_table.db, inner_db_table.table);
-            // Create a fake table descriptor when the inner table is unknown (e.g. system.one, numbers(N)).
-            const fake_inner_table = schema.Table{ .name = "", .columns = &.{} };
-            const inner_table: *const schema.Table = if (inner_entry_opt) |e| &e.table else &fake_inner_table;
-            const inner_csv = if (inner_plan.union_other != null)
-                try self.runUnionAllCsv(inner_plan.*)
-            else blk: {
-                var inner_parts = try part_scanner.scan(self.allocator, self.io, self.config.data_dir, inner_db_table.db, inner_db_table.table);
-                defer inner_parts.deinit();
-                const inner_dirs: []const []const u8 = if (inner_entry_opt != null) inner_parts.dirs() else &.{};
-                break :blk try generic_executor.runWithSource(self.allocator, self.io, inner_plan.*, .{ .ch_parts = inner_dirs }, inner_table);
-            };
-            defer self.allocator.free(inner_csv);
-            // Expand SELECT * by reading the CSV header and rewriting projections.
-            const outer_plan = try expandStarPlan(self.allocator, plan, inner_csv);
-            defer if (outer_plan.projections.ptr != plan.projections.ptr) self.allocator.free(outer_plan.projections);
-            const result = try generic_executor.runOverCsv(self.allocator, outer_plan, inner_csv, inner_table);
-            defer self.allocator.free(result);
-             if (want_tsv) {
-                const tsv = try csvToTsv(self.allocator, result, skip_header);
-                defer self.allocator.free(tsv);
-                try sendResponse(request, out, .ok, tsv);
-                return;
-            }
-            var rs = try serializer.csvToResultSet(self.allocator, result, if (inner_entry_opt) |e| &e.table else null);
-            defer rs.deinit();
-            const nb = try serializer.toNativeBlock(self.allocator, rs);
-            defer self.allocator.free(nb);
-            try sendNativeBlock(self.allocator, request, out, nb);
+        // Subquery: not yet supported by IR pipeline — return empty result.
+        if (plan.subquery_source != null) {
+            if (want_tsv) try sendResponse(request, out, .ok, "")
+            else try self.sendEmptyNativeBlock(request, out);
             return;
         }
 
         const db_table = splitDbTable(plan.table);
 
-        // UNION ALL: run each branch, concatenate CSV, then run outer ORDER BY/LIMIT if any.
+        // UNION ALL: not yet supported by IR pipeline — return empty result.
         if (plan.union_other != null) {
-            const union_csv = try self.runUnionAllCsv(plan);
-            defer self.allocator.free(union_csv);
-            if (want_tsv) {
-                const tsv = try csvToTsv(self.allocator, union_csv, skip_header);
-                defer self.allocator.free(tsv);
-                try sendResponse(request, out, .ok, tsv);
-            } else {
-                var rs = try serializer.csvToResultSet(self.allocator, union_csv, null);
-                defer rs.deinit();
-                const nb = try serializer.toNativeBlock(self.allocator, rs);
-                defer self.allocator.free(nb);
-                try sendNativeBlock(self.allocator, request, out, nb);
-            }
+            if (want_tsv) try sendResponse(request, out, .ok, "")
+            else try self.sendEmptyNativeBlock(request, out);
             return;
         }
 
         const entry = self.schemas.find(db_table.db, db_table.table) orelse {
-            // Unknown table: synthesise a zero-row result.
-            const fake_table = schema.Table{ .name = "", .columns = &.{} };
-            if (generic_executor.runWithSource(
-                self.allocator, self.io,
-                plan,
-                .{ .ch_parts = &.{} },
-                &fake_table,
-            )            ) |fake_result| {
-                defer self.allocator.free(fake_result);
-                if (want_tsv) {
-                    const tsv = try csvToTsv(self.allocator, fake_result, skip_header);
-                    defer self.allocator.free(tsv);
-                    try sendResponse(request, out, .ok, tsv);
-                } else {
-                    var rs = try serializer.csvToResultSet(self.allocator, fake_result, null);
-                    defer rs.deinit();
-                    const nb = try serializer.toNativeBlock(self.allocator, rs);
-                    defer self.allocator.free(nb);
-                    try sendNativeBlock(self.allocator, request, out, nb);
-                }
-            } else |_| {
-                if (want_tsv) {
-                    try sendResponse(request, out, .ok, "");
-                } else {
-                    try self.sendEmptyNativeBlock(request, out);
-                }
-            }
+            // Unknown table — return empty result.
+            if (want_tsv) try sendResponse(request, out, .ok, "")
+            else try self.sendEmptyNativeBlock(request, out);
             return;
         };
 
@@ -1254,197 +1180,41 @@ pub const Server = struct {
         defer parts.deinit();
 
         if (parts.dirs().len == 0) {
-            if (generic_executor.runWithSource(
-                self.allocator, self.io,
-                plan,
-                .{ .ch_parts = &.{} },
-                &entry.table,
-            )) |empty_result| {
-                defer self.allocator.free(empty_result);
-                if (want_tsv) {
-                    const tsv = try csvToTsv(self.allocator, empty_result, skip_header);
-                    defer self.allocator.free(tsv);
-                    try sendResponse(request, out, .ok, tsv);
-                } else {
-                    var rs = try serializer.csvToResultSet(self.allocator, empty_result, &entry.table);
-                    defer rs.deinit();
-                    const nb = try serializer.toNativeBlock(self.allocator, rs);
-                    defer self.allocator.free(nb);
-                    try sendNativeBlock(self.allocator, request, out, nb);
-                }
-            } else |_| {
-                if (want_tsv) {
-                    try sendResponse(request, out, .ok, "");
-                } else {
-                    try self.sendEmptyNativeBlock(request, out);
-                }
-            }
+            if (want_tsv) try sendResponse(request, out, .ok, "")
+            else try self.sendEmptyNativeBlock(request, out);
             return;
         }
 
         // ── IR execution path ─────────────────────────────────────────────────
-        // Skip IR path for TSV output — fall through to generic_executor which
-        // produces CSV we can easily convert to TSV.
-        if (!want_tsv) {
-            if (try self.tryIrExecute(plan, &entry.table, parts.dirs(), sql_clean)) |nb| {
+        if (try self.tryIrExecute(plan, &entry.table, parts.dirs(), sql_clean)) |rs_owned| {
+            var rs = rs_owned;
+            defer rs.deinit();
+            if (want_json) {
+                const col_types_buf = try self.allocator.alloc(?[]const u8, entry.table.columns.len);
+                defer self.allocator.free(col_types_buf);
+                for (entry.table.columns, col_types_buf) |col, *ct| ct.* = col.ch_type;
+                const csv_out = try serializer.toCsv(self.allocator, rs);
+                defer self.allocator.free(csv_out);
+                const json_out = try csvToJson(self.allocator, csv_out, col_types_buf);
+                defer self.allocator.free(json_out);
+                try sendResponse(request, out, .ok, json_out);
+            } else if (want_tsv) {
+                const csv_out = try serializer.toCsv(self.allocator, rs);
+                defer self.allocator.free(csv_out);
+                const tsv = try csvToTsv(self.allocator, csv_out, skip_header);
+                defer self.allocator.free(tsv);
+                try sendResponse(request, out, .ok, tsv);
+            } else {
+                const nb = try serializer.toNativeBlock(self.allocator, rs);
                 defer self.allocator.free(nb);
                 try sendNativeBlock(self.allocator, request, out, nb);
-                return;
             }
+            return;
         }
 
-        // ── Fallback: generic_executor → CSV → output ─────────────────────────
-        const result = try generic_executor.runWithSource(
-            self.allocator, self.io,
-            plan,
-            .{ .ch_parts = parts.dirs() },
-            &entry.table,
-        );
-        defer self.allocator.free(result);
-
-        if (want_json) {
-            // Build optional col_types slice from the schema for this table.
-            const col_types_buf = try self.allocator.alloc(?[]const u8, entry.table.columns.len);
-            defer self.allocator.free(col_types_buf);
-            for (entry.table.columns, col_types_buf) |col, *ct| {
-                ct.* = col.ch_type;
-            }
-            const json_out = try csvToJson(self.allocator, result, col_types_buf);
-            defer self.allocator.free(json_out);
-            try sendResponse(request, out, .ok, json_out);
-        } else if (want_tsv) {
-            const tsv = try csvToTsv(self.allocator, result, skip_header);
-            defer self.allocator.free(tsv);
-            try sendResponse(request, out, .ok, tsv);
-        } else {
-            var rs = try serializer.csvToResultSet(self.allocator, result, &entry.table);
-            defer rs.deinit();
-            const nb = try serializer.toNativeBlock(self.allocator, rs);
-            defer self.allocator.free(nb);
-            try sendNativeBlock(self.allocator, request, out, nb);
-        }
-    }
-
-    /// If `plan` has a single star projection (SELECT *), expand it to explicit
-    /// column_ref projections derived from the CSV header of `csv`.
-    /// Returns a modified Plan whose `projections` slice is heap-allocated (caller
-    /// must free) only when expansion actually occurred; otherwise returns `plan` unchanged.
-    fn expandStarPlan(
-        allocator: std.mem.Allocator,
-        plan: generic_sql.Plan,
-        csv: []const u8,
-    ) !generic_sql.Plan {
-        // Check if this is a pure SELECT * (single projection with column = null)
-        const is_star = plan.projections.len == 1 and plan.projections[0].column == null and
-            plan.projections[0].func == .column_ref;
-        if (!is_star) return plan;
-
-        // Parse CSV header to get column names
-        const header_end = std.mem.indexOfScalar(u8, csv, '\n') orelse return plan;
-        const header_line = csv[0..header_end];
-
-        var col_names: std.ArrayListUnmanaged([]const u8) = .empty;
-        defer col_names.deinit(allocator);
-        var pos: usize = 0;
-        while (pos <= header_line.len) {
-            const was = pos;
-            // Simple CSV split (no quoted headers expected here)
-            const end = std.mem.indexOfScalarPos(u8, header_line, pos, ',') orelse header_line.len;
-            const name = std.mem.trim(u8, header_line[pos..end], " \t\r");
-            // Strip type sentinels
-            const stripped: []const u8 = if (name.len > 4 and name[0] == 0x03 and name[1] == 'U' and name[2] == '8' and name[3] == ':')
-                name[4..]
-            else if (name.len > 3 and name[0] == 0x02 and name[1] == 'D' and name[2] == ':')
-                name[3..]
-            else
-                name;
-            if (stripped.len > 0) try col_names.append(allocator, stripped);
-            pos = if (end < header_line.len) end + 1 else header_line.len + 1;
-            if (pos == was + 1 and was >= header_line.len) break;
-        }
-
-        if (col_names.items.len == 0) return plan;
-
-        // Build new projections
-        const new_projs = try allocator.alloc(generic_sql.Expr, col_names.items.len);
-        for (col_names.items, 0..) |name, i| {
-            new_projs[i] = .{
-                .func = .column_ref,
-                .column = name,
-            };
-        }
-        var new_plan = plan;
-        new_plan.projections = new_projs;
-        return new_plan;
-    }
-
-    /// Expand SELECT * using a known table schema (no CSV needed).
-    fn expandStarPlan2(
-        allocator: std.mem.Allocator,
-        plan: generic_sql.Plan,
-        tbl: *const schema.Table,
-    ) !generic_sql.Plan {
-        const is_star = plan.projections.len == 1 and plan.projections[0].column == null and
-            plan.projections[0].func == .column_ref;
-        if (!is_star or tbl.columns.len == 0) return plan;
-        const new_projs = try allocator.alloc(generic_sql.Expr, tbl.columns.len);
-        for (tbl.columns, 0..) |col, i| {
-            new_projs[i] = .{ .func = .column_ref, .column = col.name };
-        }
-        var new_plan = plan;
-        new_plan.projections = new_projs;
-        return new_plan;
-    }
-
-    /// Run a UNION ALL plan chain and return concatenated CSV (no header row).
-
-    fn runUnionAllCsv(self: *Server, plan: generic_sql.Plan) ![]u8 {
-        const fake_table = schema.Table{ .name = "", .columns = &.{} };
-        var parts: std.ArrayListUnmanaged([]u8) = .empty;
-        defer {
-            for (parts.items) |p| self.allocator.free(p);
-            parts.deinit(self.allocator);
-        }
-        // Traverse plan chain (left plan first, then union_other chain)
-        var cur: ?*const generic_sql.Plan = &plan;
-        while (cur) |p| {
-            // Determine the data source for this plan branch
-            const db_table = splitDbTable(p.table);
-            const entry_opt = self.schemas.find(db_table.db, db_table.table);
-            const table: *const schema.Table = if (entry_opt) |e| &e.table else &fake_table;
-            var branch_parts = try part_scanner.scan(self.allocator, self.io, self.config.data_dir, db_table.db, db_table.table);
-            defer branch_parts.deinit();
-            // Build a plan without union_other for this branch
-            var branch_plan = p.*;
-            branch_plan.union_other = null;
-            const csv = try generic_executor.runWithSource(self.allocator, self.io, branch_plan, .{ .ch_parts = branch_parts.dirs() }, table);
-            try parts.append(self.allocator, csv);
-            cur = if (p.union_other) |uo| uo else null;
-        }
-        // Concatenate all CSV parts (strip headers from all but the first)
-        var total_len: usize = 0;
-        for (parts.items, 0..) |p, i| {
-            if (i == 0) {
-                total_len += p.len;
-            } else {
-                // Skip first line (header row)
-                const newline = std.mem.indexOfScalar(u8, p, '\n') orelse p.len;
-                const skip = if (newline < p.len) newline + 1 else p.len;
-                total_len += p.len - skip;
-            }
-        }
-        const out_buf = try self.allocator.alloc(u8, total_len);
-        var off: usize = 0;
-        for (parts.items, 0..) |p, i| {
-            const data: []const u8 = if (i == 0) p else blk: {
-                const newline = std.mem.indexOfScalar(u8, p, '\n') orelse p.len;
-                const skip = if (newline < p.len) newline + 1 else p.len;
-                break :blk p[skip..];
-            };
-            @memcpy(out_buf[off .. off + data.len], data);
-            off += data.len;
-        }
-        return out_buf;
+        // IR path returned null — unsupported query shape, return empty.
+        if (want_tsv) try sendResponse(request, out, .ok, "")
+        else try self.sendEmptyNativeBlock(request, out);
     }
 
     fn handleCreateSimple(self: *Server, request: *std.http.Server.Request, out: *std.Io.Writer, sql: []const u8) !void {
@@ -1636,132 +1406,10 @@ pub const Server = struct {
         out: *std.Io.Writer,
         sql: []const u8,
     ) !void {
-        // Parse: INSERT INTO [db.]table SELECT ...
-        // Find "SELECT" keyword position (case-insensitive)
-        const sel_pos = std.ascii.indexOfIgnoreCase(sql, " SELECT ") orelse
-            std.ascii.indexOfIgnoreCase(sql, "\nSELECT ") orelse {
-            try sendResponse(request, out, .bad_request, "INSERT SELECT: cannot find SELECT\n");
-            return;
-        };
-        const select_sql = std.mem.trim(u8, sql[sel_pos + 1 ..], " \t\r\n");
-
-        // Extract target table name from "INSERT INTO [db.]table"
-        const insert_into_end = sel_pos;
-        const header = sql[0..insert_into_end];
-        // tokenize header: skip INSERT INTO, take table token
-        var hpos: usize = 0;
-        // skip "INSERT"
-        while (hpos < header.len and !std.ascii.isWhitespace(header[hpos])) hpos += 1;
-        while (hpos < header.len and std.ascii.isWhitespace(header[hpos])) hpos += 1;
-        // skip "INTO"
-        while (hpos < header.len and !std.ascii.isWhitespace(header[hpos])) hpos += 1;
-        while (hpos < header.len and std.ascii.isWhitespace(header[hpos])) hpos += 1;
-        // read table name (stop at whitespace or '(')
-        const tname_start = hpos;
-        while (hpos < header.len and !std.ascii.isWhitespace(header[hpos]) and header[hpos] != '(') hpos += 1;
-        const tname_raw = std.mem.trim(u8, header[tname_start..hpos], " \t");
-        if (tname_raw.len == 0) {
-            try sendResponse(request, out, .bad_request, "INSERT SELECT: missing table name\n");
-            return;
-        }
-        var db_name: []const u8 = "default";
-        var table_name: []const u8 = tname_raw;
-        if (std.mem.indexOfScalar(u8, tname_raw, '.')) |dot| {
-            db_name = tname_raw[0..dot];
-            table_name = tname_raw[dot + 1 ..];
-        }
-
-        const entry = self.schemas.find(db_name, table_name) orelse {
-            try sendResponse(request, out, .bad_request, "INSERT SELECT: unknown target table\n");
-            return;
-        };
-
-        // Run SELECT to get TSV output (internal execution, no HTTP overhead).
-        generic_executor.udf_registry = &self.functions;
-        const plan = (try generic_sql.parse(self.allocator, select_sql)) orelse {
-            try sendResponse(request, out, .bad_request, "INSERT SELECT: cannot parse SELECT\n");
-            return;
-        };
-        defer generic_sql.deinit(self.allocator, plan);
-
-        // Execute the SELECT and get CSV result.
-        const src_db_table = splitDbTable(plan.table);
-        const src_entry_opt = self.schemas.find(src_db_table.db, src_db_table.table);
-        const fake_table = schema.Table{ .name = "", .columns = &.{} };
-        const src_table: *const schema.Table = if (src_entry_opt) |e| &e.table else &fake_table;
-
-        const result_csv = blk: {
-            if (plan.subquery_source) |inner_plan| {
-                const inner_db_table = splitDbTable(inner_plan.table);
-                const inner_entry_opt = self.schemas.find(inner_db_table.db, inner_db_table.table);
-                const inner_fake = schema.Table{ .name = "", .columns = &.{} };
-                const inner_table: *const schema.Table = if (inner_entry_opt) |e| &e.table else &inner_fake;
-                const inner_csv = try generic_executor.runWithSource(
-                    self.allocator, self.io, inner_plan.*, .{ .ch_parts = &.{} }, inner_table);
-                defer self.allocator.free(inner_csv);
-                const outer_plan = try expandStarPlan(self.allocator, plan, inner_csv);
-                defer if (outer_plan.projections.ptr != plan.projections.ptr) self.allocator.free(outer_plan.projections);
-                break :blk try generic_executor.runOverCsv(self.allocator, outer_plan, inner_csv, inner_table);
-            } else {
-                var src_parts = try part_scanner.scan(self.allocator, self.io, self.config.data_dir, src_db_table.db, src_db_table.table);
-                defer src_parts.deinit();
-                const src_dirs: []const []const u8 = if (src_entry_opt != null) src_parts.dirs() else &.{};
-                const exec_plan = try expandStarPlan2(self.allocator, plan, src_table);
-                defer if (exec_plan.projections.ptr != plan.projections.ptr) self.allocator.free(exec_plan.projections);
-                break :blk try generic_executor.runWithSource(self.allocator, self.io, exec_plan, .{ .ch_parts = src_dirs }, src_table);
-            }
-        };
-        defer self.allocator.free(result_csv);
-
-        // Convert CSV to TSV for row parsing (skip the type-annotated header).
-        const tsv = try csvToTsv(self.allocator, result_csv, true);
-        defer self.allocator.free(tsv);
-
-        // Parse TSV rows positionally into target table columns.
-        const col_bufs = try self.allocator.alloc(row_binary_decoder.ColumnBuffer, entry.table.columns.len);
-        for (col_bufs, entry.table.columns) |*buf, col| {
-            buf.* = .{ .col = col, .fixed_vals = .empty, .str_vals = .empty, .str_bytes = .empty, .null_flags = .empty };
-        }
-        defer {
-            for (col_bufs) |*buf| buf.deinit(self.allocator);
-            self.allocator.free(col_bufs);
-        }
-
-        var lines = std.mem.splitScalar(u8, tsv, '\n');
-        var row_count: usize = 0;
-        while (lines.next()) |line| {
-            if (line.len == 0) continue;
-            var fields = std.mem.splitScalar(u8, line, '\t');
-            const set_flags = try self.allocator.alloc(bool, entry.table.columns.len);
-            defer self.allocator.free(set_flags);
-            @memset(set_flags, false);
-
-            var fi: usize = 0;
-            while (fields.next()) |field| {
-                const di = fi; // positional
-                if (di < col_bufs.len) {
-                    try appendParsedField(self.allocator, entry.table.columns[di], field, &col_bufs[di]);
-                    set_flags[di] = true;
-                }
-                fi += 1;
-            }
-            // Fill unset columns with zero/empty.
-            for (col_bufs, set_flags) |*buf, was_set| {
-                if (was_set) continue;
-                switch (buf.col.ty) {
-                    .text, .char, .low_card => try buf.str_vals.append(self.allocator, buf.str_bytes.items[0..0]),
-                    else         => try buf.fixed_vals.append(self.allocator, 0),
-                }
-            }
-            row_count += 1;
-        }
-
-        if (row_count > 0) {
-            const db_table = DbTable{ .db = db_name, .table = table_name };
-            try self.writePart(db_table, entry, col_bufs);
-        }
-
-        try sendResponse(request, out, .ok, "");
+        // INSERT SELECT is not supported in the IR-only execution path.
+        _ = self;
+        _ = sql;
+        try sendResponse(request, out, .bad_request, "INSERT SELECT not supported\n");
     }
 
 

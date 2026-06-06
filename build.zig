@@ -255,23 +255,6 @@ pub fn build(b: *std.Build) void {
     });
     const hashmap_test_cmd = b.addRunArtifact(hashmap_tests);
 
-    const planner_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/planner.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    const planner_test_cmd = b.addRunArtifact(planner_tests);
-
-    const reader_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/reader.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    const reader_test_cmd = b.addRunArtifact(reader_tests);
 
     const generic_sql_tests = b.addTest(.{
         .root_module = b.createModule(.{
@@ -321,25 +304,6 @@ pub fn build(b: *std.Build) void {
     });
     const schema_test_cmd = b.addRunArtifact(schema_tests);
 
-    const generic_executor_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/generic_executor.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    generic_executor_tests.root_module.addImport("build_options", options_mod);
-    generic_executor_tests.root_module.link_libc = true;
-    if (enable_duckdb) {
-        const duckdb_include = b.fmt("{s}/include", .{duckdb_prefix});
-        const duckdb_lib = b.fmt("{s}/lib", .{duckdb_prefix});
-        generic_executor_tests.root_module.addIncludePath(.{ .cwd_relative = duckdb_include });
-        generic_executor_tests.root_module.addLibraryPath(.{ .cwd_relative = duckdb_lib });
-        generic_executor_tests.root_module.addRPath(.{ .cwd_relative = duckdb_lib });
-        generic_executor_tests.root_module.linkSystemLibrary("duckdb", .{});
-    }
-    const generic_executor_test_cmd = b.addRunArtifact(generic_executor_tests);
-    generic_executor_test_cmd.setCwd(b.path("."));
 
     const schema_infer_tests = b.addTest(.{
         .root_module = b.createModule(.{
@@ -584,15 +548,6 @@ pub fn build(b: *std.Build) void {
         lz4ctx.link(mod);
         zstdctx.link(mod);
     }
-    // Other test targets that use @import("schema") but not ch_part/lz4:
-    generic_executor_tests.root_module.addImport("schema", schema_mod);
-    generic_executor_tests.root_module.addImport("ch_part", ch_part_mod);
-    generic_executor_tests.root_module.addImport("generic_sql", generic_sql_mod);
-    generic_executor_tests.root_module.addImport("parquet", parquet_mod);
-    generic_executor_tests.root_module.addImport("csv", csv_mod);
-    generic_executor_tests.root_module.addImport("parallel", parallel_mod);
-    lz4ctx.link(generic_executor_tests.root_module);
-    zstdctx.link(generic_executor_tests.root_module);
     schema_infer_tests.root_module.addImport("schema", schema_mod);
     schema_infer_tests.root_module.addImport("parquet", parquet_mod);
     generic_store_tests.root_module.addImport("schema", schema_mod);
@@ -660,30 +615,6 @@ pub fn build(b: *std.Build) void {
     const part_scanner_tests = b.addTest(.{ .root_module = part_scanner_mod });
     const part_scanner_test_cmd = b.addRunArtifact(part_scanner_tests);
 
-    // generic_sql and generic_executor as named modules for server dependency.
-    const generic_executor_mod = b.createModule(.{
-        .root_source_file = b.path("src/generic_executor.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    generic_executor_mod.addImport("build_options", options_mod);
-    generic_executor_mod.addImport("csv", csv_mod);
-    generic_executor_mod.link_libc = true;
-    generic_executor_mod.addImport("schema", schema_mod);
-    generic_executor_mod.addImport("ch_part", ch_part_mod);
-    generic_executor_mod.addImport("generic_sql", generic_sql_mod);
-    generic_executor_mod.addImport("parquet", parquet_mod);
-    generic_executor_mod.addImport("parallel", parallel_mod);
-    lz4ctx.link(generic_executor_mod);
-    if (enable_duckdb) {
-        const duckdb_include_path = b.fmt("{s}/include", .{duckdb_prefix});
-        const duckdb_lib_path = b.fmt("{s}/lib", .{duckdb_prefix});
-        generic_executor_mod.addIncludePath(.{ .cwd_relative = duckdb_include_path });
-        generic_executor_mod.addLibraryPath(.{ .cwd_relative = duckdb_lib_path });
-        generic_executor_mod.addRPath(.{ .cwd_relative = duckdb_lib_path });
-        generic_executor_mod.linkSystemLibrary("duckdb", .{});
-    }
-
     const native_block_mod = b.createModule(.{
         .root_source_file = b.path("src/ingest/native_block.zig"),
         .target = target,
@@ -731,7 +662,6 @@ pub fn build(b: *std.Build) void {
     ingest_server_mod.addImport("part_scanner", part_scanner_mod);
     ingest_server_mod.addImport("row_binary_decoder", row_binary_decoder_mod);
     ingest_server_mod.addImport("part_writer_session", part_writer_session_mod);
-    ingest_server_mod.addImport("generic_executor", generic_executor_mod);
     ingest_server_mod.addImport("generic_sql", generic_sql_mod);
     ingest_server_mod.addImport("ddl_parser", ddl_parser_mod);
     ingest_server_mod.addImport("mv_parse", mv_parse_mod);
@@ -756,7 +686,6 @@ pub fn build(b: *std.Build) void {
      exe.root_module.addImport("ingest_server", ingest_server_mod);
      exe.root_module.addImport("ingest_schema_config", schema_config_mod);
      exe.root_module.addImport("ingest_schema_persist", schema_persist_mod);
-     exe.root_module.addImport("generic_executor", generic_executor_mod);
      exe.root_module.addImport("generic_sql", generic_sql_mod);
     exe.root_module.addImport("parquet", parquet_mod);
     exe.root_module.addImport("mv_persist", mv_persist_mod);
@@ -783,7 +712,6 @@ pub fn build(b: *std.Build) void {
      unit_tests.root_module.addImport("ingest_server", ingest_server_mod);
      unit_tests.root_module.addImport("ingest_schema_config", schema_config_mod);
      unit_tests.root_module.addImport("ingest_schema_persist", schema_persist_mod);
-     unit_tests.root_module.addImport("generic_executor", generic_executor_mod);
      unit_tests.root_module.addImport("generic_sql", generic_sql_mod);
     unit_tests.root_module.addImport("parquet", parquet_mod);
 
@@ -798,8 +726,6 @@ pub fn build(b: *std.Build) void {
     core_mod.addImport("parallel", parallel_mod);
     const core_tests = b.addTest(.{ .root_module = core_mod });
     const core_test_cmd = b.addRunArtifact(core_tests);
-    generic_executor_tests.root_module.addImport("core", core_mod);
-    generic_executor_mod.addImport("core", core_mod);
     unit_tests.root_module.addImport("parallel", parallel_mod);
 
     // ── ir_planner module (generic_sql.Plan → PhysicalNode IR) ───────────────
@@ -844,10 +770,12 @@ pub fn build(b: *std.Build) void {
 
     // Wire query engine into tcp_server (for SELECT on real tables)
     tcp_server_mod.addImport("generic_sql", generic_sql_mod);
-    tcp_server_mod.addImport("generic_executor", generic_executor_mod);
     tcp_server_mod.addImport("serializer", serializer_mod);
     tcp_server_mod.addImport("part_scanner", part_scanner_mod);
     tcp_server_mod.addImport("csv", csv_mod);
+    tcp_server_mod.addImport("ir_planner", ir_planner_mod);
+    tcp_server_mod.addImport("core", core_mod);
+    tcp_server_mod.addImport("part_scan_bridge", part_scan_bridge_mod);
 
     // Wire serializer into ingest_server
     ingest_server_mod.addImport("core", core_mod);
@@ -871,13 +799,10 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&simd_test_cmd.step);
     test_step.dependOn(&parallel_test_cmd.step);
     test_step.dependOn(&hashmap_test_cmd.step);
-    test_step.dependOn(&planner_test_cmd.step);
-    test_step.dependOn(&reader_test_cmd.step);
     test_step.dependOn(&generic_sql_test_cmd.step);
     test_step.dependOn(&lowcard_test_cmd.step);
     test_step.dependOn(&parquet_test_cmd.step);
     test_step.dependOn(&schema_test_cmd.step);
-    test_step.dependOn(&generic_executor_test_cmd.step);
     test_step.dependOn(&schema_infer_test_cmd.step);
     test_step.dependOn(&generic_store_test_cmd.step);
     test_step.dependOn(&loader_test_cmd.step);
@@ -947,22 +872,6 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| bench_mmap_run.addArgs(args);
     const bench_mmap_step = b.step("bench-mmap", "Run A.4 mmap vs readAlloc micro-benchmark");
     bench_mmap_step.dependOn(&bench_mmap_run.step);
-
-    const bench_hashmap = b.addExecutable(.{
-        .name = "bench-hashmap",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/bench_hashmap.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    bench_hashmap.root_module.link_libc = true;
-    b.installArtifact(bench_hashmap);
-    const bench_hashmap_run = b.addRunArtifact(bench_hashmap);
-    bench_hashmap_run.step.dependOn(b.getInstallStep());
-    if (b.args) |args| bench_hashmap_run.addArgs(args);
-    const bench_hashmap_step = b.step("bench-hashmap", "Compare custom HashU64Count vs std.AutoHashMap on Q17 workload");
-    bench_hashmap_step.dependOn(&bench_hashmap_run.step);
 
     const bench_filter = b.addExecutable(.{
         .name = "bench-filter",

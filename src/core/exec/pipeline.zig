@@ -1920,7 +1920,7 @@ fn emitCompactVals(
 ) void {
     for (vals, kinds, aggs, 0..) |v, kind, item, i| {
         out[i] = switch (kind) {
-            .count, .u64_sum, .u64_min, .u64_max => Value{ .uint64 = v },
+            .count, .u64_sum, .u64_min, .u64_max, .count_distinct_u64 => Value{ .uint64 = v },
             .i64_sum, .i64_min, .i64_max => Value{ .int64 = @bitCast(v) },
             .f64_sum, .f64_str_len_sum => blk: {
                 const sum: f64 = @bitCast(v);
@@ -1934,7 +1934,7 @@ fn emitCompactVals(
                 break :blk Value{ .float64 = sum };
             },
             .f64_min, .f64_max => Value{ .float64 = @bitCast(v) },
-            // str_min/str_max: emitted via sidecar; return empty string as sentinel.
+             // str_min/str_max: emitted via sidecar; return empty string as sentinel.
             .str_min, .str_max => Value{ .string = "" },
         };
     }
@@ -1952,7 +1952,7 @@ fn emitCompactValsWithSidecar(
 ) void {
     for (vals, kinds, aggs, 0..) |v, kind, item, i| {
         out[i] = switch (kind) {
-            .count, .u64_sum, .u64_min, .u64_max => Value{ .uint64 = v },
+            .count, .u64_sum, .u64_min, .u64_max, .count_distinct_u64 => Value{ .uint64 = v },
             .i64_sum, .i64_min, .i64_max => Value{ .int64 = @bitCast(v) },
             .f64_sum, .f64_str_len_sum => blk: {
                 const sum: f64 = @bitCast(v);
@@ -2110,17 +2110,31 @@ inline fn updateCompactVals(
                 }
             },
             .f64_str_len_sum => {
-                if (ac.arg) |arg| { if (arg == .col_ref) {
-                    const col = c.columns[arg.col_ref.index];
+                if (ac.arg) |arg| {
+                    // Resolve the string column index: either a direct col_ref (rare)
+                    // or fn_call("length", col_ref) — the common AVG(length(col)) pattern.
+                    const str_ci: usize = blk2: {
+                        if (arg == .col_ref) break :blk2 arg.col_ref.index;
+                        if (arg == .fn_call and
+                            std.mem.eql(u8, arg.fn_call.name, "length") and
+                            arg.fn_call.args.len == 1 and
+                            arg.fn_call.args[0] == .col_ref)
+                            break :blk2 arg.fn_call.args[0].col_ref.index;
+                        break; // unsupported arg pattern — skip
+                    };
+                    const col = c.columns[str_ci];
                     if (!col.isRowNull(r)) switch (col.data) {
                         .string => |v| {
                             const cur: f64 = @bitCast(slot_vals[ci]);
                             slot_vals[ci] = @bitCast(cur + @as(f64, @floatFromInt(v[r].len)));
                         },
-                        else => {},
-                    };
-                }}
-            },
+                         else => {},
+                     };
+                 }
+             },
+            // count_distinct_u64: deduplication is handled by the global pair-set
+            // in the caller (executeHashAggChunked compact path); no-op here.
+            .count_distinct_u64 => {},
         }
     }
 }
@@ -2151,15 +2165,26 @@ fn executeHashAggChunked(
         const kinds = try alloc.alloc(ht.CompactAggKind, aggs.len);
         for (aggs, 0..) |item, ci| {
              if (item.expr != .agg_call) break :blk null;
-             if (item.expr.agg_call.kind == .count and item.expr.agg_call.distinct) break :blk null;
              kinds[ci] = switch (item.expr.agg_call.kind) {
-                .count_star, .count => .count,
+                .count_star => .count,
+                .count => blk2: {
+                    if (!item.expr.agg_call.distinct) break :blk2 .count;
+                    // COUNT(DISTINCT col_ref int) → compact distinct path.
+                    const arg = item.expr.agg_call.arg orelse break :blk null;
+                    if (arg != .col_ref) break :blk null;
+                    break :blk2 .count_distinct_u64;
+                },
                 .sum  => .i64_sum,   // type refined at runtime (int64/uint64/f64)
                 .avg  => blk2: {
-                    // Non-col_ref arg (e.g. length(URL)) not supported by compact path.
                     const avg_arg = item.expr.agg_call.arg orelse break :blk null;
-                    if (avg_arg != .col_ref) break :blk null;
-                    break :blk2 .f64_sum;
+                    if (avg_arg == .col_ref) break :blk2 .f64_sum;
+                    // avg(length(str_col)) — accumulate string length sum; finalize as avg.
+                    if (avg_arg == .fn_call and
+                        std.mem.eql(u8, avg_arg.fn_call.name, "length") and
+                        avg_arg.fn_call.args.len == 1 and
+                        avg_arg.fn_call.args[0] == .col_ref)
+                        break :blk2 .f64_str_len_sum;
+                    break :blk null;
                 },
                 // min/max: string args use str_min/str_max (StrAggHashTable sidecar);
                 // numeric args use the appropriate numeric kind (refined at runtime).
@@ -2175,7 +2200,7 @@ fn executeHashAggChunked(
         const iv = try alloc.alloc(u64, ck.len);
         for (ck, 0..) |kind, ci| {
             iv[ci] = switch (kind) {
-                .count, .i64_sum, .u64_sum, .u64_max, .f64_str_len_sum => 0,
+                .count, .i64_sum, .u64_sum, .u64_max, .f64_str_len_sum, .count_distinct_u64 => 0,
                 .f64_sum => @bitCast(@as(f64, 0.0)),
                 .i64_min => @bitCast(@as(i64, std.math.maxInt(i64))),
                 .i64_max => @bitCast(@as(i64, std.math.minInt(i64))),
@@ -2205,6 +2230,22 @@ fn executeHashAggChunked(
         }
         break :blk m;
     } else &.{};
+
+    // Flat pair-set for COUNT(DISTINCT) deduplication in the compact path.
+    // Key = (group_key_bits | distinct_val_bits) packed into u128 for exact uniqueness.
+    // Only allocated when at least one compact kind is count_distinct_u64.
+    const has_distinct_compact: bool = if (compact_kinds) |ck| blk: {
+        for (ck) |k| { if (k == .count_distinct_u64) break :blk true; }
+        break :blk false;
+    } else false;
+
+    var distinct_pair_set = std.AutoHashMap(u128, void).init(std.heap.c_allocator);
+    defer distinct_pair_set.deinit();
+    if (has_distinct_compact) {
+        // Reserve capacity for up to est_rows distinct (group, value) pairs.
+        const cap: u32 = @intCast(@min(est_rows, 12_000_000));
+        try distinct_pair_set.ensureTotalCapacity(cap);
+    }
 
     // Detect Q29-style regexp_replace(col_ref, lit_str_pattern, lit_str_repl) key.
     // Cache col_idx + whether it's the URL-domain pattern to avoid per-row checks.
@@ -2634,6 +2675,28 @@ fn executeHashAggChunked(
                     }
                     if (!key_valid) continue;
                     const slot_vals = try htc.getOrInsert(int_key_buf, compact_init_vals);
+                    // COUNT(DISTINCT) deduplication via global flat pair-set.
+                    if (has_distinct_compact) {
+                        for (ck, 0..) |kind, ci| {
+                            if (kind != .count_distinct_u64) continue;
+                            const darg = aggs[ci].expr.agg_call.arg orelse continue;
+                            if (darg != .col_ref) continue;
+                            const dcol = c.columns[darg.col_ref.index];
+                            if (dcol.isRowNull(r)) continue;
+                            const dval: u64 = switch (dcol.data) {
+                                .int64    => |v| @bitCast(v[r]),
+                                .uint64   => |v| v[r],
+                                .date_u16 => |v| @as(u64, v[r]),
+                                else      => continue,
+                            };
+                            // Pack (first group key u64, distinct_val u64) into u128.
+                            // For multi-key groups hash the tail into the high bits.
+                            const gk: u64 = @bitCast(int_key_buf[0]);
+                            const pair: u128 = (@as(u128, gk) << 64) | dval;
+                            const gop = try distinct_pair_set.getOrPut(pair);
+                            if (!gop.found_existing) slot_vals[ci] += 1;
+                        }
+                    }
                     try updateCompactVals(slot_vals, ck, aggs, &c, r, null, 0, str_agg_sidecar_idx);
                 }
             } else {
@@ -2664,17 +2727,37 @@ fn executeHashAggChunked(
                 }
             }
             } // end else (regular path)
-    } else if (use_str_agg_path) {
-            // ── String-key compact agg path (e.g. Q22/Q23 GROUP BY SearchPhrase) ──
-            const col_idx = str_agg_col_idx.?;
-            const ck      = compact_kinds.?;
-            const strs    = c.columns[col_idx].data.string;
-            for (0..c.num_rows) |r| {
-                if (c.columns[col_idx].isRowNull(r)) continue;
-                const s = strs[r];
-                const res = try ht_str_agg.?.getOrInsert(s, compact_init_vals);
-                try updateCompactVals(res.vals, ck, aggs, &c, r, &ht_str_agg.?, res.slot, str_agg_sidecar_idx);
-            }
+     } else if (use_str_agg_path) {
+             // ── String-key compact agg path (e.g. Q22/Q23 GROUP BY SearchPhrase) ──
+             const col_idx = str_agg_col_idx.?;
+             const ck      = compact_kinds.?;
+             const strs    = c.columns[col_idx].data.string;
+             for (0..c.num_rows) |r| {
+                 if (c.columns[col_idx].isRowNull(r)) continue;
+                 const s = strs[r];
+                 const res = try ht_str_agg.?.getOrInsert(s, compact_init_vals);
+                 // COUNT(DISTINCT) deduplication for string-key path.
+                 if (has_distinct_compact) {
+                     const str_h: u64 = ht.StrAggHashTable.hashStr(s);
+                     for (ck, 0..) |kind, ci| {
+                         if (kind != .count_distinct_u64) continue;
+                         const darg = aggs[ci].expr.agg_call.arg orelse continue;
+                         if (darg != .col_ref) continue;
+                         const dcol = c.columns[darg.col_ref.index];
+                         if (dcol.isRowNull(r)) continue;
+                         const dval: u64 = switch (dcol.data) {
+                             .int64    => |v| @bitCast(v[r]),
+                             .uint64   => |v| v[r],
+                             .date_u16 => |v| @as(u64, v[r]),
+                             else      => continue,
+                         };
+                         const pair: u128 = (@as(u128, str_h) << 64) | dval;
+                         const gop = try distinct_pair_set.getOrPut(pair);
+                         if (!gop.found_existing) res.vals[ci] += 1;
+                     }
+                 }
+                 try updateCompactVals(res.vals, ck, aggs, &c, r, &ht_str_agg.?, res.slot, str_agg_sidecar_idx);
+             }
         } else if (regexp_replace_key_descs) |rr_descs| {
             // ── regexp_replace key fast path (e.g. Q29) ───────────────────────
             // Avoids per-row pattern string comparison in evalFnCall.
@@ -5238,7 +5321,7 @@ fn executeHashAggParallelStrKey(
     const compact_init_vals = try alloc.alloc(u64, aggs.len);
     for (compact_kinds, 0..) |kind, ci| {
         compact_init_vals[ci] = switch (kind) {
-            .count, .i64_sum, .u64_sum, .u64_max, .str_min, .str_max, .f64_str_len_sum => 0,
+            .count, .i64_sum, .u64_sum, .u64_max, .str_min, .str_max, .f64_str_len_sum, .count_distinct_u64 => 0,
             .f64_sum => @bitCast(@as(f64, 0.0)),
             .i64_min => @bitCast(@as(i64, std.math.maxInt(i64))),
             .i64_max => @bitCast(@as(i64, std.math.minInt(i64))),
@@ -5963,8 +6046,7 @@ fn executeHashAggParallelCompactTopK(
     const compact_init_vals = try alloc.alloc(u64, aggs.len);
     for (compact_kinds, 0..) |kind, i| {
         compact_init_vals[i] = switch (kind) {
-            .count => 0,
-            .i64_sum, .u64_sum, .f64_sum, .f64_str_len_sum => 0,
+            .count, .i64_sum, .u64_sum, .f64_sum, .f64_str_len_sum, .count_distinct_u64 => 0,
             .i64_min => @as(u64, @bitCast(@as(i64, std.math.maxInt(i64)))),
             .i64_max => @as(u64, @bitCast(@as(i64, std.math.minInt(i64)))),
             .u64_min => std.math.maxInt(u64),
@@ -6700,6 +6782,7 @@ fn executeHashAggParallelCompactTopK(
                     .u64_min, .u64_max => .{ .int64 = @bitCast(acc_vals[i]) },
                     .f64_min, .f64_max => .{ .float64 = @bitCast(acc_vals[i]) },
                     .str_min, .str_max => .{ .int64 = 0 },
+                    .count_distinct_u64 => .{ .uint64 = acc_vals[i] },
                 };
             }
             return row;
@@ -7271,6 +7354,7 @@ fn executeTwoPhaseHashAgg(
                     .u64_min, .u64_max => .{ .int64 = @bitCast(acc_vals[i]) },
                     .f64_min, .f64_max => .{ .float64 = @bitCast(acc_vals[i]) },
                     .str_min, .str_max => .{ .int64 = 0 },
+                    .count_distinct_u64 => .{ .uint64 = acc_vals[i] },
                 };
             }
             return row;

@@ -18,3 +18,12 @@ data/fixture_store/
 .tmp/
 *.tmp
 *.heapsnapshot
+
+# Debug/scratch binaries in src/
+src/check_*
+src/bench_*
+
+# External tools / data
+nocodb/
+data/*.duckdb
+data/*.ddb

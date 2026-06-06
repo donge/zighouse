@@ -1,6 +1,5 @@
 const std = @import("std");
 const build_options = @import("build_options");
-const clickbench_schema = schema.clickbench;
 const catalog = @import("catalog.zig");
 const schema_infer = @import("schema_infer.zig");
 const schema_persist = @import("ingest_schema_persist");
@@ -8,7 +7,6 @@ const schema_config = @import("ingest_schema_config");
 const compactor = @import("compactor");
 const mv_persist = @import("mv_persist");
 const loader = @import("loader.zig");
-const generic_executor = @import("generic_executor");
 const generic_sql = @import("generic_sql");
 const parquet = @import("parquet");
 const storage = @import("storage.zig");
@@ -24,15 +22,15 @@ const usage =
     \\  zighouse import-parquet [--format=generic|ch|ch-compact|ch-http] [--pk=<col>] <parquet_path> <store_dir> <table_name>
     \\  zighouse serve --data-dir=<dir> [--schemas=<schemas.json>] [--port=<port>]
     \\  zighouse compactor --data-dir=<dir> [--interval=<secs>] [--min-parts=<n>] [--max-parts=<n>] [--max-rows=<n>] [--once] [--codec=lz4|zstd]
-    \\  zighouse generic-query <store_dir> <table_name> <sql>
-    \\  zighouse import-clickbench-parquet-hot <hits.parquet> <data_dir> [limit_rows]
-    \\  zighouse parquet-inspect <hits.parquet>
+    \\  zighouse bench <store_dir> <table_name> <queries_path>
+    \\  zighouse bench-one <store_dir> <table_name> <queries_path> <query_num>
+    \\  zighouse bench-range <store_dir> <table_name> <queries_path> <first> <limit>
+    \\  zighouse query <store_dir> <table_name> <sql>
+    \\  zighouse parquet-inspect <parquet_path>
     \\  zighouse store-info <data_dir>
     \\
     \\Environment:
     \\  ZIGHOUSE_IMPORT_TRACE       print import phase timings
-    \\  ZIGHOUSE_CLICKBENCH_SUBMIT  enable ClickBench submission format
-    \\  ZIGHOUSE_QUERY_PATH         specialized|generic|compare, default: specialized
     \\
 ;
 
@@ -170,55 +168,6 @@ fn runCommand(init: std.process.Init, allocator: std.mem.Allocator, args: *std.p
         defer allocator.free(table_dir);
         try schema_persist.saveToDir(init.io, allocator, table_dir, db_name, &entry);
         try printOut(init.io, "imported {d} rows {s} -> {s}/{s}\n", .{ row_count, parquet_path, store_dir, table_name });
-    } else if (std.mem.eql(u8, command, "generic-query")) {
-        // Query a generic_part store.
-        // Usage: zighouse generic-query <store_dir> <table_name> <sql>
-        const store_dir = args.next() orelse return error.MissingDataDir;
-        const table_name = args.next() orelse return error.MissingTableName;
-        const sql = args.next() orelse return error.MissingSql;
-        // Locate the catalog manifest to get the original parquet path.
-        const manifest_path = try std.fmt.allocPrint(
-            allocator,
-            "{s}/{s}/parts/all_1_1_0/catalog.zig-house",
-            .{ store_dir, table_name },
-        );
-        defer allocator.free(manifest_path);
-        const manifest_content = try std.Io.Dir.cwd().readFileAlloc(
-            init.io,
-            manifest_path,
-            allocator,
-            .limited(4096),
-        );
-        defer allocator.free(manifest_content);
-        const parquet_path = parseCatalogField(manifest_content, "parquet") orelse return error.MissingParquetInManifest;
-        const part_format_str = parseCatalogField(manifest_content, "part_format") orelse "generic";
-        // Infer schema from Parquet file.
-        var inferred = try schema_infer.inferSchema(allocator, init.io, parquet_path, table_name);
-        defer inferred.deinit();
-        // Determine data source from part_format.
-        const part_dir_buf: ?[]u8 = if (std.mem.eql(u8, part_format_str, "ch_mergetree"))
-            try std.fmt.allocPrint(allocator, "{s}/{s}/parts/all_1_1_0", .{ store_dir, table_name })
-        else
-            null;
-        defer if (part_dir_buf) |b| allocator.free(b);
-        const source: generic_executor.Source = if (part_dir_buf) |d|
-            .{ .ch_part = d }
-        else
-            .{ .parquet = parquet_path };
-        // Parse and run the query.
-        const plan = (try generic_sql.parse(allocator, sql)) orelse return error.UnsupportedGenericQuery;
-        defer generic_sql.deinit(allocator, plan);
-        const output = try generic_executor.runWithSource(allocator, init.io, plan, source, &inferred.table);
-        defer allocator.free(output);
-        try writeOut(init.io, output);
-    } else if (std.mem.eql(u8, command, "import-clickbench-parquet-hot")) {
-        const parquet_path = args.next() orelse return error.MissingParquetPath;
-        const data_dir = args.next() orelse return error.MissingDataDir;
-        const limit_rows = if (args.next()) |raw| try std.fmt.parseInt(u64, raw, 10) else null;
-        var native_backend = @import("native.zig").Native.init(allocator, init.io, data_dir);
-        defer native_backend.deinit();
-        try native_backend.importClickBenchParquetHot(parquet_path, limit_rows);
-        try printOut(init.io, "imported ClickBench Parquet hot columns {s} -> {s}\n", .{ parquet_path, data_dir });
     } else if (std.mem.eql(u8, command, "parquet-inspect")) {
         const parquet_path = args.next() orelse return error.MissingParquetPath;
         const output = try parquet.inspectPath(allocator, init.io, parquet_path);
@@ -300,12 +249,22 @@ fn runCommand(init: std.process.Init, allocator: std.mem.Allocator, args: *std.p
         try writeOut(init.io, import_manifest);
         if (import_manifest.len == 0 or import_manifest[import_manifest.len - 1] != '\n') try writeOut(init.io, "\n");
     } else if (std.mem.eql(u8, command, "bench") or std.mem.eql(u8, command, "bench-one") or std.mem.eql(u8, command, "bench-range")) {
-        // Legacy bench: delegates to native engine until Phase 3.
-        const native_mod = @import("native.zig");
-        const BenchRange = @typeInfo(@TypeOf(native_mod.Native.bench)).@"fn".params[2].type.?;
-        const data_dir = args.next() orelse return error.MissingDataDir;
-        const queries_path = args.next() orelse return error.MissingQueriesPath;
-        const bench_range: BenchRange = blk: {
+        // IR-pipeline bench: reads a generic_store part and runs queries through
+        // the IR planner + pipeline, timing each query three times.
+        //
+        // Usage: zighouse bench <store_dir> <table_name> <queries_path>
+        //        zighouse bench-one <store_dir> <table_name> <queries_path> <query_num>
+        //        zighouse bench-range <store_dir> <table_name> <queries_path> <first> <limit>
+        const duckdb = @import("duckdb.zig");
+        const QueryRange = duckdb.QueryRange;
+        const ir_planner = @import("ir_planner");
+        const core = @import("core");
+        const gsb = @import("core/source/generic_store_bridge.zig");
+
+        const store_dir   = args.next() orelse return error.MissingStoreDir;
+        const table_name  = args.next() orelse return error.MissingTableName;
+        const queries_path_ir = args.next() orelse return error.MissingQueriesPath;
+        const bench_range_ir: QueryRange = blk: {
             if (std.mem.eql(u8, command, "bench-one")) {
                 const n = try std.fmt.parseInt(usize, args.next() orelse return error.MissingQueryNum, 10);
                 break :blk .{ .first = n, .limit = 1 };
@@ -316,27 +275,6 @@ fn runCommand(init: std.process.Init, allocator: std.mem.Allocator, args: *std.p
             }
             break :blk .{};
         };
-        try storage.ensureStore(init.io, data_dir);
-        var native_backend = native_mod.Native.init(allocator, init.io, data_dir);
-        defer native_backend.deinit();
-        try native_backend.bench(queries_path, bench_range);
-    } else if (std.mem.eql(u8, command, "bench-ir")) {
-        // IR-pipeline bench: reads a generic_store part and runs queries through
-        // the IR planner + pipeline, timing each query three times.
-        //
-        // Usage: zighouse bench-ir <store_dir> <table_name> <queries_path>
-        //        zighouse bench-ir-one <store_dir> <table_name> <queries_path> <query_num>
-        //        zighouse bench-ir-range <store_dir> <table_name> <queries_path> <first> <limit>
-        const duckdb = @import("duckdb.zig");
-        const QueryRange = duckdb.QueryRange;
-        const ir_planner = @import("ir_planner");
-        const core = @import("core");
-        const gsb = @import("core/source/generic_store_bridge.zig");
-
-        const store_dir   = args.next() orelse return error.MissingStoreDir;
-        const table_name  = args.next() orelse return error.MissingTableName;
-        const queries_path_ir = args.next() orelse return error.MissingQueriesPath;
-        const bench_range_ir: QueryRange = .{};
 
         // Resolve table schema from the store's columns.txt so byte widths match.
         const columns_txt = try std.fmt.allocPrint(allocator, "{s}/{s}/parts/all_1_1_0/columns.txt", .{ store_dir, table_name });
@@ -361,11 +299,11 @@ fn runCommand(init: std.process.Init, allocator: std.mem.Allocator, args: *std.p
             pub fn runQuery(self: *const @This(), query_text: []const u8) !?[]u8 {
                 // Parse SQL.
                 const maybe_gplan = generic_sql.parse(self.alloc, query_text) catch |err| {
-                    std.log.err("bench-ir parse error: {}: {s}", .{err, query_text});
+                    std.log.err("bench parse error: {}: {s}", .{err, query_text});
                     return null;
                 };
                 const gplan = maybe_gplan orelse {
-                    std.log.err("bench-ir parse null: {s}", .{query_text});
+                    std.log.err("bench parse null: {s}", .{query_text});
                     return null;
                 };
                 defer generic_sql.deinit(self.alloc, gplan);
@@ -375,12 +313,12 @@ fn runCommand(init: std.process.Init, allocator: std.mem.Allocator, args: *std.p
                 errdefer arena.deinit();
                 var pctx = ir_planner.PlannerCtx.init(arena.allocator(), self.table);
                 const node = ir_planner.plan_query(&pctx, gplan) catch |err| {
-                    std.log.err("bench-ir plan error: {}: {s}", .{err, query_text});
+                    std.log.err("bench plan error: {}: {s}", .{err, query_text});
                     arena.deinit();
                     return null;
                 };
                 if (node == null) {
-                    std.log.err("bench-ir plan null: {s}", .{query_text});
+                    std.log.err("bench plan null: {s}", .{query_text});
                     arena.deinit();
                     return null;
                 }
@@ -396,7 +334,7 @@ fn runCommand(init: std.process.Init, allocator: std.mem.Allocator, args: *std.p
                 defer qctx.deinit();
                 const t_exec_start = std.Io.Clock.Timestamp.now(self.io, .awake);
                 var rs = core.exec.pipeline.executePlan(node.?, &qctx) catch |err| {
-                    std.log.err("bench-ir exec error: {}: {s}", .{err, query_text});
+                    std.log.err("bench exec error: {}: {s}", .{err, query_text});
                     arena.deinit();
                     return null;
                 };
@@ -429,9 +367,9 @@ fn runCommand(init: std.process.Init, allocator: std.mem.Allocator, args: *std.p
             .bridge   = &shared_bridge,
         };
         try duckdb.benchWithRunner(allocator, init.io, queries_path_ir, bench_range_ir, &runner);
-    } else if (std.mem.eql(u8, command, "ir-query")) {
+    } else if (std.mem.eql(u8, command, "query")) {
         // Run a single SQL query through the IR pipeline and emit CSV to stdout.
-        // Usage: zighouse ir-query <store_dir> <table_name> <sql>
+        // Usage: zighouse query <store_dir> <table_name> <sql>
         const ir_planner2 = @import("ir_planner");
         const core2 = @import("core");
         const gsb2 = @import("core/source/generic_store_bridge.zig");
@@ -554,18 +492,6 @@ fn runCommand(init: std.process.Init, allocator: std.mem.Allocator, args: *std.p
 
 fn printUsage(io: std.Io) !void {
     try writeOut(io, usage);
-}
-
-/// Parse a `key=value\n` line from a catalog manifest.
-fn parseCatalogField(content: []const u8, key: []const u8) ?[]const u8 {
-    var lines = std.mem.splitScalar(u8, content, '\n');
-    while (lines.next()) |line| {
-        if (line.len == 0) continue;
-        const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
-        if (!std.mem.eql(u8, line[0..eq], key)) continue;
-        return line[eq + 1 ..];
-    }
-    return null;
 }
 
 fn normalizeCompareOutput(bytes: []const u8) []const u8 {
@@ -810,9 +736,7 @@ fn printSnippet(io: std.Io, label: []const u8, bytes: []const u8) !void {
 }
 
 fn printSchema(io: std.Io) !void {
-    for (clickbench_schema.hits.columns, 0..) |column, i| {
-        try printOut(io, "{d}\t{s}\t{s}\n", .{ i, column.name, @tagName(column.ty) });
-    }
+    try printOut(io, "schema command not available (clickbench/schema.zig removed)\n", .{});
 }
 
 fn writeOut(io: std.Io, bytes: []const u8) !void {
@@ -831,22 +755,8 @@ fn printErr(io: std.Io, comptime fmt: []const u8, args: anytype) !void {
     try std.Io.File.stderr().writeStreamingAll(io, bytes);
 }
 
-// Pull catalog, schema_infer and store tests into this test binary.
+// Pull catalog and schema_infer tests into this test binary.
 comptime {
     _ = catalog;
     _ = schema_infer;
-}
-
-test "schema has ClickBench column count" {
-    try std.testing.expectEqual(@as(usize, 105), clickbench_schema.hits.columns.len);
-}
-
-test "URL and Title carry hash_sidecar capability after PR-A4" {
-    const url_idx = clickbench_schema.hits.findColumn("URL").?;
-    const title_idx = clickbench_schema.hits.findColumn("Title").?;
-    try std.testing.expect(clickbench_schema.hits.columns[url_idx].capabilities.hash_sidecar);
-    try std.testing.expect(clickbench_schema.hits.columns[title_idx].capabilities.hash_sidecar);
-    // SearchPhrase must NOT carry hash_sidecar.
-    const sp_idx = clickbench_schema.hits.findColumn("SearchPhrase").?;
-    try std.testing.expect(!clickbench_schema.hits.columns[sp_idx].capabilities.hash_sidecar);
 }

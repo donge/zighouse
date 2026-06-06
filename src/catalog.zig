@@ -18,7 +18,6 @@
 const std = @import("std");
 const schema = @import("schema");
 const schema_infer = @import("schema_infer.zig");
-const clickbench_schema = schema.clickbench;
 
 /// Name of the per-table catalog manifest file stored inside the part dir.
 /// Format:
@@ -98,14 +97,6 @@ pub const Catalog = struct {
             if (schema.asciiEqlIgnoreCase(entry.table.name, name)) return entry;
         }
         return null;
-    }
-
-    /// Register the built-in ClickBench `hits` table with the given store
-    /// directory.  If store_dir is null the table is registered without a
-    /// backing store (schema-only; queries against it will fail at execution
-    /// time unless a parquet path is provided separately).
-    pub fn registerHits(self: *Catalog, store_dir: ?[]const u8) !void {
-        try self.register(clickbench_schema.hits, store_dir, .clickbench_hot);
     }
 
     /// Write a catalog manifest for a generic_part table into
@@ -254,14 +245,4 @@ test "catalog replace entry on duplicate name" {
     try std.testing.expectEqualStrings("/b", cat.find("foo").?.store_dir.?);
 }
 
-test "catalog registerHits populates hits schema" {
-    const allocator = std.testing.allocator;
-    var cat = Catalog.init(allocator);
-    defer cat.deinit();
 
-    try cat.registerHits(null);
-    const entry = cat.find("hits") orelse return error.TestExpectedHits;
-    try std.testing.expectEqualStrings("hits", entry.table.name);
-    try std.testing.expect(entry.table.columns.len > 0);
-    try std.testing.expect(entry.layout == .clickbench_hot);
-}

@@ -1,0 +1,227 @@
+{
+  "schema_version": 1,
+  "description": "Per-query result checksums (sorted-CSV SHA256) for the ZigHouse IR pipeline. Regenerate with: python3 scripts/update-result-baseline.py",
+  "store": "/var/folders/g7/4df4jppn3_x6yz0dhx66nf200000gn/T/zighouse-precommit-ir-store",
+  "queries": "clickbench-submit/zighouse/queries.sql",
+  "build": {
+    "git_commit": "bbeda8156a29c405b13b55534d8fa9db80b1dfde",
+    "git_dirty": true
+  },
+  "results": [
+    {
+      "q": 1,
+      "rows": 1,
+      "sorted_sha256": "51ff6ab2b04fdeab817c498ecb634da0a34b0994bbd286eb5c8855c66c443d4d"
+    },
+    {
+      "q": 2,
+      "rows": 1,
+      "sorted_sha256": "c45c5df58078a81e4391c34327a1961a2fbe628f7c9eda7529e614c2fe7f68f6"
+    },
+    {
+      "q": 3,
+      "rows": 1,
+      "sorted_sha256": "bb4bcfea3d1686e829692c137e25ce108de9baaf2896066167174f2ad337ff1a"
+    },
+    {
+      "q": 4,
+      "rows": 1,
+      "sorted_sha256": "4b8622f500ea1033640823557f34a45adabaef89d0edfa99c61d7f3078130ca0"
+    },
+    {
+      "q": 5,
+      "rows": 1,
+      "sorted_sha256": "be6d7f53c1bbca76c68a2b63c0d67c28f6b4576464109f013adad34393efaee3"
+    },
+    {
+      "q": 6,
+      "rows": 1,
+      "sorted_sha256": "3663dd337d7775de8122b8159506e1577897b8903ec1b5faa51c465ddb6459b7"
+    },
+    {
+      "q": 7,
+      "rows": 1,
+      "sorted_sha256": "f724fd3d03a7d33dbee71260f7e62842d39d5cf3132bf509d4092e1fc0f311ed"
+    },
+    {
+      "q": 8,
+      "rows": 8,
+      "sorted_sha256": "36923a159206a086a344813771ac72aae6cd40a3fa53df681dfb96090b5951d2"
+    },
+    {
+      "q": 9,
+      "rows": 10,
+      "sorted_sha256": "232a3ea4192e22e775862b48f665b9d9dbda5883e68f3c8c509d4ff6722a8978"
+    },
+    {
+      "q": 10,
+      "rows": 10,
+      "sorted_sha256": "d01707e52466349491f4604aa0661789cb26ad274b45e03fb629f577106d7740"
+    },
+    {
+      "q": 11,
+      "rows": 10,
+      "sorted_sha256": "3af9d1a76a81846c22bfebb0a321ab642eaad1ee3a5151667c62a4954aa2d113"
+    },
+    {
+      "q": 12,
+      "rows": 10,
+      "sorted_sha256": "975fcecd69adbf3cf345bf02cc9fc1894dab80844c48c53aa2cb34ce52c6c543"
+    },
+    {
+      "q": 13,
+      "rows": 10,
+      "sorted_sha256": "7a02485ec7c004f1ac974317291b52a7e1153591ab55a97580cf5272728ba334"
+    },
+    {
+      "q": 14,
+      "rows": 10,
+      "sorted_sha256": "176b1bb3e2676c7a7000acfb4c4165aefeae221381bbe55b333c2619087a8d79"
+    },
+    {
+      "q": 15,
+      "rows": 10,
+      "sorted_sha256": "eac73704a7341221ea5a08cb9916e2eed00363cf2a06e6a7024bfc59e3cc26a0"
+    },
+    {
+      "q": 16,
+      "rows": 10,
+      "sorted_sha256": "eb5a39b79bd26eae954bda7f86b34cf799bf8ed20d3b179387e6bff855be3b5b"
+    },
+    {
+      "q": 17,
+      "rows": 10,
+      "sorted_sha256": "ef568422ef770a7229ab74182848367016d40f6e1da88489fde6a25752d7a9d2"
+    },
+    {
+      "q": 18,
+      "rows": 10,
+      "sorted_sha256": "a22cc4938a30609cd8581c21edf50834cea6a6f2c7a78ba6e60d0bb1944999a1"
+    },
+    {
+      "q": 19,
+      "rows": 10,
+      "sorted_sha256": "226b2afd04851cae69919452bb8b84e59a3bce6f9d0c7040e98a60b5fa7dc7b0"
+    },
+    {
+      "q": 20,
+      "rows": 0,
+      "sorted_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "q": 21,
+      "rows": 1,
+      "sorted_sha256": "1423b81d4075d9f489d40b138ecb4caab1f7fb011faaf341cff0f615817e61d3"
+    },
+    {
+      "q": 22,
+      "rows": 10,
+      "sorted_sha256": "a66c9de33b4ca547c8a22dd81da85ca8dda7e73cb9a5ec8dbd1a2b016ad6360c"
+    },
+    {
+      "q": 23,
+      "rows": 10,
+      "sorted_sha256": "c060b793bef2c9a53144f533a533d40401d7939d1764a875c30d767d66f24b8a"
+    },
+    {
+      "q": 24,
+      "rows": 10,
+      "sorted_sha256": "811d3f920516c47dce55da51dc513e58a27061f7d2b400b1f50b919c137f7e7d"
+    },
+    {
+      "q": 25,
+      "rows": 10,
+      "sorted_sha256": "f145c11f490fe4d47aa8f01d755c271195491cdb154dc0c475d58737cb498094"
+    },
+    {
+      "q": 26,
+      "rows": 10,
+      "sorted_sha256": "7010229dbb7f83b7d0a33ed5f3fd8b212351e61130f7fa0e3a0824b931f4c980"
+    },
+    {
+      "q": 27,
+      "rows": 10,
+      "sorted_sha256": "f145c11f490fe4d47aa8f01d755c271195491cdb154dc0c475d58737cb498094"
+    },
+    {
+      "q": 28,
+      "rows": 11,
+      "sorted_sha256": "6c0e2bc72eeda21965077216738800d5e1e70215fd7acb5cd9a9932fe45d1c13"
+    },
+    {
+      "q": 29,
+      "rows": 15,
+      "sorted_sha256": "9a92c267018cdc55a684f1d60380aa90e0dbf5f2bfae3a479dda182b35378798"
+    },
+    {
+      "q": 30,
+      "rows": 1,
+      "sorted_sha256": "eff9b9c381c53bad321bf3bde557c212c4bbc966ef9e13232be7a906066ef4fe"
+    },
+    {
+      "q": 31,
+      "rows": 10,
+      "sorted_sha256": "b201c1a6549c7bd5deb30df879b027d1f32bc76e1e6fa72beedec47d76f51398"
+    },
+    {
+      "q": 32,
+      "rows": 10,
+      "sorted_sha256": "8865dc0a859e9367f24368657817fc1aa9c906ca73e95ab60b643bc92eac3847"
+    },
+    {
+      "q": 33,
+      "rows": 10,
+      "sorted_sha256": "7459a386c9a771408098bcd91a0feba996de6ce77898aea674a1fe9df287be21"
+    },
+    {
+      "q": 34,
+      "rows": 10,
+      "sorted_sha256": "676c52b9b0f0ebeec305a1a9c21fa518e9fe9454bb8131929794f7427ad164af"
+    },
+    {
+      "q": 35,
+      "rows": 10,
+      "sorted_sha256": "9a8707a9183117232f377696ba2227d3c4aae1a95277aedf4a11f4bbd6d4bb96"
+    },
+    {
+      "q": 36,
+      "rows": 10,
+      "sorted_sha256": "c089b128522dd7d22710aa653fffc7204c5a14d3c99a394eb44a03661ccd219f"
+    },
+    {
+      "q": 37,
+      "rows": 10,
+      "sorted_sha256": "6b278c90ecae68e2fed750ac5c54a521d00a63cebc9b5a8dfc10a2d2e1821832"
+    },
+    {
+      "q": 38,
+      "rows": 10,
+      "sorted_sha256": "a99fab580abb67189f332e70b54492d951e723661903d56e7de2b54910a30f37"
+    },
+    {
+      "q": 39,
+      "rows": 10,
+      "sorted_sha256": "1f4b669fdb9ab4aaf4a8ca6404a84259b26535c579d4c79a6daa1ceb638de29b"
+    },
+    {
+      "q": 40,
+      "rows": 10,
+      "sorted_sha256": "1d6c65ccbf9792d2d5dfee40b88e34b24679422582657184ea265e783f3a5abe"
+    },
+    {
+      "q": 41,
+      "rows": 10,
+      "sorted_sha256": "fad4cf4c503aa35ba18784bec67151f9816f1ce44f11f93a6f22150f2532680b"
+    },
+    {
+      "q": 42,
+      "rows": 0,
+      "sorted_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "q": 43,
+      "rows": 10,
+      "sorted_sha256": "6aa9c6e726a414d95880a1beea6fc828c7a8814f6b0806da783e9baffea57988"
+    }
+  ]
+}
