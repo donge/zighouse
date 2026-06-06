@@ -203,12 +203,17 @@ fn buildSelectPlan(allocator: Allocator, sel: ast.SelectStmt, ctes_from_parent: 
                     }
                 }
                 if (matched_alias) |ma| {
-                    // Dupe the alias so order_by_alias owns its string
-                    // (deinit will free it independently of the projection's alias).
-                    // Also free the already-built order_by_text slice and alias_text.
-                    if (order_by_text) |obt| allocator.free(obt);
+                    // Dupe the alias so order_by_alias owns its string independently.
                     order_by_alias = try allocator.dupe(u8, ma);
-                    order_by_text = null;
+                    // Only clear order_by_text when the alias differs from the expression
+                    // text (e.g. ORDER BY date_trunc(...) → alias "M"): the executor uses
+                    // the alias, and keeping order_by_text would be misleading.
+                    // When they're the same (e.g. ORDER BY SearchPhrase → alias
+                    // "SearchPhrase"), keep order_by_text so either path is usable.
+                    if (!std.mem.eql(u8, ma, alias_text)) {
+                        if (order_by_text) |obt| allocator.free(obt);
+                        order_by_text = null;
+                    }
                     allocator.free(alias_text);
                 } else {
                     order_by_alias = alias_text;
@@ -374,8 +379,17 @@ fn buildFuncExpr(allocator: Allocator, f: ast.FuncExpr, alias: ?[]const u8, ctes
         const col = try firstArgText(allocator, f.args, ctes);
         return Expr{ .func = .count_distinct, .column = col, .alias = alias };
     }
-    // SUM(col)
+    // SUM(col) or SUM(col + int_offset)
     if (std.mem.eql(u8, name, "sum") and f.args.len == 1) {
+        const arg = f.args[0];
+        // Detect col + constant pattern: SUM(col + 42) → .column = col, .int_offset = 42
+        if (arg == .binop and arg.binop.op == .add and arg.binop.left == .col) {
+            switch (arg.binop.right) {
+                .int  => |v| return Expr{ .func = .sum, .column = try allocator.dupe(u8, arg.binop.left.col), .int_offset = v, .alias = alias },
+                .uint => |v| return Expr{ .func = .sum, .column = try allocator.dupe(u8, arg.binop.left.col), .int_offset = @intCast(v), .alias = alias },
+                else => {},
+            }
+        }
         const col = try firstArgText(allocator, f.args, ctes);
         return Expr{ .func = .sum, .column = col, .alias = alias };
     }
@@ -465,64 +479,6 @@ fn buildFuncExpr(allocator: Allocator, f: ast.FuncExpr, alias: ?[]const u8, ctes
         defer allocator.free(inner);
         const text = try std.fmt.allocPrint(allocator, "length({s})", .{inner});
         return Expr{ .func = .column_ref, .column = text, .alias = alias };
-    }
-
-    // if(cond, then, else) → case_when
-    if (std.mem.eql(u8, name, "if") and f.args.len == 3) {
-        const when_texts = try allocator.alloc([]const u8, 1);
-        const then_texts = try allocator.alloc([]const u8, 1);
-        when_texts[0] = try exprToText(allocator, f.args[0], ctes);
-        then_texts[0] = try exprToText(allocator, f.args[1], ctes);
-        const else_text: ?[]const u8 = try exprToText(allocator, f.args[2], ctes);
-        const cwd = try allocator.create(CaseWhenData);
-        cwd.* = .{ .when_texts = when_texts, .then_texts = then_texts, .else_text = else_text };
-        return Expr{ .func = .case_when, .case_when_data = cwd, .alias = alias };
-    }
-
-    // date_part('unit', col) → ClickHouse time-unit column names
-    if (std.mem.eql(u8, name, "date_part") and f.args.len == 2 and f.args[0] == .str and f.args[1] == .col) {
-        const unit = f.args[0].str;
-        const col_name = f.args[1].col;
-        const mapped: ?[]const u8 = blk: {
-            if (std.ascii.eqlIgnoreCase(col_name, "EventTime")) {
-                if (std.ascii.eqlIgnoreCase(unit, "minute")) break :blk "EventMinuteOfHour";
-                if (std.ascii.eqlIgnoreCase(unit, "hour"))   break :blk "EventHour";
-                if (std.ascii.eqlIgnoreCase(unit, "day"))    break :blk "EventDate";
-            }
-            break :blk null;
-        };
-        if (mapped) |m| {
-            return Expr{ .func = .column_ref, .column = try allocator.dupe(u8, m), .alias = alias };
-        }
-    }
-
-    // if(cond, then, else) → case_when
-    if (std.mem.eql(u8, name, "if") and f.args.len == 3) {
-        const when_texts = try allocator.alloc([]const u8, 1);
-        const then_texts = try allocator.alloc([]const u8, 1);
-        when_texts[0] = try exprToText(allocator, f.args[0], ctes);
-        then_texts[0] = try exprToText(allocator, f.args[1], ctes);
-        const else_text: ?[]const u8 = try exprToText(allocator, f.args[2], ctes);
-        const cwd = try allocator.create(CaseWhenData);
-        cwd.* = .{ .when_texts = when_texts, .then_texts = then_texts, .else_text = else_text };
-        return Expr{ .func = .case_when, .case_when_data = cwd, .alias = alias };
-    }
-
-    // date_part('unit', col) → ClickHouse time-unit column names
-    if (std.mem.eql(u8, name, "date_part") and f.args.len == 2 and f.args[0] == .str and f.args[1] == .col) {
-        const unit = f.args[0].str;
-        const col_name = f.args[1].col;
-        const mapped: ?[]const u8 = blk: {
-            if (std.ascii.eqlIgnoreCase(col_name, "EventTime")) {
-                if (std.ascii.eqlIgnoreCase(unit, "minute")) break :blk "EventMinuteOfHour";
-                if (std.ascii.eqlIgnoreCase(unit, "hour"))   break :blk "EventHour";
-                if (std.ascii.eqlIgnoreCase(unit, "day"))    break :blk "EventDate";
-            }
-            break :blk null;
-        };
-        if (mapped) |m| {
-            return Expr{ .func = .column_ref, .column = try allocator.dupe(u8, m), .alias = alias };
-        }
     }
 
     // if(cond, then, else) → case_when
@@ -794,27 +750,15 @@ pub fn exprToText(allocator: Allocator, e: ast.Expr, ctes: []ast.Cte) BuildError
                 .like   => "LIKE",
                 .not_like => "NOT LIKE",
             };
-            // LIKE / NOT LIKE predicates must not be wrapped in parens so that
-            // where_text matches what parseFilter / test expectations require.
-            if (bo.op == .like or bo.op == .not_like) {
-                return std.fmt.allocPrint(allocator, "{s} {s} {s}", .{ ltext, op_str, rtext });
-            }
-            // LIKE / NOT LIKE predicates must not be wrapped in parens so that
-            // where_text matches what parseFilter / test expectations require.
-            if (bo.op == .like or bo.op == .not_like) {
-                return std.fmt.allocPrint(allocator, "{s} {s} {s}", .{ ltext, op_str, rtext });
-            }
-            // LIKE / NOT LIKE predicates must not be wrapped in parens so that
-            // where_text matches what parseFilter / test expectations require.
-            if (bo.op == .like or bo.op == .not_like) {
-                return std.fmt.allocPrint(allocator, "{s} {s} {s}", .{ ltext, op_str, rtext });
-            }
-            // LIKE / NOT LIKE predicates must not be wrapped in parens so that
-            // where_text matches what parseFilter / test expectations require.
-            if (bo.op == .like or bo.op == .not_like) {
-                return std.fmt.allocPrint(allocator, "{s} {s} {s}", .{ ltext, op_str, rtext });
-            }
-            return std.fmt.allocPrint(allocator, "({s} {s} {s})", .{ ltext, op_str, rtext });
+            // Only arithmetic operators need parentheses for precedence.
+            // Comparison and logical operators are rendered without parens so
+            // that where_text can be passed to parseFilter correctly.
+            return switch (bo.op) {
+                .add, .sub, .mul, .div, .mod, .concat =>
+                    std.fmt.allocPrint(allocator, "({s} {s} {s})", .{ ltext, op_str, rtext }),
+                else =>
+                    std.fmt.allocPrint(allocator, "{s} {s} {s}", .{ ltext, op_str, rtext }),
+            };
         },
         .not => |inner| {
             const s = try exprToText(allocator, inner.*, ctes);
@@ -989,7 +933,7 @@ test "plan_builder: simple SELECT column_ref" {
     try std.testing.expect(plan.projections[0].func == .column_ref);
     try std.testing.expectEqualStrings("a", plan.projections[0].column.?);
     try std.testing.expect(plan.where_text != null);
-    try std.testing.expectEqualStrings("(x = 1)", plan.where_text.?);
+    try std.testing.expectEqualStrings("x = 1", plan.where_text.?);
 }
 
 test "plan_builder: COUNT(*) aggregate" {

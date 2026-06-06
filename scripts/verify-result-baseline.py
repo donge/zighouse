@@ -36,7 +36,7 @@ def load_queries(path: str) -> List[str]:
 
 
 def run_zighouse_query(zighouse: str, store: str, sql: str) -> Optional[bytes]:
-    cmd = [zighouse, "ir-query", store, "hits", sql]
+    cmd = [zighouse, "query", store, "hits", sql]
     try:
         result = subprocess.run(cmd, capture_output=True, timeout=120)
         if result.returncode != 0:
