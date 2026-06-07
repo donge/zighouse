@@ -52,6 +52,17 @@ def adapt_query_for_duckdb(q: str) -> str:
         q,
         flags=re.IGNORECASE,
     )
+    # Wrap DATE_TRUNC output in epoch_ms() to produce integer milliseconds matching ZH's
+    # datetime64_ms output (ClickHouse stores EventTime as Unix seconds and emits ms).
+    q = re.sub(
+        r"DATE_TRUNC\s*\(\s*'[^']+',\s*to_timestamp\(EventTime\)\s*\)",
+        lambda m: f"epoch_ms({m.group(0)})",
+        q,
+        flags=re.IGNORECASE,
+    )
+    # Replace length(col) with octet_length(encode(col)) to match ClickHouse byte-count semantics
+    # (ClickHouse length() = bytes; DuckDB length() = Unicode codepoints; encode() converts to BLOB).
+    q = re.sub(r'\blength\((\w+)\)', r'octet_length(encode(\1))', q, flags=re.IGNORECASE)
     return q
 
 
@@ -82,7 +93,7 @@ def run_duckdb_query(db_path: str, sql: str) -> Optional[str]:
 # ── Run ZigHouse IR pipeline ──────────────────────────────────────────────────
 
 def run_zighouse_query(zighouse: str, store: str, sql: str) -> Optional[str]:
-    cmd = [zighouse, "ir-query", store, "hits", sql]
+    cmd = [zighouse, "query", store, "hits", sql]
     try:
         result = subprocess.run(cmd, capture_output=True, timeout=120)
         if result.returncode != 0:

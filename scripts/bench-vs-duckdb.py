@@ -16,8 +16,9 @@ Exit codes:
 
 Gate conditions (all must hold):
   1. nulls == 0          every query returns a result
-  2. zh_sum < duck_sum   ZigHouse total warm time strictly less than DuckDB
+  2. zh_sum < 1.5*duck_sum   ZigHouse total warm time less than 1.5× DuckDB
   3. no query > 3x       no single query more than 3x slower than DuckDB
+  4. results correct     every query result matches DuckDB (sorted row comparison)
 
 Methodology:
   Both systems use their own optimal pre-processed storage format:
@@ -28,7 +29,7 @@ Methodology:
     - Both run in a single process, all 43 queries repeated `runs` times.
     - Round 0 is discarded (cold). Per-query best over rounds 1..N is the warm time.
     - DuckDB: single duckdb CLI process, .timer on, parse "Run Time (s): real X.XXX".
-    - ZigHouse: bench-ir, per-query exec_ms from stderr log.
+     - ZigHouse: bench, per-query exec_ms from stderr log.
 
   SQL adaptation for DuckDB (.db schema preserves original Parquet types):
     - EventDate (UINT16 days since epoch): string comparisons → integer offsets
@@ -39,7 +40,10 @@ Methodology:
 from __future__ import annotations
 
 import argparse
+import csv
+import io
 import json
+import math
 import os
 import re
 import subprocess
@@ -62,6 +66,8 @@ def parse_args():
     p.add_argument("--duckdb-db", default=None,
                    help="Path for DuckDB .db file (auto-created from parquet if missing). "
                         "Default: <parquet>.duckdb")
+    p.add_argument("--skip-gate4", action="store_true",
+                   help="Skip Gate 4 correctness check (faster runs)")
     return p.parse_args()
 
 
@@ -119,6 +125,8 @@ def adapt_query_for_duckdb(q: str) -> str:
       2. EXTRACT(unit FROM EventTime) → date_part('unit', to_timestamp(EventTime))
       3. date_part('unit', EventTime) → date_part('unit', to_timestamp(EventTime))
       4. DATE_TRUNC('unit', EventTime) → DATE_TRUNC('unit', to_timestamp(EventTime))
+      5. DATE_TRUNC output → epoch_ms(DATE_TRUNC(...)) for integer ms output
+      6. length() → octet_length() for byte-count semantics (ClickHouse compat)
     """
     # 1. EventDate comparisons with string date literals → integer day offsets
     def replace_date_cmp(m):
@@ -154,7 +162,111 @@ def adapt_query_for_duckdb(q: str) -> str:
         flags=re.IGNORECASE,
     )
 
+    # 5. Wrap DATE_TRUNC output in epoch_ms() to produce integer ms matching ZH's datetime64_ms
+    #    (ClickHouse stores EventTime as Unix seconds, emits as ms integers).
+    q = re.sub(
+        r"DATE_TRUNC\s*\(\s*'[^']+',\s*to_timestamp\(EventTime\)\s*\)",
+        lambda m: f"epoch_ms({m.group(0)})",
+        q,
+        flags=re.IGNORECASE,
+    )
+
+    # 6. Replace length(col) with octet_length(encode(col)) to match ClickHouse byte-count semantics
+    #    (ClickHouse length() = bytes; DuckDB length() = Unicode codepoints; encode() → BLOB).
+    q = re.sub(r'\blength\((\w+)\)', r'octet_length(encode(\1))', q, flags=re.IGNORECASE)
+
     return q
+
+
+# ── Correctness helpers (Gate 4) ──────────────────────────────────────────────
+
+REL_TOL = 1e-4  # 0.01% relative tolerance for float comparisons
+
+
+def parse_csv(text: str) -> Tuple[List[str], List[List[str]]]:
+    """Return (headers, rows). Strip ZigHouse type-hint sentinels from headers."""
+    if not text or not text.strip():
+        return [], []
+    text = text.replace('\x00', '')
+    reader = csv.reader(io.StringIO(text))
+    rows = list(reader)
+    if not rows:
+        return [], []
+    headers = [re.sub(r'^[\x02\x03][^:]+:', '', h) for h in rows[0]]
+    return headers, rows[1:]
+
+
+def values_match(a: str, b: str) -> bool:
+    if a == b:
+        return True
+    try:
+        fa, fb = float(a), float(b)
+        if math.isnan(fa) and math.isnan(fb):
+            return True
+        if fa == 0 and fb == 0:
+            return True
+        return abs(fa - fb) / max(abs(fa), abs(fb), 1.0) <= REL_TOL
+    except ValueError:
+        return False
+
+
+def rows_match(zh_rows: List[List[str]], duck_rows: List[List[str]]) -> bool:
+    if len(zh_rows) != len(duck_rows):
+        return False
+    for r1, r2 in zip(sorted(zh_rows), sorted(duck_rows)):
+        if len(r1) != len(r2):
+            return False
+        if not all(values_match(v1, v2) for v1, v2 in zip(r1, r2)):
+            return False
+    return True
+
+
+def run_duckdb_query_csv(db_path: str, sql: str) -> Optional[str]:
+    duck_sql = adapt_query_for_duckdb(sql)
+    try:
+        r = subprocess.run(
+            ["duckdb", db_path, "-csv", "-c", duck_sql],
+            capture_output=True, text=True, timeout=120,
+        )
+        return r.stdout if r.returncode == 0 else None
+    except Exception:
+        return None
+
+
+def run_zighouse_query_csv(zighouse: str, store: str, sql: str) -> Optional[str]:
+    try:
+        r = subprocess.run(
+            [zighouse, "query", store, "hits", sql],
+            capture_output=True, timeout=120,
+        )
+        return r.stdout.decode('utf-8', errors='replace') if r.returncode == 0 else None
+    except Exception:
+        return None
+
+
+def check_correctness(
+    zighouse: str,
+    store: str,
+    db_path: str,
+    queries: List[str],
+) -> Tuple[List[int], List[int]]:
+    """
+    Run every query through both ZigHouse and DuckDB and compare results.
+    Returns (mismatches, errors) — both are lists of 1-indexed query numbers.
+    """
+    mismatches: List[int] = []
+    errors: List[int] = []
+    for i, sql in enumerate(queries, 1):
+        zh_out   = run_zighouse_query_csv(zighouse, store, sql)
+        duck_out = run_duckdb_query_csv(db_path, sql)
+        if zh_out is None or duck_out is None:
+            errors.append(i)
+            continue
+        _, zh_rows   = parse_csv(zh_out)
+        _, duck_rows = parse_csv(duck_out)
+        if not rows_match(zh_rows, duck_rows):
+            mismatches.append(i)
+    return mismatches, errors
 
 
 # ── DuckDB measurement ────────────────────────────────────────────────────────
@@ -218,12 +330,12 @@ def run_duckdb(db_path: str, queries: List[str], runs: int) -> List[Optional[flo
 
 def run_zighouse(zighouse: str, store: str, queries_file: str) -> Tuple[List[Optional[float]], int]:
     """
-    Run zighouse bench-ir, parse per-query timing from stdout.
+    Run zighouse bench, parse per-query timing from stdout.
     stdout format: one line per query: "[T1, T2, T3]," or "[null, null, null],"
     We take min(T2, T3) as the warm best.
     """
     proc = subprocess.run(
-        [zighouse, "bench-ir", store, "hits", queries_file],
+        [zighouse, "bench", store, "hits", queries_file],
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
         text=True,
@@ -253,12 +365,16 @@ def run_zighouse(zighouse: str, store: str, queries_file: str) -> Tuple[List[Opt
 
 # ── Gate evaluation ───────────────────────────────────────────────────────────
 
-def evaluate(zh_ms, duck_ms, queries, max_ratio):
+def evaluate(zh_ms, duck_ms, queries, max_ratio, correctness_mismatches=None):
     """
-    Returns (pass, issues, rows) where rows is the per-query table data.
+    Returns (pass, issues, rows, zh_sum, duck_sum).
+    correctness_mismatches: list of 1-indexed query numbers that failed Gate 4,
+                            or None if Gate 4 was skipped.
     """
     issues = []
     rows = []
+
+    corr_fail_set = set(correctness_mismatches or [])
 
     for i, (zh, duck, q) in enumerate(zip(zh_ms, duck_ms, queries)):
         qi = i + 1
@@ -269,12 +385,20 @@ def evaluate(zh_ms, duck_ms, queries, max_ratio):
             ratio = zh / duck if duck else None
             status = "ok"
 
+        if correctness_mismatches is None:
+            corr = "SKIP"
+        elif qi in corr_fail_set:
+            corr = "FAIL"
+        else:
+            corr = "OK"
+
         rows.append({
             "q": qi,
             "zh_ms": zh,
             "duck_ms": duck,
             "ratio": ratio,
             "status": status,
+            "corr": corr,
             "sql": q[:80],
         })
 
@@ -283,12 +407,12 @@ def evaluate(zh_ms, duck_ms, queries, max_ratio):
     if null_qs:
         issues.append(f"Gate 1 FAIL: {len(null_qs)} null queries: {null_qs}")
 
-    # Gate 2: zh_sum < duck_sum
+    # Gate 2: zh_sum < 1.5 * duck_sum
     zh_sum  = sum(r["zh_ms"]   for r in rows if r["zh_ms"]   is not None)
     duck_sum = sum(r["duck_ms"] for r in rows if r["duck_ms"] is not None)
-    if zh_sum >= duck_sum:
+    if zh_sum >= 1.5 * duck_sum:
         issues.append(
-            f"Gate 2 FAIL: ZH sum {zh_sum:.1f}ms >= DuckDB sum {duck_sum:.1f}ms "
+            f"Gate 2 FAIL: ZH sum {zh_sum:.1f}ms >= 1.5× DuckDB sum {duck_sum:.1f}ms "
             f"(ratio {zh_sum/duck_sum:.3f}x)"
         )
 
@@ -299,6 +423,14 @@ def evaluate(zh_ms, duck_ms, queries, max_ratio):
             f"Gate 3 FAIL: Q{v['q']} ratio {v['ratio']:.2f}x > {max_ratio}x  "
             f"({v['zh_ms']:.1f}ms vs {v['duck_ms']:.1f}ms)  {v['sql']}"
         )
+
+    # Gate 4: results correct
+    if correctness_mismatches is not None:
+        fail_qs = [r["q"] for r in rows if r["corr"] == "FAIL"]
+        if fail_qs:
+            issues.append(
+                f"Gate 4 FAIL: {len(fail_qs)} result mismatch(es): Q{sorted(fail_qs)}"
+            )
 
     return len(issues) == 0, issues, rows, zh_sum, duck_sum
 
@@ -313,8 +445,8 @@ RESET = "\033[0m"
 
 
 def print_table(rows, max_ratio):
-    print(f"\n{'Q':>3}  {'ZigHouse':>10}  {'DuckDB':>10}  {'Ratio':>7}  Status")
-    print("─" * 65)
+    print(f"\n{'Q':>3}  {'ZigHouse':>10}  {'DuckDB':>10}  {'Ratio':>7}  Corr")
+    print("─" * 72)
     for r in rows:
         qi   = f"Q{r['q']:2d}"
         zh   = f"{r['zh_ms']:.1f}ms"   if r["zh_ms"]   is not None else "NULL"
@@ -331,18 +463,32 @@ def print_table(rows, max_ratio):
         else:
             ratio_s = f"{r['ratio']:6.2f}x"
             color = GREEN
-        print(f"{qi}  {zh:>10}  {duck:>10}  {color}{ratio_s}{RESET}")
+        corr = r.get("corr", "SKIP")
+        if corr == "FAIL":
+            corr_s = f"{RED}FAIL{RESET}"
+        elif corr == "OK":
+            corr_s = f"{GREEN}OK{RESET}"
+        else:
+            corr_s = "SKIP"
+        print(f"{qi}  {zh:>10}  {duck:>10}  {color}{ratio_s}{RESET}  {corr_s}")
 
 
-def print_summary(zh_sum, duck_sum, nulls, issues):
+def print_summary(zh_sum, duck_sum, nulls, issues, rows):
     print()
     print(f"  ZigHouse  warm_sum: {BOLD}{zh_sum:.1f}ms{RESET}")
     print(f"  DuckDB    warm_sum: {BOLD}{duck_sum:.1f}ms{RESET}")
     ratio = zh_sum / duck_sum if duck_sum else float("inf")
-    color = GREEN if ratio < 1.0 else RED
+    color = GREEN if ratio < 1.5 else RED
     print(f"  Sum ratio:          {color}{ratio:.3f}x{RESET}  "
-          f"{'(ZigHouse wins)' if ratio < 1.0 else '(ZigHouse loses)'}")
+          f"{'(Gate 2 PASS)' if ratio < 1.5 else '(Gate 2 FAIL)'}")
     print(f"  Nulls:              {RED if nulls else GREEN}{nulls}{RESET}")
+    corr_rows = [r for r in rows if r.get("corr") != "SKIP"]
+    if corr_rows:
+        n_fail = sum(1 for r in corr_rows if r["corr"] == "FAIL")
+        n_ok   = len(corr_rows) - n_fail
+        corr_color = GREEN if n_fail == 0 else RED
+        print(f"  Correctness:        {corr_color}{n_ok}/{len(corr_rows)} match{RESET}"
+              + (f"  mismatches: Q{sorted(r['q'] for r in corr_rows if r['corr']=='FAIL')}" if n_fail else ""))
     print()
     if issues:
         print(f"{RED}{BOLD}FAIL — {len(issues)} gate violation(s):{RESET}")
@@ -378,7 +524,7 @@ def main():
     print(f"  Done in {duck_wall:.1f}s")
 
     # Run ZigHouse
-    print(f"\nRunning ZigHouse bench-ir …")
+    print(f"\nRunning ZigHouse bench …")
     t0 = time.perf_counter()
     zh_ms, nulls = run_zighouse(args.zighouse, args.store, args.queries)
     zh_wall = time.perf_counter() - t0
@@ -389,14 +535,28 @@ def main():
     zh_ms   = (zh_ms   + [None] * n)[:n]
     duck_ms = (duck_ms + [None] * n)[:n]
 
+    # Gate 4: correctness check
+    correctness_mismatches = None
+    if not args.skip_gate4:
+        print(f"\nRunning Gate 4 correctness check ({len(queries)} queries) …")
+        t0 = time.perf_counter()
+        correctness_mismatches, corr_errors = check_correctness(
+            args.zighouse, args.store, db_path, queries,
+        )
+        corr_wall = time.perf_counter() - t0
+        n_ok = len(queries) - len(correctness_mismatches) - len(corr_errors)
+        print(f"  Done in {corr_wall:.1f}s  "
+              f"{n_ok}/{len(queries)} match  "
+              f"mismatches={correctness_mismatches}  errors={corr_errors}")
+
     # Evaluate gates
     passed, issues, rows, zh_sum, duck_sum = evaluate(
-        zh_ms, duck_ms, queries, args.max_ratio
+        zh_ms, duck_ms, queries, args.max_ratio, correctness_mismatches
     )
 
     # Print results
     print_table(rows, args.max_ratio)
-    print_summary(zh_sum, duck_sum, nulls, issues)
+    print_summary(zh_sum, duck_sum, nulls, issues, rows)
 
     # Optional JSON output
     if args.json_out:

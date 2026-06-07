@@ -2056,6 +2056,16 @@ fn inferExprType(ctx: *PlannerCtx, expr: Expr) ColumnType {
             if (std.mem.eql(u8, fc.name, "if") or std.mem.eql(u8, fc.name, "multiIf")) {
                 if (fc.args.len >= 2) return inferExprType(ctx, fc.args[1]);
             }
+            if (std.mem.eql(u8, fc.name, "regexp_replace") or
+                std.mem.eql(u8, fc.name, "replaceRegexpOne") or
+                std.mem.eql(u8, fc.name, "replaceAll") or
+                std.mem.eql(u8, fc.name, "lower") or
+                std.mem.eql(u8, fc.name, "upper") or
+                std.mem.eql(u8, fc.name, "trim") or
+                std.mem.eql(u8, fc.name, "ltrim") or
+                std.mem.eql(u8, fc.name, "rtrim") or
+                std.mem.eql(u8, fc.name, "lpad") or
+                std.mem.eql(u8, fc.name, "rpad")) return .string;
             return .float64;
         },
         .dict_call => |dc| {
