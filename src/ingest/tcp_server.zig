@@ -1007,28 +1007,14 @@ fn handleSelect(ctx: *ServerCtx, a: std.mem.Allocator, w: *Io.Writer, sql: []con
     // ── Default: execute against real table data via IR pipeline ─────────────
     const plan_opt = try generic_sql.parse(a, sql);
     if (plan_opt == null) {
-        // parse failed — try DuckDB direct execution for computed queries
-        const csv_fallback = try generic_sql.execCsv(a, sql);
-        if (csv_fallback) |csv| {
-            defer a.free(csv);
-            const fake_table = schema.Table{ .name = "", .columns = &.{} };
-            var rs = try serializer.csvToResultSet(a, csv, &fake_table);
-            defer rs.deinit();
-            const nb = try serializer.toNativeBlock(a, rs);
-            defer a.free(nb);
-            try sendData(a, w, nb);
-            try sendProfileInfo(a, w);
-            try sendEos(w);
-        } else {
-            // Unknown SQL — return empty result
-            var block_buf: std.ArrayListUnmanaged(u8) = .empty;
-            defer block_buf.deinit(a);
-            try writeBlockInfo(&block_buf, a);
-            try wuv(&block_buf, a, 0); try wuv(&block_buf, a, 0);
-            try sendData(a, w, block_buf.items);
-            try sendProfileInfo(a, w);
-            try sendEos(w);
-        }
+        // Unknown SQL — return empty result
+        var block_buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer block_buf.deinit(a);
+        try writeBlockInfo(&block_buf, a);
+        try wuv(&block_buf, a, 0); try wuv(&block_buf, a, 0);
+        try sendData(a, w, block_buf.items);
+        try sendProfileInfo(a, w);
+        try sendEos(w);
         return;
     }
     const plan = plan_opt.?;

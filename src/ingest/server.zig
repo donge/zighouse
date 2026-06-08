@@ -45,7 +45,6 @@ const ddl_parser = @import("ddl_parser");
 const mv_parse = @import("mv_parse");
 const mv_persist = @import("mv_persist");
 const native_block = @import("native_block");
-const csv_mod = @import("csv");
 const serializer = @import("serializer");
 const core = @import("core");
 const ir_planner = @import("ir_planner");
@@ -969,8 +968,6 @@ pub const Server = struct {
     /// SELECT handler for body-SQL mode.
     /// Handles clickhouse-go handshake and generic SELECTs.
     fn handleSelectSimple(self: *Server, request: *std.http.Server.Request, out: *std.Io.Writer, sql: []const u8, want_tsv: bool) !void {
-        // Debug: log incoming SQL
-        std.debug.print("[SQL] {s}\n", .{sql[0..@min(3000, sql.len)]});
         // clickhouse-go handshake: SELECT displayName(), version(), revision(), timezone()
         // Must return a Native Block (clickhouse-go uses default_format=Native).
         if (std.mem.indexOf(u8, sql, "displayName()") != null or
@@ -1112,14 +1109,7 @@ pub const Server = struct {
 
         // Parse SQL into a Plan.
         const plan = (try generic_sql.parse(self.allocator, sql_clean)) orelse {
-            // parse failed — try DuckDB direct execution for computed queries
-            const csv_fallback = try generic_sql.execCsv(self.allocator, sql_clean);
-            if (csv_fallback) |csv| {
-                defer self.allocator.free(csv);
-                try sendResponse(request, out, .ok, csv);
-            } else {
-                try sendResponse(request, out, .bad_request, "Cannot parse SELECT query\n");
-            }
+            try sendResponse(request, out, .bad_request, "Cannot parse SELECT query\n");
             return;
         };
         defer generic_sql.deinit(self.allocator, plan);

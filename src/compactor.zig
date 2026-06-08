@@ -19,7 +19,6 @@ const schema_persist = @import("schema_persist");
 const ch_part       = @import("ch_part");
 const part_scanner  = @import("part_scanner");
 const mv_parse      = @import("mv_parse");
-const mv_persist_mod = @import("mv_persist");
 const generic_sql   = @import("generic_sql");
 const ir_planner    = @import("ir_planner");
 const core          = @import("core");

@@ -124,8 +124,6 @@ pub fn build(b: *std.Build) void {
         "optimize",
         "Prioritize performance, safety, or binary size (default: ReleaseFast)",
     ) orelse .ReleaseFast;
-    const enable_duckdb = b.option(bool, "duckdb", "Link DuckDB and enable DuckDB-backed commands") orelse true;
-    const duckdb_prefix = b.option([]const u8, "duckdb-prefix", "DuckDB installation prefix") orelse "/opt/homebrew/opt/duckdb";
     // -Dstatic-libs=true: link lz4 and zstd as static archives instead of dylibs.
     // Default false to preserve current dev behaviour; set true for release builds.
     const static_libs = b.option(bool, "static-libs", "Statically link lz4 and zstd") orelse false;
@@ -153,13 +151,6 @@ pub fn build(b: *std.Build) void {
         .static_libs = static_libs, .vendored = vendored_zstd_early,
     };
     const install_bench_tools = b.option(bool, "bench-tools", "Install benchmark helper executables") orelse true;
-    const options = b.addOptions();
-    options.addOption(bool, "duckdb", enable_duckdb);
-    const fixture_parquet_path = b.fmt("{s}/data/fixture_hits.parquet", .{b.build_root.path orelse "."});
-    options.addOption([]const u8, "fixture_parquet_path", fixture_parquet_path);
-    // Single shared module for build_options to avoid duplicate-module errors
-    // when generic_executor_mod / generic_sql_mod are imported into exe.root_module.
-    const options_mod = options.createModule();
 
     // Shared schema module (used by clickhouse_format test targets)
     const schema_mod = b.createModule(.{
@@ -186,16 +177,7 @@ pub fn build(b: *std.Build) void {
     if (b.option(bool, "strip", "Strip debug symbols from installed executable") orelse false) {
         exe.root_module.strip = true;
     }
-    exe.root_module.addImport("build_options", options_mod);
     exe.root_module.link_libc = true;
-    if (enable_duckdb) {
-        const duckdb_include = b.fmt("{s}/include", .{duckdb_prefix});
-        const duckdb_lib = b.fmt("{s}/lib", .{duckdb_prefix});
-        exe.root_module.addIncludePath(.{ .cwd_relative = duckdb_include });
-        exe.root_module.addLibraryPath(.{ .cwd_relative = duckdb_lib });
-        exe.root_module.addRPath(.{ .cwd_relative = duckdb_lib });
-        exe.root_module.linkSystemLibrary("duckdb", .{});
-    }
 
     b.installArtifact(exe);
 
@@ -215,17 +197,8 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
-    unit_tests.root_module.addImport("build_options", options_mod);
     unit_tests.root_module.link_libc = true;
     zstdctx_early.link(unit_tests.root_module);
-    if (enable_duckdb) {
-        const duckdb_include = b.fmt("{s}/include", .{duckdb_prefix});
-        const duckdb_lib = b.fmt("{s}/lib", .{duckdb_prefix});
-        unit_tests.root_module.addIncludePath(.{ .cwd_relative = duckdb_include });
-        unit_tests.root_module.addLibraryPath(.{ .cwd_relative = duckdb_lib });
-        unit_tests.root_module.addRPath(.{ .cwd_relative = duckdb_lib });
-        unit_tests.root_module.linkSystemLibrary("duckdb", .{});
-    }
     const test_cmd = b.addRunArtifact(unit_tests);
 
     const simd_tests = b.addTest(.{
@@ -263,17 +236,8 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
-    generic_sql_tests.root_module.addImport("build_options", options_mod);
     generic_sql_tests.root_module.link_libc = true;
     zstdctx_early.link(generic_sql_tests.root_module);
-    if (enable_duckdb) {
-        const duckdb_include = b.fmt("{s}/include", .{duckdb_prefix});
-        const duckdb_lib = b.fmt("{s}/lib", .{duckdb_prefix});
-        generic_sql_tests.root_module.addIncludePath(.{ .cwd_relative = duckdb_include });
-        generic_sql_tests.root_module.addLibraryPath(.{ .cwd_relative = duckdb_lib });
-        generic_sql_tests.root_module.addRPath(.{ .cwd_relative = duckdb_lib });
-        generic_sql_tests.root_module.linkSystemLibrary("duckdb", .{});
-    }
     const generic_sql_test_cmd = b.addRunArtifact(generic_sql_tests);
 
     const lowcard_tests = b.addTest(.{
@@ -327,6 +291,12 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const hashmap_mod = b.createModule(.{
+        .root_source_file = b.path("src/hashmap.zig"),
+        .target   = target,
+        .optimize = optimize,
+    });
+
     const generic_store_tests = b.addTest(.{ .root_module = generic_store_mod });
     generic_store_tests.root_module.link_libc = true;
     const generic_store_test_cmd = b.addRunArtifact(generic_store_tests);
@@ -352,17 +322,8 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    generic_sql_mod.addImport("build_options", options_mod);
     generic_sql_mod.addImport("sql_parser", sql_parser_mod);
     generic_sql_mod.link_libc = true;
-    if (enable_duckdb) {
-        const duckdb_include_path = b.fmt("{s}/include", .{duckdb_prefix});
-        const duckdb_lib_path = b.fmt("{s}/lib", .{duckdb_prefix});
-        generic_sql_mod.addIncludePath(.{ .cwd_relative = duckdb_include_path });
-        generic_sql_mod.addLibraryPath(.{ .cwd_relative = duckdb_lib_path });
-        generic_sql_mod.addRPath(.{ .cwd_relative = duckdb_lib_path });
-        generic_sql_mod.linkSystemLibrary("duckdb", .{});
-    }
 
     // Wire sql_parser_mod into test targets
     generic_sql_tests.root_module.addImport("sql_parser", sql_parser_mod);
@@ -671,14 +632,6 @@ pub fn build(b: *std.Build) void {
     ingest_server_mod.addImport("tcp_server", tcp_server_mod);
     ingest_server_mod.link_libc = true;
     lz4ctx.link(ingest_server_mod);
-    if (enable_duckdb) {
-        const duckdb_include_path = b.fmt("{s}/include", .{duckdb_prefix});
-        const duckdb_lib_path = b.fmt("{s}/lib", .{duckdb_prefix});
-        ingest_server_mod.addIncludePath(.{ .cwd_relative = duckdb_include_path });
-        ingest_server_mod.addLibraryPath(.{ .cwd_relative = duckdb_lib_path });
-        ingest_server_mod.addRPath(.{ .cwd_relative = duckdb_lib_path });
-        ingest_server_mod.linkSystemLibrary("duckdb", .{});
-    }
     const ingest_server_tests = b.addTest(.{ .root_module = ingest_server_mod });
     const ingest_server_test_cmd = b.addRunArtifact(ingest_server_tests);
 
@@ -724,6 +677,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     core_mod.addImport("parallel", parallel_mod);
+    core_mod.addImport("hashmap",  hashmap_mod);
     const core_tests = b.addTest(.{ .root_module = core_mod });
     const core_test_cmd = b.addRunArtifact(core_tests);
     unit_tests.root_module.addImport("parallel", parallel_mod);

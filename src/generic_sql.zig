@@ -1,6 +1,4 @@
 const std = @import("std");
-const duckdb_parse = @import("duckdb_parse.zig");
-const build_options = @import("build_options");
 const sql_parser = @import("sql_parser");
 const plan_builder = @import("sql/plan_builder.zig");
 
@@ -133,7 +131,6 @@ pub const Plan = struct {
     projections: []const Expr,
     filter: ?Filter = null,
     /// Typed WHERE predicate tree (superset of `filter`).
-    /// Populated by the DuckDB-backed parser; null when using the legacy parser.
     /// Free with freeWhereNode(allocator, where_expr) before calling deinit.
      where_expr: ?*WhereNode = null,
      where_text: ?[]const u8 = null,
@@ -162,17 +159,14 @@ pub const Plan = struct {
     /// SELECT DISTINCT deduplication
     distinct: bool = false,
     /// When true, all string fields (table, where_text, group_by, having_text,
-    /// order_by_alias, order_by_text) were heap-allocated by the DuckDB parser
+    /// order_by_alias, order_by_text) were heap-allocated by the parser
     /// and must be freed by deinit().  Legacy parser uses SQL slices (no free).
     owned: bool = false,
 };
 
-/// Parse `sql` into a Plan.  Tries the DuckDB-backed parser first (when DuckDB
-/// is linked); falls back to the native Zig parser on failure or when DuckDB
-/// is disabled.
+/// Parse `sql` into a Plan using the native Zig SQL parser.
 pub fn parse(allocator: std.mem.Allocator, sql: []const u8) !?Plan {
     // Normalize ClickHouse array-literal IN syntax: `col IN ['a','b']` → `col IN ('a','b')`
-    // DuckDB cannot parse square brackets as IN lists; convert to parens first.
     const norm1 = try normalizeInBrackets(allocator, sql);
     defer if (!std.mem.eql(u8, norm1, sql)) allocator.free(norm1);
 
@@ -180,27 +174,12 @@ pub fn parse(allocator: std.mem.Allocator, sql: []const u8) !?Plan {
     const normalized = try normalizeExtract(allocator, norm1);
     defer if (!std.mem.eql(u8, normalized, norm1)) allocator.free(normalized);
 
-    if (build_options.duckdb) {
-        const duckdb_result = duckdb_parse.parse(allocator, normalized) catch null;
-        if (duckdb_result) |plan| return plan;
-    }
-
-    // Native parser path (also used as fallback when DuckDB parse fails)
     var arena = std.heap.ArenaAllocator.init(allocator);
     const arena_alloc = arena.allocator();
     defer arena.deinit();
     const stmt = sql_parser.parse(arena_alloc, normalized) orelse return null;
     const plan = plan_builder.buildPlan(allocator, stmt, null) catch return null;
     return plan;
-}
-
-/// Execute `sql` directly via DuckDB and return CSV (header + data rows).
-/// Returns null when DuckDB is not available or the query fails.
-/// Caller owns the returned slice.
-pub fn execCsv(allocator: std.mem.Allocator, sql: []const u8) !?[]u8 {
-    const normalized = try normalizeInBrackets(allocator, sql);
-    defer if (!std.mem.eql(u8, normalized, sql)) allocator.free(normalized);
-    return duckdb_parse.execCsv(allocator, normalized);
 }
 
 /// Replace `EXTRACT(unit FROM col)` with `date_part('unit', col)`.

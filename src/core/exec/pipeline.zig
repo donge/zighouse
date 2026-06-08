@@ -17,7 +17,9 @@ const result = @import("../result.zig");
 const plan   = @import("plan.zig");
 const kernels = @import("kernels.zig");
 const ht     = @import("hash_table.zig");
+const hashmap = @import("hashmap");
 const simd   = @import("../simd_ops.zig");
+const simd_batch = @import("../simd_batch.zig");
 const parallel = @import("parallel");
 
 pub const Value      = types.Value;
@@ -85,12 +87,20 @@ pub const SourceIface = struct {
         setStringNonEmptyBool: ?*const fn (ptr: *anyopaque, col_name: ?[]const u8) void = null,
         /// Optional: return raw int16 slice for a column (bypasses fetchRange overhead).
         getRawInt16Col: ?*const fn (ptr: *anyopaque, col_name: []const u8) ?[]const i16 = null,
+        /// Optional: return raw int32 slice for a column.
+        getRawInt32Col: ?*const fn (ptr: *anyopaque, col_name: []const u8) ?[]const i32 = null,
         /// Optional: return raw int64 slice for a column.
         getRawInt64Col: ?*const fn (ptr: *anyopaque, col_name: []const u8) ?[]const i64 = null,
         /// Optional: return raw string offsets for a column.
         getRawStrOffsets: ?*const fn (ptr: *anyopaque, col_name: []const u8) ?[]const u64 = null,
         /// Optional: return raw string bytes for a column.
         getRawStrBytes: ?*const fn (ptr: *anyopaque, col_name: []const u8) ?[]const u8 = null,
+        /// Optional: restrict scan to rows [lo, hi).  rowCount() and fetchRange()
+        /// will reflect the restricted window until setRowRange(0, row_count) is called.
+        /// reset() does NOT clear this; the caller must explicitly restore.
+        setRowRange: ?*const fn (ptr: *anyopaque, lo: u64, hi: u64) void = null,
+        /// Optional: return the table's declared sort-key column names.
+        getSortKeys: ?*const fn (ptr: *anyopaque) []const []const u8 = null,
     };
 
     pub fn nextChunk(self: SourceIface, out: *DataChunk, ctx: *QueryContext) !bool {
@@ -149,6 +159,28 @@ pub const SourceIface = struct {
         const f = self.vtable.getRawStrBytes orelse return null;
         return f(self.ptr, col_name);
     }
+
+    pub fn getRawInt32Col(self: SourceIface, col_name: []const u8) ?[]const i32 {
+        const f = self.vtable.getRawInt32Col orelse return null;
+        return f(self.ptr, col_name);
+    }
+
+    pub fn getRawInt64Col(self: SourceIface, col_name: []const u8) ?[]const i64 {
+        const f = self.vtable.getRawInt64Col orelse return null;
+        return f(self.ptr, col_name);
+    }
+
+    /// Restrict subsequent scans to rows [lo, hi).  Call setRowRange(0, rowCount())
+    /// to restore the full range.  No-op if the source doesn't support it.
+    pub fn setRowRange(self: SourceIface, lo: u64, hi: u64) void {
+        if (self.vtable.setRowRange) |f| f(self.ptr, lo, hi);
+    }
+
+    /// Return the table's declared sort-key column names, or &.{} if unknown.
+    pub fn getSortKeys(self: SourceIface) []const []const u8 {
+        const f = self.vtable.getSortKeys orelse return &.{};
+        return f(self.ptr);
+    }
 };
 
 // ── Operator state ────────────────────────────────────────────────────────────
@@ -177,6 +209,60 @@ pub const StrCmpCond = struct {
     col_idx: usize,
     op: enum(u8) { eq, neq },
     val: []const u8,
+};
+
+/// Raw typed column slice backed by the mmap'd store (no fetchRange widening).
+/// Enables SIMD filter and key extraction directly on narrow on-disk formats
+/// (i16: not widened to i64; i32/date: not widened to i64; i64: already full width).
+/// Used by the raw-slice fast path in ParHashCtx.runWork and ScatterCtx.runWork
+/// to bypass the i16→i64 / i32→i64 widening that wastes 2-4× memory bandwidth.
+pub const RawColSlice = union(enum) {
+    i16s: []const i16,
+    i32s: []const i32,
+    i64s: []const i64,
+
+    /// Apply one IntCmpCond to rows [start, start+n) using SIMD.
+    /// ANDs the comparison result into mask[0..n] in place.
+    /// tmp_a/tmp_b are i16 scratch buffers (length >= n).
+    pub fn applyMaskSIMD(
+        self: RawColSlice,
+        start: usize, n: usize,
+        cond: IntCmpCond,
+        mask: []i16, tmp_a: []i16, tmp_b: []i16,
+    ) void {
+        switch (self) {
+            .i16s => |a| {
+                if (std.math.cast(i16, cond.val)) |rhs| {
+                    const rhs2: i16 = if (cond.op == .in2)
+                        (std.math.cast(i16, cond.val2) orelse rhs) else 0;
+                    cmpBatchDispatch(i16, a[start..][0..n], cond.op, rhs, rhs2,
+                        tmp_a[0..n], tmp_b[0..n]);
+                } else @memset(tmp_a[0..n], 0);
+            },
+            .i32s => |a| {
+                if (std.math.cast(i32, cond.val)) |rhs| {
+                    const rhs2: i32 = if (cond.op == .in2)
+                        (std.math.cast(i32, cond.val2) orelse rhs) else 0;
+                    cmpBatchDispatch(i32, a[start..][0..n], cond.op, rhs, rhs2,
+                        tmp_a[0..n], tmp_b[0..n]);
+                } else @memset(tmp_a[0..n], 0);
+            },
+            .i64s => |a| {
+                cmpBatchDispatch(i64, a[start..][0..n], cond.op,
+                    cond.val, cond.val2, tmp_a[0..n], tmp_b[0..n]);
+            },
+        }
+        simd_batch.andMasks(mask[0..n], tmp_a[0..n], mask[0..n]);
+    }
+
+    /// Get i64 representation of element at absolute row index (sign-extends narrow types).
+    pub fn getI64(self: RawColSlice, row: usize) i64 {
+        return switch (self) {
+            .i16s => |a| @as(i64, a[row]),
+            .i32s => |a| @as(i64, a[row]),
+            .i64s => |a| a[row],
+        };
+    }
 };
 
 /// A CASE WHEN key that evaluates to a string inline (no evalExpr needed).
@@ -240,26 +326,86 @@ fn extractCaseWhenStrKey(expr: plan.Expr) ?CaseWhenStrKey {
     return cw_result;
 }
 
-/// Parse "YYYY-MM-DD" string to days-since-epoch (i64), or null if not a date string.
-fn parseDateStrToI64(s: []const u8) ?i64 {
-    if (s.len < 10 or s[4] != '-' or s[7] != '-') return null;
-    const y = std.fmt.parseInt(i32, s[0..4], 10) catch return null;
-    const m = std.fmt.parseInt(u32, s[5..7], 10) catch return null;
-    const d = std.fmt.parseInt(u32, s[8..10], 10) catch return null;
-    var yr: i32 = y;
-    var mo: i32 = @intCast(m);
-    if (mo <= 2) { yr -= 1; mo += 9; } else { mo -= 3; }
-    const era: i32 = @divFloor(yr, 400);
-    const yoe: i32 = yr - era * 400;
-    const doy: i32 = @divFloor(153 * mo + 2, 5) + @as(i32, @intCast(d)) - 1;
-    const doe: i32 = yoe * 365 + @divFloor(yoe, 4) - @divFloor(yoe, 100) + doy;
-    const days: i32 = era * 146097 + doe - 719468;
-    return @as(i64, days);
-}
-
 /// Extract leaf int-comparison conditions from a pure-AND predicate tree.
 /// Returns false if the predicate contains any non-int or non-AND node.
 /// When `best_effort=true`, partial extraction is allowed; returns true with partial set.
+/// Dispatch cmpBatch for type T with a runtime op from IntCmpCond.
+/// For .in2: ORs two cmpBatch(eq) results into `out`.
+/// `rhs2` and `tmp_b` are only used for .in2.
+fn cmpBatchDispatch(
+    comptime T: type,
+    vals:  []const T,
+    op:    anytype,  // IntCmpCond.op (runtime enum)
+    rhs:   T,
+    rhs2:  T,
+    out:   []i16,
+    tmp_b: []i16,
+) void {
+    switch (op) {
+        .eq  => simd_batch.cmpBatch(T, vals, .eq,  rhs, out),
+        .neq => simd_batch.cmpBatch(T, vals, .neq, rhs, out),
+        .lt  => simd_batch.cmpBatch(T, vals, .lt,  rhs, out),
+        .lte => simd_batch.cmpBatch(T, vals, .lte, rhs, out),
+        .gt  => simd_batch.cmpBatch(T, vals, .gt,  rhs, out),
+        .gte => simd_batch.cmpBatch(T, vals, .gte, rhs, out),
+        .in2 => {
+            simd_batch.cmpBatch(T, vals, .eq, rhs,  out);
+            simd_batch.cmpBatch(T, vals, .eq, rhs2, tmp_b);
+            simd_batch.orMasks(out, tmp_b, out);
+        },
+    }
+}
+
+/// Apply one IntCmpCond to n rows of a DataChunk column using SIMD vectorization.
+/// Updates `mask` (AND-combines with the new condition result) in-place.
+/// `tmp_a` and `tmp_b` are scratch i16 slices; `tmp_b` is only used for .in2.
+/// All slices must have length >= n.
+/// Returns false if the column type is unsupported — caller should fall back to scalar.
+fn applyIntCondSIMD(
+    c:     *const DataChunk,
+    cond:  IntCmpCond,
+    n:     usize,
+    mask:  []i16,
+    tmp_a: []i16,
+    tmp_b: []i16,
+) bool {
+    if (cond.col_idx >= c.columns.len) {
+        @memset(mask[0..n], 0);
+        return true;
+    }
+    const col = c.columns[cond.col_idx];
+    switch (col.data) {
+        .int64 => |a| {
+            cmpBatchDispatch(i64, a[0..n], cond.op, cond.val, cond.val2, tmp_a[0..n], tmp_b[0..n]);
+        },
+        .uint64 => |a| {
+            cmpBatchDispatch(u64, a[0..n], cond.op,
+                @bitCast(cond.val), @bitCast(cond.val2),
+                tmp_a[0..n], tmp_b[0..n]);
+        },
+        .date_u16 => |a| {
+            if (cond.val < 0 or cond.val > 65535) return false;
+            if (cond.op == .in2 and (cond.val2 < 0 or cond.val2 > 65535)) return false;
+            const rhs: u16  = @intCast(cond.val);
+            const rhs2: u16 = if (cond.op == .in2) @intCast(cond.val2) else 0;
+            cmpBatchDispatch(u16, a[0..n], cond.op, rhs, rhs2, tmp_a[0..n], tmp_b[0..n]);
+        },
+        .datetime64_ms => |a| {
+            cmpBatchDispatch(i64, a[0..n], cond.op, cond.val, cond.val2, tmp_a[0..n], tmp_b[0..n]);
+        },
+        .bool_u8 => |a| {
+            if (cond.val < 0 or cond.val > 255) return false;
+            if (cond.op == .in2 and (cond.val2 < 0 or cond.val2 > 255)) return false;
+            const rhs: u8  = @intCast(cond.val);
+            const rhs2: u8 = if (cond.op == .in2) @intCast(cond.val2) else 0;
+            cmpBatchDispatch(u8, a[0..n], cond.op, rhs, rhs2, tmp_a[0..n], tmp_b[0..n]);
+        },
+        else => return false,
+    }
+    simd_batch.andMasks(mask[0..n], tmp_a[0..n], mask[0..n]);
+    return true;
+}
+
 fn extractAndIntConds(
     expr: plan.Expr,
     out:  []IntCmpCond,
@@ -514,6 +660,9 @@ pub const FilterState = struct {
     /// SIMD batch mask buffer reused across chunk calls (size = chunk_rows).
     /// Used by the evalExprBatch fast path for predicates that don't decompose to IntCmpCond.
     simd_mask_buf: ?[]i16 = null,
+    /// Scratch buffers for applyIntCondSIMD: tmp_a for cmpBatch output, tmp_b for .in2 second pass.
+    simd_tmp_a: ?[]i16 = null,
+    simd_tmp_b: ?[]i16 = null,
 
     /// Precomputed list of non-pruned column indices in the DataChunk.
     /// Used by copyRowActive() to skip the O(all_cols) loop in copyRow() when most columns
@@ -569,6 +718,8 @@ pub const FilterState = struct {
             }
             // Allocate SIMD mask buffer for evalExprBatch fast path.
             self.simd_mask_buf = try alloc.alloc(i16, c.num_rows);
+            self.simd_tmp_a    = try alloc.alloc(i16, c.num_rows);
+            self.simd_tmp_b    = try alloc.alloc(i16, c.num_rows);
             // Precompute active (non-pruned) column indices for fast copyRow.
             var active_count: usize = 0;
             for (c.columns) |col| { if (!col.pruned) active_count += 1; }
@@ -612,33 +763,55 @@ pub const FilterState = struct {
                 }
                 if (all_int) {
                     if (self.int_conds_complete) {
-                        // Complete fast path: skip evalExpr entirely.
-                        var write_pos: usize = 0;
-                        row_loop: for (0..c.num_rows) |r| {
-                            for (conds) |cond| {
-                                const col = c.columns[cond.col_idx];
-                                if (col.isRowNull(r)) continue :row_loop;
-                                const v: i64 = switch (col.data) {
-                                    .int64          => |a| a[r],
-                                    .uint64         => |a| @bitCast(a[r]),
-                                    .date_u16       => |a| @as(i64, a[r]),
-                                    .datetime64_ms  => |a| a[r],
-                                    .bool_u8        => |a| @as(i64, a[r]),
-                                    else            => continue :row_loop,
-                                };
-                                const pass = switch (cond.op) {
-                                    .eq  => v == cond.val,
-                                    .neq => v != cond.val,
-                                    .lt  => v <  cond.val,
-                                    .lte => v <= cond.val,
-                                    .gt  => v >  cond.val,
-                                    .gte => v >= cond.val,
-                                    .in2 => v == cond.val or v == cond.val2,
-                                };
-                                if (!pass) continue :row_loop;
+                        // SIMD fast path: build a pass-mask with cmpBatch, then compact.
+                        const n = c.num_rows;
+                        const i16_mask = self.simd_mask_buf.?[0..n];
+                        const i16_tmp_a = self.simd_tmp_a.?[0..n];
+                        const i16_tmp_b = self.simd_tmp_b.?[0..n];
+                        @memset(i16_mask, 1);
+                        var simd_ok = true;
+                        for (conds) |cond| {
+                            if (!applyIntCondSIMD(c, cond, n, i16_mask, i16_tmp_a, i16_tmp_b)) {
+                                simd_ok = false;
+                                break;
                             }
-                            if (write_pos != r) cr.copy(r, write_pos);
-                            write_pos += 1;
+                        }
+                        var write_pos: usize = 0;
+                        if (simd_ok) {
+                            for (0..n) |r| {
+                                if (i16_mask[r] != 0) {
+                                    if (write_pos != r) cr.copy(r, write_pos);
+                                    write_pos += 1;
+                                }
+                            }
+                        } else {
+                            // Scalar fallback (rare: only if a column type is unsupported).
+                            row_loop: for (0..n) |r| {
+                                for (conds) |cond| {
+                                    const col = c.columns[cond.col_idx];
+                                    if (col.isRowNull(r)) continue :row_loop;
+                                    const v: i64 = switch (col.data) {
+                                        .int64          => |a| a[r],
+                                        .uint64         => |a| @bitCast(a[r]),
+                                        .date_u16       => |a| @as(i64, a[r]),
+                                        .datetime64_ms  => |a| a[r],
+                                        .bool_u8        => |a| @as(i64, a[r]),
+                                        else            => continue :row_loop,
+                                    };
+                                    const pass = switch (cond.op) {
+                                        .eq  => v == cond.val,
+                                        .neq => v != cond.val,
+                                        .lt  => v <  cond.val,
+                                        .lte => v <= cond.val,
+                                        .gt  => v >  cond.val,
+                                        .gte => v >= cond.val,
+                                        .in2 => v == cond.val or v == cond.val2,
+                                    };
+                                    if (!pass) continue :row_loop;
+                                }
+                                if (write_pos != r) cr.copy(r, write_pos);
+                                write_pos += 1;
+                            }
                         }
                         c.num_rows = write_pos;
                         for (c.columns) |*col2| col2.len = write_pos;
@@ -1130,6 +1303,111 @@ fn setColValue(data: *chunk.ColumnData, r: usize, v: Value, ra: std.mem.Allocato
     }
 }
 
+const EqPred = struct { col_idx: usize, val: i64 };
+
+/// Walk an AND-tree collecting all eq(col_ref, lit_i64) or eq(lit_i64, col_ref) leaves.
+/// Returns the number of equalities written into `out` (up to `out.len`).
+fn collectEqPredicates(expr: plan.Expr, schema_metas: []const result.ColMeta, out: []EqPred) usize {
+    var n: usize = 0;
+    switch (expr) {
+        .@"and" => |op| {
+            n += collectEqPredicates(op.left, schema_metas, out[n..]);
+            n += collectEqPredicates(op.right, schema_metas, out[n..]);
+        },
+        .eq => |op| {
+            if (n >= out.len) return n;
+            const col_expr, const lit_expr = blk: {
+                if (op.left == .col_ref and op.right == .lit_i64) break :blk .{ op.left, op.right };
+                if (op.right == .col_ref and op.left == .lit_i64) break :blk .{ op.right, op.left };
+                return n;
+            };
+            out[n] = .{ .col_idx = col_expr.col_ref.index, .val = lit_expr.lit_i64 };
+            n += 1;
+        },
+        else => {},
+    }
+    return n;
+}
+
+/// If the plan has a filter containing equality predicates on a sort key column,
+/// perform binary search on the mmap'd int32 column to restrict the scan range.
+/// No-ops if the source doesn't support setRowRange / getRawInt32Col / getSortKeys.
+fn tryPushdownSortKeyRange(node: *const plan.PhysicalNode, ctx: *QueryContext) void {
+    // Find the filter predicate (may be wrapped in project/limit/top_k).
+    var predicate: ?plan.Expr = null;
+    var cur = node;
+    while (true) {
+        switch (cur.*) {
+            .filter  => |f| { predicate = f.predicate; break; },
+            .project => |p| { cur = p.input; },
+            .limit   => |l| { cur = l.input; },
+            .top_k   => |tk| { cur = tk.input; },
+            .scalar_agg => |sa| { cur = sa.input; },
+            .hash_agg   => |ha| { cur = ha.input; },
+            .order_by   => |ob| { cur = ob.input; },
+            else => return,
+        }
+    }
+    const pred = predicate orelse return;
+
+    // Get sort keys from the source.
+    const sort_keys = ctx.source.getSortKeys();
+    if (sort_keys.len == 0) return;
+
+    // Get schema to map col_idx → name.
+    const schema_metas = ctx.source.schema();
+
+    // Collect equality predicates from the filter's AND tree.
+    var eq_buf: [8]EqPred = undefined;
+    const n_eq = collectEqPredicates(pred, schema_metas, &eq_buf);
+    if (n_eq == 0) return;
+
+    // Try each sort key (only the leading key is useful for a contiguous range).
+    for (sort_keys[0..1]) |sk| {
+        // Find an equality predicate matching this sort key.
+        var match_val: ?i64 = null;
+        for (eq_buf[0..n_eq]) |ep| {
+            if (ep.col_idx < schema_metas.len and std.mem.eql(u8, schema_metas[ep.col_idx].name, sk)) {
+                match_val = ep.val;
+                break;
+            }
+        }
+        const val = match_val orelse continue;
+
+        // Fetch the raw int32 column slice.
+        const col_slice = ctx.source.getRawInt32Col(sk) orelse continue;
+        if (col_slice.len == 0) continue;
+
+        const target: i32 = @intCast(val); // CounterID fits i32
+
+        // Binary search for first index >= target.
+        var lo: usize = 0;
+        var hi: usize = col_slice.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (col_slice[mid] < target) lo = mid + 1 else hi = mid;
+        }
+        const range_lo = lo;
+
+        // Binary search for first index > target.
+        hi = col_slice.len;
+        lo = range_lo;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (col_slice[mid] <= target) lo = mid + 1 else hi = mid;
+        }
+        const range_hi = lo;
+
+        if (range_lo >= range_hi) {
+            // No matching rows — set an empty range.
+            ctx.source.setRowRange(0, 0);
+        } else {
+            ctx.source.setRowRange(range_lo, range_hi);
+        }
+        return; // Only one sort-key pushdown at a time.
+    }
+}
+
 /// Execute a PhysicalNode tree recursively, returning a ResultSet.
 /// Handles all node types including pipeline breakers (HashAgg, ScalarAgg,
 /// OrderBy, TopK, HashJoin).
@@ -1139,8 +1417,30 @@ pub fn executePlan(
 ) !ResultSet {
     const alloc = ctx.allocator();
 
+    // ── Sort-key range pushdown ────────────────────────────────────────────
+    // Restrict the scan range before executing so all paths (scannable and
+    // breaker) benefit.  Resets to full range after execution.
+    const total_rows = ctx.source.rowCount();
+    tryPushdownSortKeyRange(node, ctx);
+    defer ctx.source.setRowRange(0, total_rows);
+
     // ── Scannable path: stream chunks directly into ResultSink ─────────────
     if (isScannable(node)) {
+        // For large tables: try parallel filter-project when the only operators
+        // are project + pure-AND-int-filter. Reduces Q20-style point lookups
+        // from ~12ms (sequential) to ~3ms (parallel scan, 4 threads).
+        scan_par: {
+            if (node.* != .project) break :scan_par;
+            const p = node.project;
+            // Peel inner project nodes until we reach a filter.
+            var cur_inner = p.input;
+            while (cur_inner.* == .project) cur_inner = cur_inner.project.input;
+            if (cur_inner.* != .filter) break :scan_par;
+            const filt_pred = cur_inner.filter.predicate;
+            if (try executeFilterProjectParallel(p.items, filt_pred, ctx)) |par_rl| {
+                return par_rl.toResultSet(alloc);
+            }
+        }
         var sink = ResultSink.init(alloc);
         try executeScannableToSink(node, ctx, &sink);
         return sink.finish();
@@ -1229,7 +1529,7 @@ fn executeScannableToSink(
     const alloc = ctx.allocator();
     switch (node.*) {
         // ── Sources ───────────────────────────────────────────────────────────
-        .part_scan, .mem_scan => {
+        .part_scan, .mem_scan, .chunk_source => {
             const schema_metas = ctx.source.schema();
             const metas = try alloc.dupe(result.ColMeta, schema_metas);
             var rl = RowList.init(metas);
@@ -1246,14 +1546,7 @@ fn executeScannableToSink(
             }
             return rl;
         },
-
-        .chunk_source => |cs| return executeNode(cs.input, ctx),
-
-        // ── Filter ────────────────────────────────────────────────────────────
         .filter => |f| {
-            if (isScannable(f.input)) {
-                return executeLimitChunked(node, ctx);
-            }
             const inner = try executeNode(f.input, ctx);
             var rl = RowList.init(inner.metas);
             for (inner.rows.items) |row| {
@@ -1336,6 +1629,8 @@ fn executeScannableToSink(
                 if (try executeHashAggParallelCompact(ha.input, ha.keys, ha.aggs, ctx)) |rl| return rl;
                 // Try two-phase (i64, string) pair count (Q17/Q18).
                 if (try executeHashAggParallelPairCount(ha.input, ha.keys, ha.aggs, &.{}, 0, ctx)) |rl| return rl;
+                // Try parallel triple count: (i64, date_part, string) + count(*) (Q19).
+                if (try executeHashAggParallelTripleCount(ha.input, ha.keys, ha.aggs, &.{}, 0, ctx)) |rl| return rl;
                 // Try parallel string-key hash agg (str_min/str_max support).
                 if (try executeHashAggParallelStrKey(ha.input, ha.keys, ha.aggs, &.{}, 0, ctx)) |rl| return rl;
                 return executeHashAggChunked(ha.input, ha.keys, ha.aggs, ctx);
@@ -1363,6 +1658,7 @@ fn executeScannableToSink(
                  const ha = tk.input.hash_agg;
                  if (try executeHashAggParallelCompactTopK(ha.input, ha.keys, ha.aggs, tk.keys, k, ctx)) |rl| return rl;
                  if (try executeHashAggParallelPairCount(ha.input, ha.keys, ha.aggs, tk.keys, k, ctx)) |rl| return rl;
+                 if (try executeHashAggParallelTripleCount(ha.input, ha.keys, ha.aggs, tk.keys, k, ctx)) |rl| return rl;
                  if (try executeHashAggParallelStrKey(ha.input, ha.keys, ha.aggs, tk.keys, k, ctx)) |rl| return rl;
              }
              const inner = try executeNode(tk.input, ctx);
@@ -1674,6 +1970,75 @@ fn executeScalarAggParallel(
                      }
                  }
              }
+            // ── Raw int16 SIMD COUNT fast path (e.g. Q2: COUNT(*) WHERE AdvEngineID <> 0) ──
+            // Bypasses fetchRange entirely: reads mmap'd i16 → cmpBatch(i16, 32-lane) → count.
+            raw_int16_cnt_blk: {
+                var i16cnt_ic_buf: [4]IntCmpCond = undefined;
+                var i16cnt_ic_n: usize = 0;
+                if (!extractAndIntConds(pred, &i16cnt_ic_buf, &i16cnt_ic_n, false)) break :raw_int16_cnt_blk;
+                if (i16cnt_ic_n != 1) break :raw_int16_cnt_blk;
+                const i16cnt_cond = i16cnt_ic_buf[0];
+                const i16cnt_sm = ctx.source.schema();
+                if (i16cnt_cond.col_idx >= i16cnt_sm.len) break :raw_int16_cnt_blk;
+                const i16cnt_col = i16cnt_sm[i16cnt_cond.col_idx].name;
+                if (i16cnt_cond.val < std.math.minInt(i16) or i16cnt_cond.val > std.math.maxInt(i16)) break :raw_int16_cnt_blk;
+                if (i16cnt_cond.op == .in2 and (i16cnt_cond.val2 < std.math.minInt(i16) or i16cnt_cond.val2 > std.math.maxInt(i16))) break :raw_int16_cnt_blk;
+                const i16cnt_raw = ctx.source.getRawInt16Col(i16cnt_col) orelse break :raw_int16_cnt_blk;
+                if (i16cnt_raw.len < total_rows) break :raw_int16_cnt_blk;
+                const rhs_i16c:  i16 = @intCast(i16cnt_cond.val);
+                const rhs2_i16c: i16 = @intCast(i16cnt_cond.val2);
+                const I16CntCtx = struct {
+                    raw:        []const i16,
+                    cond:       IntCmpCond,
+                    rhs_i16:    i16,
+                    rhs2_i16:   i16,
+                    accums:     []AggAccum,
+                    morsel_src: *parallel.MorselSource,
+                    mask_buf:   []i16,
+                    tmp_buf:    []i16,
+                    fn work(self: *@This(), _: *parallel.MorselSource) void {
+                        while (self.morsel_src.next()) |m| {
+                            const n = m.end - m.start;
+                            cmpBatchDispatch(i16, self.raw[m.start..m.end], self.cond.op,
+                                self.rhs_i16, self.rhs2_i16,
+                                self.mask_buf[0..n], self.tmp_buf[0..n]);
+                            var cnt: u64 = 0;
+                            for (self.mask_buf[0..n]) |mv| { if (mv != 0) cnt += 1; }
+                            for (self.accums) |*a| { a.count += cnt; }
+                        }
+                    }
+                };
+                var i16cnt_morsels = parallel.MorselSource.init(total_rows, parallel.default_morsel_size);
+                const i16cnt_pctxs = try alloc.alloc(I16CntCtx, n_threads);
+                for (i16cnt_pctxs, 0..) |*pc, ti| {
+                    pc.* = .{
+                        .raw        = i16cnt_raw,
+                        .cond       = i16cnt_cond,
+                        .rhs_i16    = rhs_i16c,
+                        .rhs2_i16   = rhs2_i16c,
+                        .accums     = thread_accums[ti],
+                        .morsel_src = &i16cnt_morsels,
+                        .mask_buf   = try alloc.alloc(i16, parallel.default_morsel_size + 1),
+                        .tmp_buf    = try alloc.alloc(i16, parallel.default_morsel_size + 1),
+                    };
+                }
+                try parallel.parallelFor(alloc, I16CntCtx, I16CntCtx.work, i16cnt_pctxs, &i16cnt_morsels);
+                const i16cnt_merged = thread_accums[0];
+                for (thread_accums[1..]) |ta| {
+                    for (i16cnt_merged, ta, 0..) |*mv, t, ci| {
+                        try mergeAccum(mv, t, aggs[ci], alloc);
+                    }
+                }
+                const i16cnt_metas = try alloc.alloc(result.ColMeta, aggs.len);
+                const i16cnt_row   = try alloc.alloc(?Value, aggs.len);
+                for (aggs, 0..) |item, ci| {
+                    i16cnt_metas[ci] = .{ .name = item.alias, .col_type = item.out_type };
+                    i16cnt_row[ci]   = try finalizeAccum(i16cnt_merged[ci], item, alloc);
+                }
+                var i16cnt_rl = RowList.init(i16cnt_metas);
+                try i16cnt_rl.append(alloc, i16cnt_row);
+                return i16cnt_rl;
+            }
          }
     }
 
@@ -1774,6 +2139,9 @@ fn executeScalarAggParallel(
         accums:      []AggAccum,
         morsel_src:  *parallel.MorselSource,
         parent_alloc: std.mem.Allocator,
+        // Inline int conditions extracted from filter_pred (avoids FilterState.apply()).
+        inline_ic:   [16]IntCmpCond = undefined,
+        inline_ic_n: usize = 0,
         err:         ?anyerror = null,
 
         fn work(self: *@This(), _: *parallel.MorselSource) void {
@@ -1781,7 +2149,7 @@ fn executeScalarAggParallel(
         }
 
         fn runWork(self: *@This()) !void {
-            var thread_arena = std.heap.ArenaAllocator.init(self.parent_alloc);
+            var thread_arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
             defer thread_arena.deinit();
             const talloc = thread_arena.allocator();
 
@@ -1790,6 +2158,48 @@ fn executeScalarAggParallel(
                 const calloc = chunk_arena.allocator();
                 var c: DataChunk = undefined;
                 try self.source.fetchRange(m.start, m.end - m.start, &c, calloc);
+
+                // Fast path: pure int-condition filter — count matching rows inline
+                // without allocating a mask or calling the generic FilterState evaluator.
+                if (self.inline_ic_n > 0) {
+                    const ics = self.inline_ic[0..self.inline_ic_n];
+                    var count: u64 = 0;
+                    for (0..c.num_rows) |r| {
+                        var pass = true;
+                        for (ics) |cond| {
+                            if (cond.col_idx >= c.columns.len) { pass = false; break; }
+                            const col = c.columns[cond.col_idx];
+                            if (col.isRowNull(r)) { pass = false; break; }
+                            const v: i64 = switch (col.data) {
+                                .int64    => |a| a[r],
+                                .uint64   => |a| @bitCast(a[r]),
+                                .date_u16 => |a| @as(i64, a[r]),
+                                .bool_u8  => |a| @as(i64, a[r]),
+                                else => { pass = false; break; },
+                            };
+                            const ok: bool = switch (cond.op) {
+                                .eq  => v == cond.val,  .neq => v != cond.val,
+                                .lt  => v <  cond.val,  .lte => v <= cond.val,
+                                .gt  => v >  cond.val,  .gte => v >= cond.val,
+                                .in2 => v == cond.val or v == cond.val2,
+                            };
+                            if (!ok) { pass = false; break; }
+                        }
+                        if (pass) count += 1;
+                    }
+                    // Accumulate count directly.
+                    for (self.accums, self.aggs) |*accum, item| {
+                        const ac = item.expr.agg_call;
+                        if (ac.kind == .count_star) {
+                            accum.count += count;
+                        } else {
+                            // For non-count aggs fall through to generic path below.
+                            // (This block won't be reached for Q2/Q8-style queries.)
+                        }
+                    }
+                    chunk_arena.deinit();
+                    continue;
+                }
 
                 // Apply filter if any.
                 if (self.filter_pred) |pred| {
@@ -1808,15 +2218,31 @@ fn executeScalarAggParallel(
     var morsel_src = parallel.MorselSource.init(total_rows, parallel.default_morsel_size);
     const pctxs = try alloc.alloc(ParCtx, n_threads);
 
+    // Try to extract pure int conditions for the fast COUNT inline path (Q2/Q8 style).
+    const all_count_star: bool = for (aggs) |item| {
+        if (item.expr != .agg_call or item.expr.agg_call.kind != .count_star) break false;
+    } else true;
+    var pre_ic_buf: [16]IntCmpCond = undefined;
+    var pre_ic_n: usize = 0;
+    var use_inline_ic = false;
+    if (all_count_star) {
+        if (filter_pred) |fp| {
+            const ok = extractAndIntConds(fp, &pre_ic_buf, &pre_ic_n, false);
+            if (ok and pre_ic_n > 0) use_inline_ic = true;
+        }
+    }
+
     for (pctxs, 0..) |*pc, ti| {
         pc.* = .{
             .source      = ctx.source,
-            .filter_pred = filter_pred,
+            .filter_pred = if (use_inline_ic) null else filter_pred,
             .aggs        = aggs,
             .accums      = thread_accums[ti],
             .morsel_src  = &morsel_src,
             .parent_alloc = alloc,
+            .inline_ic_n = if (use_inline_ic) pre_ic_n else 0,
         };
+        if (use_inline_ic) @memcpy(pc.inline_ic[0..pre_ic_n], pre_ic_buf[0..pre_ic_n]);
     }
 
     try parallel.parallelFor(alloc, ParCtx, ParCtx.work, pctxs, &morsel_src);
@@ -1897,14 +2323,6 @@ fn keysAreIntExpr(keys: []const plan.ProjectItem) bool {
             .sub => |op| { if (op.left != .col_ref or op.right != .lit_i64) return false; },
             else => return false,
         }
-    }
-    return true;
-}
-
-/// Returns true if all keys are plain col_ref expressions.
-fn keysAreColRef(keys: []const plan.ProjectItem) bool {
-    for (keys) |k| {
-        if (k.expr != .col_ref) return false;
     }
     return true;
 }
@@ -3502,6 +3920,144 @@ fn extractLimit(node: *const plan.PhysicalNode) ?LimitState {
     };
 }
 
+// ── Parallel filter-project for large tables ─────────────────────────────────
+//
+// Handles:  project → filter(pure-AND-int-conds) → scannable
+// Splits the row range into morsels and processes them in parallel across
+// defaultThreads() workers.  Each thread writes matching rows to its own
+// per-thread ArenaAllocator (backed by c_allocator), then they are merged
+// into the query allocator after completion.
+// Returns null if the path cannot be used.
+fn executeFilterProjectParallel(
+    proj_items:  []const plan.ProjectItem,
+    filter_pred: plan.Expr,
+    ctx:         *QueryContext,
+) !?RowList {
+    if (!ctx.source.supportsRange()) return null;
+    const total_rows = ctx.source.rowCount();
+    if (total_rows < 2_000_000) return null;
+    const n_threads = parallel.defaultThreads();
+    if (n_threads <= 1) return null;
+    const alloc = ctx.allocator();
+
+    // Require a pure-AND integer condition so we know the filter is cheap and
+    // won't touch string columns, preventing scanner contention.
+    var ic_buf: [8]IntCmpCond = undefined;
+    var ic_n: usize = 0;
+    if (!extractAndIntConds(filter_pred, &ic_buf, &ic_n, false) or ic_n == 0) return null;
+
+    // Column pruning: only load columns referenced by project and filter.
+    const sm = ctx.source.schema();
+    var needed_mask = [_]bool{false} ** 256;
+    const ncols = @min(256, sm.len);
+    for (proj_items) |item| collectColRefs(item.expr, needed_mask[0..ncols]);
+    collectColRefs(filter_pred, needed_mask[0..ncols]);
+    var n_needed: usize = 0;
+    for (needed_mask[0..ncols]) |m| { if (m) n_needed += 1; }
+    if (n_needed * 2 < sm.len) {
+        var names_buf: [32][]const u8 = undefined;
+        var names_len: usize = 0;
+        for (needed_mask[0..ncols], 0..) |m, i| {
+            if (m and names_len < names_buf.len) { names_buf[names_len] = sm[i].name; names_len += 1; }
+        }
+        ctx.source.setNeededCols(names_buf[0..names_len]);
+    }
+    defer ctx.source.setNeededCols(null);
+
+    // Preload mapped columns before parallel phase.
+    { var dummy: DataChunk = undefined; ctx.source.fetchRange(0, 0, &dummy, alloc) catch {}; }
+
+    const out_metas = try alloc.alloc(result.ColMeta, proj_items.len);
+    for (proj_items, 0..) |item, i|
+        out_metas[i] = .{ .name = item.alias, .col_type = item.out_type };
+
+    const ParFpCtx = struct {
+        source:      SourceIface,
+        proj_items:  []const plan.ProjectItem,
+        filter_pred: plan.Expr,
+        morsel_src:  *parallel.MorselSource,
+        // Per-thread output: allocated via thread-local c_allocator arena.
+        // Rows are moved into the global arena after completion.
+        row_arena:   std.heap.ArenaAllocator,
+        rows:        std.ArrayListUnmanaged([]?Value),
+        err:         ?anyerror = null,
+
+        fn work(self: *@This(), _: *parallel.MorselSource) void {
+            self.doWork() catch |e| { self.err = e; };
+        }
+
+        fn doWork(self: *@This()) !void {
+            const row_alloc = self.row_arena.allocator();
+            var ta = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+            defer ta.deinit();
+            const tall = ta.allocator();
+
+            // Per-thread QueryContext so FilterState.apply can lazily init its SIMD buffers.
+            var fake_arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+            defer fake_arena.deinit();
+            var fake_ctx = QueryContext{ .arena = fake_arena, .source = self.source };
+            var fs = FilterState{ .predicate = self.filter_pred };
+
+            while (self.morsel_src.next()) |m| {
+                var ca = std.heap.ArenaAllocator.init(tall);
+                defer ca.deinit();
+                var c: DataChunk = undefined;
+                try self.source.fetchRange(m.start, m.end - m.start, &c, ca.allocator());
+                if (c.num_rows == 0) continue;
+
+                // SIMD filter: compacts c in-place, sets c.num_rows = passing rows.
+                try fs.apply(&c, &fake_ctx);
+                if (c.num_rows == 0) continue;
+
+                // Project matching rows to output.
+                for (0..c.num_rows) |r| {
+                    const row_buf = try ca.allocator().alloc(?Value, c.columns.len);
+                    for (c.columns, 0..) |col, j| {
+                        row_buf[j] = if (col.isRowNull(r)) null else col.data.get(r);
+                    }
+                    const out_row = try row_alloc.alloc(?Value, self.proj_items.len);
+                    for (self.proj_items, 0..) |item, i| {
+                        out_row[i] = try kernels.evalExpr(item.expr, row_buf, null, row_alloc);
+                    }
+                    try self.rows.append(row_alloc, out_row);
+                }
+            }
+        }
+    };
+
+    var morsel_src = parallel.MorselSource.init(total_rows, parallel.default_morsel_size);
+    const par_ctxs = try alloc.alloc(ParFpCtx, n_threads);
+    for (par_ctxs) |*pc| {
+        pc.* = .{
+            .source      = ctx.source,
+            .proj_items  = proj_items,
+            .filter_pred = filter_pred,
+            .morsel_src  = &morsel_src,
+            .row_arena   = std.heap.ArenaAllocator.init(std.heap.c_allocator),
+            .rows        = .{ .items = &.{}, .capacity = 0 },
+        };
+    }
+    try parallel.parallelFor(alloc, ParFpCtx, ParFpCtx.work, par_ctxs, &morsel_src);
+
+    // Merge per-thread row lists into global output; copy strings to query arena.
+    var rl = RowList.init(out_metas);
+    for (par_ctxs) |*pc| {
+        if (pc.err) |e| { for (par_ctxs) |*p2| p2.row_arena.deinit(); return e; }
+        for (pc.rows.items) |src_row| {
+            const dst_row = try alloc.alloc(?Value, src_row.len);
+            for (src_row, 0..) |v_opt, i| {
+                dst_row[i] = if (v_opt) |v| switch (v) {
+                    .string => |s| Value{ .string = try alloc.dupe(u8, s) },
+                    else    => v,
+                } else null;
+            }
+            try rl.append(alloc, dst_row);
+        }
+        pc.row_arena.deinit();
+    }
+    return rl;
+}
+
 // ── Chunked limit helper ──────────────────────────────────────────────────────
 
 /// Chunked streaming execution for limit/project/filter/scan patterns.
@@ -3758,14 +4314,6 @@ fn executeTopK(inner: RowList, keys: []const plan.SortKey, k: usize, alloc: std.
 
 /// Stream a scannable node (scan/filter/project/limit) directly into a min-heap
 /// of at most K rows, avoiding materialisation of all rows into a RowList.
-/// Only rows that actually enter the heap (≤ K rows) are fully materialised via readRow.
-/// Read a single row from a slice of columns (without a DataChunk wrapper).
-fn readRowFromCols(cols: []const chunk.Column, row: usize, a: std.mem.Allocator) ![]?Value {
-    const vals = try a.alloc(?Value, cols.len);
-    for (cols, 0..) |col, ci| vals[ci] = if (col.isRowNull(row)) null else col.data.get(row);
-    return vals;
-}
-
 /// Late-materialization top-K: phase 1 scans only filter+sort columns using fetchRange
 /// (so global row indices are stable), phase 2 fetches all columns for the K winners.
 /// Returns null if unable to proceed (falls back to standard path).
@@ -5075,16 +5623,67 @@ fn executeHashAggParallelPairCount(
         source:      SourceIface,
         morsel_src:  *parallel.MorselSource, // shared; each morsel assigned to one worker
         parent_alloc: std.mem.Allocator,
+        ht_alloc:    std.mem.Allocator,      // allocator for local_ht (c_allocator-backed)
+        est_per_thread_: u64,                // capacity hint for HT init (done in runWork)
         i64_ci:      usize,
         str_ci:      usize,
-        local_ht:    ht.PairCountHashTable,
+        local_ht:    ht.PairCountHashTable = undefined,
         err:         ?anyerror = null,
+        // Raw mmap slices for skip-fetchRange fast path.
+        // When both are set, we bypass fetchRange and its arena allocation entirely:
+        // strings come from the mmap'd bytes (always valid), int64 from the raw slice.
+        raw_i64:         ?[]const i64 = null,
+        raw_str_offsets: ?[]const u64 = null,
+        raw_str_bytes:   ?[]const u8  = null,
 
         fn work(self: *@This(), _: *parallel.MorselSource) void {
             self.runWork() catch |e| { self.err = e; };
         }
 
         fn runWork(self: *@This()) !void {
+            // Initialize local HT IN the worker thread so all 8 @memset ops run in
+            // parallel, eliminating the serial page-fault bottleneck in the main thread
+            // (8 × 80 MB = 640 MB of zeroing previously done single-threaded).
+            self.local_ht = try ht.PairCountHashTable.initWithCapacity(self.ht_alloc, self.est_per_thread_);
+
+            // ── Fast path: all data available as raw mmap slices ─────────────────
+            // Eliminates fetchRange overhead (~2.9 MB per morsel of arena allocations)
+            // and the ~1.9 GB total query-arena accumulation across all morsels.
+            // Strings stored in local_ht point into mmap'd bytes — always valid.
+            // Software prefetch: for each row, issue prefetch for the HT bucket of
+            // a row PDIST iterations ahead.  On M2 (DRAM latency ~100 ns, loop ~10 ns),
+            // PDIST=16 keeps ~16 outstanding DRAM requests → hides most of the latency.
+            if (self.raw_i64 != null and self.raw_str_offsets != null and self.raw_str_bytes != null) {
+                const ri64 = self.raw_i64.?;
+                const rso  = self.raw_str_offsets.?;
+                const rsb  = self.raw_str_bytes.?;
+                const PDIST: usize = 16;
+                const mask = self.local_ht.capacity - 1;
+                while (self.morsel_src.next()) |m| {
+                    // Prime the prefetch pipeline: issue prefetches for the first PDIST rows.
+                    const pre_end = @min(m.start + PDIST, m.end);
+                    for (m.start..pre_end) |pfabs| {
+                        const pfs = rsb[rso[pfabs]..rso[pfabs + 1]];
+                        const pfh = ht.PairCountHashTable.tagHash(ht.PairCountHashTable.hashPair(ri64[pfabs], pfs));
+                        @prefetch(&self.local_ht.slots[pfh & mask], .{ .rw = .read, .locality = 3, .cache = .data });
+                    }
+                    for (m.start..m.end) |abs| {
+                        // Rolling prefetch: abs+PDIST is issued before processing abs.
+                        if (abs + PDIST < m.end) {
+                            const pfabs = abs + PDIST;
+                            const pfs = rsb[rso[pfabs]..rso[pfabs + 1]];
+                            const pfh = ht.PairCountHashTable.tagHash(ht.PairCountHashTable.hashPair(ri64[pfabs], pfs));
+                            @prefetch(&self.local_ht.slots[pfh & mask], .{ .rw = .read, .locality = 3, .cache = .data });
+                        }
+                        const s = rsb[rso[abs]..rso[abs + 1]];
+                        const h = ht.PairCountHashTable.tagHash(ht.PairCountHashTable.hashPair(ri64[abs], s));
+                        try self.local_ht.incrementPrehashed(ri64[abs], s, h);
+                    }
+                }
+                return;
+            }
+
+            // ── Fallback: fetchRange path (columns not available as raw slices) ──
             var thread_arena = std.heap.ArenaAllocator.init(self.parent_alloc);
             defer thread_arena.deinit();
             const talloc = thread_arena.allocator();
@@ -5114,21 +5713,37 @@ fn executeHashAggParallelPairCount(
     // Estimate per-thread HT size: total / n_threads (each thread processes ~1/n_threads rows).
     const est_per_thread: u64 = @max(64, total_rows / @as(u64, n_threads));
 
+    // Pre-fetch raw mmap slices for the fast skip-fetchRange path.
+    // Requires the store to expose contiguous int64 + string mmap'd column data.
+    // When both are available, Worker.runWork skips fetchRange entirely, eliminating
+    // ~2.9 MB per morsel of arena allocations (~1.9 GB total across all threads/morsels).
+    const raw_i64_pre = ctx.source.getRawInt64Col(sm[i64_ci].name);
+    const raw_str_offsets_pre = ctx.source.getRawStrOffsets(sm[str_ci].name);
+    const raw_str_bytes_pre = ctx.source.getRawStrBytes(sm[str_ci].name);
+
     // Each worker gets its own arena-backed HT.
+    // Use c_allocator (malloc) instead of page_allocator to avoid page-fault overhead
+    // on freshly allocated large pages during the merge phase.
+    // NOTE: HT initialization (@memset of ~80 MB per worker) is done INSIDE runWork so
+    // all 8 workers zero their HTs in parallel, not serially in the main thread.
     const ht_arenas = try alloc.alloc(std.heap.ArenaAllocator, n_threads);
-    for (ht_arenas) |*a| a.* = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    for (ht_arenas) |*a| a.* = std.heap.ArenaAllocator.init(std.heap.c_allocator);
     defer for (ht_arenas) |*a| a.deinit();
 
     const workers = try alloc.alloc(Worker, n_threads);
     for (workers, 0..) |*w, t| {
         w.* = .{
-            .source       = ctx.source,
-            .morsel_src   = undefined,
-            .parent_alloc = alloc,
-            .i64_ci       = i64_ci,
-            .str_ci       = str_ci,
-            .local_ht     = try ht.PairCountHashTable.initWithCapacity(ht_arenas[t].allocator(), est_per_thread),
-            .err          = null,
+            .source           = ctx.source,
+            .morsel_src       = undefined,
+            .parent_alloc     = alloc,
+            .ht_alloc         = ht_arenas[t].allocator(),
+            .est_per_thread_  = est_per_thread,
+            .i64_ci           = i64_ci,
+            .str_ci           = str_ci,
+            .err              = null,
+            .raw_i64          = raw_i64_pre,
+            .raw_str_offsets  = raw_str_offsets_pre,
+            .raw_str_bytes    = raw_str_bytes_pre,
         };
     }
 
@@ -5137,11 +5752,56 @@ fn executeHashAggParallelPairCount(
     try parallel.parallelFor(alloc, Worker, Worker.work, workers, &morsel_src);
     for (workers) |w| { if (w.err) |e| return e; }
 
-    // ── Merge per-worker HTs into a single result HT ─────────────────────────
-    // Worker 0's HT becomes the master; all others are merged into it.
-    for (workers[1..]) |*w| {
-        try workers[0].local_ht.mergeFrom(&w.local_ht);
+    // ── Partitioned parallel merge ─────────────────────────────────────────────
+    // N_PARTS_PAIR independent partitions: worker p processes all local_hts but only
+    // accumulates entries where (hash & (N_PARTS_PAIR - 1)) == p.  Each worker builds
+    // its own merged_hts[p] exclusively — no shared writes, no serial bottleneck.
+    const N_PARTS_PAIR: usize = @min(n_threads, 8);
+    var total_local_count: u64 = 0;
+    for (workers) |w| total_local_count += w.local_ht.count;
+    const est_per_part_pair: u64 = total_local_count / N_PARTS_PAIR + 64;
+    const merge_arenas = try alloc.alloc(std.heap.ArenaAllocator, N_PARTS_PAIR);
+    const merged_hts   = try alloc.alloc(ht.PairCountHashTable, N_PARTS_PAIR);
+    for (merge_arenas) |*a| a.* = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    defer for (merge_arenas) |*a| a.deinit();
+    for (merge_arenas, merged_hts) |*a, *h| {
+        h.* = try ht.PairCountHashTable.initWithCapacity(a.allocator(), est_per_part_pair);
     }
+
+    const PairMergeCtx = struct {
+        workers_p:  []Worker,
+        merged_hts: []ht.PairCountHashTable,
+        morsel_src: *parallel.MorselSource,
+        n_parts:    usize,
+        err:        ?anyerror = null,
+
+        fn work(self: *@This(), _: *parallel.MorselSource) void {
+            self.doWork() catch |e| { self.err = e; };
+        }
+
+        fn doWork(self: *@This()) !void {
+            while (self.morsel_src.next()) |m| {
+                for (m.start..m.end) |p| {
+                    for (self.workers_p) |*w| {
+                        try self.merged_hts[p].mergeFromPart(&w.local_ht, p, self.n_parts);
+                    }
+                }
+            }
+        }
+    };
+
+    var pair_merge_morsel = parallel.MorselSource.init(N_PARTS_PAIR, 1);
+    const pair_merge_ctxs = try alloc.alloc(PairMergeCtx, n_threads);
+    for (pair_merge_ctxs) |*mc| {
+        mc.* = .{
+            .workers_p  = workers,
+            .merged_hts = merged_hts,
+            .morsel_src = &pair_merge_morsel,
+            .n_parts    = N_PARTS_PAIR,
+        };
+    }
+    try parallel.parallelFor(alloc, PairMergeCtx, PairMergeCtx.work, pair_merge_ctxs, &pair_merge_morsel);
+    for (pair_merge_ctxs) |mc| { if (mc.err) |e| return e; }
 
     // ── Collect results ──────────────────────────────────────────────────────
     const metas = try alloc.alloc(result.ColMeta, 3);
@@ -5156,7 +5816,7 @@ fn executeHashAggParallelPairCount(
         rl: *RowList, alloc: std.mem.Allocator, k0_is_i64: bool,
     };
     var emit_ctx = EmitCtx{ .rl = &rl, .alloc = alloc, .k0_is_i64 = k0_is_i64 };
-    workers[0].local_ht.iterate(&emit_ctx, struct {
+    const emit_cb = struct {
         fn cb(ec: *EmitCtx, n: i64, s: []const u8, count: u64) void {
             const row = ec.alloc.alloc(?Value, 3) catch return;
             if (ec.k0_is_i64) {
@@ -5169,7 +5829,8 @@ fn executeHashAggParallelPairCount(
             row[2] = Value{ .uint64 = count };
             ec.rl.append(ec.alloc, row) catch {};
         }
-    }.cb);
+    }.cb;
+    for (merged_hts) |*mht| mht.iterate(&emit_ctx, emit_cb);
 
     // Apply top_k if requested (Q17: ORDER BY count(*) DESC LIMIT 10).
     if (top_k > 0 and sort_keys.len > 0 and rl.rows.items.len > top_k) {
@@ -5190,108 +5851,350 @@ fn executeHashAggParallelCompact(
     return executeHashAggParallelCompactTopK(input, keys, aggs, &.{}, 0, ctx);
 }
 
-/// Parallel hash_agg for single string col_ref key + compact aggs (incl. str_min/str_max).
-/// Handles Q22/Q23-style: GROUP BY string_col + MIN(string_col) + COUNT(*).
-/// Each thread builds a local StrAggHashTable; then tables are merged serially.
-/// Hash-sidecar fast path for string GROUP BY with a parallel int64 hash column.
-/// Groups by the int64 hash (fast), then late-materializes the string for top-K output.
-/// Only called when str key column has hash_col_name set, no str aggs, no CASE WHEN.
-fn executeHashAggParallelStrKeyViaHash(
-    input:        *const plan.PhysicalNode,
-    keys:         []const plan.ProjectItem,
-    aggs:         []const plan.ProjectItem,
-    sort_keys:    []const plan.SortKey,
-    top_k:        usize,
-    ctx:          *QueryContext,
-    str_col_idx:  usize,  // original string column index
-    str_key_pos:  usize,  // position in keys[] of the string key
-    hash_col_idx: usize,  // int64 hash column index
+/// Parallel hash aggregation for the triple (i64, date_part(unit,datetime), string) + COUNT(*) pattern.
+/// Handles Q19: GROUP BY UserID, extract(minute FROM EventTime), SearchPhrase ORDER BY count(*) DESC LIMIT 10.
+fn executeHashAggParallelTripleCount(
+    input:     *const plan.PhysicalNode,
+    keys:      []const plan.ProjectItem,
+    aggs:      []const plan.ProjectItem,
+    sort_keys: []const plan.SortKey,
+    top_k:     usize,
+    ctx:       *QueryContext,
 ) !?RowList {
-    const alloc = ctx.allocator();
+    if (!ctx.source.supportsRange()) return null;
     const total_rows = ctx.source.rowCount();
-    if (total_rows < 500_000) return null;
+    if (total_rows < 2_000_000) return null;
     const n_threads = parallel.defaultThreads();
     if (n_threads <= 1) return null;
-    const sm = ctx.source.schema();
+    const alloc = ctx.allocator();
 
-    // Build a synthetic keys array: replace the string col_ref with the hash col_ref.
-    const syn_keys = try alloc.alloc(plan.ProjectItem, keys.len);
-    defer alloc.free(syn_keys);
-    @memcpy(syn_keys, keys);
-    syn_keys[str_key_pos] = .{
-        .alias    = keys[str_key_pos].alias,
-        .expr     = .{ .col_ref = .{ .index = hash_col_idx, .name = sm[hash_col_idx].name } },
-        .out_type = .int64,
+    // Only handle unfiltered scans (no WHERE clause support yet).
+    if (input.* != .part_scan and input.* != .mem_scan) return null;
+
+    // Guard: exactly 3 keys, exactly 1 agg (count(*)).
+    if (keys.len != 3) return null;
+    if (aggs.len != 1) return null;
+    if (aggs[0].expr != .agg_call) return null;
+    if (aggs[0].expr.agg_call.kind != .count_star) return null;
+
+    const DatePartUnit = enum { minute, hour, day };
+    const TripleParDesc = struct {
+        n0_col:       usize,
+        dp_col:       usize,
+        dp_unit:      DatePartUnit,
+        str_col:      usize,
+        key_order:    [3]u8, // key_order[output_pos] = 0→n0, 1→dp, 2→str
     };
 
-    // Run compact int aggregation with hash keys.
-    const compact_rl = (try executeHashAggParallelCompactTopK(
-        input, syn_keys, aggs, sort_keys, top_k, ctx,
-    )) orelse return null;
+    // Detect the pattern: one col_ref(int), one fn_call(date_part/extract), one col_ref(string).
+    const maybe_td: ?TripleParDesc = blk: {
+        var dp_idx:  ?usize = null;
+        var dp_col:  usize  = 0;
+        var dp_unit: DatePartUnit = .minute;
+        var col_ref_indices: [2]usize = .{0, 0};
+        var cri: usize = 0;
+        for (keys, 0..) |k, ki| {
+            switch (k.expr) {
+                .col_ref => {
+                    if (cri >= 2) break :blk null;
+                    col_ref_indices[cri] = ki;
+                    cri += 1;
+                },
+                .fn_call => |fc| {
+                    if (dp_idx != null) break :blk null; // only one fn_call allowed
+                    if (!(std.mem.eql(u8, fc.name, "date_part") or
+                          std.mem.eql(u8, fc.name, "extract"))) break :blk null;
+                    if (fc.args.len < 2) break :blk null;
+                    if (fc.args[0] != .lit_str) break :blk null;
+                    if (fc.args[1] != .col_ref) break :blk null;
+                    const unit_str = fc.args[0].lit_str;
+                    dp_unit = if (std.mem.eql(u8, unit_str, "minute") or std.mem.eql(u8, unit_str, "min"))
+                        .minute
+                    else if (std.mem.eql(u8, unit_str, "hour"))
+                        .hour
+                    else if (std.mem.eql(u8, unit_str, "day") or std.mem.eql(u8, unit_str, "dayofmonth"))
+                        .day
+                    else
+                        break :blk null;
+                    dp_col = fc.args[1].col_ref.index;
+                    dp_idx = ki;
+                },
+                else => break :blk null,
+            }
+        }
+        if (dp_idx == null or cri != 2) break :blk null;
+        const sm = ctx.source.schema();
+        const ci0 = keys[col_ref_indices[0]].expr.col_ref.index;
+        const ci1 = keys[col_ref_indices[1]].expr.col_ref.index;
+        if (ci0 >= sm.len or ci1 >= sm.len or dp_col >= sm.len) break :blk null;
+        const t0 = sm[ci0].col_type;
+        const t1 = sm[ci1].col_type;
+        // Identify which col_ref is int and which is string.
+        var n0_ci: usize = undefined;
+        var str_ci: usize = undefined;
+        var n0_key_pos: usize = undefined;
+        if ((t0 == .int64 or t0 == .uint64) and t1 == .string) {
+            n0_ci = ci0; str_ci = ci1; n0_key_pos = col_ref_indices[0];
+        } else if ((t1 == .int64 or t1 == .uint64) and t0 == .string) {
+            n0_ci = ci1; str_ci = ci0; n0_key_pos = col_ref_indices[1];
+        } else break :blk null;
+        var order: [3]u8 = .{0, 0, 0};
+        for (0..3) |ki| {
+            if (ki == dp_idx.?) order[ki] = 1
+            else if (ki == n0_key_pos) order[ki] = 0
+            else order[ki] = 2;
+        }
+        break :blk TripleParDesc{
+            .n0_col    = n0_ci,
+            .dp_col    = dp_col,
+            .dp_unit   = dp_unit,
+            .str_col   = str_ci,
+            .key_order = order,
+        };
+    };
 
-    // Late-materialize: replace int64 hash values with actual strings.
-    const out_rows = compact_rl.rows.items.len;
-    if (out_rows == 0) return compact_rl;
+    const td = maybe_td orelse return null;
+    const sm = ctx.source.schema();
 
-    // Collect result hashes.
-    const result_hashes = try alloc.alloc(i64, out_rows);
-    defer alloc.free(result_hashes);
-    const result_strs  = try alloc.alloc([]const u8, out_rows);
-    defer alloc.free(result_strs);
+    // Restrict columns to only those needed.
+    const needed_names = [_][]const u8{
+        sm[td.n0_col].name,
+        sm[td.dp_col].name,
+        sm[td.str_col].name,
+    };
+    ctx.source.setNeededCols(&needed_names);
+    defer ctx.source.setNeededCols(null);
 
-    for (compact_rl.rows.items, 0..) |row, r| {
-        result_hashes[r] = if (row[str_key_pos]) |v| v.toI64() orelse 0 else 0;
-        result_strs[r]   = "";
+    // Preload columns.
+    { var dummy: DataChunk = undefined; ctx.source.fetchRange(0, 0, &dummy, alloc) catch {}; }
+
+    // Number of hash partitions for the two-phase parallel merge.
+    // 64 partitions × ~1M unique groups / 64 = ~16K entries each → HT fits in L3 cache.
+    const N_TRIPLE_PARTS: usize = 64;
+
+    const TripleParWorker = struct {
+        source:        SourceIface,
+        morsel_src:    *parallel.MorselSource,
+        parent_alloc:  std.mem.Allocator,
+        scatter_alloc: std.mem.Allocator, // per-worker arena (c_allocator backed) for part_bufs
+        td:            TripleParDesc,
+        local_ht:      ht.TripleCountHashTable,
+        part_bufs:     []std.ArrayListUnmanaged(ht.TripleCountHashTable.Slot), // len = N_TRIPLE_PARTS
+        err:           ?anyerror = null,
+
+        fn work(self: *@This(), _: *parallel.MorselSource) void {
+            self.runWork() catch |e| { self.err = e; };
+        }
+
+        fn runWork(self: *@This()) !void {
+            var thread_arena = std.heap.ArenaAllocator.init(self.parent_alloc);
+            defer thread_arena.deinit();
+            const talloc = thread_arena.allocator();
+
+            while (self.morsel_src.next()) |m| {
+                var c: DataChunk = undefined;
+                try self.source.fetchRange(m.start, m.end - m.start, &c, talloc);
+                const desc = self.td;
+                if (desc.n0_col >= c.columns.len or desc.dp_col >= c.columns.len or desc.str_col >= c.columns.len) continue;
+                const n0_col_data = c.columns[desc.n0_col];
+                const dp_col_data = c.columns[desc.dp_col];
+                const strs = switch (c.columns[desc.str_col].data) {
+                    .string => |s| s,
+                    else => continue,
+                };
+                for (0..c.num_rows) |r| {
+                    const n0: i64 = switch (n0_col_data.data) {
+                        .int64  => |v| v[r],
+                        .uint64 => |v| @bitCast(v[r]),
+                        else    => continue,
+                    };
+                    const ms: i64 = switch (dp_col_data.data) {
+                        .datetime64_ms => |v| v[r],
+                        .int64         => |v| v[r] * 1000,
+                        else           => continue,
+                    };
+                    const secs = @divTrunc(ms, 1000);
+                    const n1: i64 = switch (desc.dp_unit) {
+                        .minute => @mod(@divTrunc(secs, 60), 60),
+                        .hour   => @mod(@divTrunc(secs, 3600), 24),
+                        .day    => blk: {
+                            const days = @divTrunc(ms, 86400 * 1000);
+                            const d = if (days >= 0) @as(u64, @intCast(days)) else 0;
+                            const n: u64 = d + 719468;
+                            const era: u64 = @divTrunc(n, 146097);
+                            const doe: u64 = n - era * 146097;
+                            const yoe: u64 = @divTrunc(doe - @divTrunc(doe, 1460) + @divTrunc(doe, 36524) - @divTrunc(doe, 146096), 365);
+                            const doy: u64 = doe - (365 * yoe + @divTrunc(yoe, 4) - @divTrunc(yoe, 100));
+                            const mp:  u64 = @divTrunc(5 * doy + 2, 153);
+                            break :blk @intCast(doy - @divTrunc(153 * mp + 2, 5) + 1);
+                        },
+                    };
+                    try self.local_ht.increment(n0, n1, strs[r]);
+                }
+            }
+            // Scatter phase: distribute local_ht entries into per-worker partition buffers.
+            // Each worker writes exclusively to its own part_bufs — no synchronization needed.
+            const part_mask: u64 = N_TRIPLE_PARTS - 1;
+            for (0..self.local_ht.capacity) |i| {
+                if (self.local_ht.slots[i].hash == ht.TripleCountHashTable.EMPTY) continue;
+                const s = self.local_ht.slots[i];
+                const p: usize = @intCast(s.hash & part_mask);
+                try self.part_bufs[p].append(self.scatter_alloc, s);
+            }
+        }
+    };
+
+    const est_per_thread: u64 = @max(64, total_rows / @as(u64, n_threads));
+    const ht_arenas = try alloc.alloc(std.heap.ArenaAllocator, n_threads);
+    for (ht_arenas) |*a| a.* = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    defer for (ht_arenas) |*a| a.deinit();
+
+    // Allocate per-worker partition scatter buffers (N_TRIPLE_PARTS lists each).
+    // Backed by the per-thread arena (c_allocator) so each worker allocates independently.
+    const per_worker_bufs = try alloc.alloc([]std.ArrayListUnmanaged(ht.TripleCountHashTable.Slot), n_threads);
+    for (per_worker_bufs, 0..) |*pb, t| {
+        pb.* = try ht_arenas[t].allocator().alloc(std.ArrayListUnmanaged(ht.TripleCountHashTable.Slot), N_TRIPLE_PARTS);
+        for (pb.*) |*list| list.* = .{ .items = &.{}, .capacity = 0 };
     }
 
-    // Scan str + hash columns to reverse-map hash → string.
-    var morsel_src = parallel.MorselSource.init(total_rows, parallel.default_morsel_size);
-    var remaining: usize = out_rows;
-    scan_loop: while (morsel_src.next()) |m| {
-        var chunk_arena = std.heap.ArenaAllocator.init(alloc);
-        defer chunk_arena.deinit();
-        var c: DataChunk = undefined;
-        ctx.source.fetchRange(m.start, m.end - m.start, &c, chunk_arena.allocator()) catch continue;
-        if (str_col_idx >= c.columns.len or hash_col_idx >= c.columns.len) continue;
-        const scol = c.columns[str_col_idx];
-        const hcol = c.columns[hash_col_idx];
-        if (scol.data != .string) continue;
+    const workers = try alloc.alloc(TripleParWorker, n_threads);
+    for (workers, 0..) |*w, t| {
+        w.* = .{
+            .source        = ctx.source,
+            .morsel_src    = undefined,
+            .parent_alloc  = alloc,
+            .scatter_alloc = ht_arenas[t].allocator(),
+            .td            = td,
+            .local_ht      = try ht.TripleCountHashTable.initWithCapacity(ht_arenas[t].allocator(), est_per_thread),
+            .part_bufs     = per_worker_bufs[t],
+            .err           = null,
+        };
+    }
 
-        for (0..c.num_rows) |r| {
-            const h: i64 = switch (hcol.data) {
-                .int64  => |a| a[r],
-                .uint64 => |a| @bitCast(a[r]),
-                else    => continue,
-            };
-            for (result_hashes, 0..) |rh, ri| {
-                if (rh == h and result_strs[ri].len == 0) {
-                    result_strs[ri] = try alloc.dupe(u8, scol.data.string[r]);
-                    remaining -= 1;
-                    if (remaining == 0) break :scan_loop;
-                    break;
+    var morsel_src = parallel.MorselSource.init(total_rows, parallel.default_morsel_size);
+    for (workers) |*w| w.morsel_src = &morsel_src;
+    try parallel.parallelFor(alloc, TripleParWorker, TripleParWorker.work, workers, &morsel_src);
+    for (workers) |w| { if (w.err) |e| return e; }
+
+    // Two-phase parallel aggregate: scatter was done inline in each worker's runWork.
+    // Now each of the N_TRIPLE_PARTS partitions is aggregated independently in parallel.
+    // Each partition HT is ~(total_unique/N_TRIPLE_PARTS) entries ≈ fits in L3 cache.
+    const part_arenas_triple = try alloc.alloc(std.heap.ArenaAllocator, N_TRIPLE_PARTS);
+    for (part_arenas_triple) |*a| a.* = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    defer for (part_arenas_triple) |*a| a.deinit();
+    const part_hts_triple = try alloc.alloc(ht.TripleCountHashTable, N_TRIPLE_PARTS);
+
+    const TriplePartAggWorker = struct {
+        per_worker_bufs: []const []std.ArrayListUnmanaged(ht.TripleCountHashTable.Slot),
+        n_scan_workers:  usize,
+        part_arenas:     []std.heap.ArenaAllocator,
+        part_hts:        []ht.TripleCountHashTable,
+        err:             ?anyerror = null,
+
+        fn work(self: *@This(), src: *parallel.MorselSource) void {
+            while (src.next()) |m| {
+                var pi = m.start;
+                while (pi < m.end) : (pi += 1) {
+                    self.processPartition(pi) catch |e| { self.err = e; return; };
                 }
             }
         }
-    }
 
-    // Build final RowList replacing the hash column values with string values.
-    const out_metas = try alloc.alloc(result.ColMeta, compact_rl.metas.len);
-    @memcpy(out_metas, compact_rl.metas);
-    out_metas[str_key_pos] = .{
-        .name     = keys[str_key_pos].alias,
-        .col_type = .string,
+        fn processPartition(self: *@This(), p: usize) !void {
+            var total: usize = 0;
+            for (0..self.n_scan_workers) |w| total += self.per_worker_bufs[w][p].items.len;
+            self.part_hts[p] = try ht.TripleCountHashTable.initWithCapacity(
+                self.part_arenas[p].allocator(),
+                @max(64, total),
+            );
+            for (0..self.n_scan_workers) |w| {
+                for (self.per_worker_bufs[w][p].items) |s| {
+                    try self.part_hts[p].mergeFromSlot(s);
+                }
+            }
+        }
     };
 
-    var final_rl = RowList.init(out_metas);
+    const part_agg_workers = try alloc.alloc(TriplePartAggWorker, n_threads);
+    for (part_agg_workers) |*aw| {
+        aw.* = .{
+            .per_worker_bufs = per_worker_bufs,
+            .n_scan_workers  = n_threads,
+            .part_arenas     = part_arenas_triple,
+            .part_hts        = part_hts_triple,
+            .err             = null,
+        };
+    }
+    var part_agg_src = parallel.MorselSource.init(N_TRIPLE_PARTS, 1);
+    try parallel.parallelFor(alloc, TriplePartAggWorker, TriplePartAggWorker.work, part_agg_workers, &part_agg_src);
+    for (part_agg_workers) |aw| { if (aw.err) |e| return e; }
 
-    for (compact_rl.rows.items, 0..) |old_row, r| {
-        const new_row = try alloc.alloc(?Value, compact_rl.metas.len);
-        @memcpy(new_row, old_row);
-        new_row[str_key_pos] = .{ .string = result_strs[r] };
-        try final_rl.append(alloc, new_row);
+    // Build output metas from keys + agg.
+    const out_metas = try alloc.alloc(result.ColMeta, keys.len + 1);
+    for (keys, 0..) |k, ki| out_metas[ki] = .{ .name = k.alias, .col_type = k.out_type };
+    out_metas[keys.len] = .{ .name = aggs[0].alias, .col_type = aggs[0].out_type };
+    var rl = RowList.init(out_metas);
+
+    const EmitCtxTriple = struct {
+        rl: *RowList, alloc: std.mem.Allocator, key_order: [3]u8,
+    };
+    var emit_ctx = EmitCtxTriple{ .rl = &rl, .alloc = alloc, .key_order = td.key_order };
+    for (0..N_TRIPLE_PARTS) |p| {
+        part_hts_triple[p].iterate(&emit_ctx, struct {
+            fn cb(ec: *EmitCtxTriple, n0: i64, n1: i64, s: []const u8, count: u64) void {
+                const row = ec.alloc.alloc(?Value, 4) catch return;
+                for (ec.key_order, 0..) |kind, i| {
+                    row[i] = switch (kind) {
+                        0 => Value{ .int64 = n0 },
+                        1 => Value{ .int64 = n1 },
+                        else => Value{ .string = s },
+                    };
+                }
+                row[3] = Value{ .uint64 = count };
+                ec.rl.append(ec.alloc, row) catch {};
+            }
+        }.cb);
     }
 
-    return final_rl;
+    if (top_k > 0 and sort_keys.len > 0 and rl.rows.items.len > top_k) {
+        return try executeTopK(rl, sort_keys, top_k, alloc);
+    }
+    return rl;
+}
+
+/// LSD (least-significant-digit) radix sort for u128 values.
+/// Uses 16 passes of 8-bit radix (256 buckets per pass).
+/// `scratch` must be the same length as `items`.
+/// After return, `items` contains the sorted result.
+fn radixSortU128(items: []u128, scratch: []u128) void {
+    if (items.len <= 1) return;
+    var cnt: [256]usize = undefined;
+    var src = items;
+    var dst = scratch;
+    comptime var pass: u7 = 0;
+    inline while (pass < 16) : (pass += 1) {
+        const shift: u7 = pass * 8;
+        @memset(&cnt, 0);
+        for (src) |v| cnt[@as(u8, @truncate(v >> shift))] += 1;
+        // prefix sum (exclusive)
+        var acc: usize = 0;
+        for (&cnt) |*c| {
+            const x = c.*;
+            c.* = acc;
+            acc += x;
+        }
+        // scatter
+        for (src) |v| {
+            const b = @as(u8, @truncate(v >> shift));
+            dst[cnt[b]] = v;
+            cnt[b] += 1;
+        }
+        // swap src/dst pointers
+        const t = src;
+        src = dst;
+        dst = t;
+    }
+    // 16 passes (even): final result is in src, which points back to items.
 }
 
 fn executeHashAggParallelStrKey(
@@ -5330,7 +6233,7 @@ fn executeHashAggParallelStrKey(
             // can reduce it to a single int aggregation — allow it through.
             var non_const_count: usize = 0;
             for (keys) |k| { if (k.expr != .lit_i64) non_const_count += 1; }
-            if (non_const_count >= 2) return null;
+            if (non_const_count > 2) return null;
         }
     }
     var cw_key: ?CaseWhenStrKey = null;
@@ -5388,41 +6291,6 @@ fn executeHashAggParallelStrKey(
     if (str_key_count != 1) return null;
     const key_col_idx = str_key_col_idx;
 
-    // ── Hash-sidecar fast path ───────────────────────────────────────────────
-    // If the string key has a parallel int64 hash column (e.g. URL → URLHash),
-    // aggregate by the int64 hash (much faster: no string hashing/comparison),
-    // then late-materialize the actual string for the top-K output rows.
-    // Only applies when there are no string aggs, no CASE WHEN key, and no filter
-    // (with filters, the StrCountHashTable path via executeHashAggChunked is better
-    // because the filter reduces cardinality and the existing path handles it efficiently).
-    if (cw_key == null and str_key_count == 1 and !has_filter_str and !rr_active) {
-        const str_meta = sm_pre[key_col_idx];
-        if (str_meta.hash_col_name) |hcn| {
-            // Find the hash column index.
-            var hash_ci: ?usize = null;
-            for (sm_pre, 0..) |m, i| {
-                if (std.mem.eql(u8, m.name, hcn)) { hash_ci = i; break; }
-            }
-            if (hash_ci) |hci| {
-                // Check no string aggs (str_min/str_max require actual string).
-                var has_str_agg = false;
-                for (aggs) |item| {
-                    if (item.expr == .agg_call) {
-                        const k = item.expr.agg_call.kind;
-                        if (k == .min or k == .max) {
-                            if (item.out_type == .string) { has_str_agg = true; break; }
-                        }
-                    }
-                }
-                if (!has_str_agg) {
-                    if (try executeHashAggParallelStrKeyViaHash(
-                        input, keys, aggs, sort_keys, top_k, ctx,
-                        key_col_idx, str_key_pos, hci,
-                    )) |rl| return rl;
-                }
-            }
-        }
-    }
 
      // Build compact_kinds; allow str_min/str_max and count_distinct_u64.
      const compact_kinds = try alloc.alloc(ht.CompactAggKind, aggs.len);
@@ -5435,15 +6303,25 @@ fn executeHashAggParallelStrKey(
                  if (arg != .col_ref) return null;
                  break :blk .count_distinct_u64;
              } else .count,
-             .sum  => .i64_sum,
-             .avg  => if (item.expr.agg_call.arg == null or item.expr.agg_call.arg.? != .col_ref) return null else .f64_sum,
-             .min  => if (item.out_type == .string) .str_min else .i64_min,
-             .max  => if (item.out_type == .string) .str_max else .i64_max,
-             else  => return null,
-         };
-     }
+              .sum  => .i64_sum,
+              .avg  => blk_avg: {
+                  const avg_arg = item.expr.agg_call.arg orelse return null;
+                  if (avg_arg == .col_ref) break :blk_avg .f64_sum;
+                  // avg(length(str_col)) — accumulate string length sum; finalize as avg.
+                  if (avg_arg == .fn_call and
+                      std.mem.eql(u8, avg_arg.fn_call.name, "length") and
+                      avg_arg.fn_call.args.len == 1 and
+                      avg_arg.fn_call.args[0] == .col_ref)
+                      break :blk_avg .f64_str_len_sum;
+                  return null;
+              },
+              .min  => if (item.out_type == .string) .str_min else .i64_min,
+              .max  => if (item.out_type == .string) .str_max else .i64_max,
+              else  => return null,
+          };
+      }
 
-    // Count str aggs and build sidecar_idx map.
+     // Count str aggs and build sidecar_idx map.
     var num_str_aggs: usize = 0;
     const sidecar_idx = try alloc.alloc(usize, aggs.len);
     for (compact_kinds, 0..) |kind, ci| {
@@ -5454,6 +6332,12 @@ fn executeHashAggParallelStrKey(
             sidecar_idx[ci] = 0; // unused
         }
     }
+
+    // Early-compute has_count_distinct so the two-phase call site can gate on it.
+    const has_count_distinct: bool = blk_hcd: {
+        for (compact_kinds) |k| { if (k == .count_distinct_u64) break :blk_hcd true; }
+        break :blk_hcd false;
+    };
 
     // Build init_vals.
     const compact_init_vals = try alloc.alloc(u64, aggs.len);
@@ -5503,6 +6387,87 @@ fn executeHashAggParallelStrKey(
         ctx.source.fetchRange(0, 0, &dummy, alloc) catch {};
     }
 
+    // ── Two-phase scatter → small-HT path for high-cardinality pure-string GROUP BY ──
+    // Conditions: no CASE WHEN, no regexp_replace, no str_min/str_max aggs, no COUNT DISTINCT,
+    // all non-string GROUP BY keys are lit_i64 constants, filter is null or a single
+    // col_ref eq/neq lit_str expression (e.g. SearchPhrase != '').
+    // For Q34/Q35 (URL GROUP BY, 2.6M unique, no filter) and Q13 (SearchPhrase GROUP BY).
+    if (cw_key == null and !rr_active and num_str_aggs == 0 and
+        (!has_count_distinct or (aggs.len == 1 and compact_kinds[0] == .count_distinct_u64)) and
+        total_rows >= 3_000_000)
+    {
+        // Check that every non-string key is either a lit_i64 constant or
+        // exactly one col_ref int key (used as an int sidecar for composite keys).
+        var all_const_int_keys_outer: bool = true;
+        var sidecar_col_idx_outer: ?usize = null;
+        var sidecar_key_pos_outer: ?usize = null;
+        for (keys, 0..) |k, ki| {
+            // The main string key is always fine.
+            if (k.expr == .col_ref and k.expr.col_ref.index == key_col_idx) continue;
+            // lit_i64 constants are always fine.
+            if (k.expr == .lit_i64) continue;
+            // Allow exactly one additional col_ref int key as a sidecar.
+            if (k.expr == .col_ref) {
+                if (sidecar_col_idx_outer == null) {
+                    sidecar_col_idx_outer = k.expr.col_ref.index;
+                    sidecar_key_pos_outer = ki;
+                    continue;
+                }
+            }
+            all_const_int_keys_outer = false; break;
+        }
+        if (all_const_int_keys_outer) {
+            const fp_tp: ?plan.Expr = switch (input.*) {
+                .filter  => |f| f.predicate,
+                .project => |p2| switch (p2.input.*) { .filter => |f| f.predicate, else => null },
+                else     => null,
+            };
+            var sf_tp: ?SimpleStrFilter = null;
+            var tp_filter_ok: bool = true;
+            var tp_ic_buf: [16]IntCmpCond = undefined;
+            var tp_ic_n: usize = 0;
+            if (fp_tp) |pred| {
+                sf_tp = tryExtractSimpleStrFilter(pred);
+                if (sf_tp == null) {
+                    // Try decomposing into int conditions + optional str condition.
+                    var sc_buf: [4]StrCmpCond = undefined;
+                    var sc_n: usize = 0;
+                    const mixed_ok = extractMixedAndConds(pred, &tp_ic_buf, &tp_ic_n, &sc_buf, &sc_n);
+                    if (mixed_ok and sc_n <= 1) {
+                        if (sc_n == 1) {
+                            sf_tp = .{ .col_idx = sc_buf[0].col_idx, .value = sc_buf[0].val,
+                                       .is_neq = (sc_buf[0].op == .neq) };
+                        }
+                        // tp_filter_ok stays true; tp_ic_n may be > 0
+                    } else {
+                        tp_filter_ok = false;
+                    }
+                }
+            }
+            if (tp_filter_ok) {
+                const tp_int_filter: ?[]const IntCmpCond = if (tp_ic_n > 0) tp_ic_buf[0..tp_ic_n] else null;
+                if (try executeTwoPhaseHashAggStrKeySimple(
+                    keys, aggs, sort_keys, top_k, ctx,
+                    key_col_idx, str_key_pos, compact_kinds, compact_init_vals, sf_tp,
+                    tp_int_filter, sidecar_col_idx_outer, sidecar_key_pos_outer,
+                )) |tp_rl| return tp_rl;
+            }
+        }
+    }
+
+    // Two-phase CW path: cw_key != null, count_only, no str_aggs, no rr.
+    // Eliminates fetchRange and string memcmp for Q40-class queries.
+    if (cw_key != null and !rr_active and num_str_aggs == 0 and
+        aggs.len == 1 and compact_kinds[0] == .count and
+        total_rows >= 3_000_000)
+    {
+        if (try executeTwoPhaseHashAggWithCW(
+            keys, aggs, sort_keys, top_k, ctx,
+            key_col_idx, str_key_pos, cw_key.?, cw_key_pos,
+            compact_kinds, compact_init_vals, sidecar_idx, filter_pred,
+        )) |cw_rl| return cw_rl;
+    }
+
     const ParStrCtx = struct {
         source:       SourceIface,
         filter_pred:  ?plan.Expr,
@@ -5539,6 +6504,11 @@ fn executeHashAggParallelStrKey(
         /// 64 partitions keyed by (group_hash & 63); each entry = (group_hash << 64) | distinct_val.
         /// Kept at end of struct so hot fields above stay in the first few cache lines.
         scatter_bufs: [64]std.ArrayListUnmanaged(u128) = undefined,
+        /// Per-thread arena for composite key buffers (int_prefix + str_val bytes).
+        /// These buffers are stored as borrowed pointers in local_ht.key_slots and must
+        /// outlive both runWork AND the subsequent tree-merge + emit phase.
+        /// Uses c_allocator (thread-safe) so threads can allocate independently.
+        thread_key_arena: std.heap.ArenaAllocator = undefined,
 
         fn work(self: *@This(), _: *parallel.MorselSource) void {
             self.runWork() catch |e| { self.err = e; };
@@ -5576,6 +6546,7 @@ fn executeHashAggParallelStrKey(
              for (int_key_specs) |spec| { if (spec.is_col) { all_const_int_keys = false; break; } }
              const int_prefix_len: usize = if (all_const_int_keys) 0 else int_key_n * 8;
 
+
             while (self.morsel_src.next()) |m| {
                 var chunk_arena = std.heap.ArenaAllocator.init(talloc);
                 defer chunk_arena.deinit();
@@ -5592,29 +6563,44 @@ fn executeHashAggParallelStrKey(
                      var ic_buf: [16]IntCmpCond = undefined;
                      var ic_n: usize = 0;
                      const ic_complete = extractAndIntConds(fp, &ic_buf, &ic_n, false);
-                     if (ic_complete and ic_n > 0) {
-                         for (0..c.num_rows) |r| {
-                             for (ic_buf[0..ic_n]) |cond| {
-                                 if (cond.col_idx >= c.columns.len) { pm[r] = false; break; }
-                                 const col = c.columns[cond.col_idx];
-                                 if (col.isRowNull(r)) { pm[r] = false; break; }
-                                 const v: i64 = switch (col.data) {
-                                     .int64 => |a| a[r], .uint64 => |a| @bitCast(a[r]),
-                                     .bool_u8 => |a| @as(i64, a[r]), .date_u16 => |a| @as(i64, a[r]),
-                                     .datetime64_ms => |a| a[r],
-                                     else => { pm[r] = false; break; },
-                                 };
-                                 const pass = switch (cond.op) {
-                                     .eq => v == cond.val, .neq => v != cond.val,
-                                     .lt => v < cond.val, .lte => v <= cond.val,
-                                     .gt => v > cond.val, .gte => v >= cond.val,
-                                     .in2 => v == cond.val or v == cond.val2,
-                                 };
-                                 if (!pass) { pm[r] = false; break; }
-                             }
-                         }
-                      } else {
-                          // Fast str-cond path: covers str_col != 'literal' (e.g. Q11 MobilePhoneModel <> '').
+                      if (ic_complete and ic_n > 0) {
+                          const n_ic = c.num_rows;
+                          const i16_mask = try calloc.alloc(i16, n_ic);
+                          const i16_tmp_a = try calloc.alloc(i16, n_ic);
+                          const i16_tmp_b = try calloc.alloc(i16, n_ic);
+                          @memset(i16_mask, 1);
+                          var simd_ok = true;
+                          for (ic_buf[0..ic_n]) |cond| {
+                              if (!applyIntCondSIMD(&c, cond, n_ic, i16_mask, i16_tmp_a, i16_tmp_b)) {
+                                  simd_ok = false; break;
+                              }
+                          }
+                          if (simd_ok) {
+                              for (0..n_ic) |r| { if (i16_mask[r] == 0) pm[r] = false; }
+                          } else {
+                              for (0..c.num_rows) |r| {
+                                  for (ic_buf[0..ic_n]) |cond| {
+                                      if (cond.col_idx >= c.columns.len) { pm[r] = false; break; }
+                                      const col = c.columns[cond.col_idx];
+                                      if (col.isRowNull(r)) { pm[r] = false; break; }
+                                      const v: i64 = switch (col.data) {
+                                          .int64 => |a| a[r], .uint64 => |a| @bitCast(a[r]),
+                                          .bool_u8 => |a| @as(i64, a[r]), .date_u16 => |a| @as(i64, a[r]),
+                                          .datetime64_ms => |a| a[r],
+                                          else => { pm[r] = false; break; },
+                                      };
+                                      const pass = switch (cond.op) {
+                                          .eq => v == cond.val, .neq => v != cond.val,
+                                          .lt => v < cond.val, .lte => v <= cond.val,
+                                          .gt => v > cond.val, .gte => v >= cond.val,
+                                          .in2 => v == cond.val or v == cond.val2,
+                                      };
+                                      if (!pass) { pm[r] = false; break; }
+                                  }
+                              }
+                          }
+                       } else {
+                           // Fast str-cond path: covers str_col != 'literal' (e.g. Q11 MobilePhoneModel <> '').
                           var sc_buf: [8]StrCmpCond = undefined;
                           var sc_n: usize = 0;
                           const sc_complete = extractAndStrConds(fp, &sc_buf, &sc_n, false);
@@ -5642,40 +6628,77 @@ fn executeHashAggParallelStrKey(
                           var msc_buf: [8]StrCmpCond = undefined;
                           var msc_n: usize = 0;
                           const mixed_complete = extractMixedAndConds(fp, &mic_buf, &mic_n, &msc_buf, &msc_n);
-                          if (mixed_complete and (mic_n > 0 or msc_n > 0)) {
-                              mixed_loop: for (0..c.num_rows) |r| {
-                                  for (mic_buf[0..mic_n]) |cond| {
-                                      if (cond.col_idx >= c.columns.len) { pm[r] = false; continue :mixed_loop; }
-                                      const col = c.columns[cond.col_idx];
-                                      if (col.isRowNull(r)) { pm[r] = false; continue :mixed_loop; }
-                                      const v: i64 = switch (col.data) {
-                                          .int64 => |a| a[r], .uint64 => |a| @bitCast(a[r]),
-                                          .bool_u8 => |a| @as(i64, a[r]), .date_u16 => |a| @as(i64, a[r]),
-                                          .datetime64_ms => |a| a[r],
-                                          else => { pm[r] = false; continue :mixed_loop; },
-                                      };
-                                      const pass = switch (cond.op) {
-                                          .eq => v == cond.val, .neq => v != cond.val,
-                                          .lt => v < cond.val, .lte => v <= cond.val,
-                                          .gt => v > cond.val, .gte => v >= cond.val,
-                                          .in2 => v == cond.val or v == cond.val2,
-                                      };
-                                      if (!pass) { pm[r] = false; continue :mixed_loop; }
-                                  }
-                                  for (msc_buf[0..msc_n]) |cond| {
-                                      if (cond.col_idx >= c.columns.len) { pm[r] = false; continue :mixed_loop; }
-                                      const col = c.columns[cond.col_idx];
-                                      const s: []const u8 = if (col.isRowNull(r)) "" else switch (col.data) {
-                                          .string => |a| a[r],
-                                          else => { pm[r] = false; continue :mixed_loop; },
-                                      };
-                                      const pass = switch (cond.op) {
-                                          .eq  => std.mem.eql(u8, s, cond.val),
-                                          .neq => !std.mem.eql(u8, s, cond.val),
-                                      };
-                                      if (!pass) { pm[r] = false; continue :mixed_loop; }
-                                  }
-                              }
+                           if (mixed_complete and (mic_n > 0 or msc_n > 0)) {
+                               // Phase 1: SIMD int conditions → build i16_mask.
+                               const n_mx = c.num_rows;
+                               const i16_mask = try calloc.alloc(i16, n_mx);
+                               const i16_tmp_a = try calloc.alloc(i16, n_mx);
+                               const i16_tmp_b = try calloc.alloc(i16, n_mx);
+                               @memset(i16_mask, 1);
+                               var simd_ok = true;
+                               for (mic_buf[0..mic_n]) |cond| {
+                                   if (!applyIntCondSIMD(&c, cond, n_mx, i16_mask, i16_tmp_a, i16_tmp_b)) {
+                                       simd_ok = false; break;
+                                   }
+                               }
+                               if (simd_ok) {
+                                   // Write int results to pm.
+                                   for (0..n_mx) |r| { if (i16_mask[r] == 0) pm[r] = false; }
+                                   // Phase 2: scalar string conditions on surviving rows only.
+                                   if (msc_n > 0) {
+                                       str_loop: for (0..n_mx) |r| {
+                                           if (!pm[r]) continue;
+                                           for (msc_buf[0..msc_n]) |cond| {
+                                               if (cond.col_idx >= c.columns.len) { pm[r] = false; continue :str_loop; }
+                                               const col = c.columns[cond.col_idx];
+                                               const s: []const u8 = if (col.isRowNull(r)) "" else switch (col.data) {
+                                                   .string => |a| a[r],
+                                                   else => { pm[r] = false; continue :str_loop; },
+                                               };
+                                               const pass = switch (cond.op) {
+                                                   .eq  => std.mem.eql(u8, s, cond.val),
+                                                   .neq => !std.mem.eql(u8, s, cond.val),
+                                               };
+                                               if (!pass) { pm[r] = false; continue :str_loop; }
+                                           }
+                                       }
+                                   }
+                               } else {
+                                   // Scalar fallback for mixed path (rare: unsupported column type).
+                                   mixed_loop: for (0..n_mx) |r| {
+                                       for (mic_buf[0..mic_n]) |cond| {
+                                           if (cond.col_idx >= c.columns.len) { pm[r] = false; continue :mixed_loop; }
+                                           const col = c.columns[cond.col_idx];
+                                           if (col.isRowNull(r)) { pm[r] = false; continue :mixed_loop; }
+                                           const v: i64 = switch (col.data) {
+                                               .int64 => |a| a[r], .uint64 => |a| @bitCast(a[r]),
+                                               .bool_u8 => |a| @as(i64, a[r]), .date_u16 => |a| @as(i64, a[r]),
+                                               .datetime64_ms => |a| a[r],
+                                               else => { pm[r] = false; continue :mixed_loop; },
+                                           };
+                                           const pass = switch (cond.op) {
+                                               .eq => v == cond.val, .neq => v != cond.val,
+                                               .lt => v < cond.val, .lte => v <= cond.val,
+                                               .gt => v > cond.val, .gte => v >= cond.val,
+                                               .in2 => v == cond.val or v == cond.val2,
+                                           };
+                                           if (!pass) { pm[r] = false; continue :mixed_loop; }
+                                       }
+                                       for (msc_buf[0..msc_n]) |cond| {
+                                           if (cond.col_idx >= c.columns.len) { pm[r] = false; continue :mixed_loop; }
+                                           const col = c.columns[cond.col_idx];
+                                           const s: []const u8 = if (col.isRowNull(r)) "" else switch (col.data) {
+                                               .string => |a| a[r],
+                                               else => { pm[r] = false; continue :mixed_loop; },
+                                           };
+                                           const pass = switch (cond.op) {
+                                               .eq  => std.mem.eql(u8, s, cond.val),
+                                               .neq => !std.mem.eql(u8, s, cond.val),
+                                           };
+                                           if (!pass) { pm[r] = false; continue :mixed_loop; }
+                                       }
+                                   }
+                               }
                           } else {
                           // Partial int pre-filter: apply any int conditions fast before evalExpr.
                           // This short-circuits most rows (e.g. CounterID=62 filters out 99%).
@@ -5768,9 +6791,39 @@ fn executeHashAggParallelStrKey(
                  if (key_col.data != .string) continue;
                  const strs = key_col.data.string;
 
-                 agg_loop: for (0..c.num_rows) |r| {
-                     // Inline fast filter: avoids separate pass_mask allocation+scan.
-                     if (self.use_inline_filter) {
+                  // SIMD chunk-skip: pre-compute int-only inline filter mask.
+                  // For Q40 (4 conditions, ~1% pass rate) reduces agg iterations from
+                  // 10M to ~412K (~24x), skipping 99% of 32-row chunks via OR-reduce.
+                  var simd_inline_mask: ?[]i16 = null;
+                  if (self.use_inline_filter and self.inline_sc_n == 0 and self.inline_ic_n > 0) blk_sim: {
+                      const _n = c.num_rows;
+                      const _im  = calloc.alloc(i16, _n) catch break :blk_sim;
+                      const _ta  = calloc.alloc(i16, _n) catch break :blk_sim;
+                      const _tb  = calloc.alloc(i16, _n) catch break :blk_sim;
+                      @memset(_im, 1);
+                      var _ok = true;
+                      for (self.inline_ic[0..self.inline_ic_n]) |cond| {
+                          if (!applyIntCondSIMD(&c, cond, _n, _im, _ta, _tb)) { _ok = false; break; }
+                      }
+                      if (_ok) simd_inline_mask = _im;
+                  }
+                  // While replaces for: _r2 incremented before any continue so
+                  // continue :agg_loop always advances to the next row.
+                  var _r2: usize = 0;
+                  agg_loop: while (_r2 < c.num_rows) {
+                      const r = _r2;
+                      if (simd_inline_mask) |_sim| {
+                          if (r & 31 == 0 and r + 32 <= c.num_rows) {
+                              var _any: i16 = 0;
+                              for (_sim[r .. r + 32]) |_v| _any |= _v;
+                              if (_any == 0) { _r2 += 32; continue :agg_loop; }
+                          }
+                      }
+                      _r2 += 1;
+                      // Inline fast filter: avoids separate pass_mask allocation+scan.
+                      if (simd_inline_mask) |_sim| {
+                          if (_sim[r] == 0) continue :agg_loop;
+                      } else if (self.use_inline_filter) {
                          for (self.inline_ic[0..self.inline_ic_n]) |cond| {
                              if (cond.col_idx >= c.columns.len) continue :agg_loop;
                              const col = c.columns[cond.col_idx];
@@ -5802,8 +6855,8 @@ fn executeHashAggParallelStrKey(
                              };
                              if (!pass) continue :agg_loop;
                          }
-                     } else if (pass_mask) |pm| { if (!pm[r]) continue; }
-                     if (key_col.isRowNull(r)) continue;
+                      } else if (pass_mask) |pm| { if (!pm[r]) continue :agg_loop; }
+                      if (key_col.isRowNull(r)) continue :agg_loop;
                     // When rr_active, extract URL domain from the raw string value.
                     const str_val: []const u8 = if (self.rr_active and self.rr_is_url_domain) blk: {
                         const raw = strs[r];
@@ -5826,9 +6879,14 @@ fn executeHashAggParallelStrKey(
                      // When no int keys and no CASE WHEN: use str_val directly (no alloc).
                      // When all int keys are constants: also use str_val directly (no prefix needed).
                      // When CASE WHEN present: encode as [int_prefix][cw_len:2B][cw_bytes][url_bytes].
+                     // Composite key buffers are allocated from thread_key_arena (backed by
+                     // c_allocator) instead of talloc.  talloc is freed when runWork returns,
+                     // but the key pointers stored in local_ht must survive until after the
+                     // tree-merge and emit phase.  thread_key_arena is freed by the caller
+                     // (executeHashAggParallelStrKey) only after iterateWithSlot completes.
                      const composite_key: []const u8 = if (self.cw_key != null) blk: {
                          const total_len = int_prefix_len + 2 + cw_str.len + str_val.len;
-                         const kbuf = try talloc.alloc(u8, total_len);
+                         const kbuf = try self.thread_key_arena.allocator().alloc(u8, total_len);
                          if (!all_const_int_keys) {
                              for (int_key_specs, 0..) |spec, ki| {
                                  const ival: u64 = if (!spec.is_col) spec.const_val else blk2: {
@@ -5851,7 +6909,7 @@ fn executeHashAggParallelStrKey(
                          break :blk kbuf;
                      } else if (int_key_n == 0 or all_const_int_keys) str_val else blk: {
                          const total_len = int_prefix_len + str_val.len;
-                         const kbuf = try talloc.alloc(u8, total_len);
+                         const kbuf = try self.thread_key_arena.allocator().alloc(u8, total_len);
                          for (int_key_specs, 0..) |spec, ki| {
                              const ival: u64 = if (!spec.is_col) spec.const_val else blk2: {
                                  const col = c.columns[spec.col_idx];
@@ -5913,10 +6971,7 @@ fn executeHashAggParallelStrKey(
      }
 
     // Pre-extract COUNT(DISTINCT) agg column indices.
-    const has_count_distinct: bool = blk: {
-        for (compact_kinds) |k| { if (k == .count_distinct_u64) break :blk true; }
-        break :blk false;
-    };
+    // has_count_distinct was already computed above (before the two-phase call site).
     var distinct_col_idx_buf: [4]usize = undefined;
     var distinct_agg_ci_buf:  [4]usize = undefined;
     var distinct_n: usize = 0;
@@ -5948,7 +7003,13 @@ fn executeHashAggParallelStrKey(
             .sidecar_idx       = sidecar_idx,
             .morsel_src        = &morsel_src,
             .parent_alloc      = alloc,
-            .local_ht          = try ht.StrAggHashTable.initWithCapacity(alloc, aggs.len, num_str_aggs, 256),
+            // Pre-size local_ht to avoid repeated grow() calls.
+            // Using total_rows / n_threads as upper bound (per-thread unique groups
+            // ≤ per-thread rows). Capped at 262_144 to limit arena usage.
+            .local_ht          = try ht.StrAggHashTable.initWithCapacity(
+                alloc, aggs.len, num_str_aggs,
+                @min(total_rows / @as(u64, n_threads), 262_144),
+            ),
             .has_count_distinct = has_count_distinct,
             .distinct_n        = distinct_n,
             .use_inline_filter = use_inline_filter,
@@ -5960,6 +7021,9 @@ fn executeHashAggParallelStrKey(
         };
         // Zero-init scatter buffers (empty ArrayListUnmanaged = no allocation).
         for (&pc.scatter_bufs) |*b| b.* = std.ArrayListUnmanaged(u128).empty;
+        // Each thread gets its own key arena (backed by c_allocator, which is thread-safe).
+        // Composite key buffers (int_prefix + str bytes) live here until after emit.
+        pc.thread_key_arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
         if (has_count_distinct) {
             @memcpy(pc.distinct_col_idx_buf[0..distinct_n], distinct_col_idx_buf[0..distinct_n]);
             @memcpy(pc.distinct_agg_ci_buf[0..distinct_n],  distinct_agg_ci_buf[0..distinct_n]);
@@ -5974,62 +7038,176 @@ fn executeHashAggParallelStrKey(
 
     try parallel.parallelFor(alloc, ParStrCtx, ParStrCtx.work, pctxs, &morsel_src);
     for (pctxs) |*pc| { if (pc.err) |e| return e; }
+    // Defer cleanup of per-thread key arenas.  Must happen AFTER iterateWithSlot (emit)
+    // because composite key bytes stored in local_ht.key_slots are borrowed from these arenas.
+    defer for (pctxs) |*pc| pc.thread_key_arena.deinit();
 
-    // Merge all local tables into pctxs[0].
-    for (pctxs[1..]) |*pc| {
-        try pctxs[0].local_ht.mergeFrom(&pc.local_ht, compact_kinds, compact_init_vals);
+    // Allocate N_PARTS result hash tables in function scope so they're visible
+    // to the COUNT(DISTINCT) reconciliation and emit sections below.
+    const N_PARTS: usize = @min(n_threads, 8);
+    const part_arenas = try alloc.alloc(std.heap.ArenaAllocator, N_PARTS);
+    for (part_arenas) |*a| a.* = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    // part_arenas freed BEFORE thread_key_arenas (LIFO defer order) — safe because
+    // freeing part_arenas only releases the HT arrays, not the key string bytes.
+    defer for (part_arenas) |*a| a.deinit();
+    const part_hts = try alloc.alloc(ht.StrAggHashTable, N_PARTS);
+
+    // ── Partitioned parallel reduce (replaces tournament tree-merge) ──────────
+    // N_PARTS independent partitions: worker p processes ALL pctxs' local_hts
+    // but only accumulates entries where (tag % N_PARTS) == p. Each worker
+    // builds its own part_hts[p] exclusively — no shared writes, no serial
+    // bottleneck. Critical for high-cardinality groups (Q40: 354K, Q14: 500K).
+    //
+    // Cost: each worker scans n_threads × local_ht.capacity tags (sequential/hot)
+    // and inserts ~(total_unique / N_PARTS) entries into its private result HT.
+    // Wall-clock time ≈ O(total_unique / N_PARTS) vs tree-merge O(total_unique).
+    {
+        var total_local_count: u64 = 0;
+        for (pctxs) |*pc| total_local_count += @as(u64, @intCast(pc.local_ht.count));
+        const est_per_part: u64 = total_local_count / N_PARTS + 64;
+
+        for (part_arenas, part_hts) |*a, *h| {
+            h.* = try ht.StrAggHashTable.initWithCapacity(
+                a.allocator(), aggs.len, num_str_aggs, est_per_part);
+        }
+
+        const PartReduceCtx = struct {
+            pctxs_view:        []const ParStrCtx,
+            part_hts:          []ht.StrAggHashTable,
+            n_parts:           usize,
+            compact_kinds:     []const ht.CompactAggKind,
+            compact_init_vals: []const u64,
+            morsel_src:        *parallel.MorselSource,
+            err:               ?anyerror = null,
+
+            fn work(self: *@This(), _: *parallel.MorselSource) void {
+                self.runWork() catch |e| { self.err = e; };
+            }
+            fn runWork(self: *@This()) !void {
+                while (self.morsel_src.next()) |m| {
+                    for (m.start..m.end) |p| {
+                        for (self.pctxs_view) |*pc| {
+                            try self.part_hts[p].mergeFromPart(
+                                &pc.local_ht,
+                                self.compact_kinds,
+                                self.compact_init_vals,
+                                p,
+                                self.n_parts,
+                            );
+                        }
+                    }
+                }
+            }
+        };
+
+        var part_morsel = parallel.MorselSource.init(N_PARTS, 1);
+        const pr_ctxs = try alloc.alloc(PartReduceCtx, n_threads);
+        for (pr_ctxs) |*c| {
+            c.* = .{
+                .pctxs_view        = pctxs,
+                .part_hts          = part_hts,
+                .n_parts           = N_PARTS,
+                .compact_kinds     = compact_kinds,
+                .compact_init_vals = compact_init_vals,
+                .morsel_src        = &part_morsel,
+            };
+        }
+        try parallel.parallelFor(alloc, PartReduceCtx, PartReduceCtx.work, pr_ctxs, &part_morsel);
+        for (pr_ctxs) |*c| { if (c.err) |e| return e; }
+        // After partitioned reduce, part_hts[0..N_PARTS] collectively hold all merged entries.
     }
 
-    // COUNT(DISTINCT) reconciliation via scatter-sort-sweep.
+    // COUNT(DISTINCT) reconciliation via parallel scatter-sort-sweep.
     // Each scatter_bufs[p] holds pairs with (group_hash & 63) == p.
     // We sort each partition and sweep to count unique (group_h, dval) pairs per group.
-    // This avoids the O(N) cache-miss HashMap merge: each partition is ~N/64 entries.
+    // Partitions are processed in parallel (one per thread) to amortise the O(N log N) sort cost.
     if (has_count_distinct and distinct_n > 0) {
+        const SortSweepCtx = struct {
+            pctxs_ptr:        []ParStrCtx,
+            local_cd_counts:  std.AutoHashMap(u64, u64),
+            morsel_src:       *parallel.MorselSource,
+            err:              ?anyerror = null,
+
+            fn work(self: *@This(), _: *parallel.MorselSource) void {
+                self.runWork() catch |e| { self.err = e; };
+            }
+            fn runWork(self: *@This()) !void {
+                var tmp_buf = std.ArrayListUnmanaged(u128).empty;
+                defer tmp_buf.deinit(std.heap.c_allocator);
+                var scratch_buf = std.ArrayListUnmanaged(u128).empty;
+                defer scratch_buf.deinit(std.heap.c_allocator);
+                while (self.morsel_src.next()) |m| {
+                    for (m.start..m.end) |p| {
+                        tmp_buf.clearRetainingCapacity();
+                        for (self.pctxs_ptr) |*pc| {
+                            try tmp_buf.appendSlice(std.heap.c_allocator, pc.scatter_bufs[p].items);
+                        }
+                        if (tmp_buf.items.len == 0) continue;
+                        // Use radix sort instead of comparison sort: O(N) vs O(N log N).
+                        // For ~140K u128 items per partition this is ~3× faster.
+                        try scratch_buf.resize(std.heap.c_allocator, tmp_buf.items.len);
+                        radixSortU128(tmp_buf.items, scratch_buf.items);
+                        var prev: u128 = tmp_buf.items[0];
+                        var prev_group_h: u64 = @truncate(prev >> 64);
+                        var count: u64 = 1;
+                        for (tmp_buf.items[1..]) |pair| {
+                            if (pair == prev) continue;
+                            const group_h: u64 = @truncate(pair >> 64);
+                            if (group_h != prev_group_h) {
+                                const gop = try self.local_cd_counts.getOrPutValue(prev_group_h, 0);
+                                gop.value_ptr.* += count;
+                                prev_group_h = group_h;
+                                count = 0;
+                            }
+                            count += 1;
+                            prev = pair;
+                        }
+                        const gop = try self.local_cd_counts.getOrPutValue(prev_group_h, 0);
+                        gop.value_ptr.* += count;
+                    }
+                }
+            }
+        };
+
+        var ss_morsel_src = parallel.MorselSource.init(64, 1);
+        const ss_ctxs = try alloc.alloc(SortSweepCtx, n_threads);
+        for (ss_ctxs) |*c| {
+            c.* = .{
+                .pctxs_ptr       = pctxs,
+                .local_cd_counts = std.AutoHashMap(u64, u64).init(std.heap.c_allocator),
+                .morsel_src      = &ss_morsel_src,
+            };
+        }
+
+        try parallel.parallelFor(alloc, SortSweepCtx, SortSweepCtx.work, ss_ctxs, &ss_morsel_src);
+        for (ss_ctxs) |*c| { if (c.err) |e| return e; }
+
+        // Merge per-thread cd_counts into a single map (serial: small, O(unique groups)).
         var cd_counts = std.AutoHashMap(u64, u64).init(alloc);
         defer cd_counts.deinit();
-        var merged_buf = std.ArrayListUnmanaged(u128).empty;
-        defer merged_buf.deinit(alloc);
-        for (0..64) |p| {
-            merged_buf.clearRetainingCapacity();
-            for (pctxs) |*pc| {
-                try merged_buf.appendSlice(alloc, pc.scatter_bufs[p].items);
+        for (ss_ctxs) |*c| {
+            var it = c.local_cd_counts.iterator();
+            while (it.next()) |entry| {
+                const gop = try cd_counts.getOrPutValue(entry.key_ptr.*, 0);
+                gop.value_ptr.* += entry.value_ptr.*;
             }
-            if (merged_buf.items.len == 0) continue;
-            // Sort: pairs sort by (group_h << 64 | dval), so same group_h are contiguous,
-            // and exact duplicates (same group_h + same dval) are adjacent.
-            std.sort.pdq(u128, merged_buf.items, {}, std.sort.asc(u128));
-            // Sweep: count unique dvals per group_h.
-            var prev: u128 = merged_buf.items[0];
-            var prev_group_h: u64 = @truncate(prev >> 64);
-            var count: u64 = 1;
-            for (merged_buf.items[1..]) |pair| {
-                if (pair == prev) continue; // exact dup: same (group_h, dval)
-                const group_h: u64 = @truncate(pair >> 64);
-                if (group_h != prev_group_h) {
-                    const gop = try cd_counts.getOrPutValue(prev_group_h, 0);
-                    gop.value_ptr.* += count;
-                    prev_group_h = group_h;
-                    count = 0;
-                }
-                count += 1;
-                prev = pair;
-            }
-            const gop = try cd_counts.getOrPutValue(prev_group_h, 0);
-            gop.value_ptr.* += count;
+            c.local_cd_counts.deinit();
         }
+
         // Free scatter buffers.
         for (pctxs) |*pc| {
             for (&pc.scatter_bufs) |*b| b.deinit(std.heap.c_allocator);
         }
-        // Update merged StrAggHashTable COUNT(DISTINCT) slots.
-        const merged = &pctxs[0].local_ht;
-        for (0..merged.capacity) |slot| {
-            if (merged.tags[slot] == 0) continue; // EMPTY_TAG
-            const group_h = merged.tags[slot];
-            const count_val = cd_counts.get(group_h) orelse 0;
-            for (0..distinct_n) |di| {
-                const ci = distinct_agg_ci_buf[di];
-                merged.vals_flat[slot * merged.num_aggs + ci] = count_val;
+        // Update COUNT(DISTINCT) slots in all partitioned result hash tables.
+        for (part_hts) |*pht| {
+            for (0..pht.capacity) |slot| {
+                if (pht.tags[slot] == 0) continue; // EMPTY_TAG
+                const group_h = pht.tags[slot];
+                const count_val = cd_counts.get(group_h) orelse 0;
+                for (0..distinct_n) |di| {
+                    const ci = distinct_agg_ci_buf[di];
+                    pht.vals_flat[slot * pht.num_aggs + ci] = count_val;
+                }
             }
         }
     } else if (has_count_distinct) {
@@ -6081,7 +7259,7 @@ fn executeHashAggParallelStrKey(
         .alloc          = alloc,
         .aggs           = aggs,
         .kinds          = compact_kinds,
-        .str_ht         = &pctxs[0].local_ht,
+        .str_ht         = &part_hts[0], // updated per partition in the emit loop below
         .sidecar_idx    = sidecar_idx,
         .keys           = keys,
         .str_key_pos    = str_key_pos,
@@ -6091,7 +7269,7 @@ fn executeHashAggParallelStrKey(
         .all_const_ints = emit_all_const,
         .sm             = sm_emit,
     };
-    pctxs[0].local_ht.iterateWithSlot(&emit_ctx, struct {
+    const EmitCb = struct {
         fn cb(ec: *EmitCtx, composite: []const u8, vals: []const u64, slot: usize) void {
             const row = ec.alloc.alloc(?Value, ec.keys.len + vals.len) catch return;
             // Decode composite key into row slots.
@@ -6102,10 +7280,15 @@ fn executeHashAggParallelStrKey(
             else 0;
             const cw_start: usize = ec.int_prefix + (if (ec.has_cw) @as(usize, 2) else 0);
             const str_start: usize = cw_start + cw_len;
-            const cw_str: []const u8 = if (ec.has_cw and cw_start + cw_len <= composite.len)
+            // Strings extracted from composite may point into thread_key_arena which
+            // is freed by a defer AFTER return — dupe them into ec.alloc so the
+            // returned RowList owns its string values.
+            const cw_str_raw: []const u8 = if (ec.has_cw and cw_start + cw_len <= composite.len)
                 composite[cw_start..cw_start+cw_len] else "";
-            const str_val: []const u8 = if (str_start <= composite.len)
+            const str_val_raw: []const u8 = if (str_start <= composite.len)
                 composite[str_start..] else "";
+            const cw_str: []const u8 = ec.alloc.dupe(u8, cw_str_raw) catch cw_str_raw;
+            const str_val: []const u8 = ec.alloc.dupe(u8, str_val_raw) catch str_val_raw;
             var int_ki: usize = 0;
             for (ec.keys, 0..) |k, ki| {
                 if (ec.has_cw and ki == ec.cw_key_pos) {
@@ -6148,7 +7331,12 @@ fn executeHashAggParallelStrKey(
             emitCompactValsWithSidecar(vals, ec.kinds, ec.aggs, row[ec.keys.len..], ec.str_ht, slot, ec.sidecar_idx);
             ec.rl.append(ec.alloc, row) catch {};
         }
-    }.cb);
+    };
+    // Emit from all N_PARTS result hash tables.
+    for (part_hts) |*pht| {
+        emit_ctx.str_ht = pht;
+        pht.iterateWithSlot(&emit_ctx, EmitCb.cb);
+    }
 
     // Apply top-K sort if requested.
     if (top_k > 0 and sort_keys.len > 0 and rl.rows.items.len > top_k) {
@@ -6232,7 +7420,17 @@ fn executeHashAggParallelCompactTopK(
                  break :blk .count_distinct_u64;
              } else .count,
              .sum  => .i64_sum,
-             .avg  => if (item.expr.agg_call.arg == null or item.expr.agg_call.arg.? != .col_ref) return null else .f64_sum,
+             .avg  => blk_avg: {
+                 const avg_arg = item.expr.agg_call.arg orelse return null;
+                 if (avg_arg == .col_ref) break :blk_avg .f64_sum;
+                 // avg(length(str_col)) — accumulate string length sum; finalize as avg.
+                 if (avg_arg == .fn_call and
+                     std.mem.eql(u8, avg_arg.fn_call.name, "length") and
+                     avg_arg.fn_call.args.len == 1 and
+                     avg_arg.fn_call.args[0] == .col_ref)
+                     break :blk_avg .f64_str_len_sum;
+                 return null;
+             },
              .min  => if (item.out_type == .string) return null else .i64_min,
              .max  => if (item.out_type == .string) return null else .i64_max,
              else  => return null,
@@ -6292,7 +7490,28 @@ fn executeHashAggParallelCompactTopK(
         }
         break :blk null;
     } else null;
-    if (str_nonempty_col_name) |col_name| ctx.source.setStringNonEmptyBool(col_name);
+    if (str_nonempty_col_name) |col_name| {
+        // Guard: do NOT optimize filter column as bool_u8 if it is also used for
+        // f64_str_len_sum (which needs actual string lengths, not bool flags).
+        var conflict = false;
+        const sm3 = ctx.source.schema();
+        for (aggs, compact_kinds) |ag, ck| {
+            if (ck != .f64_str_len_sum) continue;
+            const ac2 = ag.expr.agg_call;
+            if (ac2.arg) |arg| {
+                if (arg == .fn_call and arg.fn_call.args.len == 1 and
+                    arg.fn_call.args[0] == .col_ref)
+                {
+                    const ci2 = arg.fn_call.args[0].col_ref.index;
+                    if (ci2 < sm3.len and std.mem.eql(u8, sm3[ci2].name, col_name)) {
+                        conflict = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if (!conflict) ctx.source.setStringNonEmptyBool(col_name);
+    }
     defer ctx.source.setStringNonEmptyBool(null);
 
     // Load columns before parallel scan.
@@ -6338,6 +7557,12 @@ fn executeHashAggParallelCompactTopK(
                  else => break :two_phase,
              }
          }
+         // Guard: skip two-phase when any agg is f64_str_len_sum (AVG(length(col))).
+         // For these queries the scatter phase needs to load full string data, making
+         // scatter write overhead exceed the DRAM-stall benefit for low-cardinality keys.
+         // The parallel compact path handles f64_str_len_sum more efficiently.
+         for (compact_kinds) |ck| { if (ck == .f64_str_len_sum) break :two_phase; }
+
          // Guard: skip two-phase for low-cardinality keys (int16/bool etc.) — their HTs
          // are L1-fitting already; scatter overhead exceeds the DRAM-stall benefit.
          {
@@ -6378,6 +7603,137 @@ fn executeHashAggParallelCompactTopK(
         )) |two_phase_rl| return two_phase_rl;
     }
 
+    // ── Raw int16 histogram GROUP BY fast path ─────────────────────────────────
+    // For COUNT(*) GROUP BY single narrow-int key with a filter only on that key.
+    // e.g. Q8: SELECT AdvEngineID, COUNT(*) WHERE AdvEngineID <> 0 GROUP BY AdvEngineID
+    // Builds a 65536-entry direct array (no hash, no probing) → L1-resident for low-cardinality.
+    raw_i16_hist_blk: {
+        if (keys.len != 1) break :raw_i16_hist_blk;
+        for (compact_kinds) |k| { if (k != .count) break :raw_i16_hist_blk; }
+        const hist_key_expr = keys[0].expr;
+        if (hist_key_expr != .col_ref) break :raw_i16_hist_blk;
+        const hist_ci = hist_key_expr.col_ref.index;
+        const hist_sm = ctx.source.schema();
+        if (hist_ci >= hist_sm.len or !hist_sm[hist_ci].is_narrow_int) break :raw_i16_hist_blk;
+        const hist_col = hist_sm[hist_ci].name;
+        const hist_raw = ctx.source.getRawInt16Col(hist_col) orelse break :raw_i16_hist_blk;
+        if (hist_raw.len < total_rows) break :raw_i16_hist_blk;
+        // Filter: must be pure AND int conditions all on the key column.
+        var hist_ic_buf: [8]IntCmpCond = undefined;
+        var hist_ic_n: usize = 0;
+        if (filter_pred) |fp| {
+            if (!extractAndIntConds(fp, &hist_ic_buf, &hist_ic_n, false)) break :raw_i16_hist_blk;
+            if (hist_ic_n == 0) break :raw_i16_hist_blk;
+            for (hist_ic_buf[0..hist_ic_n]) |fc| {
+                if (fc.col_idx != hist_ci) break :raw_i16_hist_blk;
+            }
+        }
+        // Build per-thread direct histograms (65536 × u64 = 512KB each).
+        // For low-cardinality columns (e.g. AdvEngineID 0-255) only ~2KB are accessed → L1-resident.
+        const HIST_SIZE: usize = 65536;
+        const hist_per_thread = try alloc.alloc([]u64, n_threads);
+        for (hist_per_thread) |*h| {
+            h.* = try alloc.alloc(u64, HIST_SIZE);
+            @memset(h.*, 0);
+        }
+        const HistBuildCtx = struct {
+            raw:        []const i16,
+            hist:       []u64,
+            morsel_src: *parallel.MorselSource,
+            // Inline filter conditions: applied per-element to skip non-qualifying rows
+            // before updating the histogram.  For Q8 (AdvEngineID <> 0) this eliminates
+            // ~90% of histogram writes (zeros), cutting wall time 4.7ms → ~1.5ms.
+            conds:      []const IntCmpCond,
+            fn work(self: *@This(), _: *parallel.MorselSource) void {
+                const conds = self.conds;
+                while (self.morsel_src.next()) |m| {
+                    if (conds.len == 0) {
+                        // No filter: unconditional scatter-add (original fast path).
+                        for (self.raw[m.start..m.end]) |v| {
+                            self.hist[@as(usize, @as(u16, @bitCast(v)))] += 1;
+                        }
+                    } else {
+                        // Filter-gated scatter-add: skip values that don't satisfy all
+                        // conditions.  Branch predictor correctly predicts "skip" for
+                        // majority of rows (e.g. AdvEngineID=0), eliminating most stores.
+                        for (self.raw[m.start..m.end]) |v| {
+                            const iv: i64 = v;
+                            var pass = true;
+                            for (conds) |cond| {
+                                if (!switch (cond.op) {
+                                    .eq  => iv == cond.val,
+                                    .neq => iv != cond.val,
+                                    .lt  => iv <  cond.val,
+                                    .lte => iv <= cond.val,
+                                    .gt  => iv >  cond.val,
+                                    .gte => iv >= cond.val,
+                                    .in2 => iv == cond.val or iv == cond.val2,
+                                }) { pass = false; break; }
+                            }
+                            if (pass) self.hist[@as(usize, @as(u16, @bitCast(v)))] += 1;
+                        }
+                    }
+                }
+            }
+        };
+        var hist_morsels = parallel.MorselSource.init(total_rows, parallel.default_morsel_size);
+        const hist_pctxs = try alloc.alloc(HistBuildCtx, n_threads);
+        for (hist_pctxs, 0..) |*pc, ti| {
+            pc.* = .{ .raw = hist_raw, .hist = hist_per_thread[ti], .morsel_src = &hist_morsels,
+                      .conds = hist_ic_buf[0..hist_ic_n] };
+        }
+        try parallel.parallelFor(alloc, HistBuildCtx, HistBuildCtx.work, hist_pctxs, &hist_morsels);
+        // Merge thread histograms into hist_per_thread[0].
+        const final_hist = hist_per_thread[0];
+        for (hist_per_thread[1..]) |h| {
+            for (0..HIST_SIZE) |i| { final_hist[i] += h[i]; }
+        }
+        // Apply filter: zero entries that don't pass all conditions.
+        if (filter_pred != null) {
+            const fcs = hist_ic_buf[0..hist_ic_n];
+            for (0..HIST_SIZE) |ui| {
+                if (final_hist[ui] == 0) continue;
+                const v: i64 = @as(i64, @as(i16, @bitCast(@as(u16, @intCast(ui)))));
+                var pass = true;
+                for (fcs) |fc| {
+                    if (!pass) break;
+                    pass = switch (fc.op) {
+                        .eq  => v == fc.val,
+                        .neq => v != fc.val,
+                        .lt  => v <  fc.val,
+                        .lte => v <= fc.val,
+                        .gt  => v >  fc.val,
+                        .gte => v >= fc.val,
+                        .in2 => v == fc.val or v == fc.val2,
+                    };
+                }
+                if (!pass) final_hist[ui] = 0;
+            }
+        }
+        // Build RowList from non-zero histogram entries.
+        const hist_out_metas = try alloc.alloc(result.ColMeta, keys.len + aggs.len);
+        for (keys, 0..) |k, i| hist_out_metas[i] = .{ .name = k.alias, .col_type = k.out_type };
+        for (aggs, 0..) |a, i| hist_out_metas[keys.len + i] = .{ .name = a.alias, .col_type = a.out_type };
+        var hist_rl = RowList.init(hist_out_metas);
+        for (0..HIST_SIZE) |ui| {
+            if (final_hist[ui] == 0) continue;
+            const kv: i64 = @as(i64, @as(i16, @bitCast(@as(u16, @intCast(ui)))));
+            const row = try alloc.alloc(?Value, keys.len + aggs.len);
+            row[0] = .{ .int64 = kv };
+            for (0..aggs.len) |ai| { row[keys.len + ai] = .{ .int64 = @intCast(final_hist[ui]) }; }
+            try hist_rl.append(alloc, row);
+        }
+        // Handle top_k with sorting when called from the top_k fusion path.
+        if (sort_keys.len > 0 and top_k > 0) {
+            const sorted = try executeOrderBy(hist_rl, sort_keys, alloc);
+            const take = @min(sorted.rows.items.len, top_k);
+            var trimmed_rl = RowList.init(hist_out_metas);
+            for (sorted.rows.items[0..take]) |row| try trimmed_rl.append(alloc, row);
+            return trimmed_rl;
+        }
+        return hist_rl;
+    }
+
     // COUNT(DISTINCT) is only supported via the two-phase path above.
     // If we reach here with count_distinct_u64, fall back to sequential.
     for (compact_kinds) |k| { if (k == .count_distinct_u64) return null; }
@@ -6404,46 +7760,213 @@ fn executeHashAggParallelCompactTopK(
             const talloc = thread_arena.allocator();
             const key_buf = try talloc.alloc(i64, self.keys.len);
 
-            while (self.morsel_src.next()) |m| {
-                var chunk_arena = std.heap.ArenaAllocator.init(talloc);
-                defer chunk_arena.deinit();
-                const calloc = chunk_arena.allocator();
-                var c: DataChunk = undefined;
-                try self.source.fetchRange(m.start, m.end - m.start, &c, calloc);
+            // Extract filter conditions once before the morsel loop.
+            // Hoisting avoids redundant Expr-tree traversal on every morsel.
+            var pre_ic_buf: [16]IntCmpCond = undefined;
+            var pre_ic_n: usize = 0;
+            var pre_ic_complete: bool = false;
+            if (self.filter_pred) |fp| {
+                pre_ic_complete = extractAndIntConds(fp, &pre_ic_buf, &pre_ic_n, false);
+            }
+            const pre_conds = pre_ic_buf[0..pre_ic_n];
 
+            // Allocate SIMD scratch buffers once per thread for the SIMD filter path.
+            // Using i16 masks: 0 = filtered out, non-zero = pass.
+            // Allocated when ANY int conditions were extracted (complete OR partial):
+            // partial int conditions use SIMD pre-filter + evalExpr residual check.
+            const simd_sz = parallel.default_morsel_size + 1;
+            var simd_mask_buf:  ?[]i16 = null;
+            var simd_tmp_a_buf: ?[]i16 = null;
+            var simd_tmp_b_buf: ?[]i16 = null;
+            if (pre_ic_n > 0) {
+                simd_mask_buf  = try talloc.alloc(i16, simd_sz);
+                 simd_tmp_a_buf = try talloc.alloc(i16, simd_sz);
+                 simd_tmp_b_buf = try talloc.alloc(i16, simd_sz);
+             }
+ 
+            // ── Raw-slice fast path ───────────────────────────────────────────────
+            // When all filter conditions are pure int AND all GROUP BY keys are
+            // plain col_ref AND all aggregates are COUNT: bypass fetchRange entirely.
+            // Reads narrow mmap'd columns directly, eliminating i16/i32→i64 widening
+            // (~3-5× memory bandwidth savings).  For Q42 (5 filter + 2 key cols in
+            // narrow int): saves ~340MB per query → expected speedup 12ms → ~2-3ms.
+            raw_path: {
+                if (!pre_ic_complete or pre_ic_n == 0) break :raw_path;
+                for (self.keys)          |k| { if (k.expr != .col_ref) break :raw_path; }
+                for (self.compact_kinds) |k| { if (k != .count)        break :raw_path; }
+                const sch = self.source.schema();
+                // Resolve each filter condition column to a raw typed slice.
+                var rf: [16]RawColSlice = undefined;
+                for (pre_conds, 0..) |cond, ci| {
+                    const nm = if (cond.col_idx < sch.len) sch[cond.col_idx].name else break :raw_path;
+                    if (self.source.getRawInt16Col(nm)) |s| { rf[ci] = .{ .i16s = s }; }
+                    else if (self.source.getRawInt32Col(nm)) |s| { rf[ci] = .{ .i32s = s }; }
+                    else if (self.source.getRawInt64Col(nm)) |s| { rf[ci] = .{ .i64s = s }; }
+                    else break :raw_path;
+                }
+                // Resolve each GROUP BY key column to a raw typed slice.
+                var rk: [8]RawColSlice = undefined;
+                for (self.keys, 0..) |k, ki| {
+                    const col_idx = k.expr.col_ref.index;
+                    const nm = if (col_idx < sch.len) sch[col_idx].name else break :raw_path;
+                    if (self.source.getRawInt16Col(nm)) |s| { rk[ki] = .{ .i16s = s }; }
+                    else if (self.source.getRawInt32Col(nm)) |s| { rk[ki] = .{ .i32s = s }; }
+                    else if (self.source.getRawInt64Col(nm)) |s| { rk[ki] = .{ .i64s = s }; }
+                    else break :raw_path;
+                }
+                // All columns resolved — run morsel loop without fetchRange.
+                const simd_mask  = simd_mask_buf.?;
+                const simd_tmp_a = simd_tmp_a_buf.?;
+                const simd_tmp_b = simd_tmp_b_buf.?;
+
+                // ── Condition reordering: sort rf[] + pre_ic_buf[] by selectivity ─────
+                // i64 eq (e.g. URLHash exact-match) → i32 eq → i16 eq → range ops.
+                // For Q42: URLHash has ~100 matches / 10M rows.  Moving it to index 0
+                // means >99% of morsels are all-zero after the first SIMD pass and skip
+                // the remaining 5 conditions entirely via the early-exit below.
+                {
+                    const condPri = struct {
+                        fn get(sl: RawColSlice, c: IntCmpCond) u8 {
+                            return switch (sl) {
+                                .i64s => if (c.op == .eq) 0 else 3,
+                                .i32s => if (c.op == .eq) 1 else 4,
+                                .i16s => if (c.op == .eq) 2 else 5,
+                            };
+                        }
+                    };
+                    // Insertion sort (≤16 elements; virtually free at runtime).
+                    var si: usize = 1;
+                    while (si < pre_ic_n) : (si += 1) {
+                        const pi = condPri.get(rf[si], pre_ic_buf[si]);
+                        var sj = si;
+                        while (sj > 0 and condPri.get(rf[sj-1], pre_ic_buf[sj-1]) > pi) : (sj -= 1) {
+                            std.mem.swap(RawColSlice, &rf[sj-1], &rf[sj]);
+                            std.mem.swap(IntCmpCond,  &pre_ic_buf[sj-1], &pre_ic_buf[sj]);
+                        }
+                    }
+                }
+
+                const CHUNK = 32;
+                while (self.morsel_src.next()) |m| {
+                    const start = m.start;
+                    const nr    = m.end - m.start;
+                    @memset(simd_mask[0..nr], 1);
+
+                    // Apply highest-selectivity condition first (after reordering above).
+                    rf[0].applyMaskSIMD(start, nr, pre_conds[0],
+                        simd_mask[0..nr], simd_tmp_a[0..nr], simd_tmp_b[0..nr]);
+
+                    // ── Morsel-wide early-exit ──────────────────────────────────────
+                    // After the first (most selective) condition, OR-reduce the full
+                    // mask.  For Q42 with URLHash at position 0: ~99% of morsels have
+                    // mask = all-zero and we skip 5 more SIMD passes + the row scan,
+                    // saving ~4 ms per query.
+                    if (pre_ic_n > 1) {
+                        var any_pass = false;
+                        var rr: usize = 0;
+                        while (rr + CHUNK <= nr) : (rr += CHUNK) {
+                            const v: @Vector(CHUNK, i16) = simd_mask[rr..][0..CHUNK].*;
+                            if (@reduce(.Or, v) != 0) { any_pass = true; break; }
+                        }
+                        if (!any_pass) {
+                            while (rr < nr) : (rr += 1) {
+                                if (simd_mask[rr] != 0) { any_pass = true; break; }
+                            }
+                        }
+                        if (!any_pass) continue; // entire morsel filtered → next morsel
+                    }
+
+                    // Apply remaining conditions (indices 1 .. pre_ic_n-1).
+                    for (pre_conds[1..], 0..) |cond, rci| {
+                        rf[1 + rci].applyMaskSIMD(start, nr, cond,
+                            simd_mask[0..nr], simd_tmp_a[0..nr], simd_tmp_b[0..nr]);
+                    }
+
+                    // ── Chunked mask scan: OR-reduce 32-lane chunks so all-zero
+                    // blocks are skipped in ~5 cycles instead of 32 scalar checks.
+                    // With ~1% pass rate, ~76% of 32-row chunks are all zero.
+                    var r: usize = 0;
+                    while (r + CHUNK <= nr) : (r += CHUNK) {
+                        const v: @Vector(CHUNK, i16) = simd_mask[r..][0..CHUNK].*;
+                        if (@reduce(.Or, v) == 0) continue;
+                        for (r..r + CHUNK) |ri| {
+                            if (simd_mask[ri] == 0) continue;
+                            const row = start + ri;
+                            for (0..self.keys.len) |ki| { key_buf[ki] = rk[ki].getI64(row); }
+                            const slot_vals = try self.local_ht.getOrInsert(key_buf, self.compact_init_vals);
+                            for (0..self.aggs.len) |ci2| { slot_vals[ci2] += 1; }
+                        }
+                    }
+                    while (r < nr) : (r += 1) {
+                        if (simd_mask[r] == 0) continue;
+                        const row = start + r;
+                        for (0..self.keys.len) |ki| { key_buf[ki] = rk[ki].getI64(row); }
+                        const slot_vals = try self.local_ht.getOrInsert(key_buf, self.compact_init_vals);
+                        for (0..self.aggs.len) |ci2| { slot_vals[ci2] += 1; }
+                    }
+                }
+                return; // Raw path handled — skip fetchRange morsel loop.
+            }
+
+             // Pre-allocate a single reusable arena for per-morsel fetchRange data.
+             // Resetting with retain_capacity reuses the existing buffer each iteration
+             // instead of allocating ~7MB from talloc per morsel (which accumulates to
+             // ~566MB/thread = ~2.3GB total, forcing OS to zero-fill fresh pages on each
+             // query).  This is the root cause of Q42/Q41's 12ms wall time.
+             var chunk_arena = std.heap.ArenaAllocator.init(talloc);
+             defer chunk_arena.deinit();
+             while (self.morsel_src.next()) |m| {
+                 _ = chunk_arena.reset(.retain_capacity);
+                 const calloc = chunk_arena.allocator();
+                 var c: DataChunk = undefined;
+                 try self.source.fetchRange(m.start, m.end - m.start, &c, calloc);
+ 
+                 const nr = c.num_rows;
                 // Apply filter (non-compacting for parallel).
                 if (self.filter_pred) |fp| {
-                    var pass_mask = try calloc.alloc(bool, c.num_rows);
-                    @memset(pass_mask, true);
-                    // Apply int conds directly.
-                    var ic_buf: [16]IntCmpCond = undefined;
-                    var ic_n: usize = 0;
-                    const ic_complete = extractAndIntConds(fp, &ic_buf, &ic_n, false);
-                    if (ic_complete and ic_n > 0) {
-                        const conds = ic_buf[0..ic_n];
-                        for (0..c.num_rows) |r| {
-                            for (conds) |cond| {
-                                if (cond.col_idx >= c.columns.len) { pass_mask[r] = false; break; }
-                                const col = c.columns[cond.col_idx];
-                                if (col.isRowNull(r)) { pass_mask[r] = false; break; }
-                                const v: i64 = switch (col.data) {
-                                    .int64 => |a| a[r],
-                                    .uint64 => |a| @bitCast(a[r]),
-                                    .bool_u8 => |a| @as(i64, a[r]),
-                                    .date_u16 => |a| @as(i64, a[r]),
-                                    .datetime64_ms => |a| a[r],
-                                    else => { pass_mask[r] = false; break; },
-                                };
-                                const pass = switch (cond.op) {
-                                    .eq => v == cond.val, .neq => v != cond.val,
-                                    .lt => v < cond.val, .lte => v <= cond.val,
-                                    .gt => v > cond.val, .gte => v >= cond.val,
-                                    .in2 => v == cond.val or v == cond.val2,
-                                };
-                                if (!pass) { pass_mask[r] = false; break; }
+                    var pass_mask = try calloc.alloc(bool, nr);
+                    if (pre_ic_n > 0) {
+                        // SIMD column-major fast path: process all rows per int condition.
+                        // 8-16× faster than scalar row-major loop for pure-int predicates
+                        // (e.g. Q42: 6 conditions × SIMD AVX2 → reduces filter time ~10×).
+                        // When conditions are only partially int (pre_ic_complete=false),
+                        // SIMD pre-filters to a small survivor set, then evalExpr runs only
+                        // for survivors (e.g. Q38: CounterID=62 → ~1% survive, string check
+                        // runs on 100K rows instead of 10M → ~100× faster).
+                        const simd_mask  = simd_mask_buf.?;
+                        const simd_tmp_a = simd_tmp_a_buf.?;
+                        const simd_tmp_b = simd_tmp_b_buf.?;
+                        @memset(simd_mask[0..nr], 1);
+                        for (pre_conds) |cond| {
+                            _ = applyIntCondSIMD(&c, cond, nr,
+                                simd_mask[0..nr], simd_tmp_a[0..nr], simd_tmp_b[0..nr]);
+                        }
+                        if (pre_ic_complete) {
+                            // All conditions were int — SIMD mask is the final filter result.
+                            for (0..nr) |r| pass_mask[r] = (simd_mask[r] != 0);
+                        } else {
+                            // Partial int pre-filter: run full evalExpr only for SIMD survivors.
+                            const ref_mask2 = try calloc.alloc(bool, @min(256, c.columns.len));
+                            @memset(ref_mask2, false);
+                            collectColRefs(fp, ref_mask2);
+                            var ref_buf2 = try calloc.alloc(usize, c.columns.len);
+                            var ref_n2: usize = 0;
+                            for (ref_mask2, 0..) |m2, i| { if (m2 and i < c.columns.len) { ref_buf2[ref_n2] = i; ref_n2 += 1; } }
+                            const refs2 = ref_buf2[0..ref_n2];
+                            const row2 = try calloc.alloc(?Value, c.columns.len);
+                            @memset(row2, null);
+                            for (0..nr) |r| {
+                                if (simd_mask[r] == 0) { pass_mask[r] = false; continue; }
+                                for (refs2) |j| {
+                                    const col = c.columns[j];
+                                    row2[j] = if (col.isRowNull(r)) null else col.data.get(r);
+                                }
+                                const v = try kernels.evalExpr(fp, row2, null, calloc);
+                                pass_mask[r] = if (v) |val| val.bool_u8 != 0 else false;
                             }
                         }
                     } else like_str_path: {
+                        // No extractable int conditions — use fast string/general paths.
                         // Fast path: pure LIKE / NOT_LIKE col_ref lit_str.
                         switch (fp) {
                             .like, .not_like => |op| if (op.left == .col_ref and op.right == .lit_str) {
@@ -6571,17 +8094,32 @@ fn executeHashAggParallelCompactTopK(
                                         else => {},
                                     };
                                 }},
-                                .f64_sum => if (ac.arg) |arg| { if (arg == .col_ref) {
-                                    const col = c.columns[arg.col_ref.index];
-                                    if (!col.isRowNull(r)) switch (col.data) {
-                                        .int64  => |v| { var s: f64 = @bitCast(slot_vals[ci]); s += @floatFromInt(v[r]); slot_vals[ci] = @bitCast(s); },
-                                        .uint64 => |v| { var s: f64 = @bitCast(slot_vals[ci]); s += @floatFromInt(v[r]); slot_vals[ci] = @bitCast(s); },
-                                        .bool_u8 => |v| { var s: f64 = @bitCast(slot_vals[ci]); s += @floatFromInt(v[r]); slot_vals[ci] = @bitCast(s); },
-                                        .float64 => |v| { var s: f64 = @bitCast(slot_vals[ci]); s += v[r]; slot_vals[ci] = @bitCast(s); },
-                                        else => {},
-                                    };
-                                }},
-                                else => slot_vals[ci] += 1, // fallback: count
+                                 .f64_sum => if (ac.arg) |arg| { if (arg == .col_ref) {
+                                     const col = c.columns[arg.col_ref.index];
+                                     if (!col.isRowNull(r)) switch (col.data) {
+                                         .int64  => |v| { var s: f64 = @bitCast(slot_vals[ci]); s += @floatFromInt(v[r]); slot_vals[ci] = @bitCast(s); },
+                                         .uint64 => |v| { var s: f64 = @bitCast(slot_vals[ci]); s += @floatFromInt(v[r]); slot_vals[ci] = @bitCast(s); },
+                                         .bool_u8 => |v| { var s: f64 = @bitCast(slot_vals[ci]); s += @floatFromInt(v[r]); slot_vals[ci] = @bitCast(s); },
+                                         .float64 => |v| { var s: f64 = @bitCast(slot_vals[ci]); s += v[r]; slot_vals[ci] = @bitCast(s); },
+                                         else => {},
+                                     };
+                                 }},
+                                 .f64_str_len_sum => if (ac.arg) |arg| {
+                                     // AVG(length(col_ref)) — dig into fn_call arg to get string column.
+                                     if (arg == .fn_call and arg.fn_call.args.len == 1 and
+                                         arg.fn_call.args[0] == .col_ref)
+                                     {
+                                         const col_idx2 = arg.fn_call.args[0].col_ref.index;
+                                         if (col_idx2 < c.columns.len) {
+                                             const col = c.columns[col_idx2];
+                                             if (!col.isRowNull(r)) switch (col.data) {
+                                                 .string => |v| { var s: f64 = @bitCast(slot_vals[ci]); s += @floatFromInt(v[r].len); slot_vals[ci] = @bitCast(s); },
+                                                 else => {},
+                                             };
+                                         }
+                                     }
+                                 },
+                                 else => slot_vals[ci] += 1, // fallback: count
                             }
                         }
                     }
@@ -6814,6 +8352,33 @@ fn executeHashAggParallelCompactTopK(
         }
     };
 
+    // Column pruning: tell the source to only load the columns actually needed
+    // (filter + key + agg columns).  For the hits table (105 columns), Q41/Q42
+    // only touch 6-7 columns; pruning reduces fetchRange I/O from ~100MB/morsel
+    // to ~6MB/morsel, cutting scan time from ~12ms to ~1ms.
+    {
+        const ncols = @min(256, ctx.source.schema().len);
+        var needed_mask = [_]bool{false} ** 256;
+        for (keys)  |item| collectColRefs(item.expr, needed_mask[0..ncols]);
+        for (aggs)  |item| collectColRefs(item.expr, needed_mask[0..ncols]);
+        if (filter_pred) |fp| collectColRefs(fp, needed_mask[0..ncols]);
+        var needed_count: usize = 0;
+        for (needed_mask[0..ncols]) |m| { if (m) needed_count += 1; }
+        if (needed_count > 0 and needed_count * 2 < ctx.source.schema().len) {
+            const sm2 = ctx.source.schema();
+            var names_buf2: [32][]const u8 = undefined;
+            var names_len2: usize = 0;
+            for (needed_mask[0..ncols], 0..) |m, i| {
+                if (m and names_len2 < names_buf2.len) {
+                    names_buf2[names_len2] = sm2[i].name;
+                    names_len2 += 1;
+                }
+            }
+            ctx.source.setNeededCols(names_buf2[0..names_len2]);
+        }
+    }
+    defer ctx.source.setNeededCols(null);
+
     // Allocate per-thread contexts.
     var morsel_src = parallel.MorselSource.init(total_rows, parallel.default_morsel_size);
 
@@ -6923,12 +8488,9 @@ fn executeHashAggParallelCompactTopK(
     try parallel.parallelFor(alloc, PMCtx, PMCtx.work, pm_ctxs, &pm_src);
     for (pm_ctxs) |*pm| { if (pm.err) |e| return e; }
 
-    const use_part_merge = true;
     const part_hts = part_masters;
 
     // Emit result — same logic as in executeHashAggChunked compact emit path.
-    const schema_metas = ctx.source.schema();
-    _ = schema_metas;
 
     // Precompute key output types so makeRow emits the correct Value union variant.
     const key_out_types_buf = try alloc.alloc(ColumnType, keys.len);
@@ -6936,7 +8498,6 @@ fn executeHashAggParallelCompactTopK(
     const out_metas = try alloc.alloc(result.ColMeta, keys.len + aggs.len);
     for (keys, 0..) |k, i| out_metas[i] = .{ .name = k.alias, .col_type = k.out_type };
     for (aggs, 0..) |a, i| out_metas[keys.len + i] = .{ .name = a.alias, .col_type = a.out_type };
-    _ = schema_metas;
 
     var rl = RowList.init(out_metas);
     const MCtx = struct {
@@ -7110,14 +8671,9 @@ fn executeHashAggParallelCompactTopK(
         .heap = heap_buf, .heap_len = 0, .heap_k = top_k, .sort_keys = sort_keys,
         .key_out_types = key_out_types_buf,
     };
-    if (use_part_merge) {
-        // Emit from all partition HTs (each small → L3-friendly).
-        for (part_hts) |*ph| {
-            ph.iterate(&emit_ctx, MCtx.cb);
-            if (emit_ctx.err) |e| return e;
-        }
-    } else {
-        pctxs[0].local_ht.iterate(&emit_ctx, MCtx.cb);
+    // Emit from all partition HTs (each small → L3-friendly).
+    for (part_hts) |*ph| {
+        ph.iterate(&emit_ctx, MCtx.cb);
         if (emit_ctx.err) |e| return e;
     }
 
@@ -7160,31 +8716,19 @@ fn executeHashAggParallelCompactTopK(
     return rl;
 }
 
-
-/// Called after parallel workers finish to combine their per-thread results.
-fn mergeCompactIntoMaster(
-    master: *ht.CompactIntKeyHashTable,
-    local:  *const ht.CompactIntKeyHashTable,
-    kinds:  []const ht.CompactAggKind,
-    init_vals: []const u64,
-) !void {
-    // Use mergeInto which reuses precomputed hashes from tags — avoids rehashing.
-    return local.mergeInto(master, kinds, init_vals);
-}
-
 // ── Two-phase scatter → aggregate ────────────────────────────────────────────
 //
 // Avoids per-thread HT exceeding L3 cache for high-cardinality GROUP BY.
 //
 // Phase 1 (parallel scatter):
 //   Each thread scans its morsels and scatters (hash, k0[, k1], agg_partial...)
-//   into N_PARTS=64 per-thread partition ArrayLists.  No HT touched — pure
+//   into N_PARTS=128 per-thread partition ArrayLists.  No HT touched — pure
 //   sequential writes to hot (cache-resident) partition buffers.
 //
 // Phase 2 (parallel aggregate):
-//   Thread t owns partitions [t*16 .. (t+1)*16).  For each partition p, it
+//   Thread t owns partitions [t*32 .. (t+1)*32).  For each partition p, it
 //   collects all thread scatter bufs for p and aggregates with a small HT
-//   (~1M/64 = 15K expected entries → 1MB → fits in L2 cache).
+//   (~1M/128 = 8K expected entries → fits in L2 cache).
 //
 // Conditions: 1-2 plain col_ref integer keys, count/i64_sum/f64_sum aggs.
 // str_filter: optional single col_ref eq/neq lit_str pre-filter applied inline in scatter phase.
@@ -7202,11 +8746,9 @@ fn executeTwoPhaseHashAgg(
     str_filter:        ?SimpleStrFilter,
     int_filter:        ?[]const IntCmpCond,
 ) !?RowList {
-    const N_PARTS: usize = 64;
-    // row_stride = 1 (stored hash) + n_keys + n_aggs
+    const N_PARTS: usize = 128;
     const n_keys = keys.len;
     const n_aggs = aggs.len;
-    const row_stride = 1 + n_keys + n_aggs;
 
      // Pre-extract key column indices and arithmetic offsets.
      // Keys may be col_ref (offset=0) or col_ref ± lit_i64 (checked by caller).
@@ -7221,15 +8763,41 @@ fn executeTwoPhaseHashAgg(
          }
      }
 
+     // Same-column key collapsing: if all keys derive from the same source column
+     // (e.g. Q36: GROUP BY ClientIP, ClientIP-1, ClientIP-2, ClientIP-3), we only
+     // store one effective key value in scatter buffers and reconstruct the rest at
+     // emit time. This halves scatter buffer size and uses a cheaper 1-key hash.
+     var n_eff_keys: usize = n_keys;
+     if (n_keys > 1) {
+         var all_same = true;
+         for (1..n_keys) |i| {
+             if (key_ci[i] != key_ci[0]) { all_same = false; break; }
+         }
+         if (all_same) n_eff_keys = 1;
+     }
+     // count_only: sole agg is COUNT(*) — omit the count slot from scatter buffers
+     // entirely.  Phase 1 writes [hash, k0, ...] only; Phase 2 does slot_vals[0]+=1.
+     // This shrinks scatter bandwidth by 1 u64 per row (33% for 1-key queries like Q16).
+     const count_only: bool = n_aggs == 1 and compact_kinds[0] == .count;
+     // row_stride = 1 (stored hash) + n_eff_keys + n_aggs  (or n_eff_keys only when count_only)
+     const row_stride = 1 + n_eff_keys + (if (count_only) @as(usize, 0) else n_aggs);
+
     // Pre-extract agg info: (col_idx or ~0 for no-arg, kind).
     const AggInfo = struct { col_idx: usize, kind: ht.CompactAggKind };
     const agg_infos = try alloc.alloc(AggInfo, n_aggs);
     for (aggs, compact_kinds, agg_infos) |ag, kind, *info| {
         const ac = ag.expr.agg_call;
-        info.* = .{
-            .col_idx = if (ac.arg != null and ac.arg.? == .col_ref) ac.arg.?.col_ref.index else ~@as(usize, 0),
-            .kind    = kind,
+        const col_idx: usize = blk: {
+            if (ac.arg) |arg| {
+                if (arg == .col_ref) break :blk arg.col_ref.index;
+                // f64_str_len_sum: AVG(length(col_ref)) — dig into the fn_call arg.
+                if (kind == .f64_str_len_sum and arg == .fn_call and
+                    arg.fn_call.args.len == 1 and arg.fn_call.args[0] == .col_ref)
+                    break :blk arg.fn_call.args[0].col_ref.index;
+            }
+            break :blk ~@as(usize, 0);
         };
+        info.* = .{ .col_idx = col_idx, .kind = kind };
     }
 
     // ── Phase 1: parallel scatter ─────────────────────────────────────────────
@@ -7248,6 +8816,7 @@ fn executeTwoPhaseHashAgg(
         morsel_src:   *parallel.MorselSource,
         parent_alloc: std.mem.Allocator,
         n_keys:       usize,
+        n_eff_keys:   usize, // <= n_keys; =1 when all keys share one source column
         n_aggs:       usize,
         row_stride:   usize,
         key_ci:       [4]usize,
@@ -7256,6 +8825,7 @@ fn executeTwoPhaseHashAgg(
         compact_kinds: []const ht.CompactAggKind,
         str_filter:   ?SimpleStrFilter,
         int_filter:   ?[]const IntCmpCond,
+        count_only:   bool,
         err:          ?anyerror = null,
 
         fn work(self: *@This(), _: *parallel.MorselSource) void {
@@ -7265,19 +8835,139 @@ fn executeTwoPhaseHashAgg(
         fn runWork(self: *@This()) !void {
             const buf_alloc = self.buf_arena.allocator();
 
-            var thread_arena = std.heap.ArenaAllocator.init(self.parent_alloc);
-            defer thread_arena.deinit();
-            const talloc = thread_arena.allocator();
+             var thread_arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+             defer thread_arena.deinit();
+             const talloc = thread_arena.allocator();
+ 
+            // ── Raw-slice fast path for scatter phase ─────────────────────────────
+            // When: pure int filter + count_only (no agg cols) + all key cols have
+            // raw slices available.  Bypasses fetchRange for the scatter morsel loop,
+            // applying SIMD filter on narrow mmap'd slices and scattering passing rows
+            // directly.  For Q41 (5 filter + 2 key narrow cols): eliminates scalar
+            // per-row filter loop (~50M ops) and i32→i64 widening (~250MB bandwidth).
+            raw_scatter: {
+                if (self.str_filter != null) break :raw_scatter;
+                const ics = self.int_filter orelse break :raw_scatter;
+                if (!self.count_only) break :raw_scatter;
+                const sch = self.source.schema();
+                // Resolve filter condition columns to raw slices.
+                var rf: [16]RawColSlice = undefined;
+                for (ics, 0..) |cond, ci| {
+                    const nm = if (cond.col_idx < sch.len) sch[cond.col_idx].name else break :raw_scatter;
+                    if (self.source.getRawInt16Col(nm)) |s| { rf[ci] = .{ .i16s = s }; }
+                    else if (self.source.getRawInt32Col(nm)) |s| { rf[ci] = .{ .i32s = s }; }
+                    else if (self.source.getRawInt64Col(nm)) |s| { rf[ci] = .{ .i64s = s }; }
+                    else break :raw_scatter;
+                }
+                // Resolve key columns to raw slices.
+                var rk: [4]RawColSlice = undefined;
+                for (0..self.n_eff_keys) |ki| {
+                    const col_idx = self.key_ci[ki];
+                    const nm = if (col_idx < sch.len) sch[col_idx].name else break :raw_scatter;
+                    if (self.source.getRawInt16Col(nm)) |s| { rk[ki] = .{ .i16s = s }; }
+                    else if (self.source.getRawInt32Col(nm)) |s| { rk[ki] = .{ .i32s = s }; }
+                    else if (self.source.getRawInt64Col(nm)) |s| { rk[ki] = .{ .i64s = s }; }
+                    else break :raw_scatter;
+                }
+                // Allocate per-thread SIMD scratch buffers (reused across morsels).
+                const rs_sz   = parallel.default_morsel_size + 1;
+                const rs_mask  = try talloc.alloc(i16, rs_sz);
+                const rs_tmp_a = try talloc.alloc(i16, rs_sz);
+                const rs_tmp_b = try talloc.alloc(i16, rs_sz);
+                var rec: [18]u64 = undefined;
+                while (self.morsel_src.next()) |m| {
+                    const start = m.start;
+                    const nr    = m.end - m.start;
+                    @memset(rs_mask[0..nr], 1);
+                    for (ics, 0..) |cond, ci| {
+                        rf[ci].applyMaskSIMD(start, nr, cond,
+                            rs_mask[0..nr], rs_tmp_a[0..nr], rs_tmp_b[0..nr]);
+                    }
+                    // Chunked mask scan: OR-reduce 32-lane chunks to skip all-zero
+                    // blocks in ~5 cycles instead of 32 scalar checks.
+                    const CHUNK = 32;
+                    var r: usize = 0;
+                    while (r + CHUNK <= nr) : (r += CHUNK) {
+                        const v: @Vector(CHUNK, i16) = rs_mask[r..][0..CHUNK].*;
+                        if (@reduce(.Or, v) == 0) continue;
+                        for (r..r + CHUNK) |ri| {
+                            if (rs_mask[ri] == 0) continue;
+                            const row = start + ri;
+                            var kv: [4]i64 = undefined;
+                            for (0..self.n_eff_keys) |ki| {
+                                kv[ki] = rk[ki].getI64(row) +% self.key_offs[ki];
+                            }
+                            const h: u64 = blk: {
+                                if (self.n_eff_keys == 1) {
+                                    var hh: u64 = @bitCast(kv[0]);
+                                    hh ^= hh >> 33; hh *%= 0xff51afd7ed558ccd;
+                                    hh ^= hh >> 33; hh *%= 0xc4ceb9fe1a85ec53;
+                                    hh ^= hh >> 33;
+                                    break :blk hh | (1 << 63);
+                                }
+                                const hk0: u64 = @bitCast(kv[0]);
+                                const hk1: u64 = if (self.n_eff_keys >= 2) @bitCast(kv[1]) else 0;
+                                var hh = hk0 *% 0x9e3779b97f4a7c15 ^ hk1 *% 0x6c62272e07bb0142;
+                                if (self.n_eff_keys >= 3) hh ^= @as(u64, @bitCast(kv[2])) *% 0xd2a98b26625eee7b;
+                                if (self.n_eff_keys >= 4) hh ^= @as(u64, @bitCast(kv[3])) *% 0xa0761d6478bd642f;
+                                hh ^= hh >> 30; hh *%= 0xbf58476d1ce4e5b9;
+                                hh ^= hh >> 27; hh *%= 0x94d049bb133111eb;
+                                hh ^= hh >> 31;
+                                break :blk hh | (1 << 63);
+                            };
+                            const part_id = h & (N_PARTS - 1);
+                            rec[0] = h;
+                            for (0..self.n_eff_keys) |ki| rec[1 + ki] = @bitCast(kv[ki]);
+                            // count_only: no agg slots in scatter record.
+                            try self.bufs[part_id].appendSlice(buf_alloc, rec[0..self.row_stride]);
+                        }
+                    }
+                    while (r < nr) : (r += 1) {
+                        if (rs_mask[r] == 0) continue;
+                        const row = start + r;
+                        var kv: [4]i64 = undefined;
+                        for (0..self.n_eff_keys) |ki| {
+                            kv[ki] = rk[ki].getI64(row) +% self.key_offs[ki];
+                        }
+                        const h: u64 = blk: {
+                            if (self.n_eff_keys == 1) {
+                                var hh: u64 = @bitCast(kv[0]);
+                                hh ^= hh >> 33; hh *%= 0xff51afd7ed558ccd;
+                                hh ^= hh >> 33; hh *%= 0xc4ceb9fe1a85ec53;
+                                hh ^= hh >> 33;
+                                break :blk hh | (1 << 63);
+                            }
+                            const hk0: u64 = @bitCast(kv[0]);
+                            const hk1: u64 = if (self.n_eff_keys >= 2) @bitCast(kv[1]) else 0;
+                            var hh = hk0 *% 0x9e3779b97f4a7c15 ^ hk1 *% 0x6c62272e07bb0142;
+                            if (self.n_eff_keys >= 3) hh ^= @as(u64, @bitCast(kv[2])) *% 0xd2a98b26625eee7b;
+                            if (self.n_eff_keys >= 4) hh ^= @as(u64, @bitCast(kv[3])) *% 0xa0761d6478bd642f;
+                            hh ^= hh >> 30; hh *%= 0xbf58476d1ce4e5b9;
+                            hh ^= hh >> 27; hh *%= 0x94d049bb133111eb;
+                            hh ^= hh >> 31;
+                            break :blk hh | (1 << 63);
+                        };
+                        const part_id = h & (N_PARTS - 1);
+                        rec[0] = h;
+                        for (0..self.n_eff_keys) |ki| rec[1 + ki] = @bitCast(kv[ki]);
+                        // count_only: no agg slots in scatter record.
+                        try self.bufs[part_id].appendSlice(buf_alloc, rec[0..self.row_stride]);
+                    }
+                }
+                return; // Raw scatter handled — skip fetchRange scatter loop.
+            }
 
-            while (self.morsel_src.next()) |m| {
-                var chunk_arena = std.heap.ArenaAllocator.init(talloc);
-                defer chunk_arena.deinit();
-                var c: DataChunk = undefined;
-                try self.source.fetchRange(m.start, m.end - m.start, &c, chunk_arena.allocator());
-
-                const ci0 = self.key_ci[0];
-                if (ci0 >= c.columns.len) continue;
-                for (1..self.n_keys) |ki| {
+             // Reuse arena per morsel to avoid accumulating 566MB/thread of talloc growth.
+             var chunk_arena = std.heap.ArenaAllocator.init(talloc);
+             defer chunk_arena.deinit();
+             while (self.morsel_src.next()) |m| {
+                 _ = chunk_arena.reset(.retain_capacity);
+                 var c: DataChunk = undefined;
+                 try self.source.fetchRange(m.start, m.end - m.start, &c, chunk_arena.allocator());
+ 
+                 const ci0 = self.key_ci[0];
+                 if (ci0 >= c.columns.len) continue;
+                for (1..self.n_eff_keys) |ki| {
                     if (self.key_ci[ki] >= c.columns.len) continue;
                 }
 
@@ -7324,10 +9014,11 @@ fn executeTwoPhaseHashAgg(
                         if (!pass) continue;
                     }
 
-                    // Extract up to n_keys integer values (with arithmetic offsets).
+                    // Extract up to n_eff_keys integer values (with arithmetic offsets).
+                    // When n_eff_keys < n_keys (same-column collapsing), we only store kv[0].
                     var kv: [4]i64 = undefined;
                     var any_null = false;
-                    for (0..self.n_keys) |ki| {
+                    for (0..self.n_eff_keys) |ki| {
                         const col = c.columns[self.key_ci[ki]];
                         if (col.isRowNull(r)) { any_null = true; break; }
                         const base: i64 = switch (col.data) {
@@ -7341,9 +9032,9 @@ fn executeTwoPhaseHashAgg(
                     }
                     if (any_null) continue;
 
-                    // Compute hash over all N keys.
+                    // Compute hash over n_eff_keys values.
                     const h: u64 = blk: {
-                        if (self.n_keys == 1) {
+                        if (self.n_eff_keys == 1) {
                             var hh: u64 = @bitCast(kv[0]);
                             hh ^= hh >> 33; hh *%= 0xff51afd7ed558ccd;
                             hh ^= hh >> 33; hh *%= 0xc4ceb9fe1a85ec53;
@@ -7351,10 +9042,10 @@ fn executeTwoPhaseHashAgg(
                             break :blk hh | (1 << 63);
                         }
                         const hk0: u64 = @bitCast(kv[0]);
-                        const hk1: u64 = if (self.n_keys >= 2) @bitCast(kv[1]) else 0;
+                        const hk1: u64 = if (self.n_eff_keys >= 2) @bitCast(kv[1]) else 0;
                         var hh = hk0 *% 0x9e3779b97f4a7c15 ^ hk1 *% 0x6c62272e07bb0142;
-                        if (self.n_keys >= 3) hh ^= @as(u64, @bitCast(kv[2])) *% 0xd2a98b26625eee7b;
-                        if (self.n_keys >= 4) hh ^= @as(u64, @bitCast(kv[3])) *% 0xa0761d6478bd642f;
+                        if (self.n_eff_keys >= 3) hh ^= @as(u64, @bitCast(kv[2])) *% 0xd2a98b26625eee7b;
+                        if (self.n_eff_keys >= 4) hh ^= @as(u64, @bitCast(kv[3])) *% 0xa0761d6478bd642f;
                         hh ^= hh >> 30; hh *%= 0xbf58476d1ce4e5b9;
                         hh ^= hh >> 27; hh *%= 0x94d049bb133111eb;
                         hh ^= hh >> 31;
@@ -7363,10 +9054,11 @@ fn executeTwoPhaseHashAgg(
 
                     const part_id = h & (N_PARTS - 1);
                     rec[0] = h;
-                    for (0..self.n_keys) |ki| rec[1 + ki] = @bitCast(kv[ki]);
-                    // Agg partial contributions.
-                    for (self.agg_infos, 0..) |info, ai| {
-                        const base_off = 1 + self.n_keys + ai;
+                    for (0..self.n_eff_keys) |ki| rec[1 + ki] = @bitCast(kv[ki]);
+                    // Agg partial contributions — skipped in count_only mode (Phase 2 adds 1).
+                    if (!self.count_only) {
+                        for (self.agg_infos, 0..) |info, ai| {
+                        const base_off = 1 + self.n_eff_keys + ai;
                         switch (info.kind) {
                             .count => { rec[base_off] = 1; },
                             .i64_sum => {
@@ -7399,6 +9091,20 @@ fn executeTwoPhaseHashAgg(
                                     rec[base_off] = @bitCast(fv);
                                 }
                             },
+                            .f64_str_len_sum => {
+                                // Accumulate string length as f64 for AVG(length(col)).
+                                if (info.col_idx == ~@as(usize, 0) or info.col_idx >= c.columns.len) {
+                                    rec[base_off] = @bitCast(@as(f64, 0.0));
+                                } else {
+                                    const ac = c.columns[info.col_idx];
+                                    if (ac.isRowNull(r)) { rec[base_off] = @bitCast(@as(f64, 0.0)); continue; }
+                                    const len_f64: f64 = switch (ac.data) {
+                                        .string => |v| @floatFromInt(v[r].len),
+                                        else => 0.0,
+                                    };
+                                    rec[base_off] = @bitCast(len_f64);
+                                }
+                            },
                             else => { rec[base_off] = 0; },
                             .count_distinct_u64 => {
                                 // Store the actual distinct column value so phase 2 can dedup.
@@ -7416,6 +9122,7 @@ fn executeTwoPhaseHashAgg(
                             },
                         }
                     }
+                    } // if (!count_only)
 
                     try self.bufs[part_id].appendSlice(buf_alloc, rec[0..self.row_stride]);
                 }
@@ -7424,6 +9131,29 @@ fn executeTwoPhaseHashAgg(
     };
 
     var morsel_src1 = parallel.MorselSource.init(total_rows, parallel.default_morsel_size);
+
+    // Column pruning for executeTwoPhaseHashAgg: only load columns touched by filter + keys + aggs.
+    {
+        const ncols2p = @min(256, ctx.source.schema().len);
+        var needed2p = [_]bool{false} ** 256;
+        for (keys) |item| collectColRefs(item.expr, needed2p[0..ncols2p]);
+        for (aggs) |item| collectColRefs(item.expr, needed2p[0..ncols2p]);
+        if (int_filter) |ics| for (ics) |ic| { if (ic.col_idx < ncols2p) needed2p[ic.col_idx] = true; };
+        if (str_filter) |sf| { if (sf.col_idx < ncols2p) needed2p[sf.col_idx] = true; }
+        var cnt2p: usize = 0;
+        for (needed2p[0..ncols2p]) |m| { if (m) cnt2p += 1; }
+        if (cnt2p > 0 and cnt2p * 2 < ctx.source.schema().len) {
+            const sm2p = ctx.source.schema();
+            var nbuf2p: [32][]const u8 = undefined;
+            var nlen2p: usize = 0;
+            for (needed2p[0..ncols2p], 0..) |m, i| {
+                if (m and nlen2p < nbuf2p.len) { nbuf2p[nlen2p] = sm2p[i].name; nlen2p += 1; }
+            }
+            ctx.source.setNeededCols(nbuf2p[0..nlen2p]);
+        }
+    }
+    defer ctx.source.setNeededCols(null);
+
     const scatter_ctxs = try alloc.alloc(ScatterCtx, n_threads);
     for (scatter_ctxs) |*sc| {
         sc.* = .{
@@ -7433,6 +9163,7 @@ fn executeTwoPhaseHashAgg(
             .morsel_src   = &morsel_src1,
             .parent_alloc = alloc,
             .n_keys       = n_keys,
+            .n_eff_keys   = n_eff_keys,
             .n_aggs       = n_aggs,
             .row_stride   = row_stride,
             .key_ci       = key_ci,
@@ -7441,7 +9172,22 @@ fn executeTwoPhaseHashAgg(
             .compact_kinds = compact_kinds,
             .str_filter   = str_filter,
             .int_filter   = int_filter,
+            .count_only   = count_only,
         };
+        // ── Pre-allocate scatter buffers to expected size ──────────────────────────
+        // With N_PARTS=128 partitions and exponential doubling from 0, each buffer
+        // undergoes ~log2(rows_per_part) doublings, copying ~2× final data total.
+        // For Q10 (row_stride=6, 10M rows): ~20ms wasted copy work across 4 threads.
+        // Pre-allocating to expected capacity eliminates ALL realloc copies.
+        // Using c_allocator avoids new page faults on hot runs (memory recycled from
+        // previous query run; same rationale as buf_arena using c_allocator).
+        {
+            const expected_per_part: usize = total_rows / N_PARTS * row_stride + row_stride;
+            const ba = sc.buf_arena.allocator();
+            for (&sc.bufs) |*b| {
+                b.ensureTotalCapacity(ba, expected_per_part) catch {};
+            }
+        }
     }
     try parallel.parallelFor(alloc, ScatterCtx, ScatterCtx.work, scatter_ctxs, &morsel_src1);
     for (scatter_ctxs) |*sc| { if (sc.err) |e| return e; }
@@ -7453,7 +9199,7 @@ fn executeTwoPhaseHashAgg(
     const part_hts = try alloc.alloc(ht.CompactIntKeyHashTable, N_PARTS);
     // Initialize all with minimal capacity (Phase 2 will resize as needed).
     for (part_hts) |*ph| {
-        ph.* = try ht.CompactIntKeyHashTable.initWithCapacity(alloc, n_keys, n_aggs, 0);
+        ph.* = try ht.CompactIntKeyHashTable.initWithCapacity(alloc, n_eff_keys, n_aggs, 0);
     }
 
     const AggCtx = struct {
@@ -7463,7 +9209,9 @@ fn executeTwoPhaseHashAgg(
         compact_init_vals: []const u64,
         row_stride:        usize,
         n_keys:            usize,
+        n_eff_keys:        usize,
         n_aggs:            usize,
+        count_only:        bool,
         morsel_src:        *parallel.MorselSource,
         alloc:             std.mem.Allocator,
         err:               ?anyerror = null,
@@ -7478,11 +9226,23 @@ fn executeTwoPhaseHashAgg(
             for (self.compact_kinds) |k| {
                 if (k == .count_distinct_u64) { has_distinct = true; break; }
             }
-            // Per-partition distinct pair dedup set (reused across partitions).
-            // Key = (group_hash_u64 << 64) | distinct_val_u64. Correct because rows
-            // are partitioned by group_hash, so all rows of one group land together.
-            var distinct_set = std.AutoHashMap(u128, void).init(std.heap.c_allocator);
-            defer distinct_set.deinit();
+            // Per-partition hash set for COUNT(DISTINCT) deduplication.
+            // Key = group_hash ^ (distinct_val *% prime) as a single u64.
+            // Using u64 instead of u128 halves per-slot memory.
+            // Collision probability: ~N^2/2^64 ≈ negligible for practical N.
+            // DistinctEpochSet uses O(1) clearForNextPartition (epoch bump) instead
+            // of O(capacity) memset, avoiding 256MB+ of clearing overhead across
+            // 128 partitions when pre-allocated for worst-case row count.
+            const DISTINCT_PRIME: u64 = 0x9e3779b97f4a7c15;
+            var distinct_set_storage: hashmap.DistinctEpochSet = undefined;
+            var distinct_set_inited = false;
+            defer if (distinct_set_inited) distinct_set_storage.deinit();
+            if (has_distinct) {
+                // Start small (cap=64); grows lazily to actual distinct count.
+                distinct_set_storage = try hashmap.DistinctEpochSet.init(self.alloc, 32);
+                distinct_set_inited = true;
+            }
+            const distinct_set: *hashmap.DistinctEpochSet = &distinct_set_storage;
 
             while (self.morsel_src.next()) |m| {
                 for (m.start..m.end) |p| {
@@ -7495,8 +9255,11 @@ fn executeTwoPhaseHashAgg(
                     const ht_cap = @max(64, total_p * 100 / 65 + 16);
                     try self.part_hts[p].growTo(ht_cap);
 
-                    // Clear dedup set for each new partition.
-                    if (has_distinct) distinct_set.clearRetainingCapacity();
+                    // O(1) epoch-bump clear; grow if load factor ≥ 75% from previous partition.
+                    if (has_distinct) {
+                        if (distinct_set.needsGrow()) try distinct_set.growDouble();
+                        distinct_set.clearForNextPartition();
+                    }
 
                     // Aggregate all scatter records for partition p.
                     var key_buf: [4]i64 = undefined;
@@ -7504,12 +9267,22 @@ fn executeTwoPhaseHashAgg(
                         const buf   = sc.bufs[p].items;
                         const rs    = self.row_stride;
                         var   i: usize = 0;
+                        if (self.count_only) {
+                            // Fast path: no partial slots → just increment count by 1 per record.
+                            while (i < buf.len) : (i += rs) {
+                                const h = buf[i];
+                                for (0..self.n_eff_keys) |ki| key_buf[ki] = @bitCast(buf[i + 1 + ki]);
+                                const slot_vals = try self.part_hts[p].getOrInsertH(
+                                    key_buf[0..self.n_eff_keys], h, self.compact_init_vals);
+                                slot_vals[0] += 1;
+                            }
+                        } else {
                         while (i < buf.len) : (i += rs) {
                             const h = buf[i];
-                            for (0..self.n_keys) |ki| key_buf[ki] = @bitCast(buf[i + 1 + ki]);
-                            const partial = buf[i + 1 + self.n_keys .. i + rs];
+                            for (0..self.n_eff_keys) |ki| key_buf[ki] = @bitCast(buf[i + 1 + ki]);
+                            const partial = buf[i + 1 + self.n_eff_keys .. i + rs];
                             const slot_vals = try self.part_hts[p].getOrInsertH(
-                                key_buf[0..self.n_keys], h, self.compact_init_vals);
+                                key_buf[0..self.n_eff_keys], h, self.compact_init_vals);
                             for (self.compact_kinds, 0..) |kind, ci| {
                                 const src = partial[ci];
                                 switch (kind) {
@@ -7524,17 +9297,24 @@ fn executeTwoPhaseHashAgg(
                                         const b: f64 = @bitCast(src);
                                         slot_vals[ci] = @bitCast(a + b);
                                     },
+                                    .f64_str_len_sum => {
+                                        const a: f64 = @bitCast(slot_vals[ci]);
+                                        const b: f64 = @bitCast(src);
+                                        slot_vals[ci] = @bitCast(a + b);
+                                    },
                                     .count_distinct_u64 => {
                                         // src = actual distinct column value (or ~0 for null).
                                         if (src == ~@as(u64, 0)) continue; // null → skip
-                                        const pair: u128 = (@as(u128, h) << 64) | @as(u128, src);
-                                        const gop = try distinct_set.getOrPut(pair);
-                                        if (!gop.found_existing) slot_vals[ci] += 1;
+                                        // Combine (group_hash, distinct_val) into one u64 key.
+                                        const pk: u64 = h ^ (src *% DISTINCT_PRIME);
+                                        if (distinct_set.needsGrow()) try distinct_set.growDouble();
+                                        if (distinct_set.insertNew(pk)) slot_vals[ci] += 1;
                                     },
                                     else => slot_vals[ci] += src,
                                 }
                             }
                         }
+                        } // else count_only
                     }
                 }
             }
@@ -7551,7 +9331,9 @@ fn executeTwoPhaseHashAgg(
             .compact_init_vals = compact_init_vals,
             .row_stride        = row_stride,
             .n_keys            = n_keys,
+            .n_eff_keys        = n_eff_keys,
             .n_aggs            = n_aggs,
+            .count_only        = count_only,
             .morsel_src        = &morsel_src2,
             .alloc             = alloc,
         };
@@ -7571,19 +9353,21 @@ fn executeTwoPhaseHashAgg(
 
     var rl = RowList.init(out_metas);
      const EmitCtx = struct {
-        keys_n:         usize,
-        aggs_n:         usize,
-        compact_kinds:  []const ht.CompactAggKind,
-        aggs:           []const plan.ProjectItem,
-        rl:             *RowList,
-        alloc:          std.mem.Allocator,
-        key_out_types:  []const ColumnType,
-        heap:           ?[][]?Value = null,
-        heap_len:       usize = 0,
-        heap_k:         usize = 0,
-        sort_keys:      []const plan.SortKey = &.{},
+        keys_n:          usize,
+        aggs_n:          usize,
+        n_eff_keys:      usize,          // =1 when same-column collapsing active
+        key_offs_emit:   [4]i64,         // key_offs for reconstructing collapsed keys
+        compact_kinds:   []const ht.CompactAggKind,
+        aggs:            []const plan.ProjectItem,
+        rl:              *RowList,
+        alloc:           std.mem.Allocator,
+        key_out_types:   []const ColumnType,
+        heap:            ?[][]?Value = null,
+        heap_len:        usize = 0,
+        heap_k:          usize = 0,
+        sort_keys:       []const plan.SortKey = &.{},
         heap_min_cached: i64 = std.math.minInt(i64),
-        err:            ?anyerror = null,
+        err:             ?anyerror = null,
 
         fn rowLessThan(sk: []const plan.SortKey, a: []?Value, b: []?Value) bool {
             for (sk) |key| {
@@ -7634,13 +9418,28 @@ fn executeTwoPhaseHashAgg(
         }
         fn makeRow(self: *@This(), key_vals: []const i64, acc_vals: []const u64) ?[]?Value {
             const row = self.alloc.alloc(?Value, self.keys_n + self.aggs_n) catch return null;
-            for (key_vals, 0..) |kv, i| {
-                const out_type: ColumnType = if (i < self.key_out_types.len) self.key_out_types[i] else .int64;
-                row[i] = switch (out_type) {
-                    .datetime64_ms => .{ .datetime64_ms = kv },
-                    .date_u16 => .{ .date_u16 = @intCast(kv) },
-                    else => .{ .int64 = kv },
-                };
+            if (self.n_eff_keys < self.keys_n and key_vals.len > 0) {
+                // Same-column key collapsing: reconstruct all keys from the single stored key.
+                // stored eff key = raw_col +% key_offs_emit[0]; full_kv[i] = raw_col +% key_offs_emit[i]
+                const eff_base = key_vals[0];
+                for (0..self.keys_n) |i| {
+                    const full_kv = eff_base -% self.key_offs_emit[0] +% self.key_offs_emit[i];
+                    const out_type: ColumnType = if (i < self.key_out_types.len) self.key_out_types[i] else .int64;
+                    row[i] = switch (out_type) {
+                        .datetime64_ms => .{ .datetime64_ms = full_kv },
+                        .date_u16 => .{ .date_u16 = @intCast(full_kv) },
+                        else => .{ .int64 = full_kv },
+                    };
+                }
+            } else {
+                for (key_vals, 0..) |kv, i| {
+                    const out_type: ColumnType = if (i < self.key_out_types.len) self.key_out_types[i] else .int64;
+                    row[i] = switch (out_type) {
+                        .datetime64_ms => .{ .datetime64_ms = kv },
+                        .date_u16 => .{ .date_u16 = @intCast(kv) },
+                        else => .{ .int64 = kv },
+                    };
+                }
             }
             for (self.compact_kinds, 0..) |kind, i| {
                 row[self.keys_n + i] = switch (kind) {
@@ -7677,7 +9476,13 @@ fn executeTwoPhaseHashAgg(
                     const sk = self.sort_keys[0];
                     const ci = sk.col_idx;
                     const new_raw: i64 = blk: {
-                        if (ci < self.keys_n) break :blk key_vals[ci];
+                        if (ci < self.keys_n) {
+                            // Handle same-column collapsing: reconstruct key from eff_base.
+                            if (self.n_eff_keys < self.keys_n and key_vals.len > 0) {
+                                break :blk key_vals[0] -% self.key_offs_emit[0] +% self.key_offs_emit[ci];
+                            }
+                            break :blk if (ci < key_vals.len) key_vals[ci] else 0;
+                        }
                         const ai = ci - self.keys_n;
                         if (ai < self.compact_kinds.len) {
                             break :blk switch (self.compact_kinds[ai]) {
@@ -7713,6 +9518,7 @@ fn executeTwoPhaseHashAgg(
     const heap_buf: ?[][]?Value = if (use_heap) try alloc.alloc([]?Value, top_k) else null;
      var emit_ctx = EmitCtx{
         .keys_n = n_keys, .aggs_n = n_aggs,
+        .n_eff_keys = n_eff_keys, .key_offs_emit = key_offs,
         .compact_kinds = compact_kinds, .aggs = aggs, .rl = &rl, .alloc = alloc,
         .key_out_types = key_out_types_buf,
         .heap = heap_buf, .heap_len = 0, .heap_k = top_k, .sort_keys = sort_keys,
@@ -7756,5 +9562,1333 @@ fn executeTwoPhaseHashAgg(
         return result_rl;
     }
 
+    return rl;
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Two-phase scatter → aggregate for pure-string-key GROUP BY
+// (Q34/Q35: URL GROUP BY 2.6M unique, Q13: SearchPhrase GROUP BY with ≠'' filter)
+//
+// Phase 1 (parallel scatter):
+//   Each thread iterates its morsels and writes
+//   [hash:u64, str_ptr:u64, str_len:u64, agg0:u64, ...] records
+//   into N_PARTS=64 per-thread partition buffers (hot sequential writes).
+//
+// Phase 2 (parallel aggregate per partition):
+//   Thread t picks partitions from morsel_src2.  For each partition p it
+//   pre-sizes a private StrAggHashTable then sweeps all threads' scatter
+//   buffers for p.  Working set per partition ≈ 40K entries → fits L3.
+//
+// Restrictions (caller already checked):
+//   • Exactly one col_ref string key at key_col_idx / str_key_pos.
+//   • All other GROUP BY keys are lit_i64 constants.
+//   • No str_min/str_max aggs, no COUNT DISTINCT, no CASE-WHEN/regexp key.
+//   • filter: null or a single SimpleStrFilter (col_ref eq/neq lit_str).
+// ─────────────────────────────────────────────────────────────────────────────
+fn executeTwoPhaseHashAggStrKeySimple(
+    keys:              []const plan.ProjectItem,
+    aggs:              []const plan.ProjectItem,
+    sort_keys:         []const plan.SortKey,
+    top_k:             usize,
+    ctx:               *QueryContext,
+    key_col_idx:       usize,
+    str_key_pos:       usize,
+    compact_kinds:     []const ht.CompactAggKind,
+    compact_init_vals: []const u64,
+    str_filter:        ?SimpleStrFilter,
+    int_filter:        ?[]const IntCmpCond,
+    /// Optional single integer sidecar key column index (e.g. SearchEngineID for Q15).
+    /// When set, the sidecar value is XOR'd into the hash and stored in the scatter record.
+    sidecar_col_idx:   ?usize,
+    /// Index within `keys` of the sidecar key (used at emit time).
+    sidecar_key_pos:   ?usize,
+) !?RowList {
+    if (!ctx.source.supportsRange()) return null;
+
+    const N_PARTS: usize = 64;
+    const total_rows  = ctx.source.rowCount();
+    const n_threads   = parallel.defaultThreads();
+    const alloc       = ctx.allocator();
+    const n_aggs      = aggs.len;
+    // count_only: when the sole agg is COUNT(*), skip writing/reading the count
+    // slot in scatter records (stride 4→3, 25 % less bandwidth for Q34/Q35).
+    const count_only: bool = n_aggs == 1 and compact_kinds[0] == .count;
+    // has_sidecar: an extra int key (e.g. SearchEngineID for Q15) is packed
+    // into the scatter record at offset 3, shifting aggs by one slot.
+    const has_sidecar: bool = sidecar_col_idx != null;
+    // Scatter record layout: [hash:u64, str_ptr:u64, str_len:u64, (sidecar?:u64), agg0:u64, ...]
+    // count_only skips the agg0 slot; has_sidecar adds 1 slot before aggs.
+    const row_stride: usize = (if (count_only) 3 else 3 + n_aggs) + @as(usize, if (has_sidecar) 1 else 0);
+
+    // COUNT DISTINCT: single agg is count_distinct_u64, no sidecar key.
+    // scatter record: [hash:u64, str_ptr:u64, str_len:u64, raw_dval:u64] (stride=4, same as above)
+    // Phase 2 uses sort-sweep instead of HT-insert for exact deduplication.
+    const is_count_distinct: bool = n_aggs == 1 and compact_kinds.len > 0 and
+        compact_kinds[0] == .count_distinct_u64;
+    // Guard: COUNT DISTINCT + sidecar composite key not supported in two-phase path.
+    if (is_count_distinct and sidecar_col_idx != null) return null;
+
+    // Per-agg: source column index and aggregation kind.
+    const AggInfo = struct { col_idx: usize, kind: ht.CompactAggKind };
+    const agg_infos = try alloc.alloc(AggInfo, n_aggs);
+    for (aggs, compact_kinds, agg_infos) |ag, kind, *info| {
+        const ac = ag.expr.agg_call;
+        info.* = .{
+            .col_idx = if (ac.arg != null and ac.arg.? == .col_ref)
+                           ac.arg.?.col_ref.index
+                       else ~@as(usize, 0),
+            .kind    = kind,
+        };
+    }
+
+    // ── Phase 1: parallel scatter ─────────────────────────────────────────────
+    const ScatterCtx = struct {
+        bufs:         [N_PARTS]std.ArrayListUnmanaged(u64),
+        buf_arena:    std.heap.ArenaAllocator,
+        source:       SourceIface,
+        morsel_src:   *parallel.MorselSource,
+        parent_alloc: std.mem.Allocator,
+        key_col_idx:     usize,
+        str_filter:      ?SimpleStrFilter,
+        int_filter:      ?[]const IntCmpCond,
+        sidecar_col_idx: ?usize,
+        count_only:      bool,
+        n_aggs:       usize,
+        row_stride:   usize,
+        agg_infos:    []const AggInfo,
+        err:          ?anyerror = null,
+        // Raw int column data for fast SIMD filter (bypasses i16→i64 / i32→i64 widen in fetchRange).
+        // int16 → 32-lane SIMD; int32 → 16-lane SIMD; vs 8-lane for widened i64.
+        raw_ic_i16: [16]?[]const i16 = [_]?[]const i16{null} ** 16,
+        raw_ic_i32: [16]?[]const i32 = [_]?[]const i32{null} ** 16,
+        // Raw string data for key column: skip building 122 880-entry fat-pointer array in fetchRange.
+        // When set, key_col in DataChunk is decoded as bool_u8 (1=non-empty) via setStringNonEmptyBool.
+        raw_key_offsets: ?[]const u64 = null,
+        raw_key_bytes:   ?[]const u8  = null,
+        // Raw int64 slice for sidecar column (e.g. UserID for Q18).
+        // When non-null, allows skip_fetch even for composite (string + int) GROUP BY.
+        raw_sidecar_i64: ?[]const i64 = null,
+        // When true, skip fetchRange entirely — all conditions covered by raw slices.
+        // Only set when: all int conditions have raw i16/i32 slices, use_raw_key, count_only,
+        // sidecar (if any) has raw int64 slice, and str_filter (if any) is on the key column.
+        skip_fetch: bool = false,
+
+        fn work(self: *@This(), _: *parallel.MorselSource) void {
+            self.doWork() catch |e| { self.err = e; };
+        }
+
+        fn doWork(self: *@This()) !void {
+            const ba   = self.buf_arena.allocator();
+            var ta     = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+            defer ta.deinit();
+            const tall = ta.allocator();
+            // SIMD scratch buffers — allocated once per thread, reused across morsels.
+            const rs_sz    = parallel.default_morsel_size + 1;
+            const rs_mask  = try tall.alloc(i16, rs_sz);
+            const rs_tmp_a = try tall.alloc(i16, rs_sz);
+            const rs_tmp_b = try tall.alloc(i16, rs_sz);
+
+            // Fast-path flags set from pre-fetched raw column data.
+            const use_raw_key: bool = self.raw_key_offsets != null and self.raw_key_bytes != null;
+            const n_raw_ic: usize = if (self.int_filter) |ics| ics.len else 0;
+
+            // Fast path: skip fetchRange entirely when all conditions are satisfied by raw slices.
+            // For Q38-class queries (count_only + all-raw int filter + raw string key): avoids
+            // per-morsel allocation + 105-column fetchRange decode; pure SIMD filter + raw reads.
+            if (self.skip_fetch) {
+                while (self.morsel_src.next()) |m| {
+                    const nr: usize = m.end - m.start;
+                    @memset(rs_mask[0..nr], 1);
+                    if (self.int_filter) |ics| {
+                        for (ics, 0..) |cond, ci| {
+                            if (self.raw_ic_i16[ci]) |raw16| {
+                                const rhs: i16 = @intCast(cond.val);
+                                const rhs2: i16 = if (cond.op == .in2) @intCast(cond.val2) else 0;
+                                cmpBatchDispatch(i16, raw16[m.start..m.start + nr], cond.op, rhs, rhs2, rs_tmp_a[0..nr], rs_tmp_b[0..nr]);
+                                simd_batch.andMasks(rs_mask[0..nr], rs_tmp_a[0..nr], rs_mask[0..nr]);
+                            } else if (self.raw_ic_i32[ci]) |raw32| {
+                                const rhs: i32 = @intCast(cond.val);
+                                const rhs2: i32 = if (cond.op == .in2) @intCast(cond.val2) else 0;
+                                cmpBatchDispatch(i32, raw32[m.start..m.start + nr], cond.op, rhs, rhs2, rs_tmp_a[0..nr], rs_tmp_b[0..nr]);
+                                simd_batch.andMasks(rs_mask[0..nr], rs_tmp_a[0..nr], rs_mask[0..nr]);
+                            }
+                        }
+                    }
+                    const CHUNK = 32;
+                    const key_off   = self.raw_key_offsets.?;
+                    const key_bytes = self.raw_key_bytes.?;
+                    var r: usize = 0;
+                    while (r + CHUNK <= nr) : (r += CHUNK) {
+                        const v: @Vector(CHUNK, i16) = rs_mask[r..][0..CHUNK].*;
+                        if (@reduce(.Or, v) == 0) continue;
+                        for (r..r + CHUNK) |ri| {
+                            if (rs_mask[ri] == 0) continue;
+                            const abs = m.start + ri;
+                            if (self.str_filter != null and key_off[abs + 1] == key_off[abs]) continue;
+                            const s = key_bytes[key_off[abs]..key_off[abs + 1]];
+                            const h: u64 = blk: {
+                                const base_h = ht.StrAggHashTable.hashStr(s);
+                                if (self.raw_sidecar_i64) |rsid| {
+                                    const sv: u64 = @bitCast(rsid[abs]);
+                                    break :blk base_h ^ (sv *% 0x9e3779b97f4a7c15);
+                                }
+                                break :blk base_h;
+                            };
+                            const part_id = @as(usize, @truncate(h)) & (N_PARTS - 1);
+                            if (self.raw_sidecar_i64) |rsid| {
+                                var rec4: [4]u64 = .{ h, @intFromPtr(s.ptr), s.len, @bitCast(rsid[abs]) };
+                                try self.bufs[part_id].appendSlice(ba, &rec4);
+                            } else {
+                                var rec3: [3]u64 = .{ h, @intFromPtr(s.ptr), s.len };
+                                try self.bufs[part_id].appendSlice(ba, &rec3);
+                            }
+                        }
+                    }
+                    while (r < nr) : (r += 1) {
+                        if (rs_mask[r] == 0) continue;
+                        const abs = m.start + r;
+                        if (self.str_filter != null and key_off[abs + 1] == key_off[abs]) continue;
+                        const s = key_bytes[key_off[abs]..key_off[abs + 1]];
+                        const h: u64 = blk: {
+                            const base_h = ht.StrAggHashTable.hashStr(s);
+                            if (self.raw_sidecar_i64) |rsid| {
+                                const sv: u64 = @bitCast(rsid[abs]);
+                                break :blk base_h ^ (sv *% 0x9e3779b97f4a7c15);
+                            }
+                            break :blk base_h;
+                        };
+                        const part_id = @as(usize, @truncate(h)) & (N_PARTS - 1);
+                        if (self.raw_sidecar_i64) |rsid| {
+                            var rec4: [4]u64 = .{ h, @intFromPtr(s.ptr), s.len, @bitCast(rsid[abs]) };
+                            try self.bufs[part_id].appendSlice(ba, &rec4);
+                        } else {
+                            var rec3: [3]u64 = .{ h, @intFromPtr(s.ptr), s.len };
+                            try self.bufs[part_id].appendSlice(ba, &rec3);
+                        }
+                    }
+                }
+                return;
+            }
+
+            // ── Standard path (fetchRange) ─────────────────────────────────────────
+            while (self.morsel_src.next()) |m| {
+                var ca = std.heap.ArenaAllocator.init(tall);
+                defer ca.deinit();
+                var c: DataChunk = undefined;
+                try self.source.fetchRange(m.start, m.end - m.start, &c, ca.allocator());
+
+                if (self.key_col_idx >= c.columns.len) continue;
+                const key_col = c.columns[self.key_col_idx];
+                // Accept .bool_u8 when key column was switched to non-empty bool via setStringNonEmptyBool
+                // (raw_key path); otherwise require .string for the DataChunk fallback path.
+                if (use_raw_key) {
+                    if (key_col.data != .string and key_col.data != .bool_u8) continue;
+                } else {
+                    if (key_col.data != .string) continue;
+                }
+                const strs: [][]const u8 = if (key_col.data == .string) key_col.data.string else &.{};
+                const nr = c.num_rows;
+
+                // Resolve filter column once per chunk.
+                const sf_col: ?chunk.Column = if (self.str_filter) |sf|
+                    if (sf.col_idx < c.columns.len) c.columns[sf.col_idx] else null
+                else null;
+
+                var rec: [64]u64 = undefined;
+
+                // ── SIMD int pre-filter → i16 mask ──────────────────────────────────
+                // For int16/int32 columns, use raw mmap'd slices (32-lane / 16-lane SIMD)
+                // instead of the widened i64 DataChunk column (8-lane SIMD).  For Q38:
+                // CounterID(int32)→16-lane, DontCountHits/IsRefresh(int16)→32-lane (vs 8-lane).
+                // Then 32-lane OR-reduce chunk-skip skips all-zero 32-row blocks cheaply.
+                const have_int_mask: bool = if (self.int_filter) |ics| blk: {
+                    @memset(rs_mask[0..nr], 1);
+                    for (ics, 0..) |cond, ci| {
+                        var handled = false;
+                        if (ci < n_raw_ic) {
+                            if (self.raw_ic_i16[ci]) |raw16| {
+                                if (cond.val >= std.math.minInt(i16) and cond.val <= std.math.maxInt(i16)) {
+                                    const rhs: i16 = @intCast(cond.val);
+                                    const rhs2: i16 = if (cond.op == .in2 and
+                                        cond.val2 >= std.math.minInt(i16) and cond.val2 <= std.math.maxInt(i16))
+                                        @intCast(cond.val2) else 0;
+                                    cmpBatchDispatch(i16, raw16[m.start..m.start + nr], cond.op, rhs, rhs2, rs_tmp_a[0..nr], rs_tmp_b[0..nr]);
+                                    simd_batch.andMasks(rs_mask[0..nr], rs_tmp_a[0..nr], rs_mask[0..nr]);
+                                    handled = true;
+                                }
+                            } else if (self.raw_ic_i32[ci]) |raw32| {
+                                if (cond.val >= std.math.minInt(i32) and cond.val <= std.math.maxInt(i32)) {
+                                    const rhs: i32 = @intCast(cond.val);
+                                    const rhs2: i32 = if (cond.op == .in2 and
+                                        cond.val2 >= std.math.minInt(i32) and cond.val2 <= std.math.maxInt(i32))
+                                        @intCast(cond.val2) else 0;
+                                    cmpBatchDispatch(i32, raw32[m.start..m.start + nr], cond.op, rhs, rhs2, rs_tmp_a[0..nr], rs_tmp_b[0..nr]);
+                                    simd_batch.andMasks(rs_mask[0..nr], rs_tmp_a[0..nr], rs_mask[0..nr]);
+                                    handled = true;
+                                }
+                            }
+                        }
+                        if (!handled) _ = applyIntCondSIMD(&c, cond, nr, rs_mask[0..nr], rs_tmp_a[0..nr], rs_tmp_b[0..nr]);
+                    }
+                    break :blk true;
+                } else false;
+
+                // ── Chunked scatter loop with optional OR-reduce skip ─────────────
+                const CHUNK = 32;
+                var r: usize = 0;
+                while (r + CHUNK <= nr) : (r += CHUNK) {
+                    if (have_int_mask) {
+                        const v: @Vector(CHUNK, i16) = rs_mask[r..][0..CHUNK].*;
+                        if (@reduce(.Or, v) == 0) continue;
+                    }
+                    for (r..r + CHUNK) |ri| {
+                        if (have_int_mask and rs_mask[ri] == 0) continue;
+                        if (self.str_filter) |sf| {
+                            if (sf_col) |sfc| { if (!sf.passes(sfc, ri)) continue; }
+                        }
+                        if (!use_raw_key) { if (key_col.isRowNull(ri)) continue; }
+                        const s: []const u8 = if (use_raw_key) blk_s: {
+                            const a = m.start + ri;
+                            break :blk_s self.raw_key_bytes.?[self.raw_key_offsets.?[a]..self.raw_key_offsets.?[a + 1]];
+                        } else strs[ri];
+                        var sidecar_val: i64 = 0;
+                        const h: u64 = blk: {
+                            const base_h = ht.StrAggHashTable.hashStr(s);
+                            if (self.sidecar_col_idx) |sci| {
+                                if (sci < c.columns.len) {
+                                    const sc = c.columns[sci];
+                                    if (!sc.isRowNull(ri)) {
+                                        sidecar_val = switch (sc.data) {
+                                            .int64    => |a| a[ri],
+                                            .uint64   => |a| @bitCast(a[ri]),
+                                            .bool_u8  => |a| @as(i64, a[ri]),
+                                            .date_u16 => |a| @as(i64, a[ri]),
+                                            else => 0,
+                                        };
+                                    }
+                                }
+                                const sv: u64 = @bitCast(sidecar_val);
+                                break :blk base_h ^ (sv *% 0x9e3779b97f4a7c15);
+                            }
+                            break :blk base_h;
+                        };
+                        const part_id = @as(usize, @truncate(h)) & (N_PARTS - 1);
+                        rec[0] = h; rec[1] = @intFromPtr(s.ptr); rec[2] = s.len;
+                        if (self.sidecar_col_idx != null) rec[3] = @bitCast(sidecar_val);
+                        if (!self.count_only) {
+                            const agg_base: usize = if (self.sidecar_col_idx != null) 4 else 3;
+                            for (self.agg_infos, 0..) |info, ai| {
+                                const off = agg_base + ai;
+                                switch (info.kind) {
+                                    .count => { rec[off] = 1; },
+                                    .i64_sum => { rec[off] = if (info.col_idx >= c.columns.len) 0 else blk2: { const ac = c.columns[info.col_idx]; break :blk2 if (ac.isRowNull(ri)) 0 else switch (ac.data) { .int64 => |v| @bitCast(v[ri]), .uint64 => |v| v[ri], .bool_u8 => |v| @as(u64, v[ri]), else => 0 }; }; },
+                                    .u64_sum => { rec[off] = if (info.col_idx >= c.columns.len) 0 else blk2: { const ac = c.columns[info.col_idx]; break :blk2 if (ac.isRowNull(ri)) 0 else switch (ac.data) { .uint64 => |v| v[ri], .int64 => |v| @bitCast(v[ri]), .bool_u8 => |v| @as(u64, v[ri]), else => 0 }; }; },
+                                    .f64_sum => { rec[off] = if (info.col_idx >= c.columns.len) 0 else blk2: { const ac = c.columns[info.col_idx]; const fv: f64 = if (ac.isRowNull(ri)) 0.0 else switch (ac.data) { .int64 => |v| @floatFromInt(v[ri]), .uint64 => |v| @floatFromInt(v[ri]), .bool_u8 => |v| @floatFromInt(v[ri]), .float64 => |v| v[ri], else => 0.0 }; break :blk2 @bitCast(fv); }; },
+                                    .count_distinct_u64 => { rec[off] = if (info.col_idx >= c.columns.len) 0 else blk2: { const ac = c.columns[info.col_idx]; break :blk2 if (ac.isRowNull(ri)) 0 else switch (ac.data) { .int64 => |v| @bitCast(v[ri]), .uint64 => |v| v[ri], .bool_u8 => |v| @as(u64, v[ri]), .date_u16 => |v| @as(u64, v[ri]), else => 0 }; }; },
+                                    else => { rec[off] = 0; },
+                                }
+                            }
+                        }
+                        try self.bufs[part_id].appendSlice(ba, rec[0..self.row_stride]);
+                    }
+                }
+                // ── Tail: remaining rows after last full CHUNK ────────────────────
+                while (r < nr) : (r += 1) {
+                    if (have_int_mask and rs_mask[r] == 0) continue;
+                    if (self.str_filter) |sf| {
+                        if (sf_col) |sfc| { if (!sf.passes(sfc, r)) continue; }
+                    }
+                    if (!use_raw_key) { if (key_col.isRowNull(r)) continue; }
+                    const s: []const u8 = if (use_raw_key) blk_s: {
+                        const a = m.start + r;
+                        break :blk_s self.raw_key_bytes.?[self.raw_key_offsets.?[a]..self.raw_key_offsets.?[a + 1]];
+                    } else strs[r];
+                    var sidecar_val: i64 = 0;
+                    const h: u64 = blk: {
+                        const base_h = ht.StrAggHashTable.hashStr(s);
+                        if (self.sidecar_col_idx) |sci| {
+                            if (sci < c.columns.len) {
+                                const sc = c.columns[sci];
+                                if (!sc.isRowNull(r)) {
+                                    sidecar_val = switch (sc.data) {
+                                        .int64    => |a| a[r],
+                                        .uint64   => |a| @bitCast(a[r]),
+                                        .bool_u8  => |a| @as(i64, a[r]),
+                                        .date_u16 => |a| @as(i64, a[r]),
+                                        else => 0,
+                                    };
+                                }
+                            }
+                            const sv: u64 = @bitCast(sidecar_val);
+                            break :blk base_h ^ (sv *% 0x9e3779b97f4a7c15);
+                        }
+                        break :blk base_h;
+                    };
+                    const part_id = @as(usize, @truncate(h)) & (N_PARTS - 1);
+                    rec[0] = h; rec[1] = @intFromPtr(s.ptr); rec[2] = s.len;
+                    if (self.sidecar_col_idx != null) rec[3] = @bitCast(sidecar_val);
+                    if (!self.count_only) {
+                        const agg_base: usize = if (self.sidecar_col_idx != null) 4 else 3;
+                        for (self.agg_infos, 0..) |info, ai| {
+                            const off = agg_base + ai;
+                            switch (info.kind) {
+                                .count => { rec[off] = 1; },
+                                .i64_sum => { rec[off] = if (info.col_idx >= c.columns.len) 0 else blk2: { const ac = c.columns[info.col_idx]; break :blk2 if (ac.isRowNull(r)) 0 else switch (ac.data) { .int64 => |v| @bitCast(v[r]), .uint64 => |v| v[r], .bool_u8 => |v| @as(u64, v[r]), else => 0 }; }; },
+                                .u64_sum => { rec[off] = if (info.col_idx >= c.columns.len) 0 else blk2: { const ac = c.columns[info.col_idx]; break :blk2 if (ac.isRowNull(r)) 0 else switch (ac.data) { .uint64 => |v| v[r], .int64 => |v| @bitCast(v[r]), .bool_u8 => |v| @as(u64, v[r]), else => 0 }; }; },
+                                .f64_sum => { rec[off] = if (info.col_idx >= c.columns.len) 0 else blk2: { const ac = c.columns[info.col_idx]; const fv: f64 = if (ac.isRowNull(r)) 0.0 else switch (ac.data) { .int64 => |v| @floatFromInt(v[r]), .uint64 => |v| @floatFromInt(v[r]), .bool_u8 => |v| @floatFromInt(v[r]), .float64 => |v| v[r], else => 0.0 }; break :blk2 @bitCast(fv); }; },
+                                .count_distinct_u64 => { rec[off] = if (info.col_idx >= c.columns.len) 0 else blk2: { const ac = c.columns[info.col_idx]; break :blk2 if (ac.isRowNull(r)) 0 else switch (ac.data) { .int64 => |v| @bitCast(v[r]), .uint64 => |v| v[r], .bool_u8 => |v| @as(u64, v[r]), .date_u16 => |v| @as(u64, v[r]), else => 0 }; }; },
+                                else => { rec[off] = 0; },
+                            }
+                        }
+                    }
+                    try self.bufs[part_id].appendSlice(ba, rec[0..self.row_stride]);
+                }
+            }
+        }
+    };
+
+    // ── Pre-fetch raw column slices + column pruning for ScatterCtx ──────────
+    // For int-filter columns that are stored as int16/int32 on disk, grab the
+    // raw mmap'd slices so doWork can use 32-lane / 16-lane SIMD instead of the
+    // 8-lane path that operates on i64-widened DataChunk columns.
+    // For the key (string) column, grab offsets+bytes so doWork can skip the
+    // per-morsel fat-pointer array allocation in fetchRange.
+    const src_schema = ctx.source.schema();
+    var raw_ic_i16_pre: [16]?[]const i16 = [_]?[]const i16{null} ** 16;
+    var raw_ic_i32_pre: [16]?[]const i32 = [_]?[]const i32{null} ** 16;
+    var n_raw_ic_covered: usize = 0; // count of int conditions covered by raw slices
+    const n_ic_total: usize = if (int_filter) |ics| ics.len else 0;
+    if (int_filter) |ics| {
+        for (ics, 0..) |cond, ci| {
+            if (ci >= 16) break;
+            if (cond.col_idx >= src_schema.len) continue;
+            const col_name = src_schema[cond.col_idx].name;
+            if (ctx.source.getRawInt16Col(col_name)) |raw16| {
+                raw_ic_i16_pre[ci] = raw16;
+                n_raw_ic_covered += 1;
+            } else if (ctx.source.getRawInt32Col(col_name)) |raw32| {
+                raw_ic_i32_pre[ci] = raw32;
+                n_raw_ic_covered += 1;
+            }
+        }
+    }
+    var raw_key_offsets_pre: ?[]const u64 = null;
+    var raw_key_bytes_pre:   ?[]const u8  = null;
+    const key_col_name_pre: []const u8 = if (key_col_idx < src_schema.len) src_schema[key_col_idx].name else "";
+    if (key_col_idx < src_schema.len) {
+        raw_key_offsets_pre = ctx.source.getRawStrOffsets(key_col_name_pre);
+        raw_key_bytes_pre   = ctx.source.getRawStrBytes(key_col_name_pre);
+        // Switch key column to bool_u8 decoding so fetchRange emits 1B/row
+        // instead of building a 122 880-entry fat-pointer slice per morsel.
+        // defer resets this after parallelFor completes.
+        if (raw_key_offsets_pre != null and raw_key_bytes_pre != null) {
+            ctx.source.setStringNonEmptyBool(key_col_name_pre);
+        }
+    }
+    defer ctx.source.setStringNonEmptyBool(null);
+
+    // Pre-fetch raw int64 slice for sidecar column (e.g. UserID for Q18).
+    // When available, the sidecar value is read from mmap'd data in the skip_fetch path,
+    // eliminating fetchRange even for composite (string + int64) GROUP BY queries.
+    var raw_sidecar_i64_pre: ?[]const i64 = null;
+    if (sidecar_col_idx) |sci| {
+        if (sci < src_schema.len) {
+            raw_sidecar_i64_pre = ctx.source.getRawInt64Col(src_schema[sci].name);
+        }
+    }
+
+    // When ALL int conditions are covered by raw slices, the key is raw, it's count_only,
+    // sidecar (if any) has a raw int64 slice, and str_filter (if set) is on the key column —
+    // we can skip fetchRange entirely and process morsels from mmap'd raw slices.
+    const str_filter_is_key_col: bool = if (str_filter) |sf| sf.col_idx == key_col_idx else true;
+    const can_skip_fetch: bool =
+        n_raw_ic_covered == n_ic_total and                                // all int conditions have raw slices
+        raw_key_offsets_pre != null and                                   // string key available raw
+        raw_key_bytes_pre   != null and
+        count_only and                                                    // no agg columns to read
+        (sidecar_col_idx == null or raw_sidecar_i64_pre != null) and     // sidecar ok if raw slice available
+        str_filter_is_key_col;                                            // str filter checked via key offsets
+
+    // ── Column pruning via setNeededCols ─────────────────────────────────────
+    // Collect the minimal set of column names needed, avoiding decoding the
+    // other 100+ unused schema columns in fetchRange.
+    // Skipped when skip_fetch is active (no fetchRange at all) or when needed > half schema.
+    if (!can_skip_fetch) {
+        var needed_names_buf: [32][]const u8 = undefined;
+        var needed_names_n: usize = 0;
+        // Helper: add name without duplicates.
+        const addName = struct {
+            fn add(buf: [][]const u8, n: *usize, name: []const u8) void {
+                for (buf[0..n.*]) |ex| { if (std.mem.eql(u8, ex, name)) return; }
+                if (n.* < buf.len) { buf[n.*] = name; n.* += 1; }
+            }
+        }.add;
+        if (key_col_idx < src_schema.len) addName(&needed_names_buf, &needed_names_n, src_schema[key_col_idx].name);
+        if (str_filter) |sf| { if (sf.col_idx < src_schema.len) addName(&needed_names_buf, &needed_names_n, src_schema[sf.col_idx].name); }
+        if (int_filter) |ics| {
+            for (ics) |cond| {
+                if (cond.col_idx < src_schema.len) addName(&needed_names_buf, &needed_names_n, src_schema[cond.col_idx].name);
+            }
+        }
+        for (agg_infos) |info| {
+            if (!count_only and info.col_idx < src_schema.len) addName(&needed_names_buf, &needed_names_n, src_schema[info.col_idx].name);
+        }
+        if (sidecar_col_idx) |sci| { if (sci < src_schema.len) addName(&needed_names_buf, &needed_names_n, src_schema[sci].name); }
+        // Only call setNeededCols when it actually reduces work (at least 2× reduction).
+        if (needed_names_n > 0 and needed_names_n * 2 < src_schema.len) {
+            ctx.source.setNeededCols(needed_names_buf[0..needed_names_n]);
+        }
+    }
+    defer ctx.source.setNeededCols(null);
+
+    var morsel_src1 = parallel.MorselSource.init(total_rows, parallel.default_morsel_size);
+    const scatter_ctxs = try alloc.alloc(ScatterCtx, n_threads);
+    for (scatter_ctxs) |*sc| {
+        sc.* = .{
+            .bufs         = [_]std.ArrayListUnmanaged(u64){.{ .items = &.{}, .capacity = 0 }} ** N_PARTS,
+            .buf_arena    = std.heap.ArenaAllocator.init(std.heap.c_allocator),
+            .source       = ctx.source,
+            .morsel_src   = &morsel_src1,
+            .parent_alloc = alloc,
+            .key_col_idx     = key_col_idx,
+            .str_filter      = str_filter,
+            .int_filter      = int_filter,
+            .sidecar_col_idx = sidecar_col_idx,
+            .count_only      = count_only,
+            .n_aggs       = n_aggs,
+            .row_stride   = row_stride,
+            .agg_infos    = agg_infos,
+            .raw_ic_i16      = raw_ic_i16_pre,
+            .raw_ic_i32      = raw_ic_i32_pre,
+            .raw_key_offsets = raw_key_offsets_pre,
+            .raw_key_bytes   = raw_key_bytes_pre,
+            .raw_sidecar_i64 = raw_sidecar_i64_pre,
+            .skip_fetch      = can_skip_fetch,
+        };
+    }
+    try parallel.parallelFor(alloc, ScatterCtx, ScatterCtx.work, scatter_ctxs, &morsel_src1);
+    for (scatter_ctxs) |*sc| { if (sc.err) |e| return e; }
+
+    // ── Phase 2: parallel aggregate, one HT per partition ────────────────────
+    // Each partition gets its own c_allocator-backed arena so threads never
+    // share an allocator (partition ownership is disjoint).
+    const part_arenas = try alloc.alloc(std.heap.ArenaAllocator, N_PARTS);
+    const part_hts    = try alloc.alloc(ht.StrAggHashTable, N_PARTS);
+    for (0..N_PARTS) |p| {
+        part_arenas[p] = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+        part_hts[p]    = try ht.StrAggHashTable.initWithCapacity(
+            part_arenas[p].allocator(), n_aggs, 0, 0);
+    }
+
+    const AggCtx = struct {
+        scatter_ctxs:      []ScatterCtx,
+        part_hts:          []ht.StrAggHashTable,
+        part_arenas:       []std.heap.ArenaAllocator,
+        compact_kinds:     []const ht.CompactAggKind,
+        compact_init_vals: []const u64,
+        row_stride:        usize,
+        n_aggs:            usize,
+        count_only:        bool,
+        has_sidecar:       bool,
+        is_count_distinct: bool,
+        morsel_src:        *parallel.MorselSource,
+        err:               ?anyerror = null,
+
+        fn work(self: *@This(), _: *parallel.MorselSource) void {
+            self.doWork() catch |e| { self.err = e; };
+        }
+
+        fn doWork(self: *@This()) !void {
+            while (self.morsel_src.next()) |m| {
+                for (m.start..m.end) |p| {
+                    // ── COUNT DISTINCT: sort-sweep path ──────────────────────────────
+                    // Scatter records: [h:u64, ptr:u64, len:u64, raw_dval:u64] (stride=4)
+                    // Sort by (h primary, raw_dval secondary), sweep to count distinct
+                    // dvals per h-group, insert counts into part_hts[p].
+                    if (self.is_count_distinct) {
+                        const CD_RS: usize = 4;
+                        var total_p: usize = 0;
+                        for (self.scatter_ctxs) |*sc| total_p += sc.bufs[p].items.len / CD_RS;
+                        if (total_p == 0) continue;
+
+                        var par = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+                        defer par.deinit();
+                        const paa = par.allocator();
+
+                        const SortRec = struct { h: u64, ptr: u64, len: u64, dval: u64 };
+                        const recs = try paa.alloc(SortRec, total_p);
+
+                        // Collect records from all scatter bufs for this partition.
+                        var ri: usize = 0;
+                        for (self.scatter_ctxs) |*sc| {
+                            const buf = sc.bufs[p].items;
+                            var i: usize = 0;
+                            while (i < buf.len) : (i += CD_RS) {
+                                recs[ri] = .{ .h = buf[i], .ptr = buf[i+1], .len = buf[i+2], .dval = buf[i+3] };
+                                ri += 1;
+                            }
+                        }
+
+                        // Sort by (h primary, dval secondary).
+                        const SortCtxCD = struct {
+                            fn lt(_: @This(), a: SortRec, b: SortRec) bool {
+                                if (a.h != b.h) return a.h < b.h;
+                                return a.dval < b.dval;
+                            }
+                        };
+                        std.sort.pdq(SortRec, recs[0..ri], SortCtxCD{}, SortCtxCD.lt);
+
+                        // Pre-size part_hts[p] conservatively (ri is upper bound on unique groups).
+                        const ht_cap_cd = @max(64, ri * 100 / 65 + 16);
+                        try self.part_hts[p].growTo(ht_cap_cd);
+
+                        const ivs = self.compact_init_vals;
+
+                        // Sweep: count distinct dval per h-group, accumulate into part_hts[p].
+                        var si: usize = 0;
+                        while (si < ri) {
+                            const h         = recs[si].h;
+                            const first_ptr = recs[si].ptr;
+                            const first_len = recs[si].len;
+                            var prev_dval: u64 = recs[si].dval;
+                            var count: u64 = 1;
+                            si += 1;
+                            while (si < ri and recs[si].h == h) : (si += 1) {
+                                if (recs[si].dval != prev_dval) {
+                                    count += 1;
+                                    prev_dval = recs[si].dval;
+                                }
+                            }
+                            const s: []const u8 = @as([*]const u8, @ptrFromInt(first_ptr))[0..first_len];
+                            const res = try self.part_hts[p].getOrInsertHashOnly(s, h, ivs, 0);
+                            res.vals[0] += count;
+                        }
+                        continue;
+                    }
+
+                    var total_p: usize = 0;
+                    for (self.scatter_ctxs) |*sc|
+                        total_p += sc.bufs[p].items.len / self.row_stride;
+                    if (total_p == 0) continue;
+
+                    const ht_cap = @max(64, total_p * 100 / 65 + 16);
+                    try self.part_hts[p].growTo(ht_cap);
+
+                    const rs   = self.row_stride;
+                    const ivs  = self.compact_init_vals;
+                    const ks   = self.compact_kinds;
+                    // Scatter record layout:  [h, str_ptr, str_len, (sidecar?), agg0, ...]
+                    const agg_off: usize = if (self.has_sidecar) 4 else 3;
+                    for (self.scatter_ctxs) |*sc| {
+                        const buf = sc.bufs[p].items;
+                        var i: usize = 0;
+                        while (i < buf.len) : (i += rs) {
+                            const h    = buf[i];
+                            const ptr  = buf[i + 1];
+                            const slen = buf[i + 2];
+                            const s: []const u8 = @as([*]const u8, @ptrFromInt(ptr))[0..slen];
+                            const sidecar: i64 = if (self.has_sidecar) @bitCast(buf[i + 3]) else 0;
+                            // Hash-only comparison: skip std.mem.eql pointer-chase into the
+                            // mmap'd file (e.g. URL.str.bin, 900 MB).  wyhash 64-bit collision
+                            // probability ~n²/2⁶⁴ ≈ 3.6×10⁻⁷ for 2.6 M URLs — negligible.
+                            const res = try self.part_hts[p].getOrInsertHashOnly(s, h, ivs, sidecar);
+                            const sv  = res.vals;
+                            if (self.count_only) {
+                                sv[0] += 1;
+                            } else {
+                                const partial = buf[i + agg_off .. i + rs];
+                                for (ks, 0..) |kind, ci| {
+                                    const src = partial[ci];
+                                    switch (kind) {
+                                        .count, .u64_sum  => sv[ci] += src,
+                                        .i64_sum => {
+                                            const a: i64 = @bitCast(sv[ci]);
+                                            const b: i64 = @bitCast(src);
+                                            sv[ci] = @bitCast(a + b);
+                                        },
+                                        .f64_sum => {
+                                            const a: f64 = @bitCast(sv[ci]);
+                                            const b: f64 = @bitCast(src);
+                                            sv[ci] = @bitCast(a + b);
+                                        },
+                                        .u64_min => { if (src < sv[ci]) sv[ci] = src; },
+                                        .u64_max => { if (src > sv[ci]) sv[ci] = src; },
+                                        .i64_min => {
+                                            const a: i64 = @bitCast(sv[ci]);
+                                            const b: i64 = @bitCast(src);
+                                            if (b < a) sv[ci] = src;
+                                        },
+                                        .i64_max => {
+                                            const a: i64 = @bitCast(sv[ci]);
+                                            const b: i64 = @bitCast(src);
+                                            if (b > a) sv[ci] = src;
+                                        },
+                                        .f64_min => {
+                                            const a: f64 = @bitCast(sv[ci]);
+                                            const b: f64 = @bitCast(src);
+                                            if (b < a) sv[ci] = src;
+                                        },
+                                        .f64_max => {
+                                            const a: f64 = @bitCast(sv[ci]);
+                                            const b: f64 = @bitCast(src);
+                                            if (b > a) sv[ci] = src;
+                                        },
+                                        else => sv[ci] += src,
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    };
+
+    var morsel_src2 = parallel.MorselSource.init(N_PARTS, 1);
+    const agg_ctxs = try alloc.alloc(AggCtx, n_threads);
+    for (agg_ctxs) |*ac| {
+        ac.* = .{
+            .scatter_ctxs      = scatter_ctxs,
+            .part_hts          = part_hts,
+            .part_arenas       = part_arenas,
+            .compact_kinds     = compact_kinds,
+            .compact_init_vals = compact_init_vals,
+            .row_stride        = row_stride,
+            .n_aggs            = n_aggs,
+            .count_only        = count_only,
+            .has_sidecar       = has_sidecar,
+            .is_count_distinct = is_count_distinct,
+            .morsel_src        = &morsel_src2,
+        };
+    }
+    try parallel.parallelFor(alloc, AggCtx, AggCtx.work, agg_ctxs, &morsel_src2);
+    for (agg_ctxs) |*ac| { if (ac.err) |e| return e; }
+
+    // Release scatter buffers.
+    for (scatter_ctxs) |*sc| sc.buf_arena.deinit();
+
+    // ── Emit: iterate all partition HTs, build output RowList ────────────────
+    const out_metas = try alloc.alloc(result.ColMeta, keys.len + n_aggs);
+    for (keys, 0..) |k, i|   out_metas[i]            = .{ .name = k.alias, .col_type = k.out_type };
+    for (aggs, 0..) |a, i|   out_metas[keys.len + i] = .{ .name = a.alias, .col_type = a.out_type };
+
+    const use_heap = top_k > 0 and sort_keys.len > 0;
+
+    const EmitCtx = struct {
+        keys:            []const plan.ProjectItem,
+        aggs:            []const plan.ProjectItem,
+        kinds:           []const ht.CompactAggKind,
+        str_key_pos:     usize,
+        sidecar_key_pos: ?usize,
+        current_ht:      ?*const ht.StrAggHashTable,
+        rl:              RowList,
+        alloc:           std.mem.Allocator,
+        heap:            std.ArrayListUnmanaged([]?Value),
+        heap_k:          usize,
+        sort_keys:       []const plan.SortKey,
+        err:             ?anyerror = null,
+
+        fn rowWorse(sk: []const plan.SortKey, a: []?Value, b: []?Value) bool {
+            // True when `a` should be evicted from the heap before `b`.
+            // The heap is a max-heap of "worst" elements (root = eviction candidate).
+            for (sk) |key| {
+                const ai = if (key.col_idx < a.len) a[key.col_idx] else null;
+                const bi = if (key.col_idx < b.len) b[key.col_idx] else null;
+                const ord: std.math.Order = if (ai != null and bi != null) Value.order(ai.?, bi.?)
+                    else if (ai == null and bi == null) .eq
+                    else if (ai == null) .lt else .gt;
+                if (ord == .eq) continue;
+                // For ORDER BY x DESC LIMIT k: keep top-k largest → evict smallest.
+                return if (key.desc) (ord == .lt) else (ord == .gt);
+            }
+            return false;
+        }
+
+        fn siftUp(self: *@This(), idx: usize) void {
+            var i = idx;
+            const h = self.heap.items;
+            while (i > 0) {
+                const p = (i - 1) / 2;
+                if (rowWorse(self.sort_keys, h[i], h[p])) {
+                    const tmp = h[i]; h[i] = h[p]; h[p] = tmp; i = p;
+                } else break;
+            }
+        }
+
+        fn siftDown(self: *@This()) void {
+            var i: usize = 0;
+            const h = self.heap.items;
+            while (true) {
+                var worst = i;
+                const l = i * 2 + 1; const r = i * 2 + 2;
+                // Find the most-evictable (smallest count for DESC) among current and children.
+                if (l < h.len and rowWorse(self.sort_keys, h[l], h[worst]))  worst = l;
+                if (r < h.len and rowWorse(self.sort_keys, h[r], h[worst])) worst = r;
+                if (worst == i) break;
+                const tmp = h[i]; h[i] = h[worst]; h[worst] = tmp; i = worst;
+            }
+        }
+
+        fn emitRow(self: *@This(), key_str: []const u8, acc_vals: []const u64, _slot: usize) void {
+            self.doEmit(key_str, acc_vals, _slot) catch |e| { self.err = e; };
+        }
+
+        fn doEmit(self: *@This(), key_str: []const u8, acc_vals: []const u64, slot: usize) !void {
+            const nk = self.keys.len;
+            const row = try self.alloc.alloc(?Value, nk + self.aggs.len);
+
+            for (self.keys, 0..) |k, ki| {
+                row[ki] = if (ki == self.str_key_pos) blk: {
+                    const s = try self.alloc.dupe(u8, key_str);
+                    break :blk Value{ .string = s };
+                } else if (self.sidecar_key_pos != null and ki == self.sidecar_key_pos.?) blk: {
+                    // Read the int sidecar value stored in the HT key slot.
+                    const int_val: i64 = if (self.current_ht) |cht|
+                        cht.key_slots[slot].int_sidecar
+                    else 0;
+                    break :blk Value{ .int64 = int_val };
+                } else switch (k.expr) {
+                    .lit_i64 => |v| Value{ .int64 = v },
+                    else     => Value{ .int64  = 0 },
+                };
+            }
+
+            for (self.kinds, 0..) |kind, ai| {
+                const v = acc_vals[ai];
+                row[nk + ai] = switch (kind) {
+                    .count    => Value{ .int64   = @intCast(v) },
+                    .i64_sum, .i64_min, .i64_max => Value{ .int64   = @bitCast(v) },
+                    .u64_sum, .u64_min, .u64_max => Value{ .uint64  = v },
+                    .f64_sum, .f64_min, .f64_max => Value{ .float64 = @bitCast(v) },
+                    else => Value{ .int64 = @bitCast(v) },
+                };
+            }
+
+            if (self.heap_k > 0) {
+                if (self.heap.items.len < self.heap_k) {
+                    try self.heap.append(self.alloc, row);
+                    self.siftUp(self.heap.items.len - 1);
+                } else if (self.heap.items.len > 0 and
+                           rowWorse(self.sort_keys, self.heap.items[0], row))
+                {
+                    self.heap.items[0] = row;
+                    self.siftDown();
+                }
+            } else {
+                try self.rl.append(self.alloc, row);
+            }
+        }
+    };
+
+    var ec = EmitCtx{
+        .keys            = keys,
+        .aggs            = aggs,
+        .kinds           = compact_kinds,
+        .str_key_pos     = str_key_pos,
+        .sidecar_key_pos = sidecar_key_pos,
+        .current_ht      = null,
+        .rl              = RowList.init(out_metas),
+        .alloc           = alloc,
+        .heap            = .{ .items = &.{}, .capacity = 0 },
+        .heap_k          = if (use_heap) top_k else 0,
+        .sort_keys       = sort_keys,
+    };
+
+    for (part_hts) |*ph| {
+        ec.current_ht = ph;
+        ph.iterateWithSlot(&ec, EmitCtx.emitRow);
+        if (ec.err) |e| return e;
+    }
+
+    // Release partition HT memory.
+    for (0..N_PARTS) |p| part_arenas[p].deinit();
+
+    if (use_heap) {
+        const items = ec.heap.items;
+        const SortCtxTP = struct {
+            sk: []const plan.SortKey,
+            fn lessThan(s: @This(), a: []?Value, b: []?Value) bool {
+                for (s.sk) |key| {
+                    const ai = if (key.col_idx < a.len) a[key.col_idx] else null;
+                    const bi = if (key.col_idx < b.len) b[key.col_idx] else null;
+                    const ord: std.math.Order = if (ai != null and bi != null) Value.order(ai.?, bi.?)
+                        else if (ai == null and bi == null) .eq
+                        else if (ai == null) .lt else .gt;
+                    if (ord == .eq) continue;
+                    return if (key.desc) (ord == .gt) else (ord == .lt);
+                }
+                return false;
+            }
+        };
+        std.sort.pdq([]?Value, items, SortCtxTP{ .sk = sort_keys }, SortCtxTP.lessThan);
+        var tp_rl = RowList.init(out_metas);
+        for (items) |row| try tp_rl.append(alloc, row);
+        return tp_rl;
+    }
+
+    return ec.rl;
+}
+
+// ─── executeTwoPhaseHashAggWithCW ────────────────────────────────────────────
+//
+// Two-phase scatter → aggregate for queries with a CASE WHEN secondary string
+// key (e.g. Q40: GROUP BY TraficSourceID, SearchEngineID, AdvEngineID,
+//                         CASE WHEN(Referer), URL  COUNT(*)).
+//
+// Phase 1 (parallel): scatter surviving rows into N_CW_PARTS=64 partitions
+//   using raw column access (no fetchRange).  Scatter record layout:
+//   [hash:u64, url_ptr:u64, url_len:u64, cw_ptr:u64, cw_len:u64,
+//    int0..int_{n-1}:u64]  (n = number of non-str non-CW GROUP BY keys).
+//
+// Phase 2 (sequential): per-partition hash table with lazy composite-key
+//   building.  For repeat groups (hash hit): only increment count, no DRAM
+//   string access.  For new groups (hash miss): build the 195 B composite key
+//   from scatter-record pointers and insert once.
+//
+// Eliminates fetchRange and all per-row string memcmp.  Returns null when raw
+// column access is unavailable so executeHashAggParallelStrKey falls through
+// to its normal fetchRange path.
+fn executeTwoPhaseHashAggWithCW(
+    keys:              []const plan.ProjectItem,
+    aggs:              []const plan.ProjectItem,
+    sort_keys:         []const plan.SortKey,
+    top_k:             usize,
+    ctx:               *QueryContext,
+    key_col_idx:       usize,
+    str_key_pos:       usize,
+    cw_key:            CaseWhenStrKey,
+    cw_key_pos:        usize,
+    compact_kinds:     []const ht.CompactAggKind,
+    compact_init_vals: []const u64,
+    sidecar_idx:       []const usize,
+    filter_pred:       ?plan.Expr,
+) !?RowList {
+    if (!ctx.source.supportsRange()) return null;
+    const total_rows = ctx.source.rowCount();
+    if (total_rows < 3_000_000) return null;
+    const n_threads = parallel.defaultThreads();
+    if (n_threads <= 1) return null;
+    const alloc = ctx.allocator();
+    const sch   = ctx.source.schema();
+
+    // ── Build int_key_specs ──────────────────────────────────────────────────
+    const IntKeySpec2 = struct { is_col: bool, col_idx: usize = 0, const_val: u64 = 0 };
+    var int_key_specs_buf: [16]IntKeySpec2 = undefined;
+    var n_int_keys: usize = 0;
+    for (keys) |k| {
+        switch (k.expr) {
+            .col_ref => |cr| {
+                if (cr.index == key_col_idx) continue; // skip primary string key
+                if (n_int_keys < 16) {
+                    int_key_specs_buf[n_int_keys] = .{ .is_col = true, .col_idx = cr.index };
+                    n_int_keys += 1;
+                }
+            },
+            .lit_i64 => |v| {
+                if (n_int_keys < 16) {
+                    int_key_specs_buf[n_int_keys] = .{ .is_col = false, .const_val = @bitCast(v) };
+                    n_int_keys += 1;
+                }
+            },
+            else => {}, // skip CASE WHEN, fn_call, etc.
+        }
+    }
+    var all_const_int_keys = true;
+    for (int_key_specs_buf[0..n_int_keys]) |s| {
+        if (s.is_col) { all_const_int_keys = false; break; }
+    }
+    const int_prefix_len: usize  = if (all_const_int_keys) 0 else n_int_keys * 8;
+    // n_rec_ints: int slots written per scatter record (0 when all-const).
+    const n_rec_ints:  usize = if (all_const_int_keys) 0 else n_int_keys;
+    const row_stride:  usize = 5 + n_rec_ints;
+    const int_key_specs = int_key_specs_buf[0..n_int_keys];
+
+    // ── Resolve raw columns ──────────────────────────────────────────────────
+    const url_col_name = if (key_col_idx < sch.len) sch[key_col_idx].name else return null;
+    const url_offsets  = ctx.source.getRawStrOffsets(url_col_name) orelse return null;
+    const url_bytes    = ctx.source.getRawStrBytes(url_col_name)   orelse return null;
+
+    const cw_then_name   = if (cw_key.then_col_idx < sch.len) sch[cw_key.then_col_idx].name else return null;
+    const cw_offsets     = ctx.source.getRawStrOffsets(cw_then_name) orelse return null;
+    const cw_bytes_mmap  = ctx.source.getRawStrBytes(cw_then_name)   orelse return null;
+
+    var cw_when_raw: [4]RawColSlice = undefined;
+    for (cw_key.when_ic[0..cw_key.when_ic_n], 0..) |wc, wci| {
+        const nm = if (wc.col_idx < sch.len) sch[wc.col_idx].name else return null;
+        if      (ctx.source.getRawInt16Col(nm)) |s| { cw_when_raw[wci] = .{ .i16s = s }; }
+        else if (ctx.source.getRawInt32Col(nm)) |s| { cw_when_raw[wci] = .{ .i32s = s }; }
+        else if (ctx.source.getRawInt64Col(nm)) |s| { cw_when_raw[wci] = .{ .i64s = s }; }
+        else return null;
+    }
+
+    var int_key_raw: [16]RawColSlice = undefined;
+    for (int_key_specs, 0..) |spec, ki| {
+        if (!spec.is_col) { int_key_raw[ki] = .{ .i64s = &.{} }; continue; }
+        const nm = if (spec.col_idx < sch.len) sch[spec.col_idx].name else return null;
+        if      (ctx.source.getRawInt16Col(nm)) |s| { int_key_raw[ki] = .{ .i16s = s }; }
+        else if (ctx.source.getRawInt32Col(nm)) |s| { int_key_raw[ki] = .{ .i32s = s }; }
+        else if (ctx.source.getRawInt64Col(nm)) |s| { int_key_raw[ki] = .{ .i64s = s }; }
+        else return null;
+    }
+
+    // Filter: must be pure-int AND conditions (else fall back to fetchRange path).
+    var ic_buf: [16]IntCmpCond = undefined;
+    var ic_n:   usize = 0;
+    if (filter_pred) |fp| {
+        if (!extractAndIntConds(fp, &ic_buf, &ic_n, false)) return null;
+    }
+    var filt_raw: [16]RawColSlice = undefined;
+    for (ic_buf[0..ic_n], 0..) |cond, ci| {
+        const nm = if (cond.col_idx < sch.len) sch[cond.col_idx].name else return null;
+        if      (ctx.source.getRawInt16Col(nm)) |s| { filt_raw[ci] = .{ .i16s = s }; }
+        else if (ctx.source.getRawInt32Col(nm)) |s| { filt_raw[ci] = .{ .i32s = s }; }
+        else if (ctx.source.getRawInt64Col(nm)) |s| { filt_raw[ci] = .{ .i64s = s }; }
+        else return null;
+    }
+
+    const N_CW_PARTS: usize = 64;
+
+    // ── Phase 1: parallel scatter ─────────────────────────────────────────────
+    const ScatterCtx2 = struct {
+        bufs:          [N_CW_PARTS]std.ArrayListUnmanaged(u64),
+        buf_arena:     std.heap.ArenaAllocator,
+        morsel_src:    *parallel.MorselSource,
+        url_offsets:   []const u64,
+        url_bytes:     []const u8,
+        cw_offsets:    []const u64,
+        cw_bytes_mmap: []const u8,
+        cw_when_ic:    [4]IntCmpCond,
+        cw_when_n:     usize,
+        cw_when_raw:   [4]RawColSlice,
+        filt_conds:    [16]IntCmpCond,
+        filt_n:        usize,
+        filt_raw:      [16]RawColSlice,
+        int_key_specs: [16]IntKeySpec2,
+        n_int_keys:    usize,
+        n_rec_ints:    usize,
+        int_key_raw:   [16]RawColSlice,
+        all_const_int_keys: bool,
+        row_stride:    usize,
+        err:           ?anyerror = null,
+
+        fn work(self: *@This(), _: *parallel.MorselSource) void {
+            self.doWork() catch |e| { self.err = e; };
+        }
+
+        fn doWork(self: *@This()) !void {
+            const ba  = self.buf_arena.allocator();
+            var  ta   = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+            defer ta.deinit();
+            const rs_sz = parallel.default_morsel_size + 1;
+            const mask  = try ta.allocator().alloc(i16, rs_sz);
+            const tmp_a = try ta.allocator().alloc(i16, rs_sz);
+            const tmp_b = try ta.allocator().alloc(i16, rs_sz);
+
+            while (self.morsel_src.next()) |m| {
+                const start = m.start;
+                const nr    = m.end - m.start;
+
+                // Apply filter (SIMD).
+                @memset(mask[0..nr], 1);
+                for (self.filt_conds[0..self.filt_n], 0..) |cond, ci| {
+                    self.filt_raw[ci].applyMaskSIMD(start, nr, cond,
+                        mask[0..nr], tmp_a[0..nr], tmp_b[0..nr]);
+                }
+
+                // Early-exit: skip all-zero morsels.
+                {
+                    var any_pass = false;
+                    var ri: usize = 0;
+                    while (ri + 32 <= nr) : (ri += 32) {
+                        const v: @Vector(32, i16) = mask[ri..][0..32].*;
+                        if (@reduce(.Or, v) != 0) { any_pass = true; break; }
+                    }
+                    if (!any_pass) while (ri < nr) : (ri += 1) {
+                        if (mask[ri] != 0) { any_pass = true; break; }
+                    };
+                    if (!any_pass) continue;
+                }
+
+                // Write scatter records for surviving rows.
+                const CHUNK: usize = 32;
+                var ri: usize = 0;
+                while (ri < nr) {
+                    if (ri + CHUNK <= nr) {
+                        const v: @Vector(CHUNK, i16) = mask[ri..][0..CHUNK].*;
+                        if (@reduce(.Or, v) == 0) { ri += CHUNK; continue; }
+                    }
+                    const rend = @min(ri + CHUNK, nr);
+                    while (ri < rend) : (ri += 1) {
+                        if (mask[ri] == 0) continue;
+                        const abs = start + ri;
+
+                        // URL: read offsets (sequential), keep pointer + length.
+                        const u_s   = self.url_offsets[abs];
+                        const u_e   = self.url_offsets[abs + 1];
+                        const url_s = self.url_bytes[u_s..u_e];
+
+                        // CASE WHEN: evaluate using raw int slices.
+                        var cw_ok = true;
+                        for (self.cw_when_ic[0..self.cw_when_n], 0..) |wc, wci| {
+                            const v2 = self.cw_when_raw[wci].getI64(abs);
+                            const pass = switch (wc.op) {
+                                .eq  => v2 == wc.val, .neq => v2 != wc.val,
+                                .lt  => v2 < wc.val,  .lte => v2 <= wc.val,
+                                .gt  => v2 > wc.val,  .gte => v2 >= wc.val,
+                                .in2 => v2 == wc.val or v2 == wc.val2,
+                            };
+                            if (!pass) { cw_ok = false; break; }
+                        }
+                        const cw_s_off = self.cw_offsets[abs];
+                        const cw_e_off = self.cw_offsets[abs + 1];
+                        const cw_has   = cw_ok and cw_e_off > cw_s_off;
+                        const cw_ptr_u: u64 = if (cw_has)
+                            @intFromPtr(self.cw_bytes_mmap.ptr) + cw_s_off else 0;
+                        const cw_len_u: u64 = if (cw_has) cw_e_off - cw_s_off else 0;
+                        const cw_s: []const u8 = if (cw_len_u > 0)
+                            @as([*]const u8, @ptrFromInt(cw_ptr_u))[0..cw_len_u] else "";
+
+                        // Hash: combine URL + CW + int keys.
+                        const url_h = ht.StrAggHashTable.hashStr(url_s);
+                        const cw_h  = ht.StrAggHashTable.hashStr(cw_s);
+                        var h = url_h ^ (cw_h *% 0x9e3779b97f4a7c15);
+                        for (0..self.n_int_keys) |ki| {
+                            const ival: u64 = if (!self.int_key_specs[ki].is_col)
+                                self.int_key_specs[ki].const_val
+                            else @bitCast(self.int_key_raw[ki].getI64(abs));
+                            h ^= ival *% 0x6c62272e07bb0142;
+                        }
+                        h |= (1 << 63);
+
+                        const part_id: usize = @as(usize, @truncate(h)) & (N_CW_PARTS - 1);
+
+                        // Write scatter record.
+                        var rec: [5 + 16]u64 = undefined;
+                        rec[0] = h;
+                        rec[1] = @intFromPtr(self.url_bytes.ptr) + u_s;
+                        rec[2] = u_e - u_s;
+                        rec[3] = cw_ptr_u;
+                        rec[4] = cw_len_u;
+                        if (!self.all_const_int_keys) {
+                            for (0..self.n_rec_ints) |ki| {
+                                rec[5 + ki] = if (!self.int_key_specs[ki].is_col)
+                                    self.int_key_specs[ki].const_val
+                                else @bitCast(self.int_key_raw[ki].getI64(abs));
+                            }
+                        }
+                        try self.bufs[part_id].appendSlice(ba, rec[0..self.row_stride]);
+                    }
+                }
+            }
+        }
+    };
+
+    var morsel_src2 = parallel.MorselSource.init(total_rows, parallel.default_morsel_size);
+    const scatter_ctxs = try alloc.alloc(ScatterCtx2, n_threads);
+    for (scatter_ctxs) |*sc| {
+        sc.* = .{
+            .bufs          = undefined,
+            .buf_arena     = std.heap.ArenaAllocator.init(std.heap.c_allocator),
+            .morsel_src    = &morsel_src2,
+            .url_offsets   = url_offsets,
+            .url_bytes     = url_bytes,
+            .cw_offsets    = cw_offsets,
+            .cw_bytes_mmap = cw_bytes_mmap,
+            .cw_when_ic    = undefined,
+            .cw_when_n     = cw_key.when_ic_n,
+            .cw_when_raw   = cw_when_raw,
+            .filt_conds    = undefined,
+            .filt_n        = ic_n,
+            .filt_raw      = filt_raw,
+            .int_key_specs = undefined,
+            .n_int_keys    = n_int_keys,
+            .n_rec_ints    = n_rec_ints,
+            .int_key_raw   = int_key_raw,
+            .all_const_int_keys = all_const_int_keys,
+            .row_stride    = row_stride,
+        };
+        for (&sc.bufs) |*b| b.* = std.ArrayListUnmanaged(u64).empty;
+        @memcpy(sc.cw_when_ic[0..cw_key.when_ic_n], cw_key.when_ic[0..cw_key.when_ic_n]);
+        @memcpy(sc.filt_conds[0..ic_n], ic_buf[0..ic_n]);
+        @memcpy(sc.int_key_specs[0..n_int_keys], int_key_specs);
+    }
+
+    try parallel.parallelFor(alloc, ScatterCtx2, ScatterCtx2.work, scatter_ctxs, &morsel_src2);
+    for (scatter_ctxs) |*sc| { if (sc.err) |e| return e; }
+    defer for (scatter_ctxs) |*sc| sc.buf_arena.deinit();
+
+    // ── Emit infrastructure ───────────────────────────────────────────────────
+    const out_metas2 = try alloc.alloc(result.ColMeta, keys.len + aggs.len);
+    for (keys, 0..) |k, i| out_metas2[i] = .{ .name = k.alias, .col_type = k.out_type };
+    for (aggs, 0..) |a, i| out_metas2[keys.len + i] = .{ .name = a.alias, .col_type = a.out_type };
+    var rl = RowList.init(out_metas2);
+
+    // Compute emit_all_const (mirrors executeHashAggParallelStrKey logic).
+    var emit_int_key_n2: usize = 0;
+    var emit_all_const2 = true;
+    for (keys) |k| {
+        switch (k.expr) {
+            .col_ref => |cr| { if (cr.index != key_col_idx) { emit_int_key_n2 += 1; emit_all_const2 = false; } },
+            .lit_i64 => { emit_int_key_n2 += 1; },
+            else     => {},
+        }
+    }
+    if (emit_int_key_n2 == 0) emit_all_const2 = true;
+    const emit_int_prefix: usize = if (emit_all_const2) 0 else emit_int_key_n2 * 8;
+
+    const sm_emit2 = ctx.source.schema();
+
+    const EmitCtx2 = struct {
+        rl:             *RowList,
+        alloc:          std.mem.Allocator,
+        aggs:           []const plan.ProjectItem,
+        kinds:          []const ht.CompactAggKind,
+        str_ht:         *ht.StrAggHashTable,
+        sidecar_idx:    []const usize,
+        keys:           []const plan.ProjectItem,
+        str_key_pos:    usize,
+        cw_key_pos:     usize,
+        int_prefix:     usize,
+        all_const_ints: bool,
+        sm:             []const result.ColMeta,
+    };
+    var emit_ctx2 = EmitCtx2{
+        .rl             = &rl,
+        .alloc          = alloc,
+        .aggs           = aggs,
+        .kinds          = compact_kinds,
+        .str_ht         = undefined, // set per partition below
+        .sidecar_idx    = sidecar_idx,
+        .keys           = keys,
+        .str_key_pos    = str_key_pos,
+        .cw_key_pos     = cw_key_pos,
+        .int_prefix     = emit_int_prefix,
+        .all_const_ints = emit_all_const2,
+        .sm             = sm_emit2,
+    };
+    const EmitCb2 = struct {
+        fn cb(ec: *EmitCtx2, composite: []const u8, vals: []const u64, slot: usize) void {
+            const row = ec.alloc.alloc(?Value, ec.keys.len + vals.len) catch return;
+            // Decode composite key: [int_prefix][cw_len:u16LE][cw_bytes][url_bytes]
+            const cw_len_dec: usize = if (composite.len >= ec.int_prefix + 2)
+                @as(usize, std.mem.readInt(u16, composite[ec.int_prefix..ec.int_prefix+2][0..2], .little))
+            else 0;
+            const cw_start2:  usize = ec.int_prefix + 2;
+            const str_start2: usize = cw_start2 + cw_len_dec;
+            const cw_str_raw: []const u8 = if (cw_start2 + cw_len_dec <= composite.len)
+                composite[cw_start2..cw_start2 + cw_len_dec] else "";
+            const str_val_raw: []const u8 = if (str_start2 <= composite.len)
+                composite[str_start2..] else "";
+            // Dupe so RowList owns the bytes after phase2_arena is freed.
+            const cw_str2:  []const u8 = ec.alloc.dupe(u8, cw_str_raw)  catch cw_str_raw;
+            const str_val2: []const u8 = ec.alloc.dupe(u8, str_val_raw) catch str_val_raw;
+            var int_ki: usize = 0;
+            for (ec.keys, 0..) |k, ki| {
+                if (ki == ec.cw_key_pos) { row[ki] = Value{ .string = cw_str2 }; continue; }
+                if (k.expr != .col_ref and k.expr != .lit_i64) {
+                    if (ki == ec.str_key_pos) { row[ki] = Value{ .string = str_val2 }; continue; }
+                    row[ki] = Value{ .int64 = 0 }; continue;
+                }
+                if (k.expr == .lit_i64) {
+                    if (ec.all_const_ints) {
+                        row[ki] = Value{ .int64 = k.expr.lit_i64 };
+                    } else {
+                        const ival = std.mem.readInt(u64, composite[int_ki*8..int_ki*8+8][0..8], .little);
+                        row[ki] = Value{ .int64 = @bitCast(ival) };
+                        int_ki += 1;
+                    }
+                    continue;
+                }
+                const ci2 = k.expr.col_ref.index;
+                if (ki == ec.str_key_pos) {
+                    row[ki] = Value{ .string = str_val2 };
+                } else {
+                    const ival = std.mem.readInt(u64, composite[int_ki*8..int_ki*8+8][0..8], .little);
+                    row[ki] = if (ci2 < ec.sm.len) switch (ec.sm[ci2].col_type) {
+                        .int64         => Value{ .int64         = @bitCast(ival) },
+                        .uint64        => Value{ .uint64        = ival },
+                        .date_u16      => Value{ .date_u16      = @truncate(ival) },
+                        .bool_u8       => Value{ .bool_u8       = @truncate(ival) },
+                        .datetime64_ms => Value{ .datetime64_ms = @bitCast(ival) },
+                        else           => Value{ .int64         = @bitCast(ival) },
+                    } else Value{ .int64 = @bitCast(ival) };
+                    int_ki += 1;
+                }
+            }
+            emitCompactValsWithSidecar(vals, ec.kinds, ec.aggs, row[ec.keys.len..],
+                ec.str_ht, slot, ec.sidecar_idx);
+            ec.rl.append(ec.alloc, row) catch {};
+        }
+    };
+
+    // ── Phase 2: sequential per-partition aggregation ─────────────────────────
+    // All part_hts and composite-key bytes live in phase2_arena.
+    // After iterateWithSlot (which dupes strings into alloc), phase2_arena is freed.
+    var phase2_arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    defer phase2_arena.deinit();
+    const p2alloc = phase2_arena.allocator();
+
+    for (0..N_CW_PARTS) |p| {
+        var total_recs: usize = 0;
+        for (scatter_ctxs) |*sc| total_recs += sc.bufs[p].items.len / row_stride;
+        if (total_recs == 0) continue;
+
+        var part_ht = try ht.StrAggHashTable.initWithCapacity(
+            p2alloc, aggs.len, 0, @max(total_recs, 4));
+
+        for (scatter_ctxs) |*sc| {
+            const buf = sc.bufs[p].items;
+            var i: usize = 0;
+            while (i + row_stride <= buf.len) : (i += row_stride) {
+                const h       = buf[i];
+                const url_ptr = buf[i + 1];
+                const url_len = buf[i + 2];
+                const cw_ptr2 = buf[i + 3];
+                const cw_len2 = buf[i + 4];
+
+                // Ensure load-factor headroom before probe.
+                if (part_ht.count + 1 > (part_ht.capacity * 7) / 10)
+                    try part_ht.growTo(part_ht.capacity * 2);
+
+                if (part_ht.probeHashOnly(h)) |slot| {
+                    // Repeat group: increment count, no string DRAM access.
+                    part_ht.vals_flat[slot * aggs.len] += 1;
+                } else {
+                    // New group: build composite key from scatter-record pointers.
+                    const url_s: []const u8 = @as([*]const u8, @ptrFromInt(url_ptr))[0..url_len];
+                    const cw_s:  []const u8 = if (cw_len2 > 0)
+                        @as([*]const u8, @ptrFromInt(cw_ptr2))[0..cw_len2] else "";
+                    const composite_len = int_prefix_len + 2 + cw_len2 + url_len;
+                    const composite = try p2alloc.alloc(u8, composite_len);
+                    var off: usize = 0;
+                    if (!all_const_int_keys) {
+                        for (0..n_rec_ints) |ki| {
+                            std.mem.writeInt(u64, composite[off..][0..8], buf[i + 5 + ki], .little);
+                            off += 8;
+                        }
+                    }
+                    std.mem.writeInt(u16, composite[off..][0..2],
+                        @intCast(@min(cw_len2, 65535)), .little);
+                    off += 2;
+                    @memcpy(composite[off..off + cw_len2], cw_s);
+                    off += cw_len2;
+                    @memcpy(composite[off..], url_s);
+                    const res = part_ht.insertHashOnly(composite, h, compact_init_vals);
+                    res.vals[0] = 1; // first occurrence → count = 1
+                }
+            }
+        }
+
+        // Emit: strings are duped into alloc, so phase2_arena can be freed after.
+        emit_ctx2.str_ht = &part_ht;
+        part_ht.iterateWithSlot(&emit_ctx2, EmitCb2.cb);
+    }
+
+    // ── Sort / TopK ───────────────────────────────────────────────────────────
+    if (top_k > 0 and sort_keys.len > 0 and rl.rows.items.len > top_k)
+        return try executeTopK(rl, sort_keys, top_k, alloc);
+    if (sort_keys.len > 0)
+        return try executeOrderBy(rl, sort_keys, alloc);
     return rl;
 }

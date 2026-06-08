@@ -1,5 +1,4 @@
 const std = @import("std");
-const build_options = @import("build_options");
 const catalog = @import("catalog.zig");
 const schema_infer = @import("schema_infer.zig");
 const schema_persist = @import("ingest_schema_persist");
@@ -11,6 +10,7 @@ const generic_sql = @import("generic_sql");
 const parquet = @import("parquet");
 const storage = @import("storage.zig");
 const schema = @import("schema");
+const generic_store = @import("generic_store.zig");
 
 const usage =
     \\zighouse - ClickHouse-compatible analytical database
@@ -156,11 +156,37 @@ fn runCommand(init: std.process.Init, allocator: std.mem.Allocator, args: *std.p
             table_name[dot + 1 ..]
         else
             table_name;
+
+        // Detect sort keys for the generic format by sampling each int column.
+        // Only meaningful after a generic import (the .bin files exist).
+        var sort_keys: []const []const u8 = &.{};
+        defer {
+            for (sort_keys) |sk| allocator.free(sk);
+            if (sort_keys.len > 0) allocator.free(sort_keys);
+        }
+        if (format == .generic) blk: {
+            const part_path = generic_store.partDir(allocator, store_dir, bare_table) catch break :blk;
+            defer allocator.free(part_path);
+            sort_keys = loader.detectSortKeys(allocator, init.io, part_path, inferred.table) catch &.{};
+             if (sort_keys.len > 0) {
+                var sk_buf: std.ArrayListUnmanaged(u8) = .empty;
+                defer sk_buf.deinit(allocator);
+                for (sort_keys, 0..) |sk, i| {
+                    if (i > 0) try sk_buf.appendSlice(allocator, ", ");
+                    try sk_buf.appendSlice(allocator, sk);
+                }
+                try printOut(init.io, "detected sort_keys: [{s}]\n", .{sk_buf.items});
+            }
+        }
+
+        var table_with_keys = inferred.table;
+        table_with_keys.sort_keys = sort_keys;
+
         const entry = schema_config.TableEntry{
-            .db   = db_name,
-            .name = bare_table,
-            .pk   = pk_col_name,
-            .table = inferred.table,
+            .db    = db_name,
+            .name  = bare_table,
+            .pk    = pk_col_name,
+            .table = table_with_keys,
         };
         // Parts land at <store_dir>/<table_name>/parts/ (via catalog.writeManifest).
         // schema.json must be at <store_dir>/<table_name>/schema.json for `serve` to find it.

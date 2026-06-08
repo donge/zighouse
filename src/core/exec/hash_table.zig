@@ -404,7 +404,7 @@ pub const PairCountHashTable = struct {
         return p;
     }
 
-    fn tagHash(h: u64) u64 { return if (h == 0) 1 else h; }
+    pub fn tagHash(h: u64) u64 { return if (h == 0) 1 else h; }
 
     pub fn increment(self: *PairCountHashTable, i64_key: i64, str_key: []const u8) !void {
         if (self.count + 1 > (self.capacity * 7) / 10) try self.grow();
@@ -450,11 +450,13 @@ pub const PairCountHashTable = struct {
         }
     }
 
-    /// Merge all entries from `other` into `self`, summing counts.
-    pub fn mergeFrom(self: *PairCountHashTable, other: *const PairCountHashTable) !void {
+    /// Like mergeFrom but only merges entries where (slot.hash & (n_parts - 1)) == part_id.
+    /// Requires n_parts to be a power of 2.
+    pub fn mergeFromPart(self: *PairCountHashTable, other: *const PairCountHashTable, part_id: usize, n_parts: usize) !void {
         for (0..other.capacity) |i| {
             const s = other.slots[i];
             if (s.hash == EMPTY) continue;
+            if (s.hash & (n_parts - 1) != part_id) continue;
             if (self.count + 1 > (self.capacity * 7) / 10) try self.grow();
             const mask = self.capacity - 1;
             var sl = s.hash & mask;
@@ -475,11 +477,32 @@ pub const PairCountHashTable = struct {
         }
     }
 
-    fn hashPair(n: i64, s: []const u8) u64 {
+    pub fn hashPair(n: i64, s: []const u8) u64 {
         var h = std.hash.Wyhash.init(0);
         h.update(std.mem.asBytes(&n));
         h.update(s);
         return h.final();
+    }
+
+    /// Increment with a pre-computed tagged hash (avoids re-hashing in prefetch pipeline).
+    pub fn incrementPrehashed(self: *PairCountHashTable, i64_key: i64, str_key: []const u8, h: u64) !void {
+        if (self.count + 1 > (self.capacity * 7) / 10) try self.grow();
+        const mask = self.capacity - 1;
+        var slot = h & mask;
+        while (true) : (slot = (slot + 1) & mask) {
+            if (self.slots[slot].hash == EMPTY) {
+                self.slots[slot] = .{ .hash = h, .i64_key = i64_key, .str_key = str_key, .count = 1 };
+                self.count += 1;
+                return;
+            }
+            if (self.slots[slot].hash == h and
+                self.slots[slot].i64_key == i64_key and
+                std.mem.eql(u8, self.slots[slot].str_key, str_key))
+            {
+                self.slots[slot].count += 1;
+                return;
+            }
+        }
     }
 };
 
@@ -489,8 +512,8 @@ pub const PairCountHashTable = struct {
 /// Used for Q19: GROUP BY UserID, extract(minute FROM EventTime), SearchPhrase.
 /// Uses hash==0 as empty sentinel (no separate occupied[] array).
 pub const TripleCountHashTable = struct {
-    const EMPTY: u64 = 0;
-    const Slot = struct {
+    pub const EMPTY: u64 = 0;
+    pub const Slot = struct {
         hash:    u64,
         n0:      i64,
         n1:      i64,
@@ -564,6 +587,27 @@ pub const TripleCountHashTable = struct {
     pub fn iterate(self: *const TripleCountHashTable, ctx: anytype, comptime cb: fn (@TypeOf(ctx), i64, i64, []const u8, u64) void) void {
         for (0..self.capacity) |i| {
             if (self.slots[i].hash != EMPTY) cb(ctx, self.slots[i].n0, self.slots[i].n1, self.slots[i].str_key, self.slots[i].count);
+        }
+    }
+
+    pub fn mergeFromSlot(self: *TripleCountHashTable, s: Slot) !void {
+        if (self.count + 1 > (self.capacity * 7) / 10) try self.grow();
+        const mask = self.capacity - 1;
+        var sl = s.hash & mask;
+        while (true) : (sl = (sl + 1) & mask) {
+            if (self.slots[sl].hash == EMPTY) {
+                self.slots[sl] = s;
+                self.count += 1;
+                return;
+            }
+            if (self.slots[sl].hash == s.hash and
+                self.slots[sl].n0 == s.n0 and
+                self.slots[sl].n1 == s.n1 and
+                std.mem.eql(u8, self.slots[sl].str_key, s.str_key))
+            {
+                self.slots[sl].count += s.count;
+                return;
+            }
         }
     }
 
@@ -761,7 +805,8 @@ pub const StrAggHashTable = struct {
     const INITIAL_CAP = 64;
 
     const KeySlot = struct {
-        str: []const u8,
+        str:          []const u8,
+        int_sidecar:  i64 = 0,  // optional integer co-key (e.g. SearchEngineID in Q15)
     };
 
     key_slots:    []KeySlot,
@@ -865,6 +910,83 @@ pub const StrAggHashTable = struct {
         }
     }
 
+    /// Hash-only variant: treats equal 64-bit hash as equal key (no full string comparison).
+    /// Safe for high-cardinality string keys where wyhash collision probability is negligible
+    /// (~n²/2⁶⁴). Eliminates the random mmap pointer-chase in Phase 2 of two-phase string
+    /// aggregation, cutting DRAM stall time for large string columns (e.g. URL: 900 MB).
+    /// On insert the string slice is still stored in key_slots for use during emit.
+    pub fn getOrInsertHashOnly(
+        self:        *StrAggHashTable,
+        s:           []const u8,
+        h:           u64,
+        init_vals:   []const u64,
+        int_sidecar: i64,
+    ) !InsertResult {
+        if (self.count + 1 > (self.capacity * 7) / 10) try self.grow();
+        const mask = self.capacity - 1;
+        var   slot = h & mask;
+        while (true) : (slot = (slot + 1) & mask) {
+            const tag = self.tags[slot];
+            if (tag == EMPTY_TAG) {
+                self.key_slots[slot] = .{ .str = s, .int_sidecar = int_sidecar };
+                const vb = slot * self.num_aggs;
+                @memcpy(self.vals_flat[vb .. vb + self.num_aggs], init_vals);
+                self.tags[slot] = h;
+                self.count += 1;
+                if (self.num_str_aggs > 0) {
+                    const sb = slot * self.num_str_aggs;
+                    @memset(self.str_sidecar[sb .. sb + self.num_str_aggs], null);
+                }
+                return .{ .vals = self.vals_flat[vb .. vb + self.num_aggs], .slot = slot };
+            }
+            if (tag == h) { // hash match = key match (no string comparison)
+                const vb = slot * self.num_aggs;
+                return .{ .vals = self.vals_flat[vb .. vb + self.num_aggs], .slot = slot };
+            }
+        }
+    }
+
+    /// Probe-only variant: returns slot index if h matches an existing tag, null if absent.
+    /// PRECONDITION: caller must ensure count + 1 <= capacity * 7 / 10 (via growTo) before
+    /// calling so that a linear probe is guaranteed to terminate at an EMPTY_TAG.
+    pub fn probeHashOnly(self: *const StrAggHashTable, h: u64) ?usize {
+        const mask = self.capacity - 1;
+        var slot = h & mask;
+        while (true) : (slot = (slot + 1) & mask) {
+            const tag = self.tags[slot];
+            if (tag == EMPTY_TAG) return null;
+            if (tag == h) return slot;
+        }
+    }
+
+    /// Insert-only variant for use after probeHashOnly returned null.
+    /// PRECONDITION: caller already called growTo(capacity * 2) if needed, then
+    /// called probeHashOnly and confirmed the key is absent.
+    /// Finds the first EMPTY_TAG slot and inserts s with init_vals. Does NOT grow.
+    pub fn insertHashOnly(
+        self:      *StrAggHashTable,
+        s:         []const u8,
+        h:         u64,
+        init_vals: []const u64,
+    ) InsertResult {
+        const mask = self.capacity - 1;
+        var slot = h & mask;
+        while (true) : (slot = (slot + 1) & mask) {
+            if (self.tags[slot] == EMPTY_TAG) {
+                self.key_slots[slot] = .{ .str = s };
+                const vb = slot * self.num_aggs;
+                @memcpy(self.vals_flat[vb .. vb + self.num_aggs], init_vals);
+                self.tags[slot] = h;
+                self.count += 1;
+                if (self.num_str_aggs > 0) {
+                    const sb = slot * self.num_str_aggs;
+                    @memset(self.str_sidecar[sb .. sb + self.num_str_aggs], null);
+                }
+                return .{ .vals = self.vals_flat[vb .. vb + self.num_aggs], .slot = slot };
+            }
+        }
+    }
+
     /// Update a string sidecar entry (str_min or str_max) at the given slot.
     /// For str_min: replaces if new value is lexicographically smaller.
     /// For str_max: replaces if new value is lexicographically larger.
@@ -927,10 +1049,51 @@ pub const StrAggHashTable = struct {
         self.vals_flat   = new_vals;
         self.tags        = new_tags;
         self.str_sidecar = new_sc;
-        self.capacity    = new_cap;
-    }
+         self.capacity    = new_cap;
+     }
 
-    pub fn iterate(
+     /// Grow the HT to at least `new_cap` capacity before insertions to avoid
+     /// incremental doubling overhead.  No-op if already large enough.
+     /// Old arrays are leaked into `self.arena` (typically a query-lifetime arena).
+     pub fn growTo(self: *StrAggHashTable, new_cap: usize) !void {
+         if (new_cap <= self.capacity) return;
+         const actual_cap = nextPow2(new_cap);
+         const new_mask   = actual_cap - 1;
+         const new_keys   = try self.arena.alloc(KeySlot, actual_cap);
+         const new_vals   = try self.arena.alloc(u64, actual_cap * self.num_aggs);
+         const new_tags   = try self.arena.alloc(u64, actual_cap);
+         const new_sc     = if (self.num_str_aggs > 0)
+             try self.arena.alloc(?[]const u8, actual_cap * self.num_str_aggs)
+         else
+             try self.arena.alloc(?[]const u8, 0);
+         @memset(new_tags, EMPTY_TAG);
+         if (self.num_str_aggs > 0) @memset(new_sc, null);
+         for (0..self.capacity) |i| {
+             if (self.tags[i] == EMPTY_TAG) continue;
+             const h    = self.tags[i];
+             var   slot = h & new_mask;
+             while (new_tags[slot] != EMPTY_TAG) : (slot = (slot + 1) & new_mask) {}
+             new_keys[slot] = self.key_slots[i];
+             const src_vb = i          * self.num_aggs;
+             const dst_vb = slot       * self.num_aggs;
+             @memcpy(new_vals[dst_vb .. dst_vb + self.num_aggs],
+                     self.vals_flat[src_vb .. src_vb + self.num_aggs]);
+             new_tags[slot] = h;
+             if (self.num_str_aggs > 0) {
+                 const src_sb = i    * self.num_str_aggs;
+                 const dst_sb = slot * self.num_str_aggs;
+                 @memcpy(new_sc[dst_sb .. dst_sb + self.num_str_aggs],
+                         self.str_sidecar[src_sb .. src_sb + self.num_str_aggs]);
+             }
+         }
+         self.key_slots   = new_keys;
+         self.vals_flat   = new_vals;
+         self.tags        = new_tags;
+         self.str_sidecar = new_sc;
+         self.capacity    = actual_cap;
+     }
+
+     pub fn iterate(
         self: *const StrAggHashTable,
         ctx:  anytype,
         comptime cb: fn (@TypeOf(ctx), []const u8, []const u64) void,
@@ -959,19 +1122,20 @@ pub const StrAggHashTable = struct {
         }
     }
 
-    /// Merge all entries from `other` into `self`, combining accumulators by kind.
-    /// String sidecar (str_min/str_max) is also merged.
-    /// `kinds` must match the agg layout used by both tables.
-    pub fn mergeFrom(
-        self:  *StrAggHashTable,
-        other: *const StrAggHashTable,
-        kinds: []const CompactAggKind,
+    /// Like mergeFrom but only merges entries where (tags[i] % n_parts) == part_id.
+    /// Used by the partitioned parallel reduce path to avoid serial tree-merge.
+    pub fn mergeFromPart(
+        self:      *StrAggHashTable,
+        other:     *const StrAggHashTable,
+        kinds:     []const CompactAggKind,
         init_vals: []const u64,
+        part_id:   usize,
+        n_parts:   usize,
     ) !void {
         for (0..other.capacity) |i| {
             if (other.tags[i] == EMPTY_TAG) continue;
+            if (other.tags[i] % n_parts != part_id) continue;
             const key = other.key_slots[i].str;
-            // Reuse the precomputed hash stored in tags to avoid rehashing.
             const res = try self.getOrInsertH(key, other.tags[i], init_vals);
             const src_vb = i * other.num_aggs;
             for (kinds, 0..) |kind, ci| {
@@ -997,17 +1161,13 @@ pub const StrAggHashTable = struct {
                         const b: f64 = @bitCast(src);
                         if (b > a) res.vals[ci] = src;
                     },
-                    .str_min, .str_max => {
-                        // Sidecar merge.
-                    },
+                    .str_min, .str_max => {},
                 }
             }
-            // Merge str sidecar entries.
             if (other.num_str_aggs > 0 and self.num_str_aggs > 0) {
                 const src_sb = i * other.num_str_aggs;
                 for (0..@min(self.num_str_aggs, other.num_str_aggs)) |si| {
                     const src_s = other.str_sidecar[src_sb + si] orelse continue;
-                    // Determine min vs max from kinds order (str_min/str_max).
                     var sc_i: usize = 0;
                     for (kinds) |kind| {
                         if (kind == .str_min) {
@@ -1239,11 +1399,33 @@ pub const CompactIntKeyHashTable = struct {
         self.capacity = actual_cap;
     }
 
-    pub fn iterate(
-        self: *const CompactIntKeyHashTable,
-        ctx:  anytype,
-        comptime cb: fn (@TypeOf(ctx), []const i64, []const u64) void,
-    ) void {
+     /// Look up an existing entry by hash value only (no key comparison).
+     /// Returns a mutable slice of the agg vals for the first slot whose tag equals `h`,
+     /// or null if none is found (empty slot reached without a match).
+     ///
+     /// Safety: only call this after all groups have been inserted, and only when
+     /// hash collisions within the same partition are negligible (64-bit hash,
+     /// <10K groups per partition → collision prob ≈ 0).
+     pub fn lookupByHash(self: *const CompactIntKeyHashTable, h: u64) ?[]u64 {
+         const mask = self.capacity - 1;
+         const es   = self.entry_size;
+         var   slot = h & mask;
+         while (true) : (slot = (slot + 1) & mask) {
+             const base = slot * es;
+             const tag  = self.entries[base];
+             if (tag == EMPTY_TAG) return null;
+             if (tag == h) {
+                 const vb = base + 1 + self.num_keys;
+                 return self.entries[vb .. vb + self.num_aggs];
+             }
+         }
+     }
+
+     pub fn iterate(
+         self: *const CompactIntKeyHashTable,
+         ctx:  anytype,
+         comptime cb: fn (@TypeOf(ctx), []const i64, []const u64) void,
+     ) void {
         const es = self.entry_size;
         var key_buf: [16]i64 = undefined;
         for (0..self.capacity) |i| {
