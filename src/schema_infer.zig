@@ -169,10 +169,6 @@ fn inferColumn(name: []const u8, parquet_idx: usize, pt: i32, ct: ?i32) schema.C
     return .{
         .name = name,
         .ty = col_type,
-        .storage = switch (col_type) {
-            .text, .char => .lazy_source,
-            else => .fixed_eager,
-        },
         .physical = physical,
     };
 }
@@ -249,10 +245,6 @@ pub fn loadSchemaFromColumnsTxt(
         columns[ci] = .{
             .name = name_copy,
             .ty = col_type,
-            .storage = switch (col_type) {
-                .text, .char => .lazy_source,
-                else => .fixed_eager,
-            },
             .physical = physical,
         };
         ci += 1;

@@ -25,7 +25,7 @@ pub fn initStoreWithSchema(io: std.Io, data_dir: []const u8, table: schema.Table
     defer text.deinit(std.heap.smp_allocator);
     try text.print(std.heap.smp_allocator, "format=zighouse-native-v0\ntable={s}\nsegment_rows={d}\ncolumns={d}\n", .{ table.name, segment_rows, table.columns.len });
     for (table.columns, 0..) |column, i| {
-        try text.print(std.heap.smp_allocator, "column={d}:{s}:{s}:cardinality={s}:storage={s}\n", .{ i, column.name, @tagName(column.ty), @tagName(column.cardinality), @tagName(column.storage) });
+        try text.print(std.heap.smp_allocator, "column={d}:{s}:{s}\n", .{ i, column.name, @tagName(column.ty) });
         try createColumnPlaceholders(io, dir, i, column);
     }
     try dir.writeFile(io, .{ .sub_path = manifest_name, .data = text.items });

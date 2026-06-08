@@ -281,7 +281,7 @@ fn runCommand(init: std.process.Init, allocator: std.mem.Allocator, args: *std.p
         // Usage: zighouse bench <store_dir> <table_name> <queries_path>
         //        zighouse bench-one <store_dir> <table_name> <queries_path> <query_num>
         //        zighouse bench-range <store_dir> <table_name> <queries_path> <first> <limit>
-        const duckdb = @import("duckdb.zig");
+        const duckdb = @import("query_bench.zig");
         const QueryRange = duckdb.QueryRange;
         const ir_planner = @import("ir_planner");
         const core = @import("core");

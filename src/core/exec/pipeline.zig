@@ -2726,36 +2726,24 @@ fn executeHashAggChunked(
         try ht.IntKeyHashTable.initWithCapacity(alloc, keys.len, aggs.len, est_rows)
     else null;
 
-    // StrCountHashTable fast path: exactly one col_ref key (others may be constants) + count(*) agg.
-    // Handles Q34 (GROUP BY URL) and Q35 (GROUP BY 1, URL).
-    const maybe_str_count = blk: {
-        if (aggs.len != 1) break :blk false;
-        if (aggs[0].expr != .agg_call) break :blk false;
-        if (aggs[0].expr.agg_call.kind != .count_star) break :blk false;
+    // StrAggHashTable fast path: exactly one col_ref key (others may be literals) + all-compact aggs.
+    // Handles Q34 (GROUP BY URL), Q35 (GROUP BY 1, URL), Q22/Q23 (GROUP BY SearchPhrase + MIN/COUNT).
+    // Also triggered for regexp_replace single-key path (e.g. Q29).
+    const str_agg_col_idx: ?usize = blk: {
+        if (maybe_int_keys) break :blk null;
+        if (compact_kinds == null) break :blk null;
+        // Allow exactly one col_ref key with optional literal keys.
         var col_ref_count: usize = 0;
+        var col_ref_idx: usize = 0;
         for (keys) |k| {
             switch (k.expr) {
-                .col_ref => col_ref_count += 1,
+                .col_ref => |cr| { col_ref_count += 1; col_ref_idx = cr.index; },
                 .lit_i64, .lit_str => {},
-                else => break :blk false,
+                else => break :blk null,
             }
         }
-        break :blk col_ref_count == 1;
-    };
-    var ht_str_count: ?ht.StrCountHashTable = null;
-    var str_count_col_idx: usize = 0;
-    var use_str_count_path: bool = false;
-
-    // StrAggHashTable fast path: single string col_ref key + all-compact aggs
-    // (including str_min/str_max via sidecar).
-    // Handles Q22/Q23 (GROUP BY SearchPhrase + MIN/COUNT) and the Q29 regexp_replace path.
-    // Also triggered when maybe_str_count would apply but there are additional aggs beyond COUNT(*).
-    const str_agg_col_idx: ?usize = blk: {
-        if (maybe_int_keys) break :blk null;      // int key path takes priority
-        if (compact_kinds == null) break :blk null; // aggs not all compact
-        if (keys.len != 1) break :blk null;        // single key only
-        if (keys[0].expr != .col_ref) break :blk null;
-        break :blk keys[0].expr.col_ref.index;
+        if (col_ref_count != 1) break :blk null;
+        break :blk col_ref_idx;
     };
     var ht_str_agg: ?ht.StrAggHashTable = if (str_agg_col_idx != null or rr_can_use_str_agg)
         try ht.StrAggHashTable.initWithCapacity(alloc, aggs.len, num_str_aggs, est_rows)
@@ -2955,36 +2943,14 @@ fn executeHashAggChunked(
                 }
                 use_int_path = all_int;
             }
-            // Verify str-count eligibility (single string key col).
-            if (maybe_str_count and !use_int_path) {
-                // Find the single col_ref key (others are literals).
-                var found_col_ref: ?usize = null;
-                for (keys) |k| {
-                    if (k.expr == .col_ref) { found_col_ref = k.expr.col_ref.index; break; }
-                }
-                if (found_col_ref) |col_idx| {
-                    if (col_idx < c.columns.len) {
-                        switch (c.columns[col_idx].data) {
-                            .string => {
-                                str_count_col_idx = col_idx;
-                                ht_str_count = try ht.StrCountHashTable.initWithCapacity(alloc, est_rows);
-                                use_str_count_path = true;
-                            },
-                            else => {},
-                        }
-                    }
-                }
-            }
-            // Verify str-agg eligibility: single string col_ref key + compact numeric aggs.
+            // Verify str-agg eligibility: string col_ref key + compact aggs.
             if (str_agg_col_idx) |col_idx| {
-                if (!use_str_count_path and col_idx < c.columns.len and
-                    c.columns[col_idx].data == .string)
-                {
+                if (col_idx < c.columns.len and c.columns[col_idx].data == .string) {
                     use_str_agg_path = true;
                 }
             }
             // Verify pair-count eligibility: exactly two col_refs, one i64 and one string.
-            if (maybe_pair_count and !use_int_path and !use_str_count_path) {
+            if (maybe_pair_count and !use_int_path) {
                 const c0 = keys[0].expr.col_ref.index;
                 const c1 = keys[1].expr.col_ref.index;
                 if (c0 < c.columns.len and c1 < c.columns.len) {
@@ -3006,7 +2972,7 @@ fn executeHashAggChunked(
                 }
             }
             // Verify triple-count eligibility: (i64, date_part_datetime, string) + count(*).
-            if (maybe_triple_count != null and !use_int_path and !use_str_count_path and !use_pair_count_path) {
+            if (maybe_triple_count != null and !use_int_path and !use_pair_count_path) {
                 const td = maybe_triple_count.?;
                 if (td.n0_col < c.columns.len and td.dp_col < c.columns.len and td.str_col < c.columns.len) {
                     const n0_ok = c.columns[td.n0_col].data == .int64 or c.columns[td.n0_col].data == .uint64;
@@ -3021,16 +2987,6 @@ fn executeHashAggChunked(
             }
         }
         const refs = ref_indices.?;
-
-        if (use_str_count_path) {
-            // ── String-key count(*) fast path ─────────────────────────────────
-            const col = c.columns[str_count_col_idx];
-            const strs = col.data.string;
-            for (0..c.num_rows) |r| {
-                try ht_str_count.?.increment(strs[r]);
-            }
-            continue;
-        }
 
         if (use_pair_count_path) {
             // ── (i64, string) pair count(*) fast path ─────────────────────────
@@ -3336,29 +3292,7 @@ fn executeHashAggChunked(
 
     var rl = RowList.init(out_metas);
 
-    if (use_str_count_path) {
-        // Emit from StrCountHashTable. Keys may include literals (e.g. Q35: GROUP BY 1, URL).
-        const EmitCtxS = struct {
-            rl: *RowList, alloc: std.mem.Allocator,
-            keys: []const plan.ProjectItem,
-        };
-        var emit_ctx_s = EmitCtxS{ .rl = &rl, .alloc = alloc, .keys = keys };
-        ht_str_count.?.iterate(&emit_ctx_s, struct {
-            fn cb(ec: *EmitCtxS, s: []const u8, count: u64) void {
-                const row = ec.alloc.alloc(?Value, ec.keys.len + 1) catch return;
-                for (ec.keys, 0..) |k, i| {
-                    row[i] = switch (k.expr) {
-                        .col_ref => Value{ .string = s },
-                        .lit_i64 => |v| Value{ .int64 = v },
-                        .lit_str => |v| Value{ .string = v },
-                        else => Value{ .int64 = 0 },
-                    };
-                }
-                row[ec.keys.len] = Value{ .uint64 = count };
-                ec.rl.append(ec.alloc, row) catch {};
-            }
-        }.cb);
-    } else if (use_pair_count_path) {
+    if (use_pair_count_path) {
         // Emit from PairCountHashTable: restore key order (i64, str or str, i64).
         const k0_is_i64 = keys[0].expr.col_ref.index == pair_i64_col_idx;
         const EmitCtxP = struct {
@@ -3402,12 +3336,13 @@ fn executeHashAggChunked(
         }.cb);
     } else if (use_str_agg_path or rr_used_str_agg) {
         // Emit from StrAggHashTable: string key + compact aggs → Values.
-        // Uses sidecar for str_min/str_max aggs.
+        // Handles literal keys alongside the col_ref key (e.g. Q35: GROUP BY 1, URL).
         // Also used when regexp_replace key path routed to ht_str_agg (Q29).
         const EmitCtxSA = struct {
             rl:           *RowList,
             alloc:        std.mem.Allocator,
             aggs:         []const plan.ProjectItem,
+            keys:         []const plan.ProjectItem,
             kinds:        []const ht.CompactAggKind,
             str_ht:       *ht.StrAggHashTable,
             sidecar_idx:  []const usize,
@@ -3416,15 +3351,24 @@ fn executeHashAggChunked(
             .rl          = &rl,
             .alloc       = alloc,
             .aggs        = aggs,
+            .keys        = keys,
             .kinds       = compact_kinds.?,
             .str_ht      = &ht_str_agg.?,
             .sidecar_idx = str_agg_sidecar_idx,
         };
         ht_str_agg.?.iterateWithSlot(&emit_ctx_sa, struct {
             fn cb(ec: *EmitCtxSA, s: []const u8, vals: []const u64, slot: usize) void {
-                const row = ec.alloc.alloc(?Value, 1 + vals.len) catch return;
-                row[0] = Value{ .string = s };
-                emitCompactValsWithSidecar(vals, ec.kinds, ec.aggs, row[1..], ec.str_ht, slot, ec.sidecar_idx);
+                const row = ec.alloc.alloc(?Value, ec.keys.len + vals.len) catch return;
+                for (ec.keys, 0..) |k, i| {
+                    row[i] = switch (k.expr) {
+                        // col_ref and fn_call (e.g. regexp_replace) both map to the string key s.
+                        .col_ref, .fn_call => Value{ .string = s },
+                        .lit_i64 => |v| Value{ .int64 = v },
+                        .lit_str => |v| Value{ .string = v },
+                        else => Value{ .string = s },
+                    };
+                }
+                emitCompactValsWithSidecar(vals, ec.kinds, ec.aggs, row[ec.keys.len..], ec.str_ht, slot, ec.sidecar_idx);
                 ec.rl.append(ec.alloc, row) catch {};
             }
         }.cb);
