@@ -262,6 +262,25 @@ pub fn loadSchemaFromColumnsTxt(
     const final_columns = columns[0..ci];
     const final_names   = names[0..n_init];
 
+    // Wire up hash-sidecar: for any string column "X" where "XHash" (Int64/UInt64)
+    // also exists in the schema, set X.physical.lazy_text.hash_column = "XHash".
+    // This enables executeHashAggParallelStrKeyViaHash for GROUP BY X queries
+    // (aggregates by integer hash instead of string, then late-materializes strings).
+    for (final_columns) |*col| {
+        if (col.physical != .lazy_text) continue;
+        for (final_columns) |other| {
+            if (other.ty != .int64) continue;
+            const expected_len = col.name.len + 4; // "Hash" = 4 chars
+            if (other.name.len != expected_len) continue;
+            if (!std.mem.eql(u8, other.name[0..col.name.len], col.name)) continue;
+            if (!std.mem.eql(u8, other.name[col.name.len..], "Hash")) continue;
+            // other.name is "XHash" — wire it as the hash sidecar.
+            // other.name lifetime = InferredSchema lifetime (owned by names[]).
+            col.physical.lazy_text.hash_column = other.name;
+            break;
+        }
+    }
+
     return .{
         .table     = .{ .name = table_name, .columns = final_columns },
         .allocator = allocator,

@@ -181,6 +181,23 @@ pub fn loadFromSlice(allocator: std.mem.Allocator, json_bytes: []const u8) !Sche
             };
         }
 
+        // Parse optional sort_keys array.
+        var sort_keys: []const []const u8 = &.{};
+        if (obj.get("sort_keys")) |sk_val| {
+            const sk_arr = switch (sk_val) {
+                .array => |arr| arr,
+                else => return error.SortKeysNotArray,
+            };
+            const sks = try a.alloc([]const u8, sk_arr.items.len);
+            for (sk_arr.items, sks) |sk_item, *sk| {
+                sk.* = switch (sk_item) {
+                    .string => |s| s,
+                    else => return error.SortKeyNotString,
+                };
+            }
+            sort_keys = sks;
+        }
+
         const cols_arr = switch (cols_val) {
             .array => |arr| arr,
             else => return error.ColumnsNotArray,
@@ -217,7 +234,7 @@ pub fn loadFromSlice(allocator: std.mem.Allocator, json_bytes: []const u8) !Sche
             .db = db_str,
             .name = name_str,
             .pk = pk_str,
-            .table = .{ .name = name_str, .columns = columns },
+            .table = .{ .name = name_str, .columns = columns, .sort_keys = sort_keys },
         };
     }
 

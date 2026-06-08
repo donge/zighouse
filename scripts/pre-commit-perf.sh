@@ -7,7 +7,6 @@ cd "$ROOT"
 PARQUET_PATH=${ZIGHOUSE_PERF_PARQUET:-data/hits_10m.parquet}
 BASELINE=${ZIGHOUSE_PERF_BASELINE:-perf/baselines/local-10m-ir.json}
 LIMIT_ROWS=${ZIGHOUSE_PERF_LIMIT_ROWS:-10000000}
-QUERY_PATH=${ZIGHOUSE_PERF_QUERY_PATH:-specialized}
 TMP_ROOT=${TMPDIR:-/tmp}
 # Persistent store: only re-import when parquet or limit changes.
 STORE_DIR="${ZIGHOUSE_PERF_STORE:-${TMP_ROOT%/}/zighouse-precommit-ir-store}"
@@ -44,8 +43,8 @@ if $needs_import; then
   echo "pre-commit perf: importing ClickBench ${LIMIT_ROWS} rows -> ${STORE_DIR}"
   rm -rf "$STORE_DIR"
   mkdir -p "$STORE_DIR"
-  import_args=("$ZIGHOUSE" import-parquet --format=generic "$PARQUET_PATH" "$STORE_DIR" hits)
-  env ZIGHOUSE_IMPORT_TRACE=1 "${import_args[@]}"
+  env ZIGHOUSE_IMPORT_TRACE=1 \
+    "$ZIGHOUSE" import-parquet --format=generic "$PARQUET_PATH" "$STORE_DIR" hits
   echo "$FINGERPRINT" > "$FINGERPRINT_FILE"
 else
   echo "pre-commit perf: reusing cached store ${STORE_DIR}"
@@ -55,7 +54,7 @@ WORK_DIR=$(mktemp -d "${TMP_ROOT%/}/zighouse-precommit-perf.XXXXXX")
 trap 'rm -rf "$WORK_DIR"' EXIT
 OUT_JSON="$WORK_DIR/perf.json"
 
-echo "pre-commit perf: running ClickBench bench x${BENCH_REPEATS} (${QUERY_PATH})"
+echo "pre-commit perf: running ClickBench bench x${BENCH_REPEATS}"
 
 # Run bench BENCH_REPEATS times and collect timing rows.
 TMP_BENCH="$WORK_DIR/bench_runs"
@@ -67,13 +66,12 @@ else
 fi
 
 for i in $(seq 1 "$BENCH_REPEATS"); do
-  "${TIME_CMD[@]}" sh -c "env ZIGHOUSE_CLICKBENCH_SUBMIT=1 ZIGHOUSE_QUERY_PATH='$QUERY_PATH' \
+  "${TIME_CMD[@]}" sh -c "env ZIGHOUSE_CLICKBENCH_SUBMIT=1 \
     '$ZIGHOUSE' bench '$STORE_DIR' hits clickbench-submit/zighouse/queries.sql 2>/dev/null" \
     > "$TMP_BENCH/bench-${i}.log" 2>&1
 done
 
 # Import measurement: record wall time for a small sample import.
-# For the IR path, use a 1M parquet file to keep this fast.
 import_log="$WORK_DIR/import.log"
 import_store="$WORK_DIR/import_store"
 IMPORT_SAMPLE_PARQUET="${ZIGHOUSE_PERF_IMPORT_SAMPLE:-data/hits_1m_snappy.parquet}"
@@ -90,7 +88,7 @@ else
 fi
 
 python3 - "$OUT_JSON" "$PARQUET_PATH" "$STORE_DIR" "$LIMIT_ROWS" "$BENCH_REPEATS" \
-          "$TMP_BENCH" "$import_log" "$QUERY_PATH" <<'PY'
+          "$TMP_BENCH" "$import_log" <<'PY'
 import ast
 import json
 import platform
@@ -99,14 +97,13 @@ import subprocess
 import sys
 from pathlib import Path
 
-out_path    = Path(sys.argv[1])
+out_path     = Path(sys.argv[1])
 parquet_path = sys.argv[2]
-store_dir   = Path(sys.argv[3])
-limit_rows  = int(sys.argv[4])
-repeats     = int(sys.argv[5])
-bench_dir   = Path(sys.argv[6])
-import_log  = Path(sys.argv[7])
-query_path  = sys.argv[8]
+store_dir    = Path(sys.argv[3])
+limit_rows   = int(sys.argv[4])
+repeats      = int(sys.argv[5])
+bench_dir    = Path(sys.argv[6])
+import_log   = Path(sys.argv[7])
 
 
 def read(path: Path) -> str:
@@ -156,7 +153,6 @@ def extract_summary(text: str) -> dict:
 
 
 def extract_rows(text: str):
-    text = re.sub(r"query_path_compare[^\n]*\n", "", text)
     rows = []
     for line in text.splitlines():
         s = line.strip()
@@ -166,41 +162,6 @@ def extract_rows(text: str):
     if len(rows) != 43:
         raise SystemExit(f"expected 43 timing rows, got {len(rows)}")
     return rows
-
-
-def extract_compare_timings(text: str):
-    matches = list(re.finditer(
-        r"query_path_compare (?:query=([^\s]+)|path=([^\s]+)) "
-        r"generic_seconds=([0-9.]+) specialized_seconds=([0-9.]+) "
-        r"ratio=([0-9.]+) equal=(true|false)",
-        text,
-    ))
-    if not matches:
-        return None
-    if len(matches) % 43 != 0:
-        raise SystemExit(f"expected compare timing count to be divisible by 43, got {len(matches)}")
-    repeats_per_query = len(matches) // 43
-    grouped = []
-    for q in range(43):
-        rows = []
-        for m in matches[q * repeats_per_query : (q + 1) * repeats_per_query]:
-            rows.append({
-                "kind": m.group(1) or m.group(2),
-                "generic_seconds": float(m.group(3)),
-                "specialized_seconds": float(m.group(4)),
-                "ratio": float(m.group(5)),
-                "equal": m.group(6) == "true",
-            })
-        grouped.append(rows)
-    generic_best = [min(row["generic_seconds"] for row in rows) for rows in grouped]
-    specialized_best = [min(row["specialized_seconds"] for row in rows) for rows in grouped]
-    return {
-        "repeats_per_query": repeats_per_query,
-        "timings": grouped,
-        "warm_best_generic_sum": sum(generic_best),
-        "warm_best_specialized_sum": sum(specialized_best),
-        "all_equal": all(row["equal"] for rows in grouped for row in rows),
-    }
 
 
 def store_size(path: Path) -> int:
@@ -230,25 +191,22 @@ def median(values):
 
 
 # Read import measurement.
-import_text = read(import_log)
-import_wall = extract_time(import_text)
+import_text  = read(import_log)
+import_wall  = extract_time(import_text)
 import_total = extract_import_total(import_text)
 import_rss   = extract_rss(import_text)
 
-# Read bench runs (skip run 1 as warm-up if we have > 2 runs).
+# Read bench runs.
 runs = []
 for i in range(1, repeats + 1):
     bench_text = read(bench_dir / f"bench-{i}.log")
     summary = extract_summary(bench_text)
     rows = extract_rows(bench_text)
-    compare = extract_compare_timings(bench_text)
     query = {
         **summary,
         "timings": rows,
         "warm_best_from_rows": sum(min((x for x in row if x is not None), default=0.0) for row in rows),
     }
-    if compare is not None:
-        query["compare"] = compare
     runs.append({
         "run": i,
         "import": {"wall_seconds": import_wall, "total_seconds": import_total, "rss_bytes": import_rss},
@@ -266,9 +224,7 @@ data = {
     "parquet": parquet_path,
     "limit_rows": limit_rows or None,
     "queries": "clickbench-submit/zighouse/queries.sql",
-    "query_path": query_path,
     "build": {
-        "args": ["-Dduckdb=true"],
         "git_commit": git_value(["rev-parse", "HEAD"]),
         "git_dirty": bool(git_value(["status", "--short"])),
     },

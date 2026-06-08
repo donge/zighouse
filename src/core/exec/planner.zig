@@ -935,8 +935,17 @@ fn schemaToCore(ty: schema_mod.ColumnType, ch_type: ?[]const u8) ColumnType {
         // Map(String,*) stays as .string (custom blob, not array_string)
     }
     return switch (ty) {
-        .int8  => .bool_u8,
-        .int16 => .uint64,   // UInt16 → uint64 (narrowed at wire time)
+        .int8  => blk: {
+            // UInt8 / Bool → bool_u8 (unsigned byte output)
+            // Int8 (signed) → int64 to preserve negative values
+            if (ch_type) |ct| if (std.mem.startsWith(u8, ct, "Int")) break :blk .int64;
+            break :blk .bool_u8;
+        },
+        .int16 => blk: {
+            // UInt16 → uint64; Int16 (signed, default) → int64
+            if (ch_type) |ct| if (std.mem.startsWith(u8, ct, "U")) break :blk .uint64;
+            break :blk .int64;
+        },
         .int32 => blk: {
             if (ch_type) |ct| if (std.mem.startsWith(u8, ct, "U")) break :blk .uint64;
             break :blk .int64;

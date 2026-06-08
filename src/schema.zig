@@ -168,6 +168,12 @@ pub const Column = struct {
 pub const Table = struct {
     name: []const u8,
     columns: []const Column,
+    /// Columns whose data is stored in globally-sorted (non-decreasing) order
+    /// within a single part.  Used for binary-search row-range pushdown at
+    /// query time: an equality filter `col = val` on a sort key column is
+    /// resolved by binary-searching the raw column data to find [lo, hi) and
+    /// restricting all scans to that window.
+    sort_keys: []const []const u8 = &.{},
 
     pub fn findColumn(self: Table, name: []const u8) ?usize {
         for (self.columns, 0..) |column, i| {

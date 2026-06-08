@@ -118,6 +118,11 @@ const ScanState = struct {
     load_lock:    std.atomic.Value(u8),
     /// Columns to decode as bool_u8 (1=non-empty, 0=empty) instead of full slices.
     nonempty_bool: [256]bool,
+    /// Row-range restriction: only rows in [scan_lo, scan_hi) are visible.
+    /// scan_hi is clamped to row_count at access time.
+    /// Defaults to [0, maxInt(u64)] = full scan.
+    scan_lo: u64,
+    scan_hi: u64,
 
     fn init(
         alloc: std.mem.Allocator,
@@ -198,6 +203,8 @@ const ScanState = struct {
             .zero_str    = zero_str,
             .zero_astr   = zero_astr,
             .zero_nmask  = zero_nmask,
+            .scan_lo     = 0,
+            .scan_hi     = std.math.maxInt(u64),
         };
     }
 
@@ -236,7 +243,7 @@ const ScanState = struct {
             const in_override = self.override_active and ci < 256 and self.override_needed[ci];
             if (!in_needed and !in_override) continue;
 
-            if (col.ty == .text or col.ty == .char) {
+            if (col.ty == .text or col.ty == .char or col.ty == .low_card) {
                 // String column: mmap .str.bin
                 const path = try generic_store.columnStrBinPath(self.alloc, self.part_dir, col.name);
                 defer self.alloc.free(path);
@@ -303,12 +310,32 @@ const ScanState = struct {
 
     fn reset(self: *ScanState) void {
         self.rows_read = 0;
+        // Note: scan_lo/scan_hi are intentionally NOT reset here.
+        // The caller is responsible for restoring them via setRowRange(0, maxInt(u64)).
+    }
+
+    /// Effective start row (absolute) for the current scan.
+    inline fn effectiveLo(self: *const ScanState) u64 {
+        return @min(self.scan_lo, self.row_count);
+    }
+    /// Effective end row (exclusive, absolute).
+    inline fn effectiveHi(self: *const ScanState) u64 {
+        return @min(self.scan_hi, self.row_count);
+    }
+    /// Number of rows visible under the current row-range restriction.
+    inline fn effectiveCount(self: *const ScanState) u64 {
+        const hi = self.effectiveHi();
+        const lo = self.effectiveLo();
+        return if (hi > lo) hi - lo else 0;
     }
 
     /// Thread-safe: reads rows [start, start+n) for the currently-loaded columns.
+    /// `start` is relative to scan_lo (0 = first visible row).
     /// Caller must have called loadColumns() already.
     /// Uses caller-supplied `alloc` so multiple threads can allocate independently.
     fn fetchRange(self: *const ScanState, start: u64, n: usize, out: *DataChunk, alloc: std.mem.Allocator) !void {
+        // Translate relative start to absolute row index.
+        const abs_start = self.effectiveLo() + start;
         const null_words = chunk.nullMaskWords(n);
         // For pruned columns in fetchRange, we may need larger zero buffers than
         // the pre-allocated ones; now sized to 131_072 to cover morsel-sized fetches.
@@ -383,9 +410,6 @@ const ScanState = struct {
                         .{ .int64 = zero_i64_slice }
                     else
                         .{ .datetime64_ms = zero_i64_slice };
-                    const buf = try chunk_alloc.alloc(i64, n);
-                    null_mask = try chunk_alloc.alloc(u64, null_words);
-                    @memset(null_mask, 0);
                     const bytes = self.col_data[ci].fixed.bytes;
                     const width: usize = switch (col.ty) {
                         .int8  => 1,
@@ -393,16 +417,38 @@ const ScanState = struct {
                         .int32, .date => 4,
                         else   => 8,
                     };
+                    // Zero-copy fast path for native-width int64/datetime columns:
+                    // The on-disk format is 8-byte little-endian, identical to i64 in memory
+                    // on little-endian targets (x86, ARM).  Return a direct mmap'd slice
+                    // — avoids a 983KB allocation + copy per morsel (~5ms over full scan).
+                    if (width == 8) {
+                        const src: [*]i64 = @ptrCast(@alignCast(@constCast(bytes.ptr)));
+                        const slice = src[abs_start..abs_start + n];
+                        break :blk if (core_ty == .int64) .{ .int64 = slice } else .{ .datetime64_ms = slice };
+                    }
+                    const buf = try chunk_alloc.alloc(i64, n);
+                    null_mask = try chunk_alloc.alloc(u64, null_words);
+                    @memset(null_mask, 0);
                     // Fast path for int16: direct pointer cast → auto-vectorized by compiler.
                     // This avoids the readInt overhead (scalar byte-by-byte) and lets
                     // ReleaseFast emit SIMD widening instructions (≈8x faster than scalar).
                     if (width == 2) {
                         const src: [*]const i16 = @ptrCast(@alignCast(bytes.ptr));
-                        const base = start;
+                        const base = abs_start;
+                        for (0..n) |i| { buf[i] = src[base + i]; }
+                    } else if (width == 1) {
+                        // int8: direct pointer cast → auto-vectorized sign-extend i8→i64.
+                        const src: [*]const i8 = @ptrCast(bytes.ptr);
+                        const base = abs_start;
+                        for (0..n) |i| { buf[i] = src[base + i]; }
+                    } else if (width == 4) {
+                        // int32: direct pointer cast → auto-vectorized sign-extend i32→i64.
+                        const src: [*]const i32 = @ptrCast(@alignCast(bytes.ptr));
+                        const base = abs_start;
                         for (0..n) |i| { buf[i] = src[base + i]; }
                     } else {
                     for (0..n) |i| {
-                        const off = (start + i) * width;
+                        const off = (abs_start + i) * width;
                         buf[i] = switch (width) {
                             1 => @as(i8, @bitCast(bytes[off])),
                             4 => std.mem.readInt(i32, bytes[off..][0..4], .little),
@@ -414,20 +460,20 @@ const ScanState = struct {
                 },
                 .float64 => blk: {
                     if (is_pruned) break :blk .{ .float64 = zero_f64_slice };
+                    const bytes = self.col_data[ci].fixed.bytes;
+                    const width: usize = if (col.ty == .float32) 4 else 8;
+                    if (width == 8) {
+                        // Zero-copy: mmap'd f64 data is already native IEEE-754 on little-endian.
+                        const src: [*]f64 = @ptrCast(@alignCast(@constCast(bytes.ptr)));
+                        break :blk .{ .float64 = src[abs_start..abs_start + n] };
+                    }
                     const fbuf = try chunk_alloc.alloc(f64, n);
                     null_mask = try chunk_alloc.alloc(u64, null_words);
                     @memset(null_mask, 0);
-                    const bytes = self.col_data[ci].fixed.bytes;
-                    const width: usize = if (col.ty == .float32) 4 else 8;
                     for (0..n) |i| {
-                        const off = (start + i) * width;
-                        if (width == 4) {
-                            const iv = std.mem.readInt(i32, bytes[off..][0..4], .little);
-                            fbuf[i] = @floatCast(@as(f32, @bitCast(iv)));
-                        } else {
-                            const iv = std.mem.readInt(i64, bytes[off..][0..8], .little);
-                            fbuf[i] = @bitCast(iv);
-                        }
+                        const off = (abs_start + i) * width;
+                        const iv = std.mem.readInt(i32, bytes[off..][0..4], .little);
+                        fbuf[i] = @floatCast(@as(f32, @bitCast(iv)));
                     }
                     break :blk .{ .float64 = fbuf };
                 },
@@ -437,11 +483,11 @@ const ScanState = struct {
                     null_mask = try chunk_alloc.alloc(u64, null_words);
                     @memset(null_mask, 0);
                     const bytes = self.col_data[ci].fixed.bytes;
-                    for (0..n) |i| {
-                        const off = (start + i) * 4;
-                        const iv = std.mem.readInt(i32, bytes[off..][0..4], .little);
-                        ubuf[i] = @truncate(@as(u32, @bitCast(iv)));
-                    }
+                    // Fast path: date stored as int32 (4 bytes LE); truncate lower 16 bits.
+                    // Direct pointer cast → auto-vectorized truncation i32→u16.
+                    const src: [*]const i32 = @ptrCast(@alignCast(bytes.ptr));
+                    const base = abs_start;
+                    for (0..n) |i| { ubuf[i] = @truncate(@as(u32, @bitCast(src[base + i]))); }
                     break :blk .{ .date_u16 = ubuf };
                 },
                 .string => blk: {
@@ -454,7 +500,7 @@ const ScanState = struct {
                         @memset(null_mask, 0);
                         const sc = &self.col_data[ci].string;
                         for (0..n) |i| {
-                            const row = start + i;
+                            const row = abs_start + i;
                             bbuf[i] = if (sc.offsets[row + 1] > sc.offsets[row]) 1 else 0;
                         }
                         break :blk .{ .bool_u8 = bbuf };
@@ -464,7 +510,7 @@ const ScanState = struct {
                     @memset(null_mask, 0);
                     const sc = &self.col_data[ci].string;
                     for (0..n) |i| {
-                        sbuf[i] = sc.str(start + i);
+                        sbuf[i] = sc.str(abs_start + i);
                     }
                     break :blk .{ .string = sbuf };
                 },
@@ -478,15 +524,10 @@ const ScanState = struct {
                 },
                 .uint64 => blk: {
                     if (is_pruned) break :blk .{ .uint64 = zero_u64_slice };
-                    const ubuf = try chunk_alloc.alloc(u64, n);
-                    null_mask = try chunk_alloc.alloc(u64, null_words);
-                    @memset(null_mask, 0);
                     const bytes = self.col_data[ci].fixed.bytes;
-                    for (0..n) |i| {
-                        const off = (start + i) * 8;
-                        ubuf[i] = std.mem.readInt(u64, bytes[off..][0..8], .little);
-                    }
-                    break :blk .{ .uint64 = ubuf };
+                    // Zero-copy: mmap'd u64 data is already native little-endian on ARM/x86.
+                    const src: [*]u64 = @ptrCast(@alignCast(@constCast(bytes.ptr)));
+                    break :blk .{ .uint64 = src[abs_start..abs_start + n] };
                 },
                 .array_string => blk: {
                     if (is_pruned) break :blk .{ .array_string = self.zero_astr[0..@min(n, self.zero_astr.len)] };
@@ -511,9 +552,11 @@ const ScanState = struct {
     fn nextChunk(self: *ScanState, out: *DataChunk, ctx: *QueryContext) !bool {
         try self.loadColumns();
 
-        if (self.rows_read >= self.row_count) return false;
+        const eff_hi = self.effectiveHi();
+        const eff_lo = self.effectiveLo();
+        if (self.rows_read >= eff_hi - eff_lo) return false;
 
-        const remaining = self.row_count - self.rows_read;
+        const remaining = (eff_hi - eff_lo) - self.rows_read;
         const n = @min(remaining, chunk.CHUNK_SIZE);
 
         const arena_alloc = ctx.allocator();
@@ -524,7 +567,7 @@ const ScanState = struct {
         };
         const chunk_alloc = out.arena.allocator();
         const null_words  = chunk.nullMaskWords(n);
-        const base = self.rows_read;
+        const base = eff_lo + self.rows_read;  // absolute row index
 
         // Shared zero null_mask for all pruned/non-nullable columns.
         // The pre-allocated buffer covers 131_072 rows; trim to null_words.
@@ -733,7 +776,7 @@ pub const GenericStoreBridge = struct {
 
     fn rowCountFn(ptr: *anyopaque) u64 {
         const self: *GenericStoreBridge = @ptrCast(@alignCast(ptr));
-        return self.state.row_count;
+        return self.state.effectiveCount();
     }
 
     fn fetchRangeFn(ptr: *anyopaque, start: u64, n: usize, out: *DataChunk, alloc: std.mem.Allocator) !void {
@@ -763,6 +806,10 @@ pub const GenericStoreBridge = struct {
             }
         }
         s.override_active = true;
+        // Reset loaded so the next loadColumns call picks up the newly-needed columns.
+        // loadColumns skips columns already mmap'd (col_data != .none), so this is
+        // incremental: only truly new columns are opened.
+        @atomicStore(bool, &s.loaded, false, .release);
     }
 
     fn setStringNonEmptyBoolFn(ptr: *anyopaque, col_name: ?[]const u8) void {
@@ -838,6 +885,32 @@ pub const GenericStoreBridge = struct {
         return null;
     }
 
+    fn getRawInt32ColFn(ptr: *anyopaque, col_name: []const u8) ?[]const i32 {
+        const self: *GenericStoreBridge = @ptrCast(@alignCast(ptr));
+        const s = self.state;
+        s.loadColumns() catch return null;
+        for (s.table.columns, 0..) |col, ci| {
+            if (!std.mem.eql(u8, col.name, col_name)) continue;
+            if (col.ty != .int32 and col.ty != .date) return null;
+            if (ci >= s.col_data.len) return null;
+            if (s.col_data[ci] != .fixed) return null;
+            const bytes = s.col_data[ci].fixed.bytes;
+            return @as([*]const i32, @ptrCast(@alignCast(bytes.ptr)))[0 .. bytes.len / 4];
+        }
+        return null;
+    }
+
+    fn setRowRangeFn(ptr: *anyopaque, lo: u64, hi: u64) void {
+        const self: *GenericStoreBridge = @ptrCast(@alignCast(ptr));
+        self.state.scan_lo = lo;
+        self.state.scan_hi = hi;
+    }
+
+    fn getSortKeysFn(ptr: *anyopaque) []const []const u8 {
+        const self: *GenericStoreBridge = @ptrCast(@alignCast(ptr));
+        return self.state.table.sort_keys;
+    }
+
     const vtable = SourceIface.VTable{
         .nextChunk              = nextChunkFn,
         .reset                  = resetFn,
@@ -850,5 +923,8 @@ pub const GenericStoreBridge = struct {
         .getRawInt64Col         = getRawInt64ColFn,
         .getRawStrOffsets       = getRawStrOffsetsFn,
         .getRawStrBytes         = getRawStrBytesFn,
+        .getRawInt32Col         = getRawInt32ColFn,
+        .setRowRange            = setRowRangeFn,
+        .getSortKeys            = getSortKeysFn,
     };
 };

@@ -650,6 +650,48 @@ fn buildWhereNode(allocator: Allocator, e: ast.Expr, ctes: []ast.Cte) BuildError
             node.* = if (isn.is_not) .{ .is_not_null = col } else .{ .is_null = col };
             return node;
         },
+        .in_list => |il| {
+            // col IN (v1, v2, ...) → OR(col=v1, col=v2, ...)
+            // Only handle the case where LHS is a simple column and all items are integer literals.
+            if (il.lhs != .col) return error.UnsupportedFeature;
+            if (il.items.len == 0) return error.UnsupportedFeature;
+
+            // Build one cmp_int WhereNode per item (each owns its own copy of col_name).
+            const cmp_op: CmpOp = if (il.negated) .ne else .eq;
+            var children: std.ArrayListUnmanaged(*WhereNode) = .empty;
+            errdefer {
+                for (children.items) |ch| generic_sql.freeWhereNode(allocator, ch);
+                children.deinit(allocator);
+            }
+            for (il.items) |item| {
+                const val: i64 = switch (item) {
+                    .int  => |v| v,
+                    .uint => |v| @intCast(v),
+                    else  => return error.UnsupportedFeature,
+                };
+                const col_copy = try allocator.dupe(u8, il.lhs.col);
+                errdefer allocator.free(col_copy);
+                const ch = try allocator.create(WhereNode);
+                ch.* = .{ .cmp_int = .{ .col = col_copy, .op = cmp_op, .val = val } };
+                try children.append(allocator, ch);
+            }
+
+            if (children.items.len == 1) {
+                // Single value: just return the cmp_int directly.
+                node.* = children.items[0].*;
+                allocator.destroy(children.items[0]);
+                children.deinit(allocator);
+            } else if (il.negated) {
+                // NOT IN → AND(col!=v1, col!=v2, ...)
+                const owned = try children.toOwnedSlice(allocator);
+                node.* = .{ .and_ = owned };
+            } else {
+                // IN → OR(col=v1, col=v2, ...)
+                const owned = try children.toOwnedSlice(allocator);
+                node.* = .{ .or_ = owned };
+            }
+            return node;
+        },
         else => return error.UnsupportedFeature,
     }
 }

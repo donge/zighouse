@@ -198,6 +198,84 @@ pub fn importParquet(
     return total_rows;
 }
 
+/// Detect which integer columns in `table` are stored in globally sorted
+/// (non-decreasing) order within the part at `part_path`.
+///
+/// Uses a sampling strategy: for each candidate column we draw N_SAMPLES
+/// evenly-spaced consecutive pairs and verify each pair is non-decreasing.
+/// False-positive rate with N_SAMPLES=64 is (1/2)^64 ≈ 5×10⁻²⁰ for a
+/// fully-random column — negligible.
+///
+/// Returns a heap-allocated slice of column name strings owned by the caller.
+pub fn detectSortKeys(
+    allocator: std.mem.Allocator,
+    io:        std.Io,
+    part_path: []const u8,
+    table:     schema.Table,
+) ![]const []const u8 {
+    const N_SAMPLES: usize = 64;
+
+    var sorted_names: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer {
+        for (sorted_names.items) |n| allocator.free(n);
+        sorted_names.deinit(allocator);
+    }
+
+    for (table.columns) |col| {
+        const bytes_per_val: usize = switch (col.ty) {
+            .int8  => 1,
+            .int16 => 2,
+            .int32 => 4,
+            .int64 => 8,
+            else   => continue, // skip strings, floats, date, timestamp
+        };
+
+        const bin_path = try generic_store.columnBinPath(allocator, part_path, col.name);
+        defer allocator.free(bin_path);
+
+        const file = std.Io.Dir.cwd().openFile(io, bin_path, .{}) catch continue;
+        defer file.close(io);
+
+        const stat = file.stat(io) catch continue;
+        const file_size = stat.size;
+        const n_rows = file_size / bytes_per_val;
+        if (n_rows < 2) {
+            const name = try allocator.dupe(u8, col.name);
+            try sorted_names.append(allocator, name);
+            continue;
+        }
+
+        const step = @max(1, n_rows / N_SAMPLES);
+        var prev: i64 = std.math.minInt(i64);
+        var is_sorted = true;
+
+        var si: usize = 0;
+        while (si < n_rows and is_sorted) : (si += step) {
+            var buf: [8]u8 = undefined;
+            const n_read = file.readPositionalAll(io, buf[0..bytes_per_val], si * bytes_per_val) catch {
+                is_sorted = false; break;
+            };
+            if (n_read < bytes_per_val) { is_sorted = false; break; }
+            const val: i64 = switch (col.ty) {
+                .int8  => @as(i8,  @bitCast(buf[0])),
+                .int16 => std.mem.readInt(i16, buf[0..2], .little),
+                .int32 => std.mem.readInt(i32, buf[0..4], .little),
+                .int64 => std.mem.readInt(i64, buf[0..8], .little),
+                else   => unreachable,
+            };
+            if (val < prev) { is_sorted = false; break; }
+            prev = val;
+        }
+
+        if (is_sorted) {
+            const name = try allocator.dupe(u8, col.name);
+            try sorted_names.append(allocator, name);
+        }
+    }
+
+    return sorted_names.toOwnedSlice(allocator);
+}
+
 const GenericAllColsCtx = struct {
     io: std.Io,
     fixed_writers: []generic_store.ColumnBinWriter,

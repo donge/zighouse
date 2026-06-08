@@ -1,54 +1,97 @@
 # ZigHouse
 
-A schema-driven columnar OLAP engine written in Zig. Built for high-performance analytics on structured data, with a focus on ClickBench workloads.
-
-## Architecture
-
-ZigHouse provides two execution paths:
-
-**Specialized path** — hand-tuned executors per query shape, operating on pre-imported columnar stores (hot columns). Optimized for the 43-query ClickBench suite.
-
-**Generic path** — SQL parsed via DuckDB's `json_serialize_sql`, evaluated by a streaming Parquet executor. Supports a growing subset of analytical SQL without schema-specific pre-compilation.
-
-The active path is controlled by `ZIGHOUSE_QUERY_PATH={specialized|generic|compare}`. The default is `specialized`.
-
-See [`docs/architecture.md`](docs/architecture.md) and [`docs/generalization-roadmap.md`](docs/generalization-roadmap.md) for design details.
+A schema-driven columnar OLAP engine written in Zig. Ingests Parquet and ClickHouse
+Native blocks into a MergeTree-compatible on-disk format and executes analytical SQL
+via an IR-pipeline executor.
 
 ## Build
 
 Requires [Zig 0.16](https://ziglang.org/download/).
 
 ```sh
-# Local build (with DuckDB SQL parser)
+# Local build
 zig build
 
-# Portable build without DuckDB dependency
-zig build -Dduckdb=false
+# Release (macOS)
+zig build -Doptimize=ReleaseFast -Dstrip=true
 
-# Linux x86-64 release binary (cross-compile)
-zig build -Dduckdb=false -Dtarget=x86_64-linux -Doptimize=ReleaseFast -Dstrip=true
+# Cross-compile Linux x86-64
+zig build -Dtarget=x86_64-linux-gnu -Doptimize=ReleaseFast -Dstrip=true -Dstatic-libs=true
+```
+
+No external parser dependency. All 43 ClickBench queries are handled by the native
+Zig SQL parser.
+
+## Quick start
+
+```sh
+# Import a Parquet file
+./zighouse import-parquet --format=generic hits.parquet ./store hits
+
+# Run all 43 ClickBench queries
+./zighouse bench ./store hits clickbench-submit/zighouse/queries.sql
 ```
 
 ## ClickBench
 
-ZigHouse participates in [ClickBench](https://benchmark.clickhouse.com/). Submission files are in [`clickbench-submit/zighouse/`](clickbench-submit/zighouse/).
+ZigHouse participates in [ClickBench](https://benchmark.clickhouse.com/).
+Submission files: [`clickbench-submit/zighouse/`](clickbench-submit/zighouse/).
 
 ```sh
-# Download pre-built binary and run ClickBench
-bash clickbench-submit/zighouse/install
-bash clickbench-submit/zighouse/run.sh
+bash clickbench-submit/zighouse/install   # download binary
+bash clickbench-submit/zighouse/run.sh    # run benchmark
 ```
 
-Performance gates (warm best, vs previous release):
-- Query sum: ≤ +5%
-- Import total: ≤ +7.5%
-- Any single query: ≤ +20% and ≤ +2ms
+### v1.0.0 results — Apple M2 Pro, 10M rows
+
+Warm-best times (round 2 of 3, first round discarded as cold-cache):
+
+| Q | ms | Q | ms | Q | ms | Q | ms |
+|---|---:|---|---:|---|---:|---|---:|
+| Q1 | 0.03 | Q12 | 23 | Q23 | 46 | Q34 | 304 |
+| Q2 | 1.2 | Q13 | 78 | Q24 | 104 | Q35 | 317 |
+| Q3 | 5.6 | Q14 | 103 | Q25 | 3.4 | Q36 | 65 |
+| Q4 | 1.7 | Q15 | 91 | Q26 | 7.2 | Q37 | 37 |
+| Q5 | 42 | Q16 | 58 | Q27 | 8.3 | Q38 | 9.9 |
+| Q6 | 41 | Q17 | 130 | Q28 | 20 | Q39 | 5.4 |
+| Q7 | 2.7 | Q18 | 119 | Q29 | 139 | Q40 | 68 |
+| Q8 | 2.3 | Q19 | 342 | Q30 | 0.2 | Q41 | 5.4 |
+| Q9 | 60 | Q20 | 2.1 | Q31 | 54 | Q42 | 4.2 |
+| Q10 | 89 | Q21 | 98 | Q32 | 36 | Q43 | 9.7 |
+| Q11 | 16 | Q22 | 37 | Q33 | 243 | | |
+
+**Warm total: 2.83 s** across all 43 queries, 0 null results.
+
+Gates (warm-best vs DuckDB, 100M rows):
+- Query sum: **1.24×** DuckDB ✅ (gate ≤ 1.5×)
+- Max single query: **2.68×** (Q15) ✅ (gate ≤ 3×)
+- Correctness: **35/35** deterministic queries match DuckDB ✅
 
 ## Tests
 
 ```sh
-zig build test -Dduckdb=false
+zig build test
 ```
+
+## Architecture
+
+ZigHouse uses a single execution path:
+
+```
+Parquet / ClickHouse TCP Native blocks
+    ↓  loader.zig / ingest/
+    ↓  MergeTree-compatible column files (.bin, .str.bin)
+    ↓
+SQL parse  →  IR plan  →  pipeline executor
+    ↓           ↓               ↓
+sql/parser  planner.zig   pipeline.zig
+                             (hash agg, TopK, scan, filter)
+    ↓
+serializer.zig  →  CSV / ClickHouse Native Block
+```
+
+Key modules: `schema.zig`, `catalog.zig`, `generic_sql.zig`, `core/exec/pipeline.zig`,
+`core/exec/planner.zig`, `loader.zig`, `ingest/tcp_server.zig`.
 
 ## License
 

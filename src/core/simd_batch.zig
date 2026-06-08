@@ -14,6 +14,7 @@ const std = @import("std");
 
 fn lanesFor(comptime T: type) comptime_int {
     return switch (T) {
+        u8       => 64,
         i16, u16 => 32,
         i32, u32 => 16,
         i64, u64 => 8,
@@ -131,6 +132,26 @@ pub fn notMask(mask: []i16) void {
     while (i < mask.len) : (i += 1) {
         mask[i] = if (mask[i] == 0) 1 else 0;
     }
+}
+
+/// Count non-zero entries in an i16 predicate mask using 32-wide SIMD.
+pub fn countNonZeroI16(mask: []const i16) u64 {
+    const LANES = 32;
+    const V = @Vector(LANES, i16);
+    const zero: V = @splat(0);
+    const one: V = @splat(1);
+    var acc: @Vector(LANES, i32) = @splat(0);
+    var i: usize = 0;
+    while (i + LANES <= mask.len) : (i += LANES) {
+        const v: V = mask[i..][0..LANES].*;
+        const hit: @Vector(LANES, i32) = @intCast(@select(i16, v != zero, one, @as(V, @splat(0))));
+        acc += hit;
+    }
+    var total: u64 = @intCast(@reduce(.Add, acc));
+    while (i < mask.len) : (i += 1) {
+        if (mask[i] != 0) total += 1;
+    }
+    return total;
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

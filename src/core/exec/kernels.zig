@@ -253,7 +253,7 @@ pub fn likeMatch(s: []const u8, pattern: []const u8) bool {
     var star_si: usize = 0;
 
     while (si < s.len) {
-        if (pi < pattern.len and (pattern[pi] == '_' or pattern[pi] == s[si])) {
+        if (pi < pattern.len and pattern[pi] != '%' and (pattern[pi] == '_' or pattern[pi] == s[si])) {
             si += 1;
             pi += 1;
         } else if (pi < pattern.len and pattern[pi] == '%') {

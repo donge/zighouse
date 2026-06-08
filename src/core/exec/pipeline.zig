@@ -1822,10 +1822,19 @@ fn executeScalarAggChunked(
         if (filter_state) |*fs| try fs.apply(&c, ctx);
         if (lim_state)    |*ls| ls.apply(&c);
         if (c.num_rows == 0) {
+            c.deinit();
             if (lim_state) |ls| if (ls.done()) break;
             continue;
         }
         try updateAccumsFromChunk(accums, aggs, &c, alloc);
+        // Rescue str_min/str_max slices that point into the chunk's arena
+        // before freeing the chunk.  All other accumulators hold numeric values.
+        for (accums) |*acc| switch (acc.*) {
+            .str_min => |v| if (v) |s| { acc.str_min = try alloc.dupe(u8, s); },
+            .str_max => |v| if (v) |s| { acc.str_max = try alloc.dupe(u8, s); },
+            else => {},
+        };
+        c.deinit();
         if (lim_state) |ls| if (ls.done()) break;
     }
 
@@ -2002,8 +2011,7 @@ fn executeScalarAggParallel(
                             cmpBatchDispatch(i16, self.raw[m.start..m.end], self.cond.op,
                                 self.rhs_i16, self.rhs2_i16,
                                 self.mask_buf[0..n], self.tmp_buf[0..n]);
-                            var cnt: u64 = 0;
-                            for (self.mask_buf[0..n]) |mv| { if (mv != 0) cnt += 1; }
+                            const cnt = simd_batch.countNonZeroI16(self.mask_buf[0..n]);
                             for (self.accums) |*a| { a.count += cnt; }
                         }
                     }

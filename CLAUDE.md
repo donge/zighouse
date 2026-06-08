@@ -5,39 +5,36 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Build Commands
 
 ```bash
-# Standard build (with DuckDB SQL parser)
+# Standard build
 zig build
 
-# Build without DuckDB (uses native Zig parser)
-zig build -Dduckdb=false
-
-# Release build for Linux
-zig build -Dduckdb=false -Dtarget=x86_64-linux-gnu -Doptimize=ReleaseFast -Dstrip=true
+# Release build for Linux x86-64
+zig build -Dtarget=x86_64-linux-gnu -Doptimize=ReleaseFast -Dstrip=true -Dstatic-libs=true
 
 # Run all tests
-zig build test -Dduckdb=false
+zig build test
 
 # Run the binary
-./zig-out/bin/zighouse schema
-./zig-out/bin/zighouse queries
+./zig-out/bin/zighouse import-parquet --format=generic hits.parquet ./store hits
+./zig-out/bin/zighouse bench ./store hits clickbench-submit/zighouse/queries.sql
 ```
 
 **Important:** Default optimize mode is `ReleaseFast` (not Debug) because benchmarks measure 100M-row loops. Use `-Doptimize=Debug` to enable bounds/overflow checks.
 
 Key build options:
-- `-Dduckdb=false` — disable DuckDB SQL parser, use native Zig parser
-- `-Dduckdb-prefix=<path>` — DuckDB installation prefix (default: `/opt/homebrew/opt/duckdb`)
 - `-Dstatic-libs=true` — link lz4/zstd statically (use for release builds)
+- `-Dlz4-prefix=<path>` / `-Dzstd-prefix=<path>` — library search prefix overrides
+- `-Dstrip=true` — strip debug symbols from output binary
+- `-Dbench-tools=true` — build benchmark helper binaries
 
 ## Environment Variables
 
-- `ZIGHOUSE_QUERY_PATH`: `specialized` | `generic` | `compare` (default: `specialized`)
 - `ZIGHOUSE_IMPORT_TRACE`: print import phase timings
-- `ZIGHOUSE_CLICKBENCH_SUBMIT`: enable ClickBench submission format
+- `ZIGHOUSE_CLICKBENCH_SUBMIT`: enable ClickBench submission format (JSON timing rows)
 
 ## Architecture
 
-ZigHouse is a schema-driven columnar OLAP engine. It ingests Parquet/ClickHouse Native blocks into a MergeTree-compatible on-disk format and executes analytical SQL.
+ZigHouse is a schema-driven columnar OLAP engine. It ingests Parquet/ClickHouse Native blocks into a MergeTree-compatible on-disk format and executes analytical SQL via an IR-pipeline executor.
 
 ### Three Execution Stages
 
@@ -47,24 +44,28 @@ Input (Parquet / TCP Native blocks)
 Stage 1: Ingest (loader.zig, ingest/)
     — decode wire format, encode columns, write MergeTree parts
     ↓
-Stage 2: Plan + Execute (generic_sql.zig, core/, generic_executor.zig)
-    — parse SQL → build plan → two-dimensional dispatch
+Stage 2: Plan + Execute (generic_sql.zig, core/, pipeline.zig)
+    — parse SQL → IR plan → pipeline executor
     ↓
 Stage 3: Format (serializer.zig)
     — emit CSV or ClickHouse Native Block
 ```
 
-### Two Query Paths
+### Single Execution Path
 
-**Specialized path** (`native.zig`, `clickbench/`): Hand-tuned executors for the 43 ClickBench queries. ~588KB file of per-query shape-specific loops.
+All queries — including the 43 ClickBench queries — run through the same IR pipeline:
 
-**Generic path** (`generic_executor.zig`): Stream-based executor for arbitrary analytical SQL. Uses DuckDB-backed or native Zig SQL parsing.
+```
+generic_sql.parse()        native Zig SQL parser (sql/)
+    ↓
+ir_planner.plan_query()    SQL plan → PhysicalNode IR  (core/exec/planner.zig)
+    ↓
+pipeline.executePlan()     parallel hash agg, TopK, scan/filter  (core/exec/pipeline.zig)
+```
 
-Switch between paths at runtime via `ZIGHOUSE_QUERY_PATH`. Use `compare` to run both and diff results.
-
-### Two-Dimensional Dispatch
-
-Query execution dispatches on both **shape** (11 patterns: `scalar_aggregate`, `lowcard_count_top`, `fixed_count_top`, etc.) and **capability** (column encoding: `fixed_i32`, `lowcard_text`, `lazy_text`, `hash_text`). Shape is inferred by `exec/planner.zig` from the parsed plan; capability comes from the physical schema.
+Query execution dispatches on **plan shape** (11 patterns: `scalar_aggregate`,
+`lowcard_count_top`, `fixed_count_top`, etc.) inferred by the planner from the
+parsed SQL.
 
 ### Named Module Imports
 
@@ -73,20 +74,21 @@ Build uses Zig named modules — import via module name, not relative paths:
 const schema = @import("schema");
 const ch_part = @import("ch_part");
 ```
-`build.zig` (952 lines) wires the full dependency graph of 40+ modules.
+`build.zig` wires the full dependency graph of 40+ modules.
 
 ### Key Modules
 
 | Module | Role |
 |--------|------|
-| `schema.zig` | Type system: `ColumnType`, `PhysicalColumn`, `CapabilityTag`, `Table` |
+| `schema.zig` | Type system: `ColumnType`, `PhysicalColumn`, `Table` |
 | `catalog.zig` | Table registry and manifest persistence |
 | `generic_sql.zig` | SQL AST and plan structs |
-| `core/exec/planner.zig` | Generic plan → `PhysicalNode` IR |
+| `core/exec/planner.zig` | SQL plan → `PhysicalNode` IR |
 | `core/exec/pipeline.zig` | Pipeline-parallel hash table aggregation |
 | `core/exec/kernels.zig` | Scalar filter/projection/arithmetic ops |
-| `generic_executor.zig` | Streaming generic SQL executor |
-| `native.zig` | Specialized ClickBench executors |
+| `core/exec/hash_table.zig` | Specialized hash tables for aggregation |
+| `core/simd_ops.zig` | SIMD aggregation and filter primitives |
+| `core/simd_batch.zig` | SIMD comparison and mask operations |
 | `parquet.zig` | Parquet format reader/writer |
 | `loader.zig` | Parquet → MergeTree import pipeline |
 | `ingest/tcp_server.zig` | ClickHouse TCP protocol server |
@@ -95,19 +97,28 @@ const ch_part = @import("ch_part");
 | `clickhouse_format/block.zig` | ClickHouse Native Block codec (LZ4/Zstd) |
 | `compactor.zig` | Background part merging |
 | `sql/` | Native Zig SQL parser (tokenizer, parser, plan_builder, ast) |
-| `simd.zig` | AVX2 vectorized comparisons |
-| `hashmap.zig` | Specialized hash tables (`HashU64Count`, etc.) |
+| `hashmap.zig` | `DistinctEpochSet` for COUNT DISTINCT |
 | `parallel.zig` | Work-stealing parallel iteration |
 | `agg.zig` | Aggregation primitives (sum, avg, min, max, percentiles) |
 
+### Storage Layout
+
+Generic store format (used by the IR pipeline):
+- `<col>.bin` — raw LE fixed-width column data
+- `<col>.str.bin` — `[u64 row_count | (N+1)×u64 offsets | bytes]` for string columns
+- `columns.txt`, `count.txt` — table metadata
+
+MergeTree format (for ClickHouse wire protocol ingest/export):
+- `<col>.bin` — raw bytes, `<col>.size.bin` — per-row u64 lengths
+- `data.bin` + `<col>.cmrk2` — compact format with granule marks
+
 ### Schema Binding
 
-At query time, `bindColumn(native, name)` resolves a column name to a `BoundColumn` union holding mmap slice references. The `CapabilityTag` is derived from the physical form, driving operator dispatch. Columns carry no ownership — they reference memory-mapped storage directly.
-
-### MergeTree Storage Layout
-
-Each part directory contains per-column files: `<col>.bin` (encoded data), `<col>.dict` (dictionary for low-cardinality), plus metadata (`columns.txt`, `count.txt`, `marks`). The compactor periodically merges small parts and applies materialized views.
+At query time, `bindColumn(native, name)` resolves a column name to a `BoundColumn`
+union holding mmap slice references. Columns carry no ownership — they reference
+memory-mapped storage directly.
 
 ### Vendored C Libraries
 
-`vendor/` contains lz4 and zstd compiled as static libraries via `build.zig`. No external package manager.
+`vendor/` contains lz4 and zstd compiled as static libraries via `build.zig`.
+No external package manager.
