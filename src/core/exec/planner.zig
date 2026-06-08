@@ -1413,7 +1413,7 @@ fn canonFnName(name: []const u8) []const u8 {
         "IPv4StringToNumOrDefault", "IPv4NumToString",
         "IPv6StringToNumOrDefault", "IPv6NumToString",
         "greatest", "least", "intDiv", "modulo",
-        "positionCaseInsensitive", "splitByChar", "concat",
+        "positionCaseInsensitive", "splitByChar", "concat", "format",
         "if", "multiIf",
         "substring", "substr", "startsWith", "endsWith",
         "mapGet",
@@ -1459,6 +1459,8 @@ const ParseCtx = struct {
     /// Current lambda parameter name (e.g. "x"), set while parsing lambda body.
     /// References to this name compile to Expr.lambda_param.
     lambda_param: ?[]const u8 = null,
+    /// Second lambda parameter name for (x,y)->body, compiles to Expr.lambda_param2.
+    lambda_param2: ?[]const u8 = null,
 };
 
 /// Entry: try to parse `text` as a complete arithmetic/function expression.
@@ -1550,8 +1552,34 @@ fn prattExpr(pctx: *ParseCtx, min_bp: u8) anyerror!?Expr {
             break :blk_cast Expr{ .fn_call = fc };
         },
 
-        // Parenthesised sub-expression
+        // Parenthesised sub-expression OR 2-param lambda: (x,y)->body
         .lparen => blk_paren: {
+            // Speculative lookahead: consume up to 5 tokens to detect (ident,ident)->
+            const saved_pos = pctx.lex.pos;
+            const t1 = pctx.lex.next();
+            const t2 = pctx.lex.next();
+            const t3 = pctx.lex.next();
+            const t4 = pctx.lex.next();
+            const t5 = pctx.lex.next();
+            if (t1.kind == .ident and t2.kind == .comma and t3.kind == .ident and
+                t4.kind == .rparen and t5.kind == .arrow)
+            {
+                // 2-param lambda: (x,y)->body
+                const p1 = t1.text;
+                const p2 = t3.text;
+                const saved_p1 = pctx.lambda_param;
+                const saved_p2 = pctx.lambda_param2;
+                pctx.lambda_param  = p1;
+                pctx.lambda_param2 = p2;
+                const body_expr = try prattExpr(pctx, 0) orelse return null;
+                pctx.lambda_param  = saved_p1;
+                pctx.lambda_param2 = saved_p2;
+                const body_ptr = try pctx.arena.create(Expr);
+                body_ptr.* = body_expr;
+                break :blk_paren Expr{ .lambda = .{ .param = p1, .param2 = p2, .body = body_ptr } };
+            }
+            // Not a 2-param lambda — restore lexer and parse as parenthesised expression
+            pctx.lex.pos = saved_pos;
             const inner = try prattExpr(pctx, 0) orelse return null;
             const close = pctx.lex.next();
             if (close.kind != .rparen) return null;
@@ -1867,6 +1895,7 @@ fn prattExpr(pctx: *ParseCtx, min_bp: u8) anyerror!?Expr {
                         std.ascii.eqlIgnoreCase(name, "substring") or
                         std.ascii.eqlIgnoreCase(name, "substr"))) break :blk2 true;
                     if (args_slice.len >= 2 and std.ascii.eqlIgnoreCase(name, "concat")) break :blk2 true;
+                    if (args_slice.len >= 1 and std.ascii.eqlIgnoreCase(name, "format")) break :blk2 true;
                     if (args_slice.len >= 1 and std.ascii.eqlIgnoreCase(name, "tuple")) break :blk2 true;
                     if (args_slice.len >= 3 and std.ascii.eqlIgnoreCase(name, "multiIf")) break :blk2 true;
                     // Array functions (2-arg)
@@ -1893,6 +1922,9 @@ fn prattExpr(pctx: *ParseCtx, min_bp: u8) anyerror!?Expr {
                         std.ascii.eqlIgnoreCase(name, "arrayMap") or
                         std.ascii.eqlIgnoreCase(name, "arrayFilter") or
                         std.ascii.eqlIgnoreCase(name, "arrayExists")) and
+                        args_slice[0] == .lambda) break :blk2 true;
+                    // 2-param lambda: arrayMap((x,y)->body, arr1, arr2)
+                    if (args_slice.len == 3 and std.ascii.eqlIgnoreCase(name, "arrayMap") and
                         args_slice[0] == .lambda) break :blk2 true;
                     // arrayElement(arr, n): 2-arg
                     if (args_slice.len == 2 and std.ascii.eqlIgnoreCase(name, "arrayElement")) break :blk2 true;
@@ -1930,9 +1962,12 @@ fn prattExpr(pctx: *ParseCtx, min_bp: u8) anyerror!?Expr {
                 break :blk Expr{ .fn_call = fc };
             }
 
-            // Not a function call — check if it's the lambda param, then resolve as column ref or literal
+            // Not a function call — check if it's a lambda param, then resolve as column ref or literal
             if (pctx.lambda_param) |lp| {
                 if (std.mem.eql(u8, name, lp)) break :blk Expr{ .lambda_param = {} };
+            }
+            if (pctx.lambda_param2) |lp2| {
+                if (std.mem.eql(u8, name, lp2)) break :blk Expr{ .lambda_param2 = {} };
             }
             break :blk resolveColExpr(pctx.plan_ctx, name) orelse return null;
         },
@@ -2335,7 +2370,8 @@ fn aggExprToProjectItem(ctx: *PlannerCtx, p: generic_sql.Expr) !?ProjectItem {
             return ProjectItem{ .expr = .{ .agg_call = agg_call }, .alias = alias, .out_type = .uint64 };
         },
         .count_distinct, .uniq_exact => {
-            const arg_expr = resolveColExpr(ctx, col_name) orelse return null;
+            const arg_expr = resolveColExpr(ctx, col_name) orelse
+                (try parseArithExpr(ctx, col_name)) orelse return null;
             agg_call.* = .{ .kind = .count, .arg = arg_expr, .distinct = true };
             return ProjectItem{ .expr = .{ .agg_call = agg_call }, .alias = alias, .out_type = .uint64 };
         },

@@ -51,6 +51,10 @@ pub var dict_get_fn: ?*const fn (
 ///
 /// Returns null if the expression evaluates to SQL NULL.
 pub fn evalExpr(expr: Expr, row: []const ?Value, lambda_val: ?Value, arena: std.mem.Allocator) anyerror!?Value {
+    return evalExprFull(expr, row, lambda_val, null, arena);
+}
+
+fn evalExprFull(expr: Expr, row: []const ?Value, lambda_val: ?Value, lambda_val2: ?Value, arena: std.mem.Allocator) anyerror!?Value {
     switch (expr) {
         // Literals
         .lit_i64   => |v| return Value{ .int64   = v },
@@ -62,7 +66,9 @@ pub fn evalExpr(expr: Expr, row: []const ?Value, lambda_val: ?Value, arena: std.
         .lit_array => |arr| return Value{ .array_string = arr },
 
         // Lambda param — return the currently-bound element
-        .lambda_param => return lambda_val,
+        .lambda_param  => return lambda_val,
+        // Second lambda param for (x,y)->body
+        .lambda_param2 => return lambda_val2,
 
         // Lambda expression itself — should only appear as arg to arrayMap/Filter/Exists
         // If evaluated standalone, return null.
@@ -76,51 +82,51 @@ pub fn evalExpr(expr: Expr, row: []const ?Value, lambda_val: ?Value, arena: std.
 
         // Arithmetic
         .add => |op| {
-            const l = (try evalExpr(op.left,  row, lambda_val, arena)) orelse return null;
-            const r = (try evalExpr(op.right, row, lambda_val, arena)) orelse return null;
+            const l = (try evalExprFull(op.left,  row, lambda_val, lambda_val2, arena)) orelse return null;
+            const r = (try evalExprFull(op.right, row, lambda_val, lambda_val2, arena)) orelse return null;
             return numericBinOp(l, r, .add);
         },
         .sub => |op| {
-            const l = (try evalExpr(op.left,  row, lambda_val, arena)) orelse return null;
-            const r = (try evalExpr(op.right, row, lambda_val, arena)) orelse return null;
+            const l = (try evalExprFull(op.left,  row, lambda_val, lambda_val2, arena)) orelse return null;
+            const r = (try evalExprFull(op.right, row, lambda_val, lambda_val2, arena)) orelse return null;
             return numericBinOp(l, r, .sub);
         },
         .mul => |op| {
-            const l = (try evalExpr(op.left,  row, lambda_val, arena)) orelse return null;
-            const r = (try evalExpr(op.right, row, lambda_val, arena)) orelse return null;
+            const l = (try evalExprFull(op.left,  row, lambda_val, lambda_val2, arena)) orelse return null;
+            const r = (try evalExprFull(op.right, row, lambda_val, lambda_val2, arena)) orelse return null;
             return numericBinOp(l, r, .mul);
         },
         .div => |op| {
-            const l = (try evalExpr(op.left,  row, lambda_val, arena)) orelse return null;
-            const r = (try evalExpr(op.right, row, lambda_val, arena)) orelse return null;
+            const l = (try evalExprFull(op.left,  row, lambda_val, lambda_val2, arena)) orelse return null;
+            const r = (try evalExprFull(op.right, row, lambda_val, lambda_val2, arena)) orelse return null;
             return numericBinOp(l, r, .div);
         },
         .mod => |op| {
-            const l = (try evalExpr(op.left,  row, lambda_val, arena)) orelse return null;
-            const r = (try evalExpr(op.right, row, lambda_val, arena)) orelse return null;
+            const l = (try evalExprFull(op.left,  row, lambda_val, lambda_val2, arena)) orelse return null;
+            const r = (try evalExprFull(op.right, row, lambda_val, lambda_val2, arena)) orelse return null;
             return numericBinOp(l, r, .mod);
         },
 
         // Comparisons — result is always bool_u8
-        .eq  => |op| return cmpOp(try evalExpr(op.left, row, lambda_val, arena), try evalExpr(op.right, row, lambda_val, arena), .eq),
-        .neq => |op| return cmpOp(try evalExpr(op.left, row, lambda_val, arena), try evalExpr(op.right, row, lambda_val, arena), .neq),
-        .lt  => |op| return cmpOp(try evalExpr(op.left, row, lambda_val, arena), try evalExpr(op.right, row, lambda_val, arena), .lt),
-        .lte => |op| return cmpOp(try evalExpr(op.left, row, lambda_val, arena), try evalExpr(op.right, row, lambda_val, arena), .lte),
-        .gt  => |op| return cmpOp(try evalExpr(op.left, row, lambda_val, arena), try evalExpr(op.right, row, lambda_val, arena), .gt),
-        .gte => |op| return cmpOp(try evalExpr(op.left, row, lambda_val, arena), try evalExpr(op.right, row, lambda_val, arena), .gte),
+        .eq  => |op| return cmpOp(try evalExprFull(op.left, row, lambda_val, lambda_val2, arena), try evalExprFull(op.right, row, lambda_val, lambda_val2, arena), .eq),
+        .neq => |op| return cmpOp(try evalExprFull(op.left, row, lambda_val, lambda_val2, arena), try evalExprFull(op.right, row, lambda_val, lambda_val2, arena), .neq),
+        .lt  => |op| return cmpOp(try evalExprFull(op.left, row, lambda_val, lambda_val2, arena), try evalExprFull(op.right, row, lambda_val, lambda_val2, arena), .lt),
+        .lte => |op| return cmpOp(try evalExprFull(op.left, row, lambda_val, lambda_val2, arena), try evalExprFull(op.right, row, lambda_val, lambda_val2, arena), .lte),
+        .gt  => |op| return cmpOp(try evalExprFull(op.left, row, lambda_val, lambda_val2, arena), try evalExprFull(op.right, row, lambda_val, lambda_val2, arena), .gt),
+        .gte => |op| return cmpOp(try evalExprFull(op.left, row, lambda_val, lambda_val2, arena), try evalExprFull(op.right, row, lambda_val, lambda_val2, arena), .gte),
 
         // Logical
         .@"and" => |op| {
-            const l = try evalExpr(op.left,  row, lambda_val, arena);
+            const l = try evalExprFull(op.left,  row, lambda_val, lambda_val2, arena);
             if (l) |lv| if (lv.bool_u8 == 0) return Value{ .bool_u8 = 0 };
-            const r = try evalExpr(op.right, row, lambda_val, arena);
+            const r = try evalExprFull(op.right, row, lambda_val, lambda_val2, arena);
             if (l == null or r == null) return null;
             return Value{ .bool_u8 = if (l.?.bool_u8 != 0 and r.?.bool_u8 != 0) 1 else 0 };
         },
         .@"or" => |op| {
-            const l = try evalExpr(op.left,  row, lambda_val, arena);
+            const l = try evalExprFull(op.left,  row, lambda_val, lambda_val2, arena);
             if (l) |lv| if (lv.bool_u8 != 0) return Value{ .bool_u8 = 1 };
-            const r = try evalExpr(op.right, row, lambda_val, arena);
+            const r = try evalExprFull(op.right, row, lambda_val, lambda_val2, arena);
             // SQL three-valued OR truth table:
             //   TRUE  OR anything = TRUE  (handled by short-circuit above)
             //   FALSE OR FALSE    = FALSE
@@ -133,26 +139,26 @@ pub fn evalExpr(expr: Expr, row: []const ?Value, lambda_val: ?Value, arena: std.
             return Value{ .bool_u8 = if (lv != 0 or rv != 0) 1 else 0 };
         },
         .not => |op| {
-            const v = try evalExpr(op.operand, row, lambda_val, arena) orelse return null;
+            const v = try evalExprFull(op.operand, row, lambda_val, lambda_val2, arena) orelse return null;
             return Value{ .bool_u8 = if (v.bool_u8 == 0) 1 else 0 };
         },
 
         // IS NULL / IS NOT NULL
         .is_null     => |op| {
-            const v = try evalExpr(op.operand, row, lambda_val, arena);
+            const v = try evalExprFull(op.operand, row, lambda_val, lambda_val2, arena);
             return Value{ .bool_u8 = if (v == null) 1 else 0 };
         },
         .is_not_null => |op| {
-            const v = try evalExpr(op.operand, row, lambda_val, arena);
+            const v = try evalExprFull(op.operand, row, lambda_val, lambda_val2, arena);
             return Value{ .bool_u8 = if (v != null) 1 else 0 };
         },
 
         // String
-        .like     => |op| return strLike(try evalExpr(op.left, row, lambda_val, arena), try evalExpr(op.right, row, lambda_val, arena), false),
-        .not_like => |op| return strLike(try evalExpr(op.left, row, lambda_val, arena), try evalExpr(op.right, row, lambda_val, arena), true),
+        .like     => |op| return strLike(try evalExprFull(op.left, row, lambda_val, lambda_val2, arena), try evalExprFull(op.right, row, lambda_val, lambda_val2, arena), false),
+        .not_like => |op| return strLike(try evalExprFull(op.left, row, lambda_val, lambda_val2, arena), try evalExprFull(op.right, row, lambda_val, lambda_val2, arena), true),
         .concat   => |op| {
-            const l = (try evalExpr(op.left,  row, lambda_val, arena)) orelse return null;
-            const r = (try evalExpr(op.right, row, lambda_val, arena)) orelse return null;
+            const l = (try evalExprFull(op.left,  row, lambda_val, lambda_val2, arena)) orelse return null;
+            const r = (try evalExprFull(op.right, row, lambda_val, lambda_val2, arena)) orelse return null;
             const ls = l.toStr() orelse return null;
             const rs = r.toStr() orelse return null;
             const out = try std.fmt.allocPrint(arena, "{s}{s}", .{ ls, rs });
@@ -162,10 +168,10 @@ pub fn evalExpr(expr: Expr, row: []const ?Value, lambda_val: ?Value, arena: std.
         // CASE WHEN
         .case_when => |cw| {
             for (cw.when, cw.then) |when_expr, then_expr| {
-                const cond = try evalExpr(when_expr, row, lambda_val, arena) orelse continue;
-                if (cond.bool_u8 != 0) return evalExpr(then_expr, row, lambda_val, arena);
+                const cond = try evalExprFull(when_expr, row, lambda_val, lambda_val2, arena) orelse continue;
+                if (cond.bool_u8 != 0) return evalExprFull(then_expr, row, lambda_val, lambda_val2, arena);
             }
-            if (cw.else_expr) |e| return evalExpr(e, row, lambda_val, arena);
+            if (cw.else_expr) |e| return evalExprFull(e, row, lambda_val, lambda_val2, arena);
             return null;
         },
 
@@ -173,11 +179,11 @@ pub fn evalExpr(expr: Expr, row: []const ?Value, lambda_val: ?Value, arena: std.
         .agg_call => return error.AggCallInScalarContext,
 
         // Scalar function calls — dispatch by name.
-        .fn_call => |fc| return evalFnCall(fc, row, lambda_val, arena),
+        .fn_call => |fc| return evalFnCallFull(fc, row, lambda_val, lambda_val2, arena),
 
         // Cast
         .cast => |c| {
-            const v = (try evalExpr(c.expr, row, lambda_val, arena)) orelse return null;
+            const v = (try evalExprFull(c.expr, row, lambda_val, lambda_val2, arena)) orelse return null;
             return castValue(v, c.to_type, arena);
         },
 
@@ -191,10 +197,16 @@ pub fn evalExpr(expr: Expr, row: []const ?Value, lambda_val: ?Value, arena: std.
 const NumOp = enum { add, sub, mul, div, mod };
 
 fn numericBinOp(l: Value, r: Value, op: NumOp) ?Value {
-    // Prefer float if either side is float.
-    if (l == .float64 or r == .float64) {
-        const lf = l.toF64() orelse return null;
-        const rf = r.toF64() orelse return null;
+    // Prefer float if either side is float or a numeric string (e.g. array elements).
+    if (l == .float64 or r == .float64 or l == .string or r == .string) {
+        const lf: f64 = switch (l) {
+            .string => |s| std.fmt.parseFloat(f64, s) catch return null,
+            else    => l.toF64() orelse return null,
+        };
+        const rf: f64 = switch (r) {
+            .string => |s| std.fmt.parseFloat(f64, s) catch return null,
+            else    => r.toF64() orelse return null,
+        };
         return Value{ .float64 = switch (op) {
             .add => lf + rf,
             .sub => lf - rf,
@@ -346,7 +358,7 @@ pub const LikeMatcher = struct {
 
 // ── Scalar function dispatch ──────────────────────────────────────────────────
 
-fn evalFnCall(fc: *const plan.FnCall, row: []const ?Value, lambda_val: ?Value, arena: std.mem.Allocator) !?Value {
+fn evalFnCallFull(fc: *const plan.FnCall, row: []const ?Value, lambda_val: ?Value, lambda_val2: ?Value, arena: std.mem.Allocator) !?Value {
     const name = fc.name;
 
     // ── Lambda-aware array functions (must NOT pre-eval the lambda arg) ────────
@@ -360,7 +372,33 @@ fn evalFnCall(fc: *const plan.FnCall, row: []const ?Value, lambda_val: ?Value, a
             .lambda => |l| l,
             else => return null,
         };
-        const arr_val = (try evalExpr(fc.args[1], row, lambda_val, arena)) orelse return null;
+
+        if (std.mem.eql(u8, name, "arrayMap")) {
+            // 2-param lambda: arrayMap((x,y)->body, arr1, arr2)
+            if (fc.args.len >= 3) {
+                const arr1_val = (try evalExprFull(fc.args[1], row, lambda_val, lambda_val2, arena)) orelse return null;
+                const arr2_val = (try evalExprFull(fc.args[2], row, lambda_val, lambda_val2, arena)) orelse return null;
+                const arr1 = switch (arr1_val) {
+                    .array_string => |s| s,
+                    else => return null,
+                };
+                const arr2 = switch (arr2_val) {
+                    .array_string => |s| s,
+                    else => return null,
+                };
+                const len = @min(arr1.len, arr2.len);
+                const out = try arena.alloc([]const u8, len);
+                for (0..len) |i| {
+                    const e1: ?Value = Value{ .string = arr1[i] };
+                    const e2: ?Value = Value{ .string = arr2[i] };
+                    const mapped = (try evalExprFull(lam.body.*, row, e1, e2, arena)) orelse Value{ .float64 = 0.0 };
+                    out[i] = mapped.toStr() orelse try std.fmt.allocPrint(arena, "{d}", .{mapped.toF64() orelse 0.0});
+                }
+                return Value{ .array_string = out };
+            }
+        }
+
+        const arr_val = (try evalExprFull(fc.args[1], row, lambda_val, lambda_val2, arena)) orelse return null;
         const arr = switch (arr_val) {
             .array_string => |s| blk: {
                 // Convert [][]const u8 to []?Value for uniform processing
@@ -374,7 +412,7 @@ fn evalFnCall(fc: *const plan.FnCall, row: []const ?Value, lambda_val: ?Value, a
         if (std.mem.eql(u8, name, "arrayMap")) {
             const out = try arena.alloc([]const u8, arr.len);
             for (arr, 0..) |elem_v, i| {
-                const mapped = (try evalExpr(lam.body.*, row, elem_v, arena)) orelse Value{ .string = "" };
+                const mapped = (try evalExprFull(lam.body.*, row, elem_v, null, arena)) orelse Value{ .string = "" };
                 out[i] = mapped.toStr() orelse try std.fmt.allocPrint(arena, "{d}", .{mapped.toF64() orelse 0.0});
             }
             return Value{ .array_string = out };
@@ -383,7 +421,7 @@ fn evalFnCall(fc: *const plan.FnCall, row: []const ?Value, lambda_val: ?Value, a
         if (std.mem.eql(u8, name, "arrayFilter")) {
             var out: std.ArrayListUnmanaged([]const u8) = .empty;
             for (arr) |elem_v| {
-                const cond = (try evalExpr(lam.body.*, row, elem_v, arena)) orelse continue;
+                const cond = (try evalExprFull(lam.body.*, row, elem_v, null, arena)) orelse continue;
                 const keep = switch (cond) {
                     .bool_u8 => |b| b != 0,
                     .int64   => |i| i != 0,
@@ -400,7 +438,7 @@ fn evalFnCall(fc: *const plan.FnCall, row: []const ?Value, lambda_val: ?Value, a
 
         if (std.mem.eql(u8, name, "arrayExists")) {
             for (arr) |elem_v| {
-                const cond = (try evalExpr(lam.body.*, row, elem_v, arena)) orelse continue;
+                const cond = (try evalExprFull(lam.body.*, row, elem_v, null, arena)) orelse continue;
                 const hit = switch (cond) {
                     .bool_u8 => |b| b != 0,
                     .int64   => |i| i != 0,
@@ -416,7 +454,7 @@ fn evalFnCall(fc: *const plan.FnCall, row: []const ?Value, lambda_val: ?Value, a
     // Evaluate all arguments first (non-lambda path).
     const args = try arena.alloc(?Value, fc.args.len);
     for (fc.args, 0..) |arg, i| {
-        args[i] = try evalExpr(arg, row, lambda_val, arena);
+        args[i] = try evalExprFull(arg, row, lambda_val, lambda_val2, arena);
     }
 
     // Logical operators encoded as fn_call by the planner
@@ -746,6 +784,37 @@ fn evalFnCall(fc: *const plan.FnCall, row: []const ?Value, lambda_val: ?Value, a
         for (args) |a| {
             const s = (a orelse continue).toStr() orelse continue;
             try out.appendSlice(arena, s);
+        }
+        return Value{ .string = try out.toOwnedSlice(arena) };
+    }
+    // format('{} {}{}', arg1, arg2, arg3, ...) — ClickHouse {} placeholder interpolation
+    if (std.mem.eql(u8, name, "format")) {
+        if (args.len < 1) return null;
+        const fmt_str = (args[0] orelse return null).toStr() orelse return null;
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        var arg_idx: usize = 1;
+        var i: usize = 0;
+        while (i < fmt_str.len) {
+            if (i + 1 < fmt_str.len and fmt_str[i] == '{' and fmt_str[i + 1] == '}') {
+                // {} placeholder — substitute next arg
+                if (arg_idx < args.len) {
+                    const av = args[arg_idx] orelse Value{ .string = "" };
+                    const s = av.toStr() orelse blk: {
+                        const f = av.toF64() orelse 0.0;
+                        // Print integer-valued floats without decimal point
+                        if (f == @trunc(f) and @abs(f) < 1e15) {
+                            break :blk try std.fmt.allocPrint(arena, "{d}", .{@as(i64, @intFromFloat(f))});
+                        }
+                        break :blk try std.fmt.allocPrint(arena, "{d}", .{f});
+                    };
+                    try out.appendSlice(arena, s);
+                    arg_idx += 1;
+                }
+                i += 2;
+            } else {
+                try out.append(arena, fmt_str[i]);
+                i += 1;
+            }
         }
         return Value{ .string = try out.toOwnedSlice(arena) };
     }

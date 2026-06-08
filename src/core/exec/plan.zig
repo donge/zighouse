@@ -79,11 +79,16 @@ pub const Expr = union(enum) {
 
     // Reference to the current lambda-bound element (replaces the param name inside body)
     lambda_param,
+
+    // Reference to the second lambda-bound element for 2-param lambdas: (x,y)->body
+    lambda_param2,
 };
 
 pub const Lambda = struct {
     /// Parameter name (e.g. "x") — used only during planning, not at eval time.
     param: []const u8,
+    /// Optional second parameter name for (x,y)->body lambdas.
+    param2: ?[]const u8 = null,
     /// The body expression; references to `param` are compiled as `lambda_param`.
     body:  *Expr,
 };

@@ -480,6 +480,32 @@ fn buildFuncExpr(allocator: Allocator, f: ast.FuncExpr, alias: ?[]const u8, ctes
         const col = try firstArgText(allocator, f.args, ctes);
         return Expr{ .func = .uniq_exact, .column = col, .alias = alias };
     }
+    // uniqHLL12(a,b,c) multi-arg → uniq_exact on concat(a,'|',b,'|',c)
+    if ((std.mem.eql(u8, name, "uniqhll12") or
+         std.mem.eql(u8, name, "uniq_hll12") or
+         std.mem.eql(u8, name, "uniq")) and f.args.len >= 2) {
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        try buf.appendSlice(allocator, "concat(");
+        for (f.args, 0..) |arg, i| {
+            if (i > 0) try buf.appendSlice(allocator, ",'|',");
+            const t = try exprToText(allocator, arg, ctes);
+            defer allocator.free(t);
+            try buf.appendSlice(allocator, t);
+        }
+        try buf.append(allocator, ')');
+        const col = try buf.toOwnedSlice(allocator);
+        return Expr{ .func = .uniq_exact, .column = col, .alias = alias };
+    }
+    // uniqHLL12If(col,cond) → uniq_exact_if(col,cond)
+    if ((std.mem.eql(u8, name, "uniqhll12if") or
+         std.mem.eql(u8, name, "uniq_hll12_if") or
+         std.mem.eql(u8, name, "uniqif")) and f.args.len == 2) {
+        const col = try exprToText(allocator, f.args[0], ctes);
+        const cond = try buildCondExpr(allocator, f.args[1], ctes);
+        const cond_ptr = try allocator.create(CondExpr);
+        cond_ptr.* = cond;
+        return Expr{ .func = .uniq_exact_if, .column = col, .alias = alias, .cond = cond_ptr };
+    }
     // anyLast(col) → any_val (first-value approximation)
     if ((std.mem.eql(u8, name, "anylast") or std.mem.eql(u8, name, "any_last")) and f.args.len == 1) {
         const col = try firstArgText(allocator, f.args, ctes);
