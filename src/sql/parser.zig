@@ -114,12 +114,23 @@ const Parser = struct {
             from = try self.parseFromWithJoins();
         }
 
-        // WHERE
+        // WHERE / PREWHERE (ClickHouse extension — treated identically; either order)
         var where: ?*ast.Expr = null;
-        if (self.tok.eatKeyword("WHERE")) {
+        for (0..2) |_| {
+            const is_where    = self.tok.eatKeyword("WHERE");
+            const is_prewhere = if (!is_where) self.tok.eatKeyword("PREWHERE") else false;
+            if (!is_where and !is_prewhere) break;
             const e = try self.parseExpr();
-            where = try self.alloc(ast.Expr);
-            where.?.* = e;
+            if (where) |w| {
+                const binop = try self.alloc(ast.BinopExpr);
+                binop.* = .{ .op = .and_, .left = w.*, .right = e };
+                const merged = try self.alloc(ast.Expr);
+                merged.* = .{ .binop = binop };
+                where = merged;
+            } else {
+                where = try self.alloc(ast.Expr);
+                where.?.* = e;
+            }
         }
 
         // GROUP BY

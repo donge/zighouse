@@ -71,6 +71,7 @@ const KEYWORDS = [_][]const u8{
     "on", "using", "create", "table", "insert", "into", "values",
     "update", "set", "delete", "drop", "alter", "add", "column",
     "primary", "key", "engine", "mergetree", "asc", "desc",
+    "prewhere",
 };
 
 fn isKeyword(s: []const u8) bool {

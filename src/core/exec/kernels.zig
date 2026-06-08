@@ -1150,7 +1150,172 @@ fn evalFnCall(fc: *const plan.FnCall, row: []const ?Value, lambda_val: ?Value, a
         return null;
     }
     if (std.mem.eql(u8, name, "now")) {
-        return Value{ .datetime64_ms = 0 }; // stub: no wall clock in this context
+        var ts: std.posix.timespec = undefined;
+        switch (std.posix.errno(std.posix.system.clock_gettime(.REALTIME, &ts))) {
+            .SUCCESS => return Value{ .datetime64_ms = @as(i64, ts.sec) * 1000 + @divTrunc(ts.nsec, 1_000_000) },
+            else => return Value{ .datetime64_ms = 0 },
+        }
+    }
+    if (std.mem.eql(u8, name, "today")) {
+        var ts: std.posix.timespec = undefined;
+        const secs: i64 = switch (std.posix.errno(std.posix.system.clock_gettime(.REALTIME, &ts))) {
+            .SUCCESS => ts.sec,
+            else => 0,
+        };
+        const days: u16 = @truncate(@as(u64, @intCast(@max(0, @divTrunc(secs, 86400)))));
+        return Value{ .date_u16 = days };
+    }
+
+    // ── Math ──────────────────────────────────────────────────────────────────
+    if (std.mem.eql(u8, name, "sqrt")) {
+        const v = args[0] orelse return null;
+        const x = v.toF64() orelse return null;
+        return Value{ .float64 = @sqrt(x) };
+    }
+
+    // ── Time component extractors ─────────────────────────────────────────────
+    if (std.mem.eql(u8, name, "toHour") or std.mem.eql(u8, name, "hour")) {
+        const v = args[0] orelse return null;
+        const ms: i64 = switch (v) {
+            .datetime64_ms => |m| m,
+            .int64         => |i| i * 1000,
+            .date_u16      => |d| @as(i64, d) * 86400000,
+            else           => return null,
+        };
+        const secs = @divTrunc(ms, 1000);
+        return Value{ .int64 = @mod(@divTrunc(secs, 3600), 24) };
+    }
+    if (std.mem.eql(u8, name, "toMinute")) {
+        const v = args[0] orelse return null;
+        const ms: i64 = switch (v) {
+            .datetime64_ms => |m| m,
+            .int64         => |i| i * 1000,
+            else           => return null,
+        };
+        const secs = @divTrunc(ms, 1000);
+        return Value{ .int64 = @mod(@divTrunc(secs, 60), 60) };
+    }
+    if (std.mem.eql(u8, name, "toSecond")) {
+        const v = args[0] orelse return null;
+        const ms: i64 = switch (v) {
+            .datetime64_ms => |m| m,
+            .int64         => |i| i * 1000,
+            else           => return null,
+        };
+        return Value{ .int64 = @mod(@divTrunc(ms, 1000), 60) };
+    }
+
+    // ── Interval constructors (return ms as int64) ────────────────────────────
+    if (std.mem.eql(u8, name, "toIntervalSecond")) {
+        const v = args[0] orelse return null;
+        const n = v.toI64() orelse return null;
+        return Value{ .int64 = n * 1_000 };
+    }
+    if (std.mem.eql(u8, name, "toIntervalMinute")) {
+        const v = args[0] orelse return null;
+        const n = v.toI64() orelse return null;
+        return Value{ .int64 = n * 60_000 };
+    }
+    if (std.mem.eql(u8, name, "toIntervalHour")) {
+        const v = args[0] orelse return null;
+        const n = v.toI64() orelse return null;
+        return Value{ .int64 = n * 3_600_000 };
+    }
+    if (std.mem.eql(u8, name, "toIntervalDay")) {
+        const v = args[0] orelse return null;
+        const n = v.toI64() orelse return null;
+        return Value{ .int64 = n * 86_400_000 };
+    }
+    if (std.mem.eql(u8, name, "toIntervalWeek")) {
+        const v = args[0] orelse return null;
+        const n = v.toI64() orelse return null;
+        return Value{ .int64 = n * 7 * 86_400_000 };
+    }
+    if (std.mem.eql(u8, name, "toIntervalMonth")) {
+        const v = args[0] orelse return null;
+        const n = v.toI64() orelse return null;
+        return Value{ .int64 = n * 30 * 86_400_000 };
+    }
+    if (std.mem.eql(u8, name, "toIntervalYear")) {
+        const v = args[0] orelse return null;
+        const n = v.toI64() orelse return null;
+        return Value{ .int64 = n * 365 * 86_400_000 };
+    }
+
+    // ── Array element access ───────────────────────────────────────────────────
+    if (std.mem.eql(u8, name, "arrayElement")) {
+        if (args.len < 2) return null;
+        const arr_val = args[0] orelse return null;
+        const idx_val = args[1] orelse return null;
+        const arr = switch (arr_val) {
+            .array_string => |s| s,
+            else => return null,
+        };
+        const idx = idx_val.toI64() orelse return null;
+        // 1-based index; negative indexes from end
+        const len: i64 = @intCast(arr.len);
+        const pos: i64 = if (idx > 0) idx - 1 else len + idx;
+        if (pos < 0 or pos >= len) return null;
+        return Value{ .string = arr[@intCast(pos)] };
+    }
+
+    // ── Array scalar aggregates ────────────────────────────────────────────────
+    if (std.mem.eql(u8, name, "arraySum")) {
+        const v = args[0] orelse return null;
+        const arr = switch (v) {
+            .array_string => |s| s,
+            else => return null,
+        };
+        var total: f64 = 0;
+        for (arr) |elem| total += std.fmt.parseFloat(f64, elem) catch 0;
+        return Value{ .float64 = total };
+    }
+    if (std.mem.eql(u8, name, "arrayAvg")) {
+        const v = args[0] orelse return null;
+        const arr = switch (v) {
+            .array_string => |s| s,
+            else => return null,
+        };
+        if (arr.len == 0) return Value{ .float64 = 0 };
+        var total: f64 = 0;
+        for (arr) |elem| total += std.fmt.parseFloat(f64, elem) catch 0;
+        return Value{ .float64 = total / @as(f64, @floatFromInt(arr.len)) };
+    }
+
+    // ── Array constructor: array(v1, v2, ...) ─────────────────────────────────
+    if (std.mem.eql(u8, name, "array")) {
+        const items = try arena.alloc([]const u8, args.len);
+        for (args, 0..) |av, i| {
+            if (av) |vv| {
+                items[i] = vv.toStr() orelse try std.fmt.allocPrint(arena, "{d}", .{vv.toF64() orelse 0.0});
+            } else {
+                items[i] = "";
+            }
+        }
+        return Value{ .array_string = items };
+    }
+
+    // ── arrayIntersect(arr1, arr2) ────────────────────────────────────────────
+    if (std.mem.eql(u8, name, "arrayIntersect")) {
+        if (args.len < 2) return Value{ .array_string = &.{} };
+        const a1 = switch (args[0] orelse return Value{ .array_string = &.{} }) {
+            .array_string => |s| s,
+            else => return Value{ .array_string = &.{} },
+        };
+        const a2 = switch (args[1] orelse return Value{ .array_string = &.{} }) {
+            .array_string => |s| s,
+            else => return Value{ .array_string = &.{} },
+        };
+        var out: std.ArrayListUnmanaged([]const u8) = .empty;
+        for (a1) |elem| {
+            for (a2) |e2| {
+                if (std.mem.eql(u8, elem, e2)) {
+                    try out.append(arena, elem);
+                    break;
+                }
+            }
+        }
+        return Value{ .array_string = try out.toOwnedSlice(arena) };
     }
 
     // ── Conditional ───────────────────────────────────────────────────────────

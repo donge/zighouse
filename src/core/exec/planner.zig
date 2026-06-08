@@ -242,9 +242,12 @@ pub fn plan_query(
         const fn_ptr = try ctx.alloc.create(PhysicalNode);
         fn_ptr.* = .{ .filter = .{ .input = source, .predicate = pred } };
         source = fn_ptr;
-    } else if (gplan.where_text != null) {
-        // No structured WhereNode (translateWhere failed) — fall back.
-        return null;
+    } else if (gplan.where_text) |wt| {
+        // No structured WhereNode — parse where_text as a typed expression.
+        const pred = try parseArithExpr(ctx, wt) orelse return null;
+        const fn_ptr = try ctx.alloc.create(PhysicalNode);
+        fn_ptr.* = .{ .filter = .{ .input = source, .predicate = pred } };
+        source = fn_ptr;
     }
 
     // ── Collect projections ───────────────────────────────────────────────────
@@ -541,9 +544,12 @@ pub fn plan_query(
             const filter_node = try ctx.alloc.create(PhysicalNode);
             filter_node.* = .{ .filter = .{ .input = source, .predicate = pred } };
             source = filter_node;
-        } else if (gplan.having_text != null) {
-            // having_text present but no structured expr — fall back.
-            return null;
+        } else if (gplan.having_text) |ht| {
+            // having_text present but no structured expr — parse via ArithExpr.
+            const pred = try parseArithExpr(ctx, ht) orelse return null;
+            const filter_node = try ctx.alloc.create(PhysicalNode);
+            filter_node.* = .{ .filter = .{ .input = source, .predicate = pred } };
+            source = filter_node;
         }
     }
 
@@ -1169,6 +1175,24 @@ const scalar_fns = [_]ScalarFn{
      .{ .name = "IPv4NumToString", .out = .string        },
      .{ .name = "IPv6StringToNumOrDefault", .out = .uint64 },
      .{ .name = "IPv6NumToString", .out = .string        },
+     // Time component extractors
+     .{ .name = "toHour",                .out = .int64         },
+     .{ .name = "hour",                  .out = .int64         },
+     .{ .name = "toMinute",              .out = .int64         },
+     .{ .name = "toSecond",              .out = .int64         },
+     // Math
+     .{ .name = "sqrt",                  .out = .float64       },
+     // Array scalar aggregates
+     .{ .name = "arraySum",              .out = .float64       },
+     .{ .name = "arrayAvg",              .out = .float64       },
+     // Interval constructors (return ms as int64)
+     .{ .name = "toIntervalSecond",      .out = .int64         },
+     .{ .name = "toIntervalMinute",      .out = .int64         },
+     .{ .name = "toIntervalHour",        .out = .int64         },
+     .{ .name = "toIntervalDay",         .out = .int64         },
+     .{ .name = "toIntervalWeek",        .out = .int64         },
+     .{ .name = "toIntervalMonth",       .out = .int64         },
+     .{ .name = "toIntervalYear",        .out = .int64         },
 };
 
 /// Map date_trunc unit string → kernels function name and output ColumnType.
@@ -1401,6 +1425,12 @@ fn canonFnName(name: []const u8) []const u8 {
         "mapKeys", "mapValues",
         "tuple",
         "regexp_replace", "replaceRegexpOne",
+        "now", "today",
+        "toHour", "hour", "toMinute", "toSecond",
+        "sqrt",
+        "arrayElement", "arraySum", "arrayAvg", "array", "arrayIntersect",
+        "toIntervalSecond", "toIntervalMinute", "toIntervalHour",
+        "toIntervalDay", "toIntervalWeek", "toIntervalMonth", "toIntervalYear",
     };
     for (canon_names) |cn| {
         if (std.ascii.eqlIgnoreCase(cn, name)) return cn;
@@ -1864,6 +1894,16 @@ fn prattExpr(pctx: *ParseCtx, min_bp: u8) anyerror!?Expr {
                         std.ascii.eqlIgnoreCase(name, "arrayFilter") or
                         std.ascii.eqlIgnoreCase(name, "arrayExists")) and
                         args_slice[0] == .lambda) break :blk2 true;
+                    // arrayElement(arr, n): 2-arg
+                    if (args_slice.len == 2 and std.ascii.eqlIgnoreCase(name, "arrayElement")) break :blk2 true;
+                    // arrayIntersect(arr1, arr2): 2-arg
+                    if (args_slice.len == 2 and std.ascii.eqlIgnoreCase(name, "arrayIntersect")) break :blk2 true;
+                    // array(v1, v2, ...): N-arg constructor
+                    if (args_slice.len >= 1 and std.ascii.eqlIgnoreCase(name, "array")) break :blk2 true;
+                    // Zero-arg functions: now(), today()
+                    if (args_slice.len == 0 and (
+                        std.ascii.eqlIgnoreCase(name, "now") or
+                        std.ascii.eqlIgnoreCase(name, "today"))) break :blk2 true;
                     break :blk2 false;
                 };
                 if (!is_known) return null;
@@ -1942,10 +1982,23 @@ fn prattExpr(pctx: *ParseCtx, min_bp: u8) anyerror!?Expr {
             continue;
         }
 
-        // MAP SUBSCRIPT: lhs['key']  →  mapGet(lhs, key) or mapGetFloat64(lhs, key)
+        // MAP/ARRAY SUBSCRIPT: lhs['key'] → mapGet, lhs[N] → arrayElement
         if (op.kind == .lbracket) {
             _ = pctx.lex.next(); // consume '['
             const key_tok = pctx.lex.next();
+            if (key_tok.kind == .num_int) {
+                // Integer index: arr[N] → arrayElement(arr, N)
+                const rb = pctx.lex.next();
+                if (rb.kind != .rbracket) return null;
+                const idx = std.fmt.parseInt(i64, key_tok.text, 10) catch return null;
+                const fc = try pctx.arena.create(plan.FnCall);
+                const fc_args = try pctx.arena.alloc(Expr, 2);
+                fc_args[0] = lhs;
+                fc_args[1] = Expr{ .lit_i64 = idx };
+                fc.* = .{ .name = "arrayElement", .args = fc_args };
+                lhs = Expr{ .fn_call = fc };
+                continue;
+            }
             if (key_tok.kind != .str_lit) return null;
             const rb = pctx.lex.next();
             if (rb.kind != .rbracket) return null;
@@ -2062,6 +2115,11 @@ fn inferExprType(ctx: *PlannerCtx, expr: Expr) ColumnType {
             if (std.mem.eql(u8, fc.name, "arrayJoin")) return .string;
             if (std.mem.eql(u8, fc.name, "arrayMap") or std.mem.eql(u8, fc.name, "arrayFilter")) return .array_string;
             if (std.mem.eql(u8, fc.name, "and") or std.mem.eql(u8, fc.name, "or")) return .uint64;
+            if (std.mem.eql(u8, fc.name, "now")) return .datetime64_ms;
+            if (std.mem.eql(u8, fc.name, "today")) return .date_u16;
+            if (std.mem.eql(u8, fc.name, "arrayElement")) return .string;
+            if (std.mem.eql(u8, fc.name, "arrayIntersect") or
+                std.mem.eql(u8, fc.name, "array")) return .array_string;
             if (std.mem.eql(u8, fc.name, "if") or std.mem.eql(u8, fc.name, "multiIf")) {
                 if (fc.args.len >= 2) return inferExprType(ctx, fc.args[1]);
             }

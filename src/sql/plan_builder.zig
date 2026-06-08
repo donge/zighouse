@@ -408,12 +408,12 @@ fn buildFuncExpr(allocator: Allocator, f: ast.FuncExpr, alias: ?[]const u8, ctes
         const col = try firstArgText(allocator, f.args, ctes);
         return Expr{ .func = .max, .column = col, .alias = alias };
     }
-    // countIf(cond_expr)
+    // countIf(cond_expr) → sum(if(cond, 1, 0))  — avoids pipeline changes
     if ((std.mem.eql(u8, name, "countif") or std.mem.eql(u8, name, "count_if")) and f.args.len == 1) {
-        const cond = try buildCondExpr(allocator, f.args[0], ctes);
-        const cond_ptr = try allocator.create(CondExpr);
-        cond_ptr.* = cond;
-        return Expr{ .func = .count_if, .alias = alias, .cond = cond_ptr };
+        const cond_text = try exprToText(allocator, f.args[0], ctes);
+        defer allocator.free(cond_text);
+        const col = try std.fmt.allocPrint(allocator, "if({s}, 1, 0)", .{cond_text});
+        return Expr{ .func = .sum, .column = col, .alias = alias };
     }
     // minIf(col, cond)
     if ((std.mem.eql(u8, name, "minif") or std.mem.eql(u8, name, "min_if")) and f.args.len == 2) {
@@ -471,6 +471,33 @@ fn buildFuncExpr(allocator: Allocator, f: ast.FuncExpr, alias: ?[]const u8, ctes
     if (std.mem.eql(u8, name, "any_value") and f.args.len == 1) {
         const col = try firstArgText(allocator, f.args, ctes);
         return Expr{ .func = .any_val, .column = col, .alias = alias };
+    }
+
+    // uniq(col) / uniqHLL12(col) → uniqExact (exact distinct; memory tradeoff accepted)
+    if ((std.mem.eql(u8, name, "uniq") or
+         std.mem.eql(u8, name, "uniqhll12") or
+         std.mem.eql(u8, name, "uniq_hll12")) and f.args.len == 1) {
+        const col = try firstArgText(allocator, f.args, ctes);
+        return Expr{ .func = .uniq_exact, .column = col, .alias = alias };
+    }
+    // anyLast(col) → any_val (first-value approximation)
+    if ((std.mem.eql(u8, name, "anylast") or std.mem.eql(u8, name, "any_last")) and f.args.len == 1) {
+        const col = try firstArgText(allocator, f.args, ctes);
+        return Expr{ .func = .any_val, .column = col, .alias = alias };
+    }
+    // groupArray(col) → group_uniq_array (deduplicating approximation)
+    if ((std.mem.eql(u8, name, "grouparray") or std.mem.eql(u8, name, "group_array")) and f.args.len >= 1) {
+        const col = try firstArgText(allocator, f.args, ctes);
+        return Expr{ .func = .group_uniq_array, .column = col, .alias = alias };
+    }
+    // sumIf(col, cond) → sum(if(cond, col, 0))  — avoids pipeline changes
+    if ((std.mem.eql(u8, name, "sumif") or std.mem.eql(u8, name, "sum_if")) and f.args.len == 2) {
+        const col_text  = try exprToText(allocator, f.args[0], ctes);
+        defer allocator.free(col_text);
+        const cond_text = try exprToText(allocator, f.args[1], ctes);
+        defer allocator.free(cond_text);
+        const col = try std.fmt.allocPrint(allocator, "if({s}, {s}, 0)", .{ cond_text, col_text });
+        return Expr{ .func = .sum, .column = col, .alias = alias };
     }
 
     // length(col) → column_ref "length(col)"
