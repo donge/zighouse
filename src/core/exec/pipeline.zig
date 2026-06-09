@@ -2139,6 +2139,127 @@ fn executeScalarAggParallel(
         return i16_rl;
     } // end blk_i16
 
+    // ── Raw int64 COUNT(DISTINCT) two-phase fast path ─────────────────────────
+    // For queries like Q5: SELECT COUNT(DISTINCT UserID) FROM hits
+    //
+    // Phase 1 (parallel): scatter raw i64 values into N_CD_PARTS=64 partitions
+    //   using low 6 bits of value as partition selector.
+    // Phase 2 (parallel): each partition deduplicates independently using an
+    //   AutoHashMap sized to partition cardinality → fits in L2 cache.
+    // Avoids fetchRange, eliminates the serial O(N) key-set merge.
+    blk_cdf: {
+        if (aggs.len != 1) break :blk_cdf;
+        const ac0 = switch (aggs[0].expr) { .agg_call => |a| a, else => break :blk_cdf };
+        if (ac0.kind != .count or !ac0.distinct) break :blk_cdf;
+        const arg0 = ac0.arg orelse break :blk_cdf;
+        if (arg0 != .col_ref) break :blk_cdf;
+        if (filter_pred != null) break :blk_cdf;
+        const cd_col_idx = arg0.col_ref.index;
+        const cd_schema = ctx.source.schema();
+        if (cd_col_idx >= cd_schema.len) break :blk_cdf;
+        const cd_col_name = cd_schema[cd_col_idx].name;
+        const cd_raw = ctx.source.getRawInt64Col(cd_col_name) orelse break :blk_cdf;
+        if (cd_raw.len < total_rows) break :blk_cdf;
+
+        const N_CD_PARTS: usize = 64;
+
+        const CdScatterCtx = struct {
+            raw_col:    []const i64,
+            parts:      [N_CD_PARTS]std.ArrayListUnmanaged(u64),
+            buf_arena:  std.heap.ArenaAllocator,
+            morsel_src: *parallel.MorselSource,
+            err:        ?anyerror = null,
+
+            fn work(self: *@This(), _: *parallel.MorselSource) void {
+                self.doWork() catch |e| { self.err = e; };
+            }
+
+            fn doWork(self: *@This()) !void {
+                const ba = self.buf_arena.allocator();
+                while (self.morsel_src.next()) |m| {
+                    for (m.start..m.end) |r| {
+                        const v: u64 = @bitCast(self.raw_col[r]);
+                        try self.parts[v & (N_CD_PARTS - 1)].append(ba, v);
+                    }
+                }
+            }
+        };
+
+        var cd_scatter_src = parallel.MorselSource.init(total_rows, parallel.default_morsel_size);
+        const cd_scatter_ctxs = try alloc.alloc(CdScatterCtx, n_threads);
+        for (cd_scatter_ctxs) |*sc| {
+            sc.* = .{
+                .raw_col    = cd_raw,
+                .parts      = undefined,
+                .buf_arena  = std.heap.ArenaAllocator.init(std.heap.c_allocator),
+                .morsel_src = &cd_scatter_src,
+            };
+            for (&sc.parts) |*p| p.* = std.ArrayListUnmanaged(u64).empty;
+        }
+        try parallel.parallelFor(alloc, CdScatterCtx, CdScatterCtx.work, cd_scatter_ctxs, &cd_scatter_src);
+        for (cd_scatter_ctxs) |*sc| { if (sc.err) |e| return e; }
+        defer for (cd_scatter_ctxs) |*sc| sc.buf_arena.deinit();
+
+        // Phase 2: parallel per-partition deduplication.
+        const cd_distinct_counts = try alloc.alloc(u64, N_CD_PARTS);
+        @memset(cd_distinct_counts, 0);
+
+        const CdAggCtx = struct {
+            scatter_ctxs:    []CdScatterCtx,
+            distinct_counts: []u64,
+            morsel_src:      *parallel.MorselSource,
+            err:             ?anyerror = null,
+
+            fn work(self: *@This(), _: *parallel.MorselSource) void {
+                self.doWork() catch |e| { self.err = e; };
+            }
+
+            fn doWork(self: *@This()) !void {
+                while (self.morsel_src.next()) |m| {
+                    const p = m.start;
+                    var part_total: usize = 0;
+                    for (self.scatter_ctxs) |*sc| part_total += sc.parts[p].items.len;
+                    if (part_total == 0) continue;
+
+                    // Per-partition arena: freed at end of partition loop iteration.
+                    var part_arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+                    defer part_arena.deinit();
+
+                    var hm = std.AutoHashMap(u64, void).init(part_arena.allocator());
+                    // Pre-size: assume up to 50% distinct within partition.
+                    try hm.ensureTotalCapacity(@intCast(part_total / 2 + 64));
+                    for (self.scatter_ctxs) |*sc| {
+                        for (sc.parts[p].items) |v| try hm.put(v, {});
+                    }
+                    self.distinct_counts[p] = hm.count();
+                }
+            }
+        };
+
+        var cd_agg_src = parallel.MorselSource.init(N_CD_PARTS, 1);
+        const cd_agg_ctxs = try alloc.alloc(CdAggCtx, n_threads);
+        for (cd_agg_ctxs) |*ac| {
+            ac.* = .{
+                .scatter_ctxs    = cd_scatter_ctxs,
+                .distinct_counts = cd_distinct_counts,
+                .morsel_src      = &cd_agg_src,
+            };
+        }
+        try parallel.parallelFor(alloc, CdAggCtx, CdAggCtx.work, cd_agg_ctxs, &cd_agg_src);
+        for (cd_agg_ctxs) |*ac| { if (ac.err) |e| return e; }
+
+        var cd_total: u64 = 0;
+        for (cd_distinct_counts) |c| cd_total += c;
+
+        const cd_metas  = try alloc.alloc(result.ColMeta, 1);
+        cd_metas[0] = .{ .name = aggs[0].alias, .col_type = aggs[0].out_type };
+        const cd_row = try alloc.alloc(?Value, 1);
+        cd_row[0] = Value{ .uint64 = cd_total };
+        var cd_rl = RowList.init(cd_metas);
+        try cd_rl.append(alloc, cd_row);
+        return cd_rl;
+    } // end blk_cdf
+
 
     const ParCtx = struct {
         source:      SourceIface,
@@ -10792,20 +10913,6 @@ fn executeTwoPhaseHashAggWithCW(
         all_const_ints: bool,
         sm:             []const result.ColMeta,
     };
-    var emit_ctx2 = EmitCtx2{
-        .rl             = &rl,
-        .alloc          = alloc,
-        .aggs           = aggs,
-        .kinds          = compact_kinds,
-        .str_ht         = undefined, // set per partition below
-        .sidecar_idx    = sidecar_idx,
-        .keys           = keys,
-        .str_key_pos    = str_key_pos,
-        .cw_key_pos     = cw_key_pos,
-        .int_prefix     = emit_int_prefix,
-        .all_const_ints = emit_all_const2,
-        .sm             = sm_emit2,
-    };
     const EmitCb2 = struct {
         fn cb(ec: *EmitCtx2, composite: []const u8, vals: []const u64, slot: usize) void {
             const row = ec.alloc.alloc(?Value, ec.keys.len + vals.len) catch return;
@@ -10861,67 +10968,151 @@ fn executeTwoPhaseHashAggWithCW(
         }
     };
 
-    // ── Phase 2: sequential per-partition aggregation ─────────────────────────
-    // All part_hts and composite-key bytes live in phase2_arena.
-    // After iterateWithSlot (which dupes strings into alloc), phase2_arena is freed.
-    var phase2_arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
-    defer phase2_arena.deinit();
-    const p2alloc = phase2_arena.allocator();
+    // ── Phase 2: parallel per-partition aggregation ───────────────────────────
+    // Each partition gets its own ArenaAllocator for composite-key bytes.
+    // Workers pull partitions from a MorselSource and emit into per-partition
+    // RowLists; those are merged into rl after all workers finish.
+    const part_arenas = try alloc.alloc(std.heap.ArenaAllocator, N_CW_PARTS);
+    for (part_arenas) |*pa| pa.* = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    defer for (part_arenas) |*pa| pa.deinit();
+    const part_rls = try alloc.alloc(?RowList, N_CW_PARTS);
+    for (part_rls) |*pr| pr.* = null;
 
-    for (0..N_CW_PARTS) |p| {
-        var total_recs: usize = 0;
-        for (scatter_ctxs) |*sc| total_recs += sc.bufs[p].items.len / row_stride;
-        if (total_recs == 0) continue;
+    const P2CwCtx = struct {
+        scatter_ctxs:       []ScatterCtx2,
+        part_arenas:        []std.heap.ArenaAllocator,
+        part_rls:           []?RowList,
+        alloc:              std.mem.Allocator,
+        out_metas:          []result.ColMeta,
+        row_stride:         usize,
+        aggs:               []const plan.ProjectItem,
+        compact_kinds:      []const ht.CompactAggKind,
+        compact_init_vals:  []const u64,
+        int_prefix_len:     usize,
+        n_rec_ints:         usize,
+        all_const_int_keys: bool,
+        emit_int_prefix:    usize,
+        emit_all_const:     bool,
+        str_key_pos:        usize,
+        cw_key_pos:         usize,
+        keys:               []const plan.ProjectItem,
+        sm:                 []const result.ColMeta,
+        sidecar_idx:        []const usize,
+        morsel_src:         *parallel.MorselSource,
+        err:                ?anyerror = null,
 
-        var part_ht = try ht.StrAggHashTable.initWithCapacity(
-            p2alloc, aggs.len, 0, @max(total_recs, 4));
-
-        for (scatter_ctxs) |*sc| {
-            const buf = sc.bufs[p].items;
-            var i: usize = 0;
-            while (i + row_stride <= buf.len) : (i += row_stride) {
-                const h       = buf[i];
-                const url_ptr = buf[i + 1];
-                const url_len = buf[i + 2];
-                const cw_ptr2 = buf[i + 3];
-                const cw_len2 = buf[i + 4];
-
-                // Ensure load-factor headroom before probe.
-                if (part_ht.count + 1 > (part_ht.capacity * 7) / 10)
-                    try part_ht.growTo(part_ht.capacity * 2);
-
-                if (part_ht.probeHashOnly(h)) |slot| {
-                    // Repeat group: increment count, no string DRAM access.
-                    part_ht.vals_flat[slot * aggs.len] += 1;
-                } else {
-                    // New group: build composite key from scatter-record pointers.
-                    const url_s: []const u8 = @as([*]const u8, @ptrFromInt(url_ptr))[0..url_len];
-                    const cw_s:  []const u8 = if (cw_len2 > 0)
-                        @as([*]const u8, @ptrFromInt(cw_ptr2))[0..cw_len2] else "";
-                    const composite_len = int_prefix_len + 2 + cw_len2 + url_len;
-                    const composite = try p2alloc.alloc(u8, composite_len);
-                    var off: usize = 0;
-                    if (!all_const_int_keys) {
-                        for (0..n_rec_ints) |ki| {
-                            std.mem.writeInt(u64, composite[off..][0..8], buf[i + 5 + ki], .little);
-                            off += 8;
-                        }
-                    }
-                    std.mem.writeInt(u16, composite[off..][0..2],
-                        @intCast(@min(cw_len2, 65535)), .little);
-                    off += 2;
-                    @memcpy(composite[off..off + cw_len2], cw_s);
-                    off += cw_len2;
-                    @memcpy(composite[off..], url_s);
-                    const res = part_ht.insertHashOnly(composite, h, compact_init_vals);
-                    res.vals[0] = 1; // first occurrence → count = 1
-                }
-            }
+        fn work(self: *@This(), _: *parallel.MorselSource) void {
+            self.doWork() catch |e| { self.err = e; };
         }
 
-        // Emit: strings are duped into alloc, so phase2_arena can be freed after.
-        emit_ctx2.str_ht = &part_ht;
-        part_ht.iterateWithSlot(&emit_ctx2, EmitCb2.cb);
+        fn doWork(self: *@This()) !void {
+            while (self.morsel_src.next()) |m| {
+                const p = m.start;
+                var total_recs: usize = 0;
+                for (self.scatter_ctxs) |*sc| total_recs += sc.bufs[p].items.len / self.row_stride;
+                if (total_recs == 0) continue;
+
+                const p2alloc = self.part_arenas[p].allocator();
+                var part_ht = try ht.StrAggHashTable.initWithCapacity(
+                    p2alloc, self.aggs.len, 0, @max(total_recs, 4));
+
+                for (self.scatter_ctxs) |*sc| {
+                    const buf = sc.bufs[p].items;
+                    var i: usize = 0;
+                    while (i + self.row_stride <= buf.len) : (i += self.row_stride) {
+                        const h       = buf[i];
+                        const url_ptr = buf[i + 1];
+                        const url_len = buf[i + 2];
+                        const cw_ptr2 = buf[i + 3];
+                        const cw_len2 = buf[i + 4];
+
+                        if (part_ht.count + 1 > (part_ht.capacity * 7) / 10)
+                            try part_ht.growTo(part_ht.capacity * 2);
+
+                        if (part_ht.probeHashOnly(h)) |slot| {
+                            part_ht.vals_flat[slot * self.aggs.len] += 1;
+                        } else {
+                            const url_s: []const u8 = @as([*]const u8, @ptrFromInt(url_ptr))[0..url_len];
+                            const cw_s:  []const u8 = if (cw_len2 > 0)
+                                @as([*]const u8, @ptrFromInt(cw_ptr2))[0..cw_len2] else "";
+                            const composite_len = self.int_prefix_len + 2 + cw_len2 + url_len;
+                            const composite = try p2alloc.alloc(u8, composite_len);
+                            var off: usize = 0;
+                            if (!self.all_const_int_keys) {
+                                for (0..self.n_rec_ints) |ki| {
+                                    std.mem.writeInt(u64, composite[off..][0..8], buf[i + 5 + ki], .little);
+                                    off += 8;
+                                }
+                            }
+                            std.mem.writeInt(u16, composite[off..][0..2],
+                                @intCast(@min(cw_len2, 65535)), .little);
+                            off += 2;
+                            @memcpy(composite[off..off + cw_len2], cw_s);
+                            off += cw_len2;
+                            @memcpy(composite[off..], url_s);
+                            const res = part_ht.insertHashOnly(composite, h, self.compact_init_vals);
+                            res.vals[0] = 1;
+                        }
+                    }
+                }
+
+                // Emit rows into a per-partition RowList (alloc is thread-safe c_allocator).
+                var part_rl = RowList.init(self.out_metas);
+                var local_emit = EmitCtx2{
+                    .rl             = &part_rl,
+                    .alloc          = self.alloc,
+                    .aggs           = self.aggs,
+                    .kinds          = self.compact_kinds,
+                    .str_ht         = &part_ht,
+                    .sidecar_idx    = self.sidecar_idx,
+                    .keys           = self.keys,
+                    .str_key_pos    = self.str_key_pos,
+                    .cw_key_pos     = self.cw_key_pos,
+                    .int_prefix     = self.emit_int_prefix,
+                    .all_const_ints = self.emit_all_const,
+                    .sm             = self.sm,
+                };
+                part_ht.iterateWithSlot(&local_emit, EmitCb2.cb);
+                self.part_rls[p] = part_rl;
+                // part_arenas[p] freed by outer defer after all workers complete.
+            }
+        }
+    };
+
+    var morsel_src_p2 = parallel.MorselSource.init(N_CW_PARTS, 1);
+    const p2cw_ctxs = try alloc.alloc(P2CwCtx, n_threads);
+    for (p2cw_ctxs) |*pc| {
+        pc.* = .{
+            .scatter_ctxs       = scatter_ctxs,
+            .part_arenas        = part_arenas,
+            .part_rls           = part_rls,
+            .alloc              = alloc,
+            .out_metas          = out_metas2,
+            .row_stride         = row_stride,
+            .aggs               = aggs,
+            .compact_kinds      = compact_kinds,
+            .compact_init_vals  = compact_init_vals,
+            .int_prefix_len     = int_prefix_len,
+            .n_rec_ints         = n_rec_ints,
+            .all_const_int_keys = all_const_int_keys,
+            .emit_int_prefix    = emit_int_prefix,
+            .emit_all_const     = emit_all_const2,
+            .str_key_pos        = str_key_pos,
+            .cw_key_pos         = cw_key_pos,
+            .keys               = keys,
+            .sm                 = sm_emit2,
+            .sidecar_idx        = sidecar_idx,
+            .morsel_src         = &morsel_src_p2,
+        };
+    }
+    try parallel.parallelFor(alloc, P2CwCtx, P2CwCtx.work, p2cw_ctxs, &morsel_src_p2);
+    for (p2cw_ctxs) |*pc| { if (pc.err) |e| return e; }
+
+    // Merge per-partition RowLists into rl (order preserved: p=0..63).
+    for (part_rls) |maybe_rl| {
+        if (maybe_rl) |part_rl| {
+            for (part_rl.rows.items) |row| try rl.append(alloc, row);
+        }
     }
 
     // ── Sort / TopK ───────────────────────────────────────────────────────────
