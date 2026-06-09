@@ -26,6 +26,15 @@ def main() -> int:
     parser.add_argument("--query-threshold", type=float, default=5.0, help="Allowed warm_best_sum regression percent")
     parser.add_argument("--import-threshold", type=float, default=7.5, help="Allowed import wall regression percent")
     parser.add_argument("--per-query-threshold", type=float, default=20.0, help="Allowed per-query warm best regression percent")
+    # DuckDB-relative gates (optional — only active when --duckdb-ref is supplied).
+    parser.add_argument("--duckdb-ref", type=Path, default=None,
+                        help="Path to DuckDB reference JSON (perf/baselines/duckdb-10m.json). "
+                             "When supplied, enables two additional gates.")
+    parser.add_argument("--duckdb-sum-ratio", type=float, default=1.0,
+                        help="Gate: candidate warm_best_sum must be < duckdb_sum × ratio (default 1.0 = must beat DuckDB)")
+    parser.add_argument("--duckdb-query-ratio", type=float, default=2.0,
+                        help="Gate: each per-query warm best must be < duckdb_query × ratio (default 2.0). "
+                             "A floor of 1 ms is applied to DuckDB reference times so near-zero queries are not penalised.")
     args = parser.parse_args()
 
     base = load(args.baseline)
@@ -70,6 +79,41 @@ def main() -> int:
         if d > args.per_query_threshold and c - b > 0.005:
             failures.append(f"q{idx} warm best regressed {d:.2f}% ({b:.6f}s -> {c:.6f}s)")
 
+    # ── DuckDB-relative gates ──────────────────────────────────────────────────
+    duck_violations: list[str] = []
+    duck_ref_sum_ms: float | None = None
+    if args.duckdb_ref is not None:
+        duck_ref = load(args.duckdb_ref)
+        duck_ref_sum_ms = float(duck_ref["warm_best_sum_ms"])
+        duck_per_q_ms: list[float] = [float(v) if v is not None else 0.0
+                                      for v in duck_ref["per_query_ms"]]
+        FLOOR_MS = 2.0  # floor for near-zero DuckDB times (DuckDB timer has 1ms resolution)
+
+        # Gate A: overall warm_best_sum < duckdb_sum × duckdb_sum_ratio
+        cand_sum_ms = float(cand["query"]["warm_best_sum"]) * 1000.0
+        limit_ms = duck_ref_sum_ms * args.duckdb_sum_ratio
+        if cand_sum_ms >= limit_ms:
+            failures.append(
+                f"duckdb-sum gate: {cand_sum_ms:.1f}ms >= {limit_ms:.1f}ms "
+                f"(DuckDB {duck_ref_sum_ms:.1f}ms × {args.duckdb_sum_ratio})"
+            )
+
+        # Gate B: per-query warm best < duckdb_time × duckdb_query_ratio
+        cand_timings = cand["query"]["timings"]
+        for idx, crow in enumerate(cand_timings, 1):
+            cvals = [float(x) for x in crow[1:] if x is not None]
+            if not cvals:
+                continue
+            c_ms = min(cvals) * 1000.0
+            ref_ms = max(FLOOR_MS, duck_per_q_ms[idx - 1] if idx - 1 < len(duck_per_q_ms) else FLOOR_MS)
+            limit_q = ref_ms * args.duckdb_query_ratio
+            if c_ms >= limit_q:
+                duck_violations.append((idx, c_ms, ref_ms, c_ms / ref_ms))
+                failures.append(
+                    f"duckdb-query gate: q{idx} {c_ms:.1f}ms >= {limit_q:.1f}ms "
+                    f"(DuckDB {ref_ms:.1f}ms × {args.duckdb_query_ratio})"
+                )
+
     base_cmp = compare_summary(base)
     cand_cmp = compare_summary(cand)
     compare_generic = []
@@ -96,6 +140,11 @@ def main() -> int:
     if base_path is not None or cand_path is not None:
         print(f"query_path: {base_path!r} -> {cand_path!r}")
     print(f"warm_best_sum: {base_q:.6f}s -> {cand_q:.6f}s ({q_delta:+.2f}%)")
+    if duck_ref_sum_ms is not None:
+        cand_sum_ms = float(cand["query"]["warm_best_sum"]) * 1000.0
+        duck_ratio = cand_sum_ms / duck_ref_sum_ms
+        gate_a_symbol = "PASS" if cand_sum_ms < duck_ref_sum_ms * args.duckdb_sum_ratio else "FAIL"
+        print(f"vs DuckDB sum: {cand_sum_ms:.1f}ms / {duck_ref_sum_ms:.1f}ms = {duck_ratio:.3f}x  [{gate_a_symbol}]")
     if base_cmp is not None and cand_cmp is not None:
         print(f"compare_generic_sum: {base_gen:.6f}s -> {cand_gen:.6f}s ({generic_delta:+.2f}%)")
         print(f"compare_specialized_sum: {base_spec:.6f}s -> {cand_spec:.6f}s ({specialized_delta:+.2f}%)")
@@ -104,6 +153,10 @@ def main() -> int:
     print("largest per-query regressions:")
     for idx, b, c, d in sorted(per_query, key=lambda x: x[3], reverse=True)[:10]:
         print(f"  q{idx}: {b:.6f}s -> {c:.6f}s ({d:+.2f}%)")
+    if duck_violations:
+        print("duckdb-query gate failures (zh >= duckdb × ratio):")
+        for idx, c_ms, ref_ms, ratio_v in sorted(duck_violations, key=lambda x: x[3], reverse=True):
+            print(f"  q{idx}: {c_ms:.1f}ms vs DuckDB {ref_ms:.1f}ms ({ratio_v:.2f}x)")
     if compare_generic:
         print("largest compare generic regressions:")
         for idx, b, c, d in sorted(compare_generic, key=lambda x: x[3], reverse=True)[:10]:

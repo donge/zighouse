@@ -260,4 +260,7 @@ scripts/perf-compare.py \
   --query-threshold 15 \
   --import-threshold 20 \
   --per-query-threshold 35 \
+  --duckdb-ref "${ROOT}/perf/baselines/duckdb-10m.json" \
+  --duckdb-sum-ratio 1.0 \
+  --duckdb-query-ratio 2.0 \
   "$BASELINE" "$OUT_JSON"
