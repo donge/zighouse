@@ -6585,12 +6585,30 @@ fn executeHashAggParallelPairCount(
         // If this path is driven by LIMIT(hash_agg(...)) without ORDER BY, the
         // aggregate has already seen all rows, so we can materialize only N groups.
         const unordered_limit = top_k > 0 and sort_keys.len == 0;
+        const count_top = top_k > 0 and sort_keys.len == 1 and sort_keys[0].desc and sort_keys[0].col_idx == 2;
+        const P2Out = struct { i64_key: i64, str_start: u32, str_len: u32, count: u64 };
+        const top_buf: ?[]P2Out = if (count_top) try alloc.alloc(P2Out, top_k) else null;
+        var top_len: usize = 0;
         var emitted_p2: usize = 0;
         p2_emit: for (0..N_P2) |p| {
             const slots = part_slots2[p];
             if (slots.len == 0) continue;
             for (slots[0..part_caps2[p]]) |s| {
                 if (s.hash == 0) continue;
+                if (top_buf) |tb| {
+                    const cand: P2Out = .{ .i64_key = s.i64_key, .str_start = s.str_start, .str_len = s.str_len, .count = s.count };
+                    if (top_len < tb.len) {
+                        tb[top_len] = cand;
+                        top_len += 1;
+                    } else {
+                        var min_i: usize = 0;
+                        for (tb[1..], 1..) |v, i| {
+                            if (v.count < tb[min_i].count) min_i = i;
+                        }
+                        if (cand.count > tb[min_i].count) tb[min_i] = cand;
+                    }
+                    continue;
+                }
                 const str = rsb[s.str_start .. s.str_start + s.str_len];
                 const row = try alloc.alloc(?Value, 3);
                 if (k0_is_i64) {
@@ -6604,6 +6622,27 @@ fn executeHashAggParallelPairCount(
                 try rl2.append(alloc, row);
                 emitted_p2 += 1;
                 if (unordered_limit and emitted_p2 >= top_k) break :p2_emit;
+            }
+        }
+        if (top_buf) |tb| {
+            const SortTop = struct {
+                fn lessThan(_: void, a: P2Out, b: P2Out) bool {
+                    return a.count > b.count;
+                }
+            };
+            std.sort.pdq(P2Out, tb[0..top_len], {}, SortTop.lessThan);
+            for (tb[0..top_len]) |s| {
+                const str = rsb[s.str_start .. s.str_start + s.str_len];
+                const row = try alloc.alloc(?Value, 3);
+                if (k0_is_i64) {
+                    row[0] = Value{ .int64 = s.i64_key };
+                    row[1] = Value{ .string = str };
+                } else {
+                    row[0] = Value{ .string = str };
+                    row[1] = Value{ .int64 = s.i64_key };
+                }
+                row[2] = Value{ .uint64 = s.count };
+                try rl2.append(alloc, row);
             }
         }
 
