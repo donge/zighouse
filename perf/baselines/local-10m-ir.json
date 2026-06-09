@@ -5,7 +5,7 @@
   "limit_rows": 10000000,
   "queries": "clickbench-submit/zighouse/queries.sql",
   "build": {
-    "git_commit": "b084efbda8bad7a9952d564567c72b52750ec0b7",
+    "git_commit": "65f73eca535280fdea3403036dd2950c18a73fe9",
     "git_dirty": false
   },
   "host": {
@@ -23,7 +23,7 @@
     "queries": 43,
     "nulls": 0,
     "first_sum": 9.356155,
-    "warm_best_sum": 2.2806335,
+    "warm_best_sum": 2.248,
     "all_runs_sum": null,
     "timings": [
       [
