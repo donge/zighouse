@@ -8796,7 +8796,7 @@ fn executeTwoPhaseHashAgg(
             // per-row filter loop (~50M ops) and i32→i64 widening (~250MB bandwidth).
             raw_scatter: {
                 if (self.str_filter != null) break :raw_scatter;
-                const ics = self.int_filter orelse break :raw_scatter;
+                const ics: []const IntCmpCond = if (self.int_filter) |ic| ic else &.{};
                 if (!self.count_only) break :raw_scatter;
                 const sch = self.source.schema();
                 // Resolve filter condition columns to raw slices.
@@ -8818,6 +8818,41 @@ fn executeTwoPhaseHashAgg(
                     else if (self.source.getRawInt64Col(nm)) |s| { rk[ki] = .{ .i64s = s }; }
                     else break :raw_scatter;
                 }
+                // No-filter fast path: scatter every row without mask allocation or SIMD.
+                // Activated for queries like Q16 (GROUP BY int-key, no WHERE clause).
+                if (ics.len == 0) {
+                    var rec: [18]u64 = undefined;
+                    while (self.morsel_src.next()) |m| {
+                        for (m.start..m.end) |row| {
+                            var kv: [4]i64 = undefined;
+                            for (0..self.n_eff_keys) |ki|
+                                kv[ki] = rk[ki].getI64(row) +% self.key_offs[ki];
+                            const h: u64 = blk: {
+                                if (self.n_eff_keys == 1) {
+                                    var hh: u64 = @bitCast(kv[0]);
+                                    hh ^= hh >> 33; hh *%= 0xff51afd7ed558ccd;
+                                    hh ^= hh >> 33; hh *%= 0xc4ceb9fe1a85ec53;
+                                    hh ^= hh >> 33;
+                                    break :blk hh | (1 << 63);
+                                }
+                                const hk0: u64 = @bitCast(kv[0]);
+                                const hk1: u64 = if (self.n_eff_keys >= 2) @bitCast(kv[1]) else 0;
+                                var hh = hk0 *% 0x9e3779b97f4a7c15 ^ hk1 *% 0x6c62272e07bb0142;
+                                if (self.n_eff_keys >= 3) hh ^= @as(u64, @bitCast(kv[2])) *% 0xd2a98b26625eee7b;
+                                if (self.n_eff_keys >= 4) hh ^= @as(u64, @bitCast(kv[3])) *% 0xa0761d6478bd642f;
+                                hh ^= hh >> 30; hh *%= 0xbf58476d1ce4e5b9;
+                                hh ^= hh >> 27; hh *%= 0x94d049bb133111eb;
+                                hh ^= hh >> 31;
+                                break :blk hh | (1 << 63);
+                            };
+                            rec[0] = h;
+                            for (0..self.n_eff_keys) |ki| rec[1 + ki] = @bitCast(kv[ki]);
+                            try self.bufs[h & (N_PARTS - 1)].appendSlice(buf_alloc, rec[0..self.row_stride]);
+                        }
+                    }
+                    return;
+                }
+
                 // Allocate per-thread SIMD scratch buffers (reused across morsels).
                 const rs_sz   = parallel.default_morsel_size + 1;
                 const rs_mask  = try talloc.alloc(i16, rs_sz);
@@ -8831,6 +8866,21 @@ fn executeTwoPhaseHashAgg(
                     for (ics, 0..) |cond, ci| {
                         rf[ci].applyMaskSIMD(start, nr, cond,
                             rs_mask[0..nr], rs_tmp_a[0..nr], rs_tmp_b[0..nr]);
+                        // Inter-condition early-exit: if the mask is already all-zero,
+                        // remaining conditions cannot revive any row — skip them.
+                        // Helps Q41 where CounterID=62 kills ~99% of rows upfront.
+                        {
+                            var still_live = false;
+                            var ei: usize = 0;
+                            while (ei + 32 <= nr) : (ei += 32) {
+                                const v: @Vector(32, i16) = rs_mask[ei..][0..32].*;
+                                if (@reduce(.Or, v) != 0) { still_live = true; break; }
+                            }
+                            if (!still_live) while (ei < nr) : (ei += 1) {
+                                if (rs_mask[ei] != 0) { still_live = true; break; }
+                            };
+                            if (!still_live) break;
+                        }
                     }
                     // Chunked mask scan: OR-reduce 32-lane chunks to skip all-zero
                     // blocks in ~5 cycles instead of 32 scalar checks.
@@ -9663,6 +9713,20 @@ fn executeTwoPhaseHashAggStrKeySimple(
                                 simd_batch.andMasks(rs_mask[0..nr], rs_tmp_a[0..nr], rs_mask[0..nr]);
                             }
                         }
+                    }
+                    // Post-filter early-exit: skip morsel if all rows were filtered out.
+                    // Mirrors the same pattern in executeTwoPhaseHashAggWithCW.
+                    {
+                        var any_pass = false;
+                        var ri: usize = 0;
+                        while (ri + 32 <= nr) : (ri += 32) {
+                            const v: @Vector(32, i16) = rs_mask[ri..][0..32].*;
+                            if (@reduce(.Or, v) != 0) { any_pass = true; break; }
+                        }
+                        if (!any_pass) while (ri < nr) : (ri += 1) {
+                            if (rs_mask[ri] != 0) { any_pass = true; break; }
+                        };
+                        if (!any_pass) continue;
                     }
                     const CHUNK = 32;
                     const key_off   = self.raw_key_offsets.?;
