@@ -2442,56 +2442,6 @@ fn aggExprToProjectItem(ctx: *PlannerCtx, p: generic_sql.Expr) !?ProjectItem {
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
-test "planner: simple scan" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-
-    // Build a minimal schema: table "t" with column "n" Int64
-    const cols = [_]schema_mod.Column{
-        .{ .name = "n", .ty = .int64 },
-    };
-    const tbl = schema_mod.Table{ .name = "t", .columns = &cols };
-    var ctx = PlannerCtx.init(alloc, tbl);
-
-    const proj_expr = generic_sql.Expr{
-        .func   = .column_ref,
-        .column = "n",
-        .alias  = "n",
-    };
-    const projs = [_]generic_sql.Expr{proj_expr};
-    const gplan = generic_sql.Plan{
-        .table       = "t",
-        .projections = &projs,
-    };
-
-    const node = try plan_query(&ctx, gplan);
-    try std.testing.expect(node != null);
-    try std.testing.expect(node.?.* == .project or node.?.* == .part_scan);
-}
-
-test "planner: count(*) scalar agg" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-
-    const cols = [_]schema_mod.Column{ .{ .name = "n", .ty = .int64 } };
-    const tbl = schema_mod.Table{ .name = "t", .columns = &cols };
-    var ctx = PlannerCtx.init(alloc, tbl);
-
-    const proj_expr = generic_sql.Expr{ .func = .count_star, .alias = "cnt" };
-    const projs = [_]generic_sql.Expr{proj_expr};
-    const gplan = generic_sql.Plan{ .table = "t", .projections = &projs };
-
-    const node = try plan_query(&ctx, gplan);
-    try std.testing.expect(node != null);
-    // Root should be scalar_agg
-    var n = node.?;
-    while (true) {
-        switch (n.*) {
-            .scalar_agg => break,
-            .limit => |lm| n = lm.input,
-            else => { try std.testing.expect(false); break; },
-        }
-    }
+test {
+    _ = @import("planner_test.zig");
 }

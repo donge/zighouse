@@ -1231,6 +1231,12 @@ pub const CompactIntKeyHashTable = struct {
         @prefetch(&self.entries[slot * self.entry_size], .{ .rw = .read, .locality = 1, .cache = .data });
     }
 
+    /// Prefetch using a precomputed hash (for Phase 2 loops that already have the hash).
+    pub inline fn prefetchH(self: *const CompactIntKeyHashTable, h: u64) void {
+        const slot = h & (self.capacity - 1);
+        @prefetch(&self.entries[slot * self.entry_size], .{ .rw = .read, .locality = 1, .cache = .data });
+    }
+
     /// Prefetch variant for single key (Q16, Q36, etc.).
     pub inline fn prefetchForKey1(self: *const CompactIntKeyHashTable, key0: i64) void {
         var h: u64 = @bitCast(key0);

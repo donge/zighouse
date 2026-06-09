@@ -14,8 +14,8 @@
 const std = @import("std");
 const types = @import("types.zig");
 
-pub const ColumnType  = types.ColumnType;
-pub const Value       = types.Value;
+pub const ColumnType = types.ColumnType;
+pub const Value = types.Value;
 
 /// Default number of rows per DataChunk. Tuned for L1/L2 cache residency on
 /// typical OLAP workloads. Can be overridden at comptime via build options.
@@ -57,14 +57,14 @@ pub fn allNonNull(null_mask: []const u64) bool {
 /// String slices point into the chunk's ArenaAllocator; they are valid
 /// for the lifetime of the owning DataChunk.
 pub const ColumnData = union(ColumnType) {
-    bool_u8:       []u8,
-    int64:         []i64,
-    uint64:        []u64,
-    float64:       []f64,
-    date_u16:      []u16,
+    bool_u8: []u8,
+    int64: []i64,
+    uint64: []u64,
+    float64: []f64,
+    date_u16: []u16,
     datetime64_ms: []i64,
-    string:        [][]const u8,
-    array_string:  [][][]const u8,
+    string: [][]const u8,
+    array_string: [][][]const u8,
 
     /// Return the number of elements stored.
     pub fn len(self: ColumnData) usize {
@@ -76,29 +76,76 @@ pub const ColumnData = union(ColumnType) {
     /// Read the value at index `i` as a tagged Value.
     pub fn get(self: ColumnData, i: usize) Value {
         return switch (self) {
-            .bool_u8       => |s| .{ .bool_u8       = s[i] },
-            .int64         => |s| .{ .int64         = s[i] },
-            .uint64        => |s| .{ .uint64        = s[i] },
-            .float64       => |s| .{ .float64       = s[i] },
-            .date_u16      => |s| .{ .date_u16      = s[i] },
+            .bool_u8 => |s| .{ .bool_u8 = s[i] },
+            .int64 => |s| .{ .int64 = s[i] },
+            .uint64 => |s| .{ .uint64 = s[i] },
+            .float64 => |s| .{ .float64 = s[i] },
+            .date_u16 => |s| .{ .date_u16 = s[i] },
             .datetime64_ms => |s| .{ .datetime64_ms = s[i] },
-            .string        => |s| .{ .string        = s[i] },
-            .array_string  => |s| .{ .array_string  = s[i] },
+            .string => |s| .{ .string = s[i] },
+            .array_string => |s| .{ .array_string = s[i] },
         };
     }
 
     /// Write the value `v` at index `i`. Panics on type mismatch.
     pub fn set(self: *ColumnData, i: usize, v: Value) void {
         switch (self.*) {
-            .bool_u8       => |s| s[i] = v.bool_u8,
-            .int64         => |s| s[i] = v.int64,
-            .uint64        => |s| s[i] = v.uint64,
-            .float64       => |s| s[i] = v.float64,
-            .date_u16      => |s| s[i] = v.date_u16,
+            .bool_u8 => |s| s[i] = v.bool_u8,
+            .int64 => |s| s[i] = v.int64,
+            .uint64 => |s| s[i] = v.uint64,
+            .float64 => |s| s[i] = v.float64,
+            .date_u16 => |s| s[i] = v.date_u16,
             .datetime64_ms => |s| s[i] = v.datetime64_ms,
-            .string        => |s| s[i] = v.string,
-            .array_string  => |s| s[i] = v.array_string,
+            .string => |s| s[i] = v.string,
+            .array_string => |s| s[i] = v.array_string,
         }
+    }
+
+    /// Copy one value within the same typed column buffer.
+    pub fn copyWithin(self: ColumnData, from: usize, to: usize) void {
+        switch (self) {
+            inline else => |s| s[to] = s[from],
+        }
+    }
+};
+
+// ── SelectionVector ──────────────────────────────────────────────────────────
+
+/// Row ids that survived a filter. Keeping this as a first-class value lets
+/// filters hand downstream operators a compact row set without immediately
+/// materialising a physically compacted chunk.
+pub const SelectionVector = struct {
+    indices: []u32,
+    len: usize,
+
+    pub fn init(buffer: []u32) SelectionVector {
+        return .{ .indices = buffer, .len = 0 };
+    }
+
+    pub fn append(self: *SelectionVector, row_idx: usize) void {
+        std.debug.assert(self.len < self.indices.len);
+        self.indices[self.len] = @intCast(row_idx);
+        self.len += 1;
+    }
+
+    pub fn slice(self: SelectionVector) []const u32 {
+        return self.indices[0..self.len];
+    }
+
+    pub fn full(buffer: []u32, n: usize) SelectionVector {
+        std.debug.assert(buffer.len >= n);
+        var sel = SelectionVector.init(buffer);
+        for (0..n) |i| sel.append(i);
+        return sel;
+    }
+
+    pub fn fromI16Mask(buffer: []u32, mask: []const i16) SelectionVector {
+        std.debug.assert(buffer.len >= mask.len);
+        var sel = SelectionVector.init(buffer);
+        for (mask, 0..) |m, i| {
+            if (m != 0) sel.append(i);
+        }
+        return sel;
     }
 };
 
@@ -107,18 +154,18 @@ pub const ColumnData = union(ColumnType) {
 /// One column in a DataChunk.
 pub const Column = struct {
     /// Column name (or alias) — slice into the chunk's arena.
-    name:      []const u8,
+    name: []const u8,
     /// The column type and data buffer.
-    data:      ColumnData,
+    data: ColumnData,
     /// NULL bitmap: bit[i] = 1 means row i is NULL.
     /// Length: nullMaskWords(len) u64 words.
     null_mask: []u64,
     /// Number of rows in this column (== DataChunk.num_rows).
-    len:       usize,
+    len: usize,
     /// True if this column was pruned (not needed by query). Its data
     /// buffer may point to a shared read-only zero buffer; copyRow must
     /// not write to it.
-    pruned:    bool = false,
+    pruned: bool = false,
 
     /// Read value at row `i`, or null if masked.
     pub fn getOpt(self: Column, i: usize) ?Value {
@@ -140,9 +187,9 @@ pub const Column = struct {
 ///   All column buffers (data slices, null_masks, string slices, name strings)
 ///   are allocated from `arena`. Call `deinit()` to free everything at once.
 pub const DataChunk = struct {
-    columns:  []Column,  // mutable slice; owned by arena
+    columns: []Column, // mutable slice; owned by arena
     num_rows: usize,
-    arena:    std.heap.ArenaAllocator,
+    arena: std.heap.ArenaAllocator,
 
     /// Release all memory owned by this chunk.
     pub fn deinit(self: *DataChunk) void {
@@ -172,19 +219,42 @@ pub const DataChunk = struct {
         }
         return vals;
     }
+
+    /// Physically compact this chunk in-place according to `selection`.
+    /// This is the compatibility bridge while operators are migrated to
+    /// consume SelectionVector directly. Pruned columns are skipped because
+    /// they may point at shared read-only zero buffers.
+    pub fn compactSelection(self: *DataChunk, selection: SelectionVector) void {
+        const rows = selection.slice();
+        for (rows, 0..) |src_u32, dst| {
+            const src: usize = @intCast(src_u32);
+            if (src == dst) continue;
+            for (self.columns) |*col| {
+                if (col.pruned) continue;
+                col.data.copyWithin(src, dst);
+                if (isNull(col.null_mask, src)) {
+                    setNull(col.null_mask, dst);
+                } else {
+                    clearNull(col.null_mask, dst);
+                }
+            }
+        }
+        self.num_rows = rows.len;
+        for (self.columns) |*col| col.len = rows.len;
+    }
 };
 
 /// Return the zero/empty value for a given ColumnData's type.
 fn zeroValue(data: ColumnData) Value {
     return switch (data) {
-        .bool_u8       => .{ .bool_u8       = 0 },
-        .int64         => .{ .int64         = 0 },
-        .uint64        => .{ .uint64        = 0 },
-        .float64       => .{ .float64       = 0.0 },
-        .date_u16      => .{ .date_u16      = 0 },
+        .bool_u8 => .{ .bool_u8 = 0 },
+        .int64 => .{ .int64 = 0 },
+        .uint64 => .{ .uint64 = 0 },
+        .float64 => .{ .float64 = 0.0 },
+        .date_u16 => .{ .date_u16 = 0 },
         .datetime64_ms => .{ .datetime64_ms = 0 },
-        .string        => .{ .string        = "" },
-        .array_string  => .{ .array_string  = &.{} },
+        .string => .{ .string = "" },
+        .array_string => .{ .array_string = &.{} },
     };
 }
 
@@ -204,9 +274,9 @@ pub const ChunkBuilder = struct {
     pub fn init(child_alloc: std.mem.Allocator, num_rows: usize) ChunkBuilder {
         return .{
             .chunk = .{
-                .columns  = &.{},
+                .columns = &.{},
                 .num_rows = num_rows,
-                .arena    = std.heap.ArenaAllocator.init(child_alloc),
+                .arena = std.heap.ArenaAllocator.init(child_alloc),
             },
         };
     }
@@ -220,8 +290,8 @@ pub const ChunkBuilder = struct {
         col_type: ColumnType,
     ) !usize {
         const alloc = self.chunk.arena.allocator();
-        const n     = self.chunk.num_rows;
-        const nw    = nullMaskWords(n);
+        const n = self.chunk.num_rows;
+        const nw = nullMaskWords(n);
 
         const null_mask = try alloc.alloc(u64, nw);
         @memset(null_mask, 0); // all non-NULL by default
@@ -229,25 +299,25 @@ pub const ChunkBuilder = struct {
         const name_copy = try alloc.dupe(u8, name);
 
         const data: ColumnData = switch (col_type) {
-            .bool_u8       => .{ .bool_u8       = try alloc.alloc(u8,          n) },
-            .int64         => .{ .int64         = try alloc.alloc(i64,         n) },
-            .uint64        => .{ .uint64        = try alloc.alloc(u64,         n) },
-            .float64       => .{ .float64       = try alloc.alloc(f64,         n) },
-            .date_u16      => .{ .date_u16      = try alloc.alloc(u16,         n) },
-            .datetime64_ms => .{ .datetime64_ms = try alloc.alloc(i64,         n) },
-            .string        => .{ .string        = try alloc.alloc([]const u8,  n) },
-            .array_string  => .{ .array_string  = try alloc.alloc([][]const u8, n) },
+            .bool_u8 => .{ .bool_u8 = try alloc.alloc(u8, n) },
+            .int64 => .{ .int64 = try alloc.alloc(i64, n) },
+            .uint64 => .{ .uint64 = try alloc.alloc(u64, n) },
+            .float64 => .{ .float64 = try alloc.alloc(f64, n) },
+            .date_u16 => .{ .date_u16 = try alloc.alloc(u16, n) },
+            .datetime64_ms => .{ .datetime64_ms = try alloc.alloc(i64, n) },
+            .string => .{ .string = try alloc.alloc([]const u8, n) },
+            .array_string => .{ .array_string = try alloc.alloc([][]const u8, n) },
         };
 
         // Grow columns slice by 1. Both old and new slices come from the
         // same arena so realloc is safe and no @constCast is needed.
-        const old_len  = self.chunk.columns.len;
+        const old_len = self.chunk.columns.len;
         const new_cols = try alloc.realloc(self.chunk.columns, old_len + 1);
         new_cols[old_len] = .{
-            .name      = name_copy,
-            .data      = data,
+            .name = name_copy,
+            .data = data,
             .null_mask = null_mask,
-            .len       = n,
+            .len = n,
         };
         self.chunk.columns = new_cols;
         return old_len; // index of the newly added column
@@ -289,9 +359,59 @@ test "DataChunk.findColumn" {
     var b = ChunkBuilder.init(std.testing.allocator, 1);
     defer b.chunk.deinit();
     _ = try b.addColumn("alpha", .string);
-    _ = try b.addColumn("beta",  .float64);
+    _ = try b.addColumn("beta", .float64);
     const chunk = b.finish();
     try std.testing.expectEqual(@as(?usize, 0), chunk.findColumn("alpha"));
     try std.testing.expectEqual(@as(?usize, 1), chunk.findColumn("beta"));
     try std.testing.expectEqual(@as(?usize, null), chunk.findColumn("gamma"));
+}
+
+test "SelectionVector from mask and compactSelection" {
+    var b = ChunkBuilder.init(std.testing.allocator, 5);
+    defer b.chunk.deinit();
+
+    const ci = try b.addColumn("score", .int64);
+    for (b.chunk.columns[ci].data.int64, 0..) |*v, i| v.* = @intCast(i + 10);
+    setNull(b.chunk.columns[ci].null_mask, 3);
+
+    var buf: [5]u32 = undefined;
+    const mask = [_]i16{ 0, 1, 0, 1, 1 };
+    const sel = SelectionVector.fromI16Mask(&buf, &mask);
+    try std.testing.expectEqual(@as(usize, 3), sel.len);
+    try std.testing.expectEqual(@as(u32, 1), sel.slice()[0]);
+    try std.testing.expectEqual(@as(u32, 3), sel.slice()[1]);
+    try std.testing.expectEqual(@as(u32, 4), sel.slice()[2]);
+
+    b.chunk.compactSelection(sel);
+    try std.testing.expectEqual(@as(usize, 3), b.chunk.num_rows);
+    try std.testing.expectEqual(@as(i64, 11), b.chunk.columns[ci].data.int64[0]);
+    try std.testing.expectEqual(@as(i64, 13), b.chunk.columns[ci].data.int64[1]);
+    try std.testing.expectEqual(@as(i64, 14), b.chunk.columns[ci].data.int64[2]);
+    try std.testing.expect(!b.chunk.columns[ci].isRowNull(0));
+    try std.testing.expect(b.chunk.columns[ci].isRowNull(1));
+    try std.testing.expect(!b.chunk.columns[ci].isRowNull(2));
+}
+
+test "compactSelection handles empty and full selections" {
+    var b = ChunkBuilder.init(std.testing.allocator, 3);
+    defer b.chunk.deinit();
+
+    const ci = try b.addColumn("score", .int64);
+    b.chunk.columns[ci].data.int64[0] = 7;
+    b.chunk.columns[ci].data.int64[1] = 8;
+    b.chunk.columns[ci].data.int64[2] = 9;
+
+    var full_buf: [3]u32 = undefined;
+    const full_sel = SelectionVector.full(&full_buf, 3);
+    b.chunk.compactSelection(full_sel);
+    try std.testing.expectEqual(@as(usize, 3), b.chunk.num_rows);
+    try std.testing.expectEqual(@as(i64, 7), b.chunk.columns[ci].data.int64[0]);
+    try std.testing.expectEqual(@as(i64, 8), b.chunk.columns[ci].data.int64[1]);
+    try std.testing.expectEqual(@as(i64, 9), b.chunk.columns[ci].data.int64[2]);
+
+    var empty_buf: [3]u32 = undefined;
+    const empty_sel = SelectionVector.init(&empty_buf);
+    b.chunk.compactSelection(empty_sel);
+    try std.testing.expectEqual(@as(usize, 0), b.chunk.num_rows);
+    try std.testing.expectEqual(@as(usize, 0), b.chunk.columns[ci].len);
 }
