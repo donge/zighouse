@@ -6586,7 +6586,26 @@ fn executeHashAggParallelPairCount(
         // aggregate has already seen all rows, so we can materialize only N groups.
         const unordered_limit = top_k > 0 and sort_keys.len == 0;
         const count_top = top_k > 0 and sort_keys.len == 1 and sort_keys[0].desc and sort_keys[0].col_idx == 2;
-        const P2Out = struct { i64_key: i64, str_start: u32, str_len: u32, count: u64 };
+        const P2Out = struct {
+            i64_key: i64,
+            str_start: u32,
+            str_len: u32,
+            count: u64,
+
+            fn appendTo(self: @This(), out: *RowList, allocator: std.mem.Allocator, bytes: []const u8, int_first: bool) !void {
+                const str = bytes[self.str_start .. self.str_start + self.str_len];
+                const row = try allocator.alloc(?Value, 3);
+                if (int_first) {
+                    row[0] = Value{ .int64 = self.i64_key };
+                    row[1] = Value{ .string = str };
+                } else {
+                    row[0] = Value{ .string = str };
+                    row[1] = Value{ .int64 = self.i64_key };
+                }
+                row[2] = Value{ .uint64 = self.count };
+                try out.append(allocator, row);
+            }
+        };
         const top_buf: ?[]P2Out = if (count_top) try alloc.alloc(P2Out, top_k) else null;
         var top_len: usize = 0;
         var emitted_p2: usize = 0;
@@ -6609,17 +6628,7 @@ fn executeHashAggParallelPairCount(
                     }
                     continue;
                 }
-                const str = rsb[s.str_start .. s.str_start + s.str_len];
-                const row = try alloc.alloc(?Value, 3);
-                if (k0_is_i64) {
-                    row[0] = Value{ .int64 = s.i64_key };
-                    row[1] = Value{ .string = str };
-                } else {
-                    row[0] = Value{ .string = str };
-                    row[1] = Value{ .int64 = s.i64_key };
-                }
-                row[2] = Value{ .uint64 = s.count };
-                try rl2.append(alloc, row);
+                try (P2Out{ .i64_key = s.i64_key, .str_start = s.str_start, .str_len = s.str_len, .count = s.count }).appendTo(&rl2, alloc, rsb, k0_is_i64);
                 emitted_p2 += 1;
                 if (unordered_limit and emitted_p2 >= top_k) break :p2_emit;
             }
@@ -6632,17 +6641,7 @@ fn executeHashAggParallelPairCount(
             };
             std.sort.pdq(P2Out, tb[0..top_len], {}, SortTop.lessThan);
             for (tb[0..top_len]) |s| {
-                const str = rsb[s.str_start .. s.str_start + s.str_len];
-                const row = try alloc.alloc(?Value, 3);
-                if (k0_is_i64) {
-                    row[0] = Value{ .int64 = s.i64_key };
-                    row[1] = Value{ .string = str };
-                } else {
-                    row[0] = Value{ .string = str };
-                    row[1] = Value{ .int64 = s.i64_key };
-                }
-                row[2] = Value{ .uint64 = s.count };
-                try rl2.append(alloc, row);
+                try s.appendTo(&rl2, alloc, rsb, k0_is_i64);
             }
         }
 
