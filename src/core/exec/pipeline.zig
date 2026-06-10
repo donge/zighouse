@@ -10980,6 +10980,125 @@ fn executeTwoPhaseHashAgg(
     }
     // Note: scatter_ctxs[*].buf_arena must NOT be freed yet — Phase 2 reads from the bufs.
 
+    if (count_only and n_eff_keys == 1 and top_k > 0 and sort_keys.len == 1 and sort_keys[0].desc and
+        sort_keys[0].col_idx == n_keys and total_rows <= std.math.maxInt(u32))
+    {
+        const Candidate = struct { key: i64 = 0, count: u64 = 0 };
+        const part_candidates = try alloc.alloc(Candidate, N_PARTS * top_k);
+        @memset(part_candidates, .{});
+
+        const FlatPartCtx = struct {
+            scatter_ctxs: []ScatterCtx,
+            out: []Candidate,
+            row_stride: usize,
+            k: usize,
+            morsel_src: *parallel.MorselSource,
+            alloc: std.mem.Allocator,
+            err: ?anyerror = null,
+
+            fn addTop(buf: []Candidate, c: Candidate) void {
+                if (c.count == 0) return;
+                var empty_i: ?usize = null;
+                var worst_i: usize = 0;
+                for (buf, 0..) |cur, i| {
+                    if (cur.count == 0) {
+                        empty_i = i;
+                        break;
+                    }
+                    if (cur.count < buf[worst_i].count) worst_i = i;
+                }
+                if (empty_i) |i| {
+                    buf[i] = c;
+                } else if (c.count > buf[worst_i].count) {
+                    buf[worst_i] = c;
+                }
+            }
+
+            fn work(self: *@This(), _: *parallel.MorselSource) void {
+                self.runWork() catch |e| {
+                    self.err = e;
+                };
+            }
+
+            fn runWork(self: *@This()) !void {
+                while (self.morsel_src.next()) |m| {
+                    for (m.start..m.end) |p| {
+                        var total_p: usize = 0;
+                        for (self.scatter_ctxs) |*sc| total_p += sc.bufs[p].items.len / self.row_stride;
+                        if (total_p == 0) continue;
+
+                        {
+                            var table = try hashmap.HashU64Count.init(self.alloc, total_p);
+                            defer table.deinit();
+                            var empty_key_count: u64 = 0;
+                            for (self.scatter_ctxs) |*sc| {
+                                const buf = sc.bufs[p].items;
+                                var i: usize = 0;
+                                while (i < buf.len) : (i += self.row_stride) {
+                                    const key_bits = buf[i + 1];
+                                    if (key_bits == hashmap.empty_key) {
+                                        empty_key_count += 1;
+                                    } else {
+                                        table.bump(key_bits);
+                                    }
+                                }
+                            }
+
+                            const out_slice = self.out[p * self.k .. p * self.k + self.k];
+                            if (empty_key_count > 0) {
+                                addTop(out_slice, .{ .key = @bitCast(hashmap.empty_key), .count = empty_key_count });
+                            }
+                            var it = table.iterator();
+                            while (it.next()) |entry| {
+                                addTop(out_slice, .{ .key = @bitCast(entry.key), .count = entry.value });
+                            }
+                        }
+                    }
+                }
+            }
+        };
+
+        var flat_morsels = parallel.MorselSource.init(N_PARTS, 1);
+        const flat_ctxs = try alloc.alloc(FlatPartCtx, n_threads);
+        for (flat_ctxs) |*fc| {
+            fc.* = .{
+                .scatter_ctxs = scatter_ctxs,
+                .out = part_candidates,
+                .row_stride = row_stride,
+                .k = top_k,
+                .morsel_src = &flat_morsels,
+                .alloc = std.heap.c_allocator,
+            };
+        }
+        try parallel.parallelFor(alloc, FlatPartCtx, FlatPartCtx.work, flat_ctxs, &flat_morsels);
+        for (flat_ctxs) |*fc| {
+            if (fc.err) |e| return e;
+        }
+        for (scatter_ctxs) |*sc| sc.buf_arena.deinit();
+
+        const out_metas = try alloc.alloc(result.ColMeta, n_keys + n_aggs);
+        for (keys, 0..) |k, i| out_metas[i] = .{ .name = k.alias, .col_type = k.out_type };
+        for (aggs, 0..) |a, i| out_metas[n_keys + i] = .{ .name = a.alias, .col_type = a.out_type };
+        var rl = RowList.init(out_metas);
+        for (part_candidates) |c| {
+            if (c.count == 0) continue;
+            const row = try alloc.alloc(?Value, n_keys + n_aggs);
+            const base_key = c.key -% key_offs[0];
+            for (0..n_keys) |ki| {
+                const kv = base_key +% key_offs[ki];
+                row[ki] = switch (keys[ki].out_type) {
+                    .uint64 => Value{ .uint64 = @bitCast(kv) },
+                    .date_u16 => Value{ .date_u16 = @truncate(@as(u64, @bitCast(kv))) },
+                    .bool_u8 => Value{ .bool_u8 = @truncate(@as(u64, @bitCast(kv))) },
+                    else => Value{ .int64 = kv },
+                };
+            }
+            row[n_keys] = .{ .uint64 = c.count };
+            try rl.append(alloc, row);
+        }
+        return try executeTopK(rl, sort_keys, top_k, alloc);
+    }
+
     // ── Phase 2: parallel aggregate per partition ─────────────────────────────
 
     // Allocate output partition HTs (filled by Phase 2 workers).
