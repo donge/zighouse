@@ -11423,13 +11423,11 @@ fn executeTwoPhaseHashAggStrKeySimple(
     // count_only skips the agg0 slot; has_sidecar adds 1 slot before aggs.
     const row_stride: usize = (if (count_only) 3 else 3 + n_aggs) + @as(usize, if (has_sidecar) 1 else 0);
 
-    // COUNT DISTINCT: single agg is count_distinct_u64, no sidecar key.
-    // scatter record: [hash:u64, str_ptr:u64, str_len:u64, raw_dval:u64] (stride=4, same as above)
+    // COUNT DISTINCT: single agg is count_distinct_u64.
+    // scatter record: [hash:u64, str_ptr:u64, str_len:u64, (sidecar?:u64), raw_dval:u64]
     // Phase 2 uses sort-sweep instead of HT-insert for exact deduplication.
     const is_count_distinct: bool = n_aggs == 1 and compact_kinds.len > 0 and
         compact_kinds[0] == .count_distinct_u64;
-    // Guard: COUNT DISTINCT + sidecar composite key not supported in two-phase path.
-    if (is_count_distinct and sidecar_col_idx != null) return null;
 
     // Per-agg: source column index and aggregation kind.
     const AggInfo = struct { col_idx: usize, kind: ht.CompactAggKind };
@@ -11469,9 +11467,10 @@ fn executeTwoPhaseHashAggStrKeySimple(
         // When set, key_col in DataChunk is decoded as bool_u8 (1=non-empty) via setStringNonEmptyBool.
         raw_key_offsets: ?[]const u64 = null,
         raw_key_bytes: ?[]const u8 = null,
-        // Raw int64 slice for sidecar column (e.g. UserID for Q18).
+        // Raw integer slice for sidecar column (e.g. MobilePhone in Q12).
         // When non-null, allows skip_fetch even for composite (string + int) GROUP BY.
-        raw_sidecar_i64: ?[]const i64 = null,
+        raw_sidecar: ?RawColSlice = null,
+        raw_distinct: ?RawColSlice = null,
         // When true, skip fetchRange entirely — all conditions covered by raw slices.
         // Only set when: all int conditions have raw i16/i32 slices, use_raw_key, count_only,
         // sidecar (if any) has raw int64 slice, and str_filter (if any) is on the key column.
@@ -11554,15 +11553,23 @@ fn executeTwoPhaseHashAggStrKeySimple(
                             const s = key_bytes[key_off[abs]..key_off[abs + 1]];
                             const h: u64 = blk: {
                                 const base_h = ht.StrAggHashTable.hashStr(s);
-                                if (self.raw_sidecar_i64) |rsid| {
-                                    const sv: u64 = @bitCast(rsid[abs]);
+                                if (self.raw_sidecar) |rsid| {
+                                    const sv: u64 = @bitCast(rsid.getI64(abs));
                                     break :blk base_h ^ (sv *% 0x9e3779b97f4a7c15);
                                 }
                                 break :blk base_h;
                             };
                             const part_id = @as(usize, @truncate(h)) & (N_PARTS - 1);
-                            if (self.raw_sidecar_i64) |rsid| {
-                                var rec4: [4]u64 = .{ h, @intFromPtr(s.ptr), s.len, @bitCast(rsid[abs]) };
+                            if (self.raw_distinct) |rd| {
+                                if (self.raw_sidecar) |rsid| {
+                                    var rec5: [5]u64 = .{ h, @intFromPtr(s.ptr), s.len, @bitCast(rsid.getI64(abs)), @bitCast(rd.getI64(abs)) };
+                                    try self.bufs[part_id].appendSlice(ba, &rec5);
+                                } else {
+                                    var rec4: [4]u64 = .{ h, @intFromPtr(s.ptr), s.len, @bitCast(rd.getI64(abs)) };
+                                    try self.bufs[part_id].appendSlice(ba, &rec4);
+                                }
+                            } else if (self.raw_sidecar) |rsid| {
+                                var rec4: [4]u64 = .{ h, @intFromPtr(s.ptr), s.len, @bitCast(rsid.getI64(abs)) };
                                 try self.bufs[part_id].appendSlice(ba, &rec4);
                             } else {
                                 var rec3: [3]u64 = .{ h, @intFromPtr(s.ptr), s.len };
@@ -11577,15 +11584,23 @@ fn executeTwoPhaseHashAggStrKeySimple(
                         const s = key_bytes[key_off[abs]..key_off[abs + 1]];
                         const h: u64 = blk: {
                             const base_h = ht.StrAggHashTable.hashStr(s);
-                            if (self.raw_sidecar_i64) |rsid| {
-                                const sv: u64 = @bitCast(rsid[abs]);
+                            if (self.raw_sidecar) |rsid| {
+                                const sv: u64 = @bitCast(rsid.getI64(abs));
                                 break :blk base_h ^ (sv *% 0x9e3779b97f4a7c15);
                             }
                             break :blk base_h;
                         };
                         const part_id = @as(usize, @truncate(h)) & (N_PARTS - 1);
-                        if (self.raw_sidecar_i64) |rsid| {
-                            var rec4: [4]u64 = .{ h, @intFromPtr(s.ptr), s.len, @bitCast(rsid[abs]) };
+                        if (self.raw_distinct) |rd| {
+                            if (self.raw_sidecar) |rsid| {
+                                var rec5: [5]u64 = .{ h, @intFromPtr(s.ptr), s.len, @bitCast(rsid.getI64(abs)), @bitCast(rd.getI64(abs)) };
+                                try self.bufs[part_id].appendSlice(ba, &rec5);
+                            } else {
+                                var rec4: [4]u64 = .{ h, @intFromPtr(s.ptr), s.len, @bitCast(rd.getI64(abs)) };
+                                try self.bufs[part_id].appendSlice(ba, &rec4);
+                            }
+                        } else if (self.raw_sidecar) |rsid| {
+                            var rec4: [4]u64 = .{ h, @intFromPtr(s.ptr), s.len, @bitCast(rsid.getI64(abs)) };
                             try self.bufs[part_id].appendSlice(ba, &rec4);
                         } else {
                             var rec3: [3]u64 = .{ h, @intFromPtr(s.ptr), s.len };
@@ -11924,26 +11939,30 @@ fn executeTwoPhaseHashAggStrKeySimple(
     }
     defer ctx.source.setStringNonEmptyBool(null);
 
-    // Pre-fetch raw int64 slice for sidecar column (e.g. UserID for Q18).
+    // Pre-fetch raw integer slice for sidecar column (e.g. MobilePhone for Q12).
     // When available, the sidecar value is read from mmap'd data in the skip_fetch path,
     // eliminating fetchRange even for composite (string + int64) GROUP BY queries.
-    var raw_sidecar_i64_pre: ?[]const i64 = null;
+    var raw_sidecar_pre: ?RawColSlice = null;
     if (sidecar_col_idx) |sci| {
         if (sci < src_schema.len) {
-            raw_sidecar_i64_pre = ctx.source.getRawInt64Col(src_schema[sci].name);
+            raw_sidecar_pre = RawColSlice.resolve(ctx.source, src_schema, sci);
         }
     }
+    const raw_distinct_pre: ?RawColSlice = if (is_count_distinct and agg_infos.len > 0 and agg_infos[0].col_idx < src_schema.len)
+        RawColSlice.resolve(ctx.source, src_schema, agg_infos[0].col_idx)
+    else
+        null;
 
     // When ALL int conditions are covered by raw slices, the key is raw, it's count_only,
-    // sidecar (if any) has a raw int64 slice, and str_filter (if set) is on the key column —
+    // sidecar (if any) has a raw integer slice, and str_filter (if set) is on the key column —
     // we can skip fetchRange entirely and process morsels from mmap'd raw slices.
     const str_filter_is_key_col: bool = if (str_filter) |sf| sf.col_idx == key_col_idx else true;
     const can_skip_fetch: bool =
         n_raw_ic_covered == n_ic_total and // all int conditions have raw slices
         raw_key_offsets_pre != null and // string key available raw
         raw_key_bytes_pre != null and
-        count_only and // no agg columns to read
-        (sidecar_col_idx == null or raw_sidecar_i64_pre != null) and // sidecar ok if raw slice available
+        (count_only or (is_count_distinct and raw_distinct_pre != null)) and // no DataChunk agg columns to read
+        (sidecar_col_idx == null or raw_sidecar_pre != null) and // sidecar ok if raw slice available
         str_filter_is_key_col; // str filter checked via key offsets
 
     // ── Column pruning via setNeededCols ─────────────────────────────────────
@@ -12008,7 +12027,8 @@ fn executeTwoPhaseHashAggStrKeySimple(
             .raw_ic_i32 = raw_ic_i32_pre,
             .raw_key_offsets = raw_key_offsets_pre,
             .raw_key_bytes = raw_key_bytes_pre,
-            .raw_sidecar_i64 = raw_sidecar_i64_pre,
+            .raw_sidecar = raw_sidecar_pre,
+            .raw_distinct = raw_distinct_pre,
             .skip_fetch = can_skip_fetch,
         };
     }
@@ -12051,11 +12071,63 @@ fn executeTwoPhaseHashAggStrKeySimple(
             while (self.morsel_src.next()) |m| {
                 for (m.start..m.end) |p| {
                     // ── COUNT DISTINCT: sort-sweep path ──────────────────────────────
-                    // Scatter records: [h:u64, ptr:u64, len:u64, raw_dval:u64] (stride=4)
+                    // Scatter records: [h:u64, ptr:u64, len:u64, (sidecar?:u64), raw_dval:u64]
                     // Sort by (h primary, raw_dval secondary), sweep to count distinct
                     // dvals per h-group, insert counts into part_hts[p].
                     if (self.is_count_distinct) {
-                        const CD_RS: usize = 4;
+                        if (!self.has_sidecar) {
+                            const CD_RS: usize = 4;
+                            var total_p: usize = 0;
+                            for (self.scatter_ctxs) |*sc| total_p += sc.bufs[p].items.len / CD_RS;
+                            if (total_p == 0) continue;
+
+                            var par = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+                            defer par.deinit();
+                            const paa = par.allocator();
+
+                            const SortRecNoSidecar = struct { h: u64, ptr: u64, len: u64, dval: u64 };
+                            const recs = try paa.alloc(SortRecNoSidecar, total_p);
+                            var ri: usize = 0;
+                            for (self.scatter_ctxs) |*sc| {
+                                const buf = sc.bufs[p].items;
+                                var i: usize = 0;
+                                while (i < buf.len) : (i += CD_RS) {
+                                    recs[ri] = .{ .h = buf[i], .ptr = buf[i + 1], .len = buf[i + 2], .dval = buf[i + 3] };
+                                    ri += 1;
+                                }
+                            }
+                            const SortCtxNoSidecar = struct {
+                                fn lt(_: @This(), a: SortRecNoSidecar, b: SortRecNoSidecar) bool {
+                                    if (a.h != b.h) return a.h < b.h;
+                                    return a.dval < b.dval;
+                                }
+                            };
+                            std.sort.pdq(SortRecNoSidecar, recs[0..ri], SortCtxNoSidecar{}, SortCtxNoSidecar.lt);
+                            try self.part_hts[p].growTo(@max(64, ri * 100 / 65 + 16));
+                            const ivs = self.compact_init_vals;
+                            var si: usize = 0;
+                            while (si < ri) {
+                                const h = recs[si].h;
+                                const first_ptr = recs[si].ptr;
+                                const first_len = recs[si].len;
+                                var prev_dval: u64 = recs[si].dval;
+                                var count: u64 = 1;
+                                si += 1;
+                                while (si < ri and recs[si].h == h) : (si += 1) {
+                                    if (recs[si].dval != prev_dval) {
+                                        count += 1;
+                                        prev_dval = recs[si].dval;
+                                    }
+                                }
+                                const s: []const u8 = @as([*]const u8, @ptrFromInt(first_ptr))[0..first_len];
+                                const res = try self.part_hts[p].getOrInsertHashOnly(s, h, ivs, 0);
+                                res.vals[0] += count;
+                            }
+                            continue;
+                        }
+
+                        const CD_RS: usize = 5;
+                        const dval_off: usize = 4;
                         var total_p: usize = 0;
                         for (self.scatter_ctxs) |*sc| total_p += sc.bufs[p].items.len / CD_RS;
                         if (total_p == 0) continue;
@@ -12064,7 +12136,7 @@ fn executeTwoPhaseHashAggStrKeySimple(
                         defer par.deinit();
                         const paa = par.allocator();
 
-                        const SortRec = struct { h: u64, ptr: u64, len: u64, dval: u64 };
+                        const SortRec = struct { h: u64, ptr: u64, len: u64, sidecar: i64, dval: u64 };
                         const recs = try paa.alloc(SortRec, total_p);
 
                         // Collect records from all scatter bufs for this partition.
@@ -12073,7 +12145,13 @@ fn executeTwoPhaseHashAggStrKeySimple(
                             const buf = sc.bufs[p].items;
                             var i: usize = 0;
                             while (i < buf.len) : (i += CD_RS) {
-                                recs[ri] = .{ .h = buf[i], .ptr = buf[i + 1], .len = buf[i + 2], .dval = buf[i + 3] };
+                                recs[ri] = .{
+                                    .h = buf[i],
+                                    .ptr = buf[i + 1],
+                                    .len = buf[i + 2],
+                                    .sidecar = if (self.has_sidecar) @bitCast(buf[i + 3]) else 0,
+                                    .dval = buf[i + dval_off],
+                                };
                                 ri += 1;
                             }
                         }
@@ -12099,6 +12177,7 @@ fn executeTwoPhaseHashAggStrKeySimple(
                             const h = recs[si].h;
                             const first_ptr = recs[si].ptr;
                             const first_len = recs[si].len;
+                            const first_sidecar = recs[si].sidecar;
                             var prev_dval: u64 = recs[si].dval;
                             var count: u64 = 1;
                             si += 1;
@@ -12109,7 +12188,7 @@ fn executeTwoPhaseHashAggStrKeySimple(
                                 }
                             }
                             const s: []const u8 = @as([*]const u8, @ptrFromInt(first_ptr))[0..first_len];
-                            const res = try self.part_hts[p].getOrInsertHashOnly(s, h, ivs, 0);
+                            const res = try self.part_hts[p].getOrInsertHashOnly(s, h, ivs, first_sidecar);
                             res.vals[0] += count;
                         }
                         continue;
@@ -12784,9 +12863,40 @@ fn executeTwoPhaseHashAggWithCW(
         int_prefix: usize,
         all_const_ints: bool,
         sm: []const result.ColMeta,
+        heap_k: usize,
+        heap_counts: std.ArrayListUnmanaged(u64),
+
+        fn siftUpCount(self: *@This(), idx: usize) void {
+            var i = idx;
+            while (i > 0) {
+                const p = (i - 1) / 2;
+                if (self.heap_counts.items[i] >= self.heap_counts.items[p]) break;
+                std.mem.swap(u64, &self.heap_counts.items[i], &self.heap_counts.items[p]);
+                std.mem.swap([]?Value, &self.rl.rows.items[i], &self.rl.rows.items[p]);
+                i = p;
+            }
+        }
+
+        fn siftDownCount(self: *@This()) void {
+            var i: usize = 0;
+            while (true) {
+                var smallest = i;
+                const l = i * 2 + 1;
+                const r = i * 2 + 2;
+                if (l < self.heap_counts.items.len and self.heap_counts.items[l] < self.heap_counts.items[smallest]) smallest = l;
+                if (r < self.heap_counts.items.len and self.heap_counts.items[r] < self.heap_counts.items[smallest]) smallest = r;
+                if (smallest == i) break;
+                std.mem.swap(u64, &self.heap_counts.items[i], &self.heap_counts.items[smallest]);
+                std.mem.swap([]?Value, &self.rl.rows.items[i], &self.rl.rows.items[smallest]);
+                i = smallest;
+            }
+        }
     };
     const EmitCb2 = struct {
         fn cb(ec: *EmitCtx2, composite: []const u8, vals: []const u64, slot: usize) void {
+            const count = if (vals.len > 0) vals[0] else 0;
+            if (ec.heap_k > 0 and ec.heap_counts.items.len >= ec.heap_k and count <= ec.heap_counts.items[0]) return;
+
             const row = ec.alloc.alloc(?Value, ec.keys.len + vals.len) catch return;
             // Decode composite key: [int_prefix][cw_len:u16LE][cw_bytes][url_bytes]
             const cw_len_dec: usize = if (composite.len >= ec.int_prefix + 2)
@@ -12847,7 +12957,19 @@ fn executeTwoPhaseHashAggWithCW(
                 }
             }
             emitCompactValsWithSidecar(vals, ec.kinds, ec.aggs, row[ec.keys.len..], ec.str_ht, slot, ec.sidecar_idx);
-            ec.rl.append(ec.alloc, row) catch {};
+            if (ec.heap_k > 0) {
+                if (ec.heap_counts.items.len < ec.heap_k) {
+                    ec.rl.append(ec.alloc, row) catch return;
+                    ec.heap_counts.append(ec.alloc, count) catch return;
+                    ec.siftUpCount(ec.heap_counts.items.len - 1);
+                } else {
+                    ec.rl.rows.items[0] = row;
+                    ec.heap_counts.items[0] = count;
+                    ec.siftDownCount();
+                }
+            } else {
+                ec.rl.append(ec.alloc, row) catch {};
+            }
         }
     };
 
@@ -12881,6 +13003,7 @@ fn executeTwoPhaseHashAggWithCW(
         keys: []const plan.ProjectItem,
         sm: []const result.ColMeta,
         sidecar_idx: []const usize,
+        heap_k: usize,
         morsel_src: *parallel.MorselSource,
         err: ?anyerror = null,
 
@@ -12956,6 +13079,8 @@ fn executeTwoPhaseHashAggWithCW(
                     .int_prefix = self.emit_int_prefix,
                     .all_const_ints = self.emit_all_const,
                     .sm = self.sm,
+                    .heap_k = self.heap_k,
+                    .heap_counts = std.ArrayListUnmanaged(u64).empty,
                 };
                 part_ht.iterateWithSlot(&local_emit, EmitCb2.cb);
                 self.part_rls[p] = part_rl;
@@ -12966,6 +13091,10 @@ fn executeTwoPhaseHashAggWithCW(
 
     var morsel_src_p2 = parallel.MorselSource.init(N_CW_PARTS, 1);
     const p2cw_ctxs = try alloc.alloc(P2CwCtx, n_threads);
+    const cw_heap_k: usize = if (top_k > 0 and sort_keys.len == 1 and sort_keys[0].desc and sort_keys[0].col_idx == keys.len)
+        top_k
+    else
+        0;
     for (p2cw_ctxs) |*pc| {
         pc.* = .{
             .scatter_ctxs = scatter_ctxs,
@@ -12987,6 +13116,7 @@ fn executeTwoPhaseHashAggWithCW(
             .keys = keys,
             .sm = sm_emit2,
             .sidecar_idx = sidecar_idx,
+            .heap_k = cw_heap_k,
             .morsel_src = &morsel_src_p2,
         };
     }
