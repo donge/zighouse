@@ -105,6 +105,8 @@ const ScanState = struct {
     override_active: bool,
     /// String columns decoded as bool_u8 for `col <> ''` predicates.
     nonempty_bool: [256]bool,
+    scan_lo: u64,
+    scan_hi: u64,
 
     fn init(
         alloc: std.mem.Allocator,
@@ -160,6 +162,8 @@ const ScanState = struct {
             .override_needed = [_]bool{false} ** 256,
             .override_active = false,
             .nonempty_bool = [_]bool{false} ** 256,
+            .scan_lo = 0,
+            .scan_hi = std.math.maxInt(u64),
         };
     }
 
@@ -186,6 +190,24 @@ const ScanState = struct {
         }
         if (self.needed_cols) |nc| return ci < nc.len and nc[ci];
         return true;
+    }
+
+    inline fn effectiveLo(self: *const ScanState) u64 {
+        return @min(self.scan_lo, self.row_count);
+    }
+
+    inline fn effectiveHi(self: *const ScanState) u64 {
+        return @min(self.scan_hi, self.row_count);
+    }
+
+    inline fn effectiveCount(self: *const ScanState) u64 {
+        const lo = self.effectiveLo();
+        const hi = self.effectiveHi();
+        return if (hi > lo) hi - lo else 0;
+    }
+
+    inline fn rangeActive(self: *const ScanState) bool {
+        return self.effectiveLo() != 0 or self.effectiveHi() != self.row_count;
     }
 
     fn colIndex(self: *const ScanState, col_name: []const u8) ?usize {
@@ -552,6 +574,15 @@ const ScanState = struct {
 
     /// Read up to CHUNK_SIZE rows into a DataChunk. Returns false when all parts exhausted.
     fn nextChunk(self: *ScanState, out: *DataChunk, ctx: *QueryContext) !bool {
+        if (self.rangeActive()) {
+            const remaining = self.effectiveCount() -| self.rows_read;
+            if (remaining == 0) return false;
+            const n: usize = @intCast(@min(remaining, chunk.CHUNK_SIZE));
+            try self.fillRange(self.effectiveLo() + self.rows_read, n, out, ctx.allocator());
+            self.rows_read += n;
+            return true;
+        }
+
         // Advance to a part with remaining rows.
         while (true) {
             if (self.opened) |*op| {
@@ -726,6 +757,7 @@ const ScanState = struct {
     fn reset(self: *ScanState) void {
         self.closeCurrentPart();
         self.part_idx = 0;
+        self.rows_read = 0;
     }
 };
 
@@ -771,7 +803,7 @@ pub const PartScanBridge = struct {
 
     fn fetchRangeFn(ptr: *anyopaque, start: u64, n: usize, out: *DataChunk, alloc: std.mem.Allocator) !void {
         const self: *PartScanBridge = @ptrCast(@alignCast(ptr));
-        try self.state.fillRange(start, n, out, alloc);
+        try self.state.fillRange(self.state.effectiveLo() + start, n, out, alloc);
     }
 
     fn resetFn(ptr: *anyopaque) void {
@@ -786,7 +818,7 @@ pub const PartScanBridge = struct {
 
     fn rowCountFn(ptr: *anyopaque) u64 {
         const self: *PartScanBridge = @ptrCast(@alignCast(ptr));
-        return self.state.row_count;
+        return self.state.effectiveCount();
     }
 
     fn setNeededColsFn(ptr: *anyopaque, col_names: ?[]const []const u8) void {
@@ -828,6 +860,13 @@ pub const PartScanBridge = struct {
     fn getSortKeysFn(ptr: *anyopaque) []const []const u8 {
         const self: *PartScanBridge = @ptrCast(@alignCast(ptr));
         return self.state.table.sort_keys;
+    }
+
+    fn setRowRangeFn(ptr: *anyopaque, lo: u64, hi: u64) void {
+        const self: *PartScanBridge = @ptrCast(@alignCast(ptr));
+        self.state.scan_lo = lo;
+        self.state.scan_hi = hi;
+        self.state.reset();
     }
 
     fn getRawInt16ColFn(ptr: *anyopaque, col_name: []const u8) ?[]const i16 {
@@ -902,6 +941,7 @@ pub const PartScanBridge = struct {
         .getRawInt64Col        = getRawInt64ColFn,
         .getRawStrOffsets      = getRawStrOffsetsFn,
         .getRawStrBytes        = getRawStrBytesFn,
+        .setRowRange           = setRowRangeFn,
         .getSortKeys           = getSortKeysFn,
     };
 };
@@ -985,4 +1025,25 @@ test "PartScanBridge exposes raw views for compact parts" {
     try std.testing.expect(pruned_out.columns[2].pruned);
     try std.testing.expectEqual(@as(i64, 1), pruned_out.columns[0].data.int64[0]);
     try std.testing.expectEqual(@as(i64, 0), pruned_out.columns[1].data.int64[0]);
+
+    source.setNeededCols(null);
+    source.setRowRange(1, 3);
+    defer source.setRowRange(0, 3);
+    try std.testing.expectEqual(@as(u64, 2), source.rowCount());
+
+    var ranged_fetch: DataChunk = undefined;
+    try source.fetchRange(0, 2, &ranged_fetch, allocator);
+    defer ranged_fetch.deinit();
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 2, 3 }, ranged_fetch.columns[0].data.int64);
+    try std.testing.expectEqualStrings("", ranged_fetch.columns[2].data.string[0]);
+    try std.testing.expectEqualStrings("bbb", ranged_fetch.columns[2].data.string[1]);
+
+    source.reset();
+    var ranged_ctx = QueryContext.init(allocator, source);
+    defer ranged_ctx.deinit();
+    var ranged_next: DataChunk = undefined;
+    try std.testing.expect(try source.nextChunk(&ranged_next, &ranged_ctx));
+    defer ranged_next.deinit();
+    try std.testing.expectEqual(@as(usize, 2), ranged_next.num_rows);
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 2, 3 }, ranged_next.columns[0].data.int64);
 }
