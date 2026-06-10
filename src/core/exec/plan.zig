@@ -277,11 +277,23 @@ pub const LimitNode = struct {
 // ── Pipeline breaker nodes ────────────────────────────────────────────────────
 
 pub const HashAggNode = struct {
+    pub const Strategy = enum {
+        auto,
+        compact_int,
+        pair_count,
+        triple_count,
+        string_key,
+        grouped_distinct,
+    };
+
     input:   *PhysicalNode,
     /// GROUP BY key expressions.
     keys:    []ProjectItem,
     /// Aggregate function expressions (must be agg_call Expr variants).
     aggs:    []ProjectItem,
+    /// Planner-selected physical strategy. Executors still fall back to `auto`
+    /// probing if a strategy's preconditions fail at runtime.
+    strategy: Strategy = .auto,
 };
 
 pub const ScalarAggNode = struct {

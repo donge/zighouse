@@ -1821,15 +1821,7 @@ fn executeNode(node: *const plan.PhysicalNode, ctx: *QueryContext) !RowList {
         // ── HashAgg ───────────────────────────────────────────────────────────
         .hash_agg => |ha| {
             if (isScannable(ha.input)) {
-                // Try parallel compact int-key hash agg first.
-                if (try executeHashAggParallelCompact(ha.input, ha.keys, ha.aggs, ctx)) |rl| return rl;
-                // Try two-phase (i64, string) pair count (Q17/Q18).
-                if (try executeHashAggParallelPairCount(ha.input, ha.keys, ha.aggs, &.{}, 0, ctx)) |rl| return rl;
-                // Try parallel triple count: (i64, date_part, string) + count(*) (Q19).
-                if (try executeHashAggParallelTripleCount(ha.input, ha.keys, ha.aggs, &.{}, 0, ctx)) |rl| return rl;
-                // Try parallel string-key hash agg (str_min/str_max support).
-                if (try executeHashAggParallelStrKey(ha.input, ha.keys, ha.aggs, &.{}, 0, ctx)) |rl| return rl;
-                return executeHashAggChunked(ha.input, ha.keys, ha.aggs, ctx);
+                return executeHashAggScannable(ha, &.{}, 0, ctx);
             }
             const inner = try executeNode(ha.input, ctx);
             return executeHashAgg(inner, ha.keys, ha.aggs, alloc);
@@ -1852,10 +1844,7 @@ fn executeNode(node: *const plan.PhysicalNode, ctx: *QueryContext) !RowList {
             // Fusion: top_k(hash_agg(scannable)) — avoid building full RowList.
             if (tk.input.* == .hash_agg and isScannable(tk.input.hash_agg.input)) {
                 const ha = tk.input.hash_agg;
-                if (try executeHashAggParallelCompactTopK(ha.input, ha.keys, ha.aggs, tk.keys, k, ctx)) |rl| return rl;
-                if (try executeHashAggParallelPairCount(ha.input, ha.keys, ha.aggs, tk.keys, k, ctx)) |rl| return rl;
-                if (try executeHashAggParallelTripleCount(ha.input, ha.keys, ha.aggs, tk.keys, k, ctx)) |rl| return rl;
-                if (try executeHashAggParallelStrKey(ha.input, ha.keys, ha.aggs, tk.keys, k, ctx)) |rl| return rl;
+                return executeHashAggScannable(ha, tk.keys, k, ctx);
             }
             const inner = try executeNode(tk.input, ctx);
             // For small K, use a partial selection (heap-based) instead of full sort.
@@ -1876,6 +1865,43 @@ fn executeNode(node: *const plan.PhysicalNode, ctx: *QueryContext) !RowList {
             return executeHashJoin(left_rl, right_rl, hj, alloc);
         },
     }
+}
+
+fn executeHashAggScannable(
+    ha: plan.HashAggNode,
+    sort_keys: []const plan.SortKey,
+    top_k: usize,
+    ctx: *QueryContext,
+) !RowList {
+    if (try executeHashAggStrategy(ha.strategy, ha, sort_keys, top_k, ctx)) |rl| return rl;
+    const fallback_order = [_]plan.HashAggNode.Strategy{ .compact_int, .pair_count, .triple_count, .string_key };
+    for (fallback_order) |strategy| {
+        if (strategy == ha.strategy) continue;
+        if (ha.strategy == .grouped_distinct and strategy == .compact_int) continue;
+        if (try executeHashAggStrategy(strategy, ha, sort_keys, top_k, ctx)) |rl| return rl;
+    }
+    return executeHashAggChunked(ha.input, ha.keys, ha.aggs, ctx);
+}
+
+fn executeHashAggStrategy(
+    strategy: plan.HashAggNode.Strategy,
+    ha: plan.HashAggNode,
+    sort_keys: []const plan.SortKey,
+    top_k: usize,
+    ctx: *QueryContext,
+) !?RowList {
+    return switch (strategy) {
+        .auto => null,
+        .compact_int, .grouped_distinct => blk: {
+            if (top_k > 0 and sort_keys.len > 0) {
+                break :blk try executeHashAggParallelCompactTopK(ha.input, ha.keys, ha.aggs, sort_keys, top_k, ctx);
+            }
+            break :blk try executeHashAggParallelCompact(ha.input, ha.keys, ha.aggs, ctx);
+        },
+        .pair_count => try executeHashAggParallelPairCount(ha.input, ha.keys, ha.aggs, sort_keys, top_k, ctx),
+        .triple_count => try executeHashAggParallelTripleCount(ha.input, ha.keys, ha.aggs, sort_keys, top_k, ctx),
+        .string_key => try executeHashAggParallelStrKey(ha.input, ha.keys, ha.aggs, sort_keys, top_k, ctx),
+    };
 }
 
 fn valueToBool(v: ?Value) bool {

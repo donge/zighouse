@@ -178,6 +178,30 @@ pub fn findPrunedCols(node: *const PhysicalNode) []const []const u8 {
     };
 }
 
+fn inferHashAggStrategy(keys: []const ProjectItem, aggs: []const ProjectItem) plan.HashAggNode.Strategy {
+    var str_keys: usize = 0;
+    for (keys) |k| {
+        if (k.out_type == .string) str_keys += 1;
+    }
+
+    var count_only = aggs.len > 0;
+    var has_distinct = false;
+    for (aggs) |a| {
+        if (a.expr != .agg_call) {
+            count_only = false;
+            continue;
+        }
+        const ac = a.expr.agg_call;
+        if (ac.distinct) has_distinct = true;
+        if (ac.kind != .count_star and ac.kind != .count) count_only = false;
+    }
+    if (has_distinct) return .grouped_distinct;
+    if (str_keys == 0) return .compact_int;
+    if (count_only and str_keys == 1 and keys.len == 2) return .pair_count;
+    if (count_only and str_keys == 1 and keys.len == 3) return .triple_count;
+    return .string_key;
+}
+
 pub fn plan_query(
     ctx: *PlannerCtx,
     gplan: generic_sql.Plan,
@@ -394,9 +418,10 @@ pub fn plan_query(
 
             const agg_node = try ctx.alloc.create(PhysicalNode);
             agg_node.* = .{ .hash_agg = .{
-                .input = pre_proj_node,
-                .keys  = hash_keys,
-                .aggs  = agg_items,
+                .input    = pre_proj_node,
+                .keys     = hash_keys,
+                .aggs     = agg_items,
+                .strategy = inferHashAggStrategy(hash_keys, agg_items),
             }};
             source = agg_node;
         } else {
@@ -435,9 +460,10 @@ pub fn plan_query(
                 agg_node.* = .{ .scalar_agg = .{ .input = source, .aggs = agg_items } };
             } else {
                 agg_node.* = .{ .hash_agg = .{
-                    .input = source,
-                    .keys  = key_items,
-                    .aggs  = agg_items,
+                    .input    = source,
+                    .keys     = key_items,
+                    .aggs     = agg_items,
+                    .strategy = inferHashAggStrategy(key_items, agg_items),
                 }};
             }
             source = agg_node;
@@ -2441,6 +2467,21 @@ fn aggExprToProjectItem(ctx: *PlannerCtx, p: generic_sql.Expr) !?ProjectItem {
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
+
+test "inferHashAggStrategy recognizes core physical agg shapes" {
+    var count_call = AggCall{ .kind = .count_star, .arg = null, .distinct = false };
+    const distinct_arg = Expr{ .lit_i64 = 1 };
+    var distinct_call = AggCall{ .kind = .count, .arg = distinct_arg, .distinct = true };
+
+    const int_key = ProjectItem{ .expr = .{ .lit_i64 = 1 }, .alias = "k", .out_type = .int64 };
+    const str_key = ProjectItem{ .expr = .{ .lit_str = "s" }, .alias = "s", .out_type = .string };
+    const count_agg = ProjectItem{ .expr = .{ .agg_call = &count_call }, .alias = "c", .out_type = .uint64 };
+    const distinct_agg = ProjectItem{ .expr = .{ .agg_call = &distinct_call }, .alias = "u", .out_type = .uint64 };
+
+    try std.testing.expectEqual(plan.HashAggNode.Strategy.compact_int, inferHashAggStrategy(&.{int_key}, &.{count_agg}));
+    try std.testing.expectEqual(plan.HashAggNode.Strategy.grouped_distinct, inferHashAggStrategy(&.{int_key}, &.{distinct_agg}));
+    try std.testing.expectEqual(plan.HashAggNode.Strategy.pair_count, inferHashAggStrategy(&.{ int_key, str_key }, &.{count_agg}));
+}
 
 test {
     _ = @import("planner_test.zig");
