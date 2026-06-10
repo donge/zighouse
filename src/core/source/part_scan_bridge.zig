@@ -95,6 +95,7 @@ const ScanState = struct {
     row_count:   u64,                            // total rows across all parts
     col_readers: []?part_mod.ColumnReader,       // one per table column; null if unopened
     raw_cols:    []RawColData,                   // lazy all-part raw views
+    raw_lock:    std.atomic.Value(u32),
     metas:       []ColMeta,                      // schema metas (allocated once)
     /// If non-null, only columns marked `true` are read from disk.
     /// Length == table.columns.len.  null means read all.
@@ -153,6 +154,7 @@ const ScanState = struct {
             .row_count   = total_rows,
             .col_readers = col_readers,
             .raw_cols    = raw_cols,
+            .raw_lock    = .init(0),
             .metas       = metas,
             .needed_cols = needed_cols,
             .override_needed = [_]bool{false} ** 256,
@@ -193,6 +195,16 @@ const ScanState = struct {
         return null;
     }
 
+    fn lockRaw(self: *ScanState) void {
+        while (self.raw_lock.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) {
+            std.atomic.spinLoopHint();
+        }
+    }
+
+    fn unlockRaw(self: *ScanState) void {
+        self.raw_lock.store(0, .release);
+    }
+
     fn readFixedInto(self: *ScanState, ci: usize, out: anytype) !void {
         const Slice = @TypeOf(out);
         const Elem = @typeInfo(Slice).pointer.child;
@@ -217,10 +229,19 @@ const ScanState = struct {
 
     fn ensureRawFixed(self: *ScanState, ci: usize) !void {
         if (self.raw_cols[ci] != .none) return;
+        self.lockRaw();
+        defer self.unlockRaw();
+        if (self.raw_cols[ci] != .none) return;
         const col = self.table.columns[ci];
         const total: usize = @intCast(self.row_count);
 
         switch (col.ty) {
+            .int8, .float32, .float64 => {
+                const out = try self.alloc.alloc(i64, total);
+                errdefer self.alloc.free(out);
+                try self.readFixedInto(ci, out);
+                self.raw_cols[ci] = .{ .i64s = out };
+            },
             .int16 => {
                 const out = try self.alloc.alloc(i16, total);
                 errdefer self.alloc.free(out);
@@ -244,6 +265,9 @@ const ScanState = struct {
     }
 
     fn ensureRawString(self: *ScanState, ci: usize) !void {
+        if (self.raw_cols[ci] != .none) return;
+        self.lockRaw();
+        defer self.unlockRaw();
         if (self.raw_cols[ci] != .none) return;
         const col = self.table.columns[ci];
         switch (col.ty) {
@@ -295,6 +319,220 @@ const ScanState = struct {
             .offsets = offsets,
             .bytes = try bytes.toOwnedSlice(self.alloc),
         }};
+    }
+
+    fn readArrayRange(self: *ScanState, ci: usize, start: u64, n: usize, out: [][][]const u8, alloc: std.mem.Allocator) !void {
+        var global_base: u64 = 0;
+        var dst: usize = 0;
+        for (self.part_dirs) |dir| {
+            const part_rows = try readPartCount(self.alloc, self.io, dir);
+            defer global_base += part_rows;
+            if (start >= global_base + part_rows) continue;
+            if (start + n <= global_base) break;
+
+            var op = try part_mod.OpenedPartAny.open(self.io, self.alloc, dir, self.table);
+            defer op.deinit();
+            var cr = try op.columnReader(ci);
+            defer cr.deinit();
+
+            const local_start: usize = if (start > global_base) @intCast(start - global_base) else 0;
+            if (local_start > 0) _ = try cr.skipArrayStrings(local_start);
+            const available: usize = @intCast(part_rows - local_start);
+            const want = @min(n - dst, available);
+            const Ctx = struct {
+                out: [][][]const u8,
+                idx: usize,
+            };
+            var ctx = Ctx{ .out = out, .idx = dst };
+            _ = try cr.readArrayStrings(want, alloc, &ctx,
+                struct {
+                    fn cb(c: *Ctx, arr: [][]const u8) !void {
+                        c.out[c.idx] = arr;
+                        c.idx += 1;
+                    }
+                }.cb,
+            );
+            dst = ctx.idx;
+            if (dst >= n) break;
+        }
+        while (dst < n) : (dst += 1) out[dst] = &.{};
+    }
+
+    fn fillRange(self: *ScanState, start: u64, n: usize, out: *DataChunk, alloc: std.mem.Allocator) !void {
+        out.* = .{
+            .columns = undefined,
+            .num_rows = n,
+            .arena = std.heap.ArenaAllocator.init(alloc),
+        };
+        const chunk_alloc = out.arena.allocator();
+        out.columns = try chunk_alloc.alloc(chunk.Column, self.table.columns.len);
+        const null_words = chunk.nullMaskWords(n);
+        const end: usize = @intCast(start + n);
+        const base: usize = @intCast(start);
+
+        for (self.table.columns, 0..) |col, ci| {
+            const null_mask = try chunk_alloc.alloc(u64, null_words);
+            @memset(null_mask, 0);
+            const core_ty = toCoreColTypeFull(col);
+            const is_pruned = !self.isNeeded(ci);
+
+            const col_data: chunk.ColumnData = switch (core_ty) {
+                .int64, .datetime64_ms => blk: {
+                    const buf = try chunk_alloc.alloc(i64, n);
+                    if (is_pruned) {
+                        @memset(buf, 0);
+                    } else {
+                        try self.ensureRawFixed(ci);
+                        switch (self.raw_cols[ci]) {
+                            .i16s => |s| {
+                                for (s[base..end], 0..) |v, i| buf[i] = v;
+                            },
+                            .i32s => |s| {
+                                for (s[base..end], 0..) |v, i| buf[i] = v;
+                            },
+                            .i64s => |s| {
+                                @memcpy(buf, s[base..end]);
+                            },
+                            else => {
+                                @memset(buf, 0);
+                            },
+                        }
+                    }
+                    break :blk if (core_ty == .int64) .{ .int64 = buf } else .{ .datetime64_ms = buf };
+                },
+                .float64 => blk: {
+                    const fbuf = try chunk_alloc.alloc(f64, n);
+                    if (is_pruned) {
+                        @memset(fbuf, 0.0);
+                    } else {
+                        try self.ensureRawFixed(ci);
+                        switch (self.raw_cols[ci]) {
+                            .i64s => |s| {
+                                if (col.ty == .float32) {
+                                    for (s[base..end], 0..) |iv, i| {
+                                        fbuf[i] = @floatCast(@as(f32, @bitCast(@as(u32, @truncate(@as(u64, @bitCast(iv)))))));
+                                    }
+                                } else {
+                                    for (s[base..end], 0..) |iv, i| fbuf[i] = @bitCast(iv);
+                                }
+                            },
+                            else => {
+                                @memset(fbuf, 0.0);
+                            },
+                        }
+                    }
+                    break :blk .{ .float64 = fbuf };
+                },
+                .date_u16 => blk: {
+                    const ubuf = try chunk_alloc.alloc(u16, n);
+                    if (is_pruned) {
+                        @memset(ubuf, 0);
+                    } else {
+                        try self.ensureRawFixed(ci);
+                        switch (self.raw_cols[ci]) {
+                            .i32s => |s| {
+                                for (s[base..end], 0..) |v, i| ubuf[i] = @truncate(@as(u32, @bitCast(v)));
+                            },
+                            else => {
+                                @memset(ubuf, 0);
+                            },
+                        }
+                    }
+                    break :blk .{ .date_u16 = ubuf };
+                },
+                .bool_u8 => blk: {
+                    const bbuf = try chunk_alloc.alloc(u8, n);
+                    if (is_pruned) {
+                        @memset(bbuf, 0);
+                    } else {
+                        try self.ensureRawFixed(ci);
+                        switch (self.raw_cols[ci]) {
+                            .i64s => |s| {
+                                for (s[base..end], 0..) |v, i| bbuf[i] = @intCast(@as(u8, @truncate(@as(u64, @bitCast(v)))));
+                            },
+                            else => {
+                                @memset(bbuf, 0);
+                            },
+                        }
+                    }
+                    break :blk .{ .bool_u8 = bbuf };
+                },
+                .uint64 => blk: {
+                    const ubuf = try chunk_alloc.alloc(u64, n);
+                    if (is_pruned) {
+                        @memset(ubuf, 0);
+                    } else {
+                        try self.ensureRawFixed(ci);
+                        switch (self.raw_cols[ci]) {
+                            .i64s => |s| {
+                                for (s[base..end], 0..) |v, i| ubuf[i] = @bitCast(v);
+                            },
+                            else => {
+                                @memset(ubuf, 0);
+                            },
+                        }
+                    }
+                    break :blk .{ .uint64 = ubuf };
+                },
+                .string => blk: {
+                    if (ci < 256 and self.nonempty_bool[ci]) {
+                        const bbuf = try chunk_alloc.alloc(u8, n);
+                        if (is_pruned) {
+                            @memset(bbuf, 0);
+                        } else {
+                            try self.ensureRawString(ci);
+                            switch (self.raw_cols[ci]) {
+                                .string => |s| {
+                                    for (0..n) |i| {
+                                        bbuf[i] = if (s.offsets[base + i + 1] > s.offsets[base + i]) 1 else 0;
+                                    }
+                                },
+                                else => {
+                                    @memset(bbuf, 0);
+                                },
+                            }
+                        }
+                        break :blk .{ .bool_u8 = bbuf };
+                    }
+                    const sbuf = try chunk_alloc.alloc([]const u8, n);
+                    if (is_pruned) {
+                        @memset(sbuf, "");
+                    } else {
+                        try self.ensureRawString(ci);
+                        switch (self.raw_cols[ci]) {
+                            .string => |s| {
+                                for (0..n) |i| {
+                                    const lo: usize = @intCast(s.offsets[base + i]);
+                                    const hi: usize = @intCast(s.offsets[base + i + 1]);
+                                    sbuf[i] = s.bytes[lo..hi];
+                                }
+                            },
+                            else => {
+                                @memset(sbuf, "");
+                            },
+                        }
+                    }
+                    break :blk .{ .string = sbuf };
+                },
+                .array_string => blk: {
+                    const abuf = try chunk_alloc.alloc([][]const u8, n);
+                    if (is_pruned) {
+                        @memset(abuf, &.{});
+                    } else {
+                        try self.readArrayRange(ci, start, n, abuf, chunk_alloc);
+                    }
+                    break :blk .{ .array_string = abuf };
+                },
+            };
+
+            out.columns[ci] = .{
+                .name = col.name,
+                .data = col_data,
+                .null_mask = null_mask,
+                .len = n,
+                .pruned = is_pruned,
+            };
+        }
     }
 
     /// Open the next part in the list. Returns false if no more parts.
@@ -531,6 +769,11 @@ pub const PartScanBridge = struct {
         return self.state.nextChunk(out, ctx);
     }
 
+    fn fetchRangeFn(ptr: *anyopaque, start: u64, n: usize, out: *DataChunk, alloc: std.mem.Allocator) !void {
+        const self: *PartScanBridge = @ptrCast(@alignCast(ptr));
+        try self.state.fillRange(start, n, out, alloc);
+    }
+
     fn resetFn(ptr: *anyopaque) void {
         const self: *PartScanBridge = @ptrCast(@alignCast(ptr));
         self.state.reset();
@@ -651,6 +894,7 @@ pub const PartScanBridge = struct {
         .reset                 = resetFn,
         .schema                = schemaFn,
         .rowCount              = rowCountFn,
+        .fetchRange            = fetchRangeFn,
         .setNeededCols         = setNeededColsFn,
         .setStringNonEmptyBool = setStringNonEmptyBoolFn,
         .getRawInt16Col        = getRawInt16ColFn,
@@ -719,4 +963,26 @@ test "PartScanBridge exposes raw views for compact parts" {
     defer out.deinit();
     try std.testing.expectEqual(chunk.ColumnData.bool_u8, std.meta.activeTag(out.columns[2].data));
     try std.testing.expectEqualSlices(u8, &[_]u8{ 1, 0, 1 }, out.columns[2].data.bool_u8);
+
+    source.setStringNonEmptyBool(null);
+    try std.testing.expect(source.supportsRange());
+    var range_out: DataChunk = undefined;
+    try source.fetchRange(1, 2, &range_out, allocator);
+    defer range_out.deinit();
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 2, 3 }, range_out.columns[0].data.int64);
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 20, 30 }, range_out.columns[1].data.int64);
+    try std.testing.expectEqualStrings("", range_out.columns[2].data.string[0]);
+    try std.testing.expectEqualStrings("bbb", range_out.columns[2].data.string[1]);
+
+    const only_id = [_][]const u8{"id"};
+    source.setNeededCols(&only_id);
+    defer source.setNeededCols(null);
+    var pruned_out: DataChunk = undefined;
+    try source.fetchRange(0, 1, &pruned_out, allocator);
+    defer pruned_out.deinit();
+    try std.testing.expect(!pruned_out.columns[0].pruned);
+    try std.testing.expect(pruned_out.columns[1].pruned);
+    try std.testing.expect(pruned_out.columns[2].pruned);
+    try std.testing.expectEqual(@as(i64, 1), pruned_out.columns[0].data.int64[0]);
+    try std.testing.expectEqual(@as(i64, 0), pruned_out.columns[1].data.int64[0]);
 }
