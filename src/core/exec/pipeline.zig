@@ -11099,6 +11099,116 @@ fn executeTwoPhaseHashAgg(
         return try executeTopK(rl, sort_keys, top_k, alloc);
     }
 
+    dense_distinct: {
+        if (count_only or n_eff_keys != 1 or n_aggs != 1 or compact_kinds[0] != .count_distinct_u64) break :dense_distinct;
+        if (str_filter != null or int_filter != null) break :dense_distinct;
+        if (top_k == 0 or sort_keys.len != 1 or !sort_keys[0].desc or sort_keys[0].col_idx != n_keys) break :dense_distinct;
+
+        const sm = ctx.source.schema();
+        const key_raw = RawColSlice.resolve(ctx.source, sm, key_ci[0]) orelse break :dense_distinct;
+        var min_key: i64 = std.math.maxInt(i64);
+        var max_key: i64 = std.math.minInt(i64);
+        for (0..@as(usize, @intCast(total_rows))) |row| {
+            const key = key_raw.getI64(row) +% key_offs[0];
+            min_key = @min(min_key, key);
+            max_key = @max(max_key, key);
+        }
+        if (min_key > max_key) break :dense_distinct;
+        const span_i = max_key -% min_key + 1;
+        const key_span = std.math.cast(usize, span_i) orelse break :dense_distinct;
+        if (key_span == 0 or key_span > 1_000_000) break :dense_distinct;
+
+        const counts = try alloc.alloc(u64, key_span);
+        @memset(counts, 0);
+
+        const DenseDistinctCtx = struct {
+            scatter_ctxs: []ScatterCtx,
+            counts: []u64,
+            min_key: i64,
+            row_stride: usize,
+            morsel_src: *parallel.MorselSource,
+            alloc: std.mem.Allocator,
+            err: ?anyerror = null,
+
+            fn work(self: *@This(), _: *parallel.MorselSource) void {
+                self.runWork() catch |e| {
+                    self.err = e;
+                };
+            }
+
+            fn runWork(self: *@This()) !void {
+                const DISTINCT_PRIME: u64 = 0x9e3779b97f4a7c15;
+                var distinct_set = try hashmap.DistinctEpochSet.init(self.alloc, 32);
+                defer distinct_set.deinit();
+
+                while (self.morsel_src.next()) |m| {
+                    for (m.start..m.end) |p| {
+                        var total_p: usize = 0;
+                        for (self.scatter_ctxs) |*sc| total_p += sc.bufs[p].items.len / self.row_stride;
+                        if (total_p == 0) continue;
+
+                        if (distinct_set.needsGrow()) try distinct_set.growDouble();
+                        distinct_set.clearForNextPartition();
+
+                        for (self.scatter_ctxs) |*sc| {
+                            const buf = sc.bufs[p].items;
+                            var i: usize = 0;
+                            while (i < buf.len) : (i += self.row_stride) {
+                                const h = buf[i];
+                                const key: i64 = @bitCast(buf[i + 1]);
+                                const dval = buf[i + 2];
+                                if (dval == ~@as(u64, 0)) continue;
+                                const pk = h ^ (dval *% DISTINCT_PRIME);
+                                if (distinct_set.needsGrow()) try distinct_set.growDouble();
+                                if (distinct_set.insertNew(pk)) {
+                                    const idx: usize = @intCast(key -% self.min_key);
+                                    self.counts[idx] += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        };
+
+        var dense_morsels = parallel.MorselSource.init(N_PARTS, 1);
+        const dense_ctxs = try alloc.alloc(DenseDistinctCtx, n_threads);
+        for (dense_ctxs) |*dc| {
+            dc.* = .{
+                .scatter_ctxs = scatter_ctxs,
+                .counts = counts,
+                .min_key = min_key,
+                .row_stride = row_stride,
+                .morsel_src = &dense_morsels,
+                .alloc = alloc,
+            };
+        }
+        try parallel.parallelFor(alloc, DenseDistinctCtx, DenseDistinctCtx.work, dense_ctxs, &dense_morsels);
+        for (dense_ctxs) |*dc| {
+            if (dc.err) |e| return e;
+        }
+        for (scatter_ctxs) |*sc| sc.buf_arena.deinit();
+
+        const out_metas = try alloc.alloc(result.ColMeta, n_keys + n_aggs);
+        for (keys, 0..) |k, i| out_metas[i] = .{ .name = k.alias, .col_type = k.out_type };
+        for (aggs, 0..) |a, i| out_metas[n_keys + i] = .{ .name = a.alias, .col_type = a.out_type };
+        var rl = RowList.init(out_metas);
+        for (counts, 0..) |count, idx| {
+            if (count == 0) continue;
+            const row = try alloc.alloc(?Value, n_keys + n_aggs);
+            const key = min_key + @as(i64, @intCast(idx));
+            row[0] = switch (keys[0].out_type) {
+                .uint64 => Value{ .uint64 = @bitCast(key) },
+                .date_u16 => Value{ .date_u16 = @truncate(@as(u64, @bitCast(key))) },
+                .bool_u8 => Value{ .bool_u8 = @truncate(@as(u64, @bitCast(key))) },
+                else => Value{ .int64 = key },
+            };
+            row[n_keys] = .{ .uint64 = count };
+            try rl.append(alloc, row);
+        }
+        return try executeTopK(rl, sort_keys, top_k, alloc);
+    }
+
     // ── Phase 2: parallel aggregate per partition ─────────────────────────────
 
     // Allocate output partition HTs (filled by Phase 2 workers).
