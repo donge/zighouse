@@ -30,6 +30,34 @@ pub const SourceIface  = pipeline.SourceIface;
 pub const QueryContext = pipeline.QueryContext;
 pub const ColMeta      = result.ColMeta;
 
+const RawStringCol = struct {
+    offsets: []u64,
+    bytes: []u8,
+
+    fn deinit(self: RawStringCol, alloc: std.mem.Allocator) void {
+        alloc.free(self.offsets);
+        alloc.free(self.bytes);
+    }
+};
+
+const RawColData = union(enum) {
+    none,
+    i16s: []i16,
+    i32s: []i32,
+    i64s: []i64,
+    string: RawStringCol,
+
+    fn deinit(self: RawColData, alloc: std.mem.Allocator) void {
+        switch (self) {
+            .none => {},
+            .i16s => |s| alloc.free(s),
+            .i32s => |s| alloc.free(s),
+            .i64s => |s| alloc.free(s),
+            .string => |s| s.deinit(alloc),
+        }
+    }
+};
+
 // ── schema.ColumnType → core.ColumnType ──────────────────────────────────────
 
 fn toCoreColType(ty: schema.ColumnType) ColumnType {
@@ -64,11 +92,18 @@ const ScanState = struct {
     part_idx:    usize,                          // which part we're on
     opened:      ?part_mod.OpenedPartAny,        // currently-open part (wide or compact)
     rows_read:   u64,                            // rows read from current part
+    row_count:   u64,                            // total rows across all parts
     col_readers: []?part_mod.ColumnReader,       // one per table column; null if unopened
+    raw_cols:    []RawColData,                   // lazy all-part raw views
     metas:       []ColMeta,                      // schema metas (allocated once)
     /// If non-null, only columns marked `true` are read from disk.
     /// Length == table.columns.len.  null means read all.
-    needed_cols: ?[]const bool,
+    needed_cols: ?[]bool,
+    /// Runtime override used by late-materialized physical strategies.
+    override_needed: [256]bool,
+    override_active: bool,
+    /// String columns decoded as bool_u8 for `col <> ''` predicates.
+    nonempty_bool: [256]bool,
 
     fn init(
         alloc: std.mem.Allocator,
@@ -87,6 +122,13 @@ const ScanState = struct {
         }
         const col_readers = try alloc.alloc(?part_mod.ColumnReader, table.columns.len);
         @memset(col_readers, null);
+        const raw_cols = try alloc.alloc(RawColData, table.columns.len);
+        @memset(raw_cols, .none);
+
+        var total_rows: u64 = 0;
+        for (part_dirs) |dir| {
+            total_rows += try readPartCount(alloc, io, dir);
+        }
 
         // Build needed_cols mask if pruned list is provided.
         const needed_cols: ?[]bool = if (pruned_columns.len == 0) null else blk: {
@@ -108,14 +150,21 @@ const ScanState = struct {
             .part_idx    = 0,
             .opened      = null,
             .rows_read   = 0,
+            .row_count   = total_rows,
             .col_readers = col_readers,
+            .raw_cols    = raw_cols,
             .metas       = metas,
             .needed_cols = needed_cols,
+            .override_needed = [_]bool{false} ** 256,
+            .override_active = false,
+            .nonempty_bool = [_]bool{false} ** 256,
         };
     }
 
     fn deinit(self: *ScanState) void {
         self.closeCurrentPart();
+        for (self.raw_cols) |rc| rc.deinit(self.alloc);
+        self.alloc.free(self.raw_cols);
         self.alloc.free(self.col_readers);
         self.alloc.free(self.metas);
         if (self.needed_cols) |nc| self.alloc.free(nc);
@@ -129,6 +178,125 @@ const ScanState = struct {
         self.rows_read = 0;
     }
 
+    inline fn isNeeded(self: *const ScanState, ci: usize) bool {
+        if (self.override_active) {
+            return ci < 256 and self.override_needed[ci];
+        }
+        if (self.needed_cols) |nc| return ci < nc.len and nc[ci];
+        return true;
+    }
+
+    fn colIndex(self: *const ScanState, col_name: []const u8) ?usize {
+        for (self.table.columns, 0..) |col, ci| {
+            if (std.mem.eql(u8, col.name, col_name)) return ci;
+        }
+        return null;
+    }
+
+    fn readFixedInto(self: *ScanState, ci: usize, out: anytype) !void {
+        const Slice = @TypeOf(out);
+        const Elem = @typeInfo(Slice).pointer.child;
+        var tmp_buf: [8192]i64 = undefined;
+        var pos: usize = 0;
+        for (self.part_dirs) |dir| {
+            var op = try part_mod.OpenedPartAny.open(self.io, self.alloc, dir, self.table);
+            defer op.deinit();
+            var cr = try op.columnReader(ci);
+            defer cr.deinit();
+            while (pos < out.len) {
+                const want = @min(tmp_buf.len, out.len - pos);
+                const got = try cr.readFixed(tmp_buf[0..want]);
+                if (got == 0) break;
+                for (tmp_buf[0..got], 0..) |v, i| {
+                    out[pos + i] = if (Elem == i64) v else @intCast(v);
+                }
+                pos += got;
+            }
+        }
+    }
+
+    fn ensureRawFixed(self: *ScanState, ci: usize) !void {
+        if (self.raw_cols[ci] != .none) return;
+        const col = self.table.columns[ci];
+        const total: usize = @intCast(self.row_count);
+
+        switch (col.ty) {
+            .int16 => {
+                const out = try self.alloc.alloc(i16, total);
+                errdefer self.alloc.free(out);
+                try self.readFixedInto(ci, out);
+                self.raw_cols[ci] = .{ .i16s = out };
+            },
+            .int32, .date => {
+                const out = try self.alloc.alloc(i32, total);
+                errdefer self.alloc.free(out);
+                try self.readFixedInto(ci, out);
+                self.raw_cols[ci] = .{ .i32s = out };
+            },
+            .int64, .timestamp => {
+                const out = try self.alloc.alloc(i64, total);
+                errdefer self.alloc.free(out);
+                try self.readFixedInto(ci, out);
+                self.raw_cols[ci] = .{ .i64s = out };
+            },
+            else => {},
+        }
+    }
+
+    fn ensureRawString(self: *ScanState, ci: usize) !void {
+        if (self.raw_cols[ci] != .none) return;
+        const col = self.table.columns[ci];
+        switch (col.ty) {
+            .text, .char, .low_card => {},
+            else => return,
+        }
+
+        const total: usize = @intCast(self.row_count);
+        const offsets = try self.alloc.alloc(u64, total + 1);
+        errdefer self.alloc.free(offsets);
+        offsets[0] = 0;
+        var bytes: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer bytes.deinit(self.alloc);
+
+        const Ctx = struct {
+            alloc: std.mem.Allocator,
+            offsets: []u64,
+            row: usize,
+            bytes: *std.ArrayListUnmanaged(u8),
+        };
+
+        var ctx = Ctx{
+            .alloc = self.alloc,
+            .offsets = offsets,
+            .row = 0,
+            .bytes = &bytes,
+        };
+        for (self.part_dirs) |dir| {
+            var op = try part_mod.OpenedPartAny.open(self.io, self.alloc, dir, self.table);
+            defer op.deinit();
+            var cr = try op.columnReader(ci);
+            defer cr.deinit();
+            while (ctx.row < total) {
+                const remaining = total - ctx.row;
+                const got = try cr.readStrings(@min(remaining, chunk.CHUNK_SIZE), &ctx,
+                    struct {
+                        fn cb(c: *Ctx, str: []const u8) !void {
+                            try c.bytes.appendSlice(c.alloc, str);
+                            c.row += 1;
+                            c.offsets[c.row] = c.bytes.items.len;
+                        }
+                    }.cb,
+                );
+                if (got == 0) break;
+            }
+        }
+
+        self.raw_cols[ci] = .{ .string = .{
+            .offsets = offsets,
+            .bytes = try bytes.toOwnedSlice(self.alloc),
+        }};
+    }
+
     /// Open the next part in the list. Returns false if no more parts.
     fn openNextPart(self: *ScanState) !bool {
         self.closeCurrentPart();
@@ -138,9 +306,7 @@ const ScanState = struct {
         self.opened = try part_mod.OpenedPartAny.open(self.io, self.alloc, dir, self.table);
         for (self.table.columns, 0..) |_, i| {
             // Skip columns not in the needed set (column pruning).
-            if (self.needed_cols) |nc| {
-                if (!nc[i]) continue;
-            }
+            if (!self.isNeeded(i)) continue;
             self.col_readers[i] = try self.opened.?.columnReader(i);
         }
         return true;
@@ -175,8 +341,7 @@ const ScanState = struct {
             @memset(null_mask, 0);
             const core_ty = toCoreColTypeFull(col);
             // Pruned column: produce zero/empty data without reading from disk.
-            const is_pruned = self.col_readers[ci] == null and
-                (self.needed_cols != null and !self.needed_cols.?[ci]);
+            const is_pruned = self.col_readers[ci] == null and !self.isNeeded(ci);
             const col_data: chunk.ColumnData = switch (core_ty) {
                 .int64, .datetime64_ms => blk: {
                     const buf = try chunk_alloc.alloc(i64, n);
@@ -233,6 +398,28 @@ const ScanState = struct {
                     break :blk .{ .uint64 = ubuf };
                 },
                 .string => blk: {
+                    if (ci < 256 and self.nonempty_bool[ci]) {
+                        const bbuf = try chunk_alloc.alloc(u8, n);
+                        if (is_pruned) {
+                            @memset(bbuf, 0);
+                        } else {
+                            const Ctx = struct {
+                                buf: []u8,
+                                idx: usize,
+                            };
+                            var sctx = Ctx{ .buf = bbuf, .idx = 0 };
+                            const actual = try self.col_readers[ci].?.readStrings(n, &sctx,
+                                struct {
+                                    fn cb(c: *Ctx, str: []const u8) !void {
+                                        c.buf[c.idx] = if (str.len != 0) 1 else 0;
+                                        c.idx += 1;
+                                    }
+                                }.cb,
+                            );
+                            if (actual < n) @memset(bbuf[actual..], 0);
+                        }
+                        break :blk .{ .bool_u8 = bbuf };
+                    }
                     const sbuf = try chunk_alloc.alloc([]const u8, n);
                     if (is_pruned) {
                         @memset(sbuf, "");
@@ -304,6 +491,14 @@ const ScanState = struct {
     }
 };
 
+fn readPartCount(alloc: std.mem.Allocator, io: std.Io, part_dir: []const u8) !u64 {
+    const path = try std.fmt.allocPrint(alloc, "{s}/count.txt", .{part_dir});
+    defer alloc.free(path);
+    const raw = try std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(128));
+    defer alloc.free(raw);
+    return try std.fmt.parseInt(u64, std.mem.trim(u8, raw, " \t\r\n"), 10);
+}
+
 // ── PartScanBridge — public API ───────────────────────────────────────────────
 
 pub const PartScanBridge = struct {
@@ -346,12 +541,182 @@ pub const PartScanBridge = struct {
         return self.state.metas;
     }
 
-    fn rowCountFn(_: *anyopaque) u64 { return 0; }
+    fn rowCountFn(ptr: *anyopaque) u64 {
+        const self: *PartScanBridge = @ptrCast(@alignCast(ptr));
+        return self.state.row_count;
+    }
+
+    fn setNeededColsFn(ptr: *anyopaque, col_names: ?[]const []const u8) void {
+        const self: *PartScanBridge = @ptrCast(@alignCast(ptr));
+        const s = self.state;
+        if (col_names == null) {
+            s.override_active = false;
+            return;
+        }
+        @memset(&s.override_needed, false);
+        for (col_names.?) |name| {
+            for (s.table.columns, 0..) |col, ci| {
+                if (ci >= 256) break;
+                if (std.mem.eql(u8, col.name, name)) {
+                    s.override_needed[ci] = true;
+                    break;
+                }
+            }
+        }
+        s.override_active = true;
+    }
+
+    fn setStringNonEmptyBoolFn(ptr: *anyopaque, col_name: ?[]const u8) void {
+        const self: *PartScanBridge = @ptrCast(@alignCast(ptr));
+        const s = self.state;
+        if (col_name == null) {
+            @memset(&s.nonempty_bool, false);
+            return;
+        }
+        for (s.table.columns, 0..) |col, ci| {
+            if (ci >= 256) break;
+            if (std.mem.eql(u8, col.name, col_name.?)) {
+                s.nonempty_bool[ci] = true;
+                break;
+            }
+        }
+    }
+
+    fn getSortKeysFn(ptr: *anyopaque) []const []const u8 {
+        const self: *PartScanBridge = @ptrCast(@alignCast(ptr));
+        return self.state.table.sort_keys;
+    }
+
+    fn getRawInt16ColFn(ptr: *anyopaque, col_name: []const u8) ?[]const i16 {
+        const self: *PartScanBridge = @ptrCast(@alignCast(ptr));
+        const ci = self.state.colIndex(col_name) orelse return null;
+        if (self.state.table.columns[ci].ty != .int16) return null;
+        self.state.ensureRawFixed(ci) catch return null;
+        return switch (self.state.raw_cols[ci]) {
+            .i16s => |s| s,
+            else => null,
+        };
+    }
+
+    fn getRawInt32ColFn(ptr: *anyopaque, col_name: []const u8) ?[]const i32 {
+        const self: *PartScanBridge = @ptrCast(@alignCast(ptr));
+        const ci = self.state.colIndex(col_name) orelse return null;
+        const ty = self.state.table.columns[ci].ty;
+        if (ty != .int32 and ty != .date) return null;
+        self.state.ensureRawFixed(ci) catch return null;
+        return switch (self.state.raw_cols[ci]) {
+            .i32s => |s| s,
+            else => null,
+        };
+    }
+
+    fn getRawInt64ColFn(ptr: *anyopaque, col_name: []const u8) ?[]const i64 {
+        const self: *PartScanBridge = @ptrCast(@alignCast(ptr));
+        const ci = self.state.colIndex(col_name) orelse return null;
+        const ty = self.state.table.columns[ci].ty;
+        if (ty != .int64 and ty != .timestamp) return null;
+        self.state.ensureRawFixed(ci) catch return null;
+        return switch (self.state.raw_cols[ci]) {
+            .i64s => |s| s,
+            else => null,
+        };
+    }
+
+    fn getRawStrOffsetsFn(ptr: *anyopaque, col_name: []const u8) ?[]const u64 {
+        const self: *PartScanBridge = @ptrCast(@alignCast(ptr));
+        const ci = self.state.colIndex(col_name) orelse return null;
+        const ty = self.state.table.columns[ci].ty;
+        if (ty != .text and ty != .char and ty != .low_card) return null;
+        self.state.ensureRawString(ci) catch return null;
+        return switch (self.state.raw_cols[ci]) {
+            .string => |s| s.offsets,
+            else => null,
+        };
+    }
+
+    fn getRawStrBytesFn(ptr: *anyopaque, col_name: []const u8) ?[]const u8 {
+        const self: *PartScanBridge = @ptrCast(@alignCast(ptr));
+        const ci = self.state.colIndex(col_name) orelse return null;
+        const ty = self.state.table.columns[ci].ty;
+        if (ty != .text and ty != .char and ty != .low_card) return null;
+        self.state.ensureRawString(ci) catch return null;
+        return switch (self.state.raw_cols[ci]) {
+            .string => |s| s.bytes,
+            else => null,
+        };
+    }
 
     const vtable = SourceIface.VTable{
-        .nextChunk = nextChunkFn,
-        .reset     = resetFn,
-        .schema    = schemaFn,
-        .rowCount  = rowCountFn,
+        .nextChunk             = nextChunkFn,
+        .reset                 = resetFn,
+        .schema                = schemaFn,
+        .rowCount              = rowCountFn,
+        .setNeededCols         = setNeededColsFn,
+        .setStringNonEmptyBool = setStringNonEmptyBoolFn,
+        .getRawInt16Col        = getRawInt16ColFn,
+        .getRawInt32Col        = getRawInt32ColFn,
+        .getRawInt64Col        = getRawInt64ColFn,
+        .getRawStrOffsets      = getRawStrOffsetsFn,
+        .getRawStrBytes        = getRawStrBytesFn,
+        .getSortKeys           = getSortKeysFn,
     };
 };
+
+test "PartScanBridge exposes raw views for compact parts" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const part_dir = "/tmp/zig_test_part_scan_bridge_raw";
+
+    {
+        var cwd = std.Io.Dir.cwd();
+        cwd.deleteTree(io, part_dir) catch {};
+    }
+
+    const cols = [_]schema.Column{
+        .{ .name = "id", .ty = .int32 },
+        .{ .name = "ts", .ty = .int64 },
+        .{ .name = "name", .ty = .text },
+    };
+    const sort_keys = [_][]const u8{"id"};
+    const table = schema.Table{ .name = "raw_bridge", .columns = &cols, .sort_keys = &sort_keys };
+
+    {
+        var cp = try part_mod.CompactPart.open(io, allocator, part_dir, table, 0x82);
+        defer cp.deinit();
+        const ids = [_]i64{ 1, 2, 3 };
+        const ts = [_]i64{ 10, 20, 30 };
+        try cp.appendFixedBatch(0, &ids);
+        try cp.appendFixedBatch(1, &ts);
+        try cp.appendString(2, "aa");
+        try cp.appendString(2, "");
+        try cp.appendString(2, "bbb");
+        try cp.finish();
+    }
+
+    var bridge = try PartScanBridge.init(allocator, io, table, &[_][]const u8{part_dir}, &.{});
+    defer bridge.deinit();
+    const source = bridge.source();
+
+    try std.testing.expectEqual(@as(u64, 3), source.rowCount());
+    try std.testing.expectEqualStrings("id", source.getSortKeys()[0]);
+
+    const ids_raw = source.getRawInt32Col("id") orelse return error.TestExpectedRawInt32;
+    try std.testing.expectEqualSlices(i32, &[_]i32{ 1, 2, 3 }, ids_raw);
+    const ts_raw = source.getRawInt64Col("ts") orelse return error.TestExpectedRawInt64;
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 10, 20, 30 }, ts_raw);
+
+    const offsets = source.getRawStrOffsets("name") orelse return error.TestExpectedRawStrOffsets;
+    const bytes = source.getRawStrBytes("name") orelse return error.TestExpectedRawStrBytes;
+    try std.testing.expectEqualSlices(u64, &[_]u64{ 0, 2, 2, 5 }, offsets);
+    try std.testing.expectEqualStrings("aabbb", bytes);
+
+    source.setStringNonEmptyBool("name");
+    defer source.setStringNonEmptyBool(null);
+    var qctx = QueryContext.init(allocator, source);
+    defer qctx.deinit();
+    var out: DataChunk = undefined;
+    try std.testing.expect(try source.nextChunk(&out, &qctx));
+    defer out.deinit();
+    try std.testing.expectEqual(chunk.ColumnData.bool_u8, std.meta.activeTag(out.columns[2].data));
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 1, 0, 1 }, out.columns[2].data.bool_u8);
+}
