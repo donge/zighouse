@@ -842,4 +842,20 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| bench_filter_run.addArgs(args);
     const bench_filter_step = b.step("bench-filter", "A.5 scalar evalExpr vs IntCmpCond vs evalExprBatch SIMD filter");
     bench_filter_step.dependOn(&bench_filter_run.step);
+
+    const bench_distinct = b.addExecutable(.{
+        .name = "bench-distinct",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench_distinct.zig"),
+            .target   = target,
+            .optimize = optimize,
+        }),
+    });
+    bench_distinct.root_module.addImport("hashmap", hashmap_mod);
+    b.installArtifact(bench_distinct);
+    const bench_distinct_run = b.addRunArtifact(bench_distinct);
+    bench_distinct_run.step.dependOn(b.getInstallStep());
+    if (b.args) |args| bench_distinct_run.addArgs(args);
+    const bench_distinct_step = b.step("bench-distinct", "COUNT DISTINCT hash-set strategy micro-benchmark");
+    bench_distinct_step.dependOn(&bench_distinct_run.step);
 }
