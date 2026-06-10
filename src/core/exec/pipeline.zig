@@ -1821,7 +1821,7 @@ fn executeNode(node: *const plan.PhysicalNode, ctx: *QueryContext) !RowList {
         // ── HashAgg ───────────────────────────────────────────────────────────
         .hash_agg => |ha| {
             if (isScannable(ha.input)) {
-                return executeHashAggScannable(ha, &.{}, 0, ctx);
+                return executeHashAggScannable(ha, &.{}, 0, 0, ctx);
             }
             const inner = try executeNode(ha.input, ctx);
             return executeHashAgg(inner, ha.keys, ha.aggs, alloc);
@@ -1844,7 +1844,7 @@ fn executeNode(node: *const plan.PhysicalNode, ctx: *QueryContext) !RowList {
             // Fusion: top_k(hash_agg(scannable)) — avoid building full RowList.
             if (tk.input.* == .hash_agg and isScannable(tk.input.hash_agg.input)) {
                 const ha = tk.input.hash_agg;
-                return executeHashAggScannable(ha, tk.keys, k, ctx);
+                return executeHashAggScannable(ha, tk.keys, k, @intCast(tk.offset), ctx);
             }
             const inner = try executeNode(tk.input, ctx);
             // For small K, use a partial selection (heap-based) instead of full sort.
@@ -1871,9 +1871,10 @@ fn executeHashAggScannable(
     ha: plan.HashAggNode,
     sort_keys: []const plan.SortKey,
     top_k: usize,
+    top_offset: usize,
     ctx: *QueryContext,
 ) !RowList {
-    if (try executeHashAggStrategy(ha.strategy, ha, sort_keys, top_k, ctx)) |rl| return rl;
+    if (try executeHashAggStrategy(ha.strategy, ha, sort_keys, top_k, top_offset, ctx)) |rl| return rl;
     const fallback_order = [_]plan.HashAggNode.Strategy{
         .compact_int,
         .single_int_count_topk,
@@ -1887,7 +1888,7 @@ fn executeHashAggScannable(
     for (fallback_order) |strategy| {
         if (strategy == ha.strategy) continue;
         if (ha.strategy == .grouped_distinct and strategy == .compact_int) continue;
-        if (try executeHashAggStrategy(strategy, ha, sort_keys, top_k, ctx)) |rl| return rl;
+        if (try executeHashAggStrategy(strategy, ha, sort_keys, top_k, top_offset, ctx)) |rl| return rl;
     }
     return executeHashAggChunked(ha.input, ha.keys, ha.aggs, ctx);
 }
@@ -1897,13 +1898,14 @@ fn executeHashAggStrategy(
     ha: plan.HashAggNode,
     sort_keys: []const plan.SortKey,
     top_k: usize,
+    top_offset: usize,
     ctx: *QueryContext,
 ) !?RowList {
     return switch (strategy) {
         .auto => null,
         .compact_int, .single_int_count_topk, .single_int_distinct_topk, .grouped_distinct => blk: {
             if (top_k > 0 and sort_keys.len > 0) {
-                break :blk try executeHashAggParallelCompactTopK(ha.input, ha.keys, ha.aggs, sort_keys, top_k, ctx);
+                break :blk try executeHashAggParallelCompactTopK(ha.input, ha.keys, ha.aggs, sort_keys, top_k, top_offset, ctx);
             }
             break :blk try executeHashAggParallelCompact(ha.input, ha.keys, ha.aggs, ctx);
         },
@@ -4979,6 +4981,7 @@ fn executeTopKLateMat(
         key_vals: []?Value,
         /// Only used in parallel raw fast path (key_vals = &.{}, no alloc per row).
         sort_key_i64: i64 = 0,
+        sort_key_str: []const u8 = &.{},
     };
     const heap_e = try alloc.alloc(HeapEntry, k);
     var heap_e_len: usize = 0;
@@ -4994,6 +4997,12 @@ fn executeTopKLateMat(
                 if (ord != .eq) {
                     const desc = self.keys.len > 0 and self.keys[0].desc;
                     return if (desc) ord == .gt else ord == .lt;
+                }
+                if (self.keys.len > 1) {
+                    const s_ord = std.mem.order(u8, a.sort_key_str, b.sort_key_str);
+                    if (s_ord != .eq) {
+                        return if (self.keys[1].desc) s_ord == .gt else s_ord == .lt;
+                    }
                 }
                 return a.global_row < b.global_row;
             }
@@ -5086,9 +5095,9 @@ fn executeTopKLateMat(
             parent_alloc: std.mem.Allocator,
             // Raw-byte fast path: if set, skip fetchRange in phase 1.
             raw_filter_offsets: ?[]const u64 = null,
-            raw_filter_bytes: ?[]const u8 = null, // null when neq_empty (not needed)
-            /// Raw sort key i64 values (e.g. EventTime). Only used when
-            /// there is exactly one sort key and it is an i64 column.
+            raw_filter_bytes: ?[]const u8 = null,
+            raw_string_tiebreak: bool = false,
+            /// Raw sort key i64 values (e.g. EventTime).
             raw_sortkey_i64: ?[]const i64 = null,
             raw_sortkey_col_idx: usize = 0,
             // Output (allocated per-ctx from parent_alloc after run).
@@ -5123,6 +5132,12 @@ fn executeTopKLateMat(
                             if (ord != .eq) {
                                 const desc = sc.keys.len > 0 and sc.keys[0].desc;
                                 return if (desc) ord == .gt else ord == .lt;
+                            }
+                            if (sc.keys.len > 1) {
+                                const s_ord = std.mem.order(u8, a.sort_key_str, b.sort_key_str);
+                                if (s_ord != .eq) {
+                                    return if (sc.keys[1].desc) s_ord == .gt else s_ord == .lt;
+                                }
                             }
                             return a.global_row < b.global_row;
                         }
@@ -5159,7 +5174,13 @@ fn executeTopKLateMat(
                             const global_row: u64 = @intCast(r);
                             // Store sort key inline — no per-row allocation.
                             const sk_val: i64 = if (self.raw_sortkey_i64) |rk| rk[r] else 0;
-                            const candidate = HeapEntry{ .global_row = global_row, .key_vals = &.{}, .sort_key_i64 = sk_val };
+                            const sk_str: []const u8 = if (self.raw_string_tiebreak) blk: {
+                                const rb = self.raw_filter_bytes.?;
+                                const lo: usize = @intCast(ro[r]);
+                                const hi: usize = @intCast(ro[r + 1]);
+                                break :blk rb[lo..hi];
+                            } else &.{};
+                            const candidate = HeapEntry{ .global_row = global_row, .key_vals = &.{}, .sort_key_i64 = sk_val, .sort_key_str = sk_str };
                             if (heap_len < self.k) {
                                 heap_buf[heap_len] = candidate;
                                 heap_len += 1;
@@ -5280,6 +5301,7 @@ fn executeTopKLateMat(
                 for (out_heap, 0..) |*e, i| {
                     e.global_row = heap_buf[i].global_row;
                     e.sort_key_i64 = heap_buf[i].sort_key_i64; // preserve raw-path sort key
+                    e.sort_key_str = heap_buf[i].sort_key_str;
                     // Copy key_vals to parent alloc.
                     const kv = try self.parent_alloc.alloc(?Value, heap_buf[i].key_vals.len);
                     @memcpy(kv, heap_buf[i].key_vals);
@@ -5293,28 +5315,34 @@ fn executeTopKLateMat(
         var morsel_src = parallel.MorselSource.init(@intCast(total_rows), 65536);
         const pctxs = try alloc.alloc(ParPhase1Ctx, n_par_threads);
 
-        // Try raw fast path: get filter column's raw offsets (and bytes for LIKE).
-        // For neq_empty, only offsets are needed (check offset[r+1] > offset[r]).
+        // Try raw fast path: get filter column's raw offsets and bytes.
+        // For neq_empty, bytes are only needed when the filter column is also a
+        // string sort tie-breaker.
         const raw_filt_offsets = ctx.source.getRawStrOffsets(filt_col_name);
-        const raw_filt_bytes = if (raw_filt_offsets != null and !phase1_pure_neq_empty)
+        const raw_second_key_is_filter_str =
+            keys.len == 2 and keys[1].col_idx == filt_col_idx_par and filt_col_idx_par < schema_metas.len and
+            schema_metas[filt_col_idx_par].col_type == .string;
+        const need_raw_filter_bytes = !phase1_pure_neq_empty or raw_second_key_is_filter_str;
+        const raw_filt_bytes = if (raw_filt_offsets != null and need_raw_filter_bytes)
             ctx.source.getRawStrBytes(filt_col_name)
         else
             null;
         // For LIKE: need both offsets + bytes; for neq_empty: only offsets needed.
         const use_raw_phase1 = raw_filt_offsets != null and
-            (phase1_pure_neq_empty or raw_filt_bytes != null);
-        // Only use raw sort key if there's exactly one int64 sort key.
-        const raw_sk_i64: ?[]const i64 = if (use_raw_phase1 and keys.len == 1 and keys[0].col_idx < schema_metas.len) blk: {
+            (phase1_pure_neq_empty or raw_filt_bytes != null) and
+            (!raw_second_key_is_filter_str or raw_filt_bytes != null);
+        const raw_sk_i64: ?[]const i64 = if (use_raw_phase1 and keys.len >= 1 and keys[0].col_idx < schema_metas.len) blk: {
             const sk_name = schema_metas[keys[0].col_idx].name;
             if (ctx.source.vtable.getRawInt64Col) |f| {
                 break :blk f(ctx.source.ptr, sk_name);
             }
             break :blk null;
         } else null;
-        const raw_sk_col_idx: usize = if (keys.len == 1) keys[0].col_idx else 0;
+        const raw_sk_col_idx: usize = if (keys.len >= 1) keys[0].col_idx else 0;
         // Raw path is only correct when we have sort key data for ALL sort keys.
-        // Multi-key queries (keys.len > 1) or missing raw sort key → force standard path.
-        const raw_path_safe = keys.len == 0 or raw_sk_i64 != null;
+        const raw_path_safe = keys.len == 0 or
+            (keys.len == 1 and raw_sk_i64 != null) or
+            (keys.len == 2 and raw_sk_i64 != null and raw_second_key_is_filter_str);
 
         for (pctxs) |*pc| {
             pc.* = .{
@@ -5329,7 +5357,8 @@ fn executeTopKLateMat(
                 .morsel_src = &morsel_src,
                 .parent_alloc = alloc,
                 .raw_filter_offsets = if (use_raw_phase1 and raw_path_safe) raw_filt_offsets else null,
-                .raw_filter_bytes = if (use_raw_phase1 and raw_path_safe and !phase1_pure_neq_empty) raw_filt_bytes else null,
+                .raw_filter_bytes = if (use_raw_phase1 and raw_path_safe and need_raw_filter_bytes) raw_filt_bytes else null,
+                .raw_string_tiebreak = raw_second_key_is_filter_str,
                 .raw_sortkey_i64 = raw_sk_i64,
                 .raw_sortkey_col_idx = raw_sk_col_idx,
             };
@@ -6822,7 +6851,7 @@ fn executeHashAggParallelCompact(
     aggs: []const plan.ProjectItem,
     ctx: *QueryContext,
 ) !?RowList {
-    return executeHashAggParallelCompactTopK(input, keys, aggs, &.{}, 0, ctx);
+    return executeHashAggParallelCompactTopK(input, keys, aggs, &.{}, 0, 0, ctx);
 }
 
 /// Parallel hash aggregation for the triple (i64, date_part(unit,datetime), string) + COUNT(*) pattern.
@@ -8732,6 +8761,7 @@ fn executeHashAggParallelCompactTopK(
     aggs: []const plan.ProjectItem,
     sort_keys: []const plan.SortKey,
     top_k: usize,
+    top_offset: usize,
     ctx: *QueryContext,
 ) !?RowList {
     if (!ctx.source.supportsRange()) return null;
@@ -10124,6 +10154,12 @@ fn executeHashAggParallelCompactTopK(
     for (keys, 0..) |k, i| out_metas[i] = .{ .name = k.alias, .col_type = k.out_type };
     for (aggs, 0..) |a, i| out_metas[keys.len + i] = .{ .name = a.alias, .col_type = a.out_type };
 
+    if (top_offset > 0 and top_k > 0 and sort_keys.len > 0) {
+        var merged_count: usize = 0;
+        for (part_hts) |*ph| merged_count += ph.count;
+        if (merged_count <= top_offset) return RowList.init(out_metas);
+    }
+
     var rl = RowList.init(out_metas);
     const MCtx = struct {
         keys_n: usize,
@@ -10424,8 +10460,11 @@ fn executeTwoPhaseHashAgg(
     // entirely.  Phase 1 writes [hash, k0, ...] only; Phase 2 does slot_vals[0]+=1.
     // This shrinks scatter bandwidth by 1 u64 per row (33% for 1-key queries like Q16).
     const count_only: bool = n_aggs == 1 and compact_kinds[0] == .count;
-    // row_stride = 1 (stored hash) + n_eff_keys + n_aggs  (or n_eff_keys only when count_only)
-    const row_stride = 1 + n_eff_keys + (if (count_only) @as(usize, 0) else n_aggs);
+    const omit_first_count: bool = !count_only and n_aggs > 0 and compact_kinds[0] == .count;
+    // row_stride = 1 (stored hash) + n_eff_keys + scatter agg slots.
+    // COUNT(*) partials are implicit when they are the first aggregate.
+    const scatter_aggs = if (count_only) @as(usize, 0) else n_aggs - @as(usize, if (omit_first_count) 1 else 0);
+    const row_stride = 1 + n_eff_keys + scatter_aggs;
 
     // Pre-extract agg info: (col_idx or ~0 for no-arg, kind).
     const AggInfo = struct { col_idx: usize, kind: ht.CompactAggKind };
@@ -10471,6 +10510,7 @@ fn executeTwoPhaseHashAgg(
         str_filter: ?SimpleStrFilter,
         int_filter: ?[]const IntCmpCond,
         count_only: bool,
+        omit_first_count: bool,
         err: ?anyerror = null,
 
         fn work(self: *@This(), _: *parallel.MorselSource) void {
@@ -10559,7 +10599,9 @@ fn executeTwoPhaseHashAgg(
                             for (0..self.n_eff_keys) |ki| rec[1 + ki] = @bitCast(kv[ki]);
                             if (!self.count_only) {
                                 for (self.compact_kinds, 0..) |kind, ai| {
-                                    rec[1 + self.n_eff_keys + ai] = if (kind == .count) 1 else ra[ai].getAggPartial(row, kind);
+                                    if (self.omit_first_count and ai == 0) continue;
+                                    const out_ai = ai - @as(usize, if (self.omit_first_count) 1 else 0);
+                                    rec[1 + self.n_eff_keys + out_ai] = if (kind == .count) 1 else ra[ai].getAggPartial(row, kind);
                                 }
                             }
                             try self.bufs[h & (N_PARTS - 1)].appendSlice(buf_alloc, rec[0..self.row_stride]);
@@ -10643,7 +10685,9 @@ fn executeTwoPhaseHashAgg(
                             for (0..self.n_eff_keys) |ki| rec[1 + ki] = @bitCast(kv[ki]);
                             if (!self.count_only) {
                                 for (self.compact_kinds, 0..) |kind, ai| {
-                                    rec[1 + self.n_eff_keys + ai] = if (kind == .count) 1 else ra[ai].getAggPartial(row, kind);
+                                    if (self.omit_first_count and ai == 0) continue;
+                                    const out_ai = ai - @as(usize, if (self.omit_first_count) 1 else 0);
+                                    rec[1 + self.n_eff_keys + out_ai] = if (kind == .count) 1 else ra[ai].getAggPartial(row, kind);
                                 }
                             }
                             try self.bufs[part_id].appendSlice(buf_alloc, rec[0..self.row_stride]);
@@ -10683,7 +10727,9 @@ fn executeTwoPhaseHashAgg(
                         for (0..self.n_eff_keys) |ki| rec[1 + ki] = @bitCast(kv[ki]);
                         if (!self.count_only) {
                             for (self.compact_kinds, 0..) |kind, ai| {
-                                rec[1 + self.n_eff_keys + ai] = if (kind == .count) 1 else ra[ai].getAggPartial(row, kind);
+                                if (self.omit_first_count and ai == 0) continue;
+                                const out_ai = ai - @as(usize, if (self.omit_first_count) 1 else 0);
+                                rec[1 + self.n_eff_keys + out_ai] = if (kind == .count) 1 else ra[ai].getAggPartial(row, kind);
                             }
                         }
                         try self.bufs[part_id].appendSlice(buf_alloc, rec[0..self.row_stride]);
@@ -10821,7 +10867,9 @@ fn executeTwoPhaseHashAgg(
                     // Agg partial contributions — skipped in count_only mode (Phase 2 adds 1).
                     if (!self.count_only) {
                         for (self.agg_infos, 0..) |info, ai| {
-                            const base_off = 1 + self.n_eff_keys + ai;
+                            if (self.omit_first_count and ai == 0) continue;
+                            const out_ai = ai - @as(usize, if (self.omit_first_count) 1 else 0);
+                            const base_off = 1 + self.n_eff_keys + out_ai;
                             switch (info.kind) {
                                 .count => {
                                     rec[base_off] = 1;
@@ -10958,6 +11006,7 @@ fn executeTwoPhaseHashAgg(
             .str_filter = str_filter,
             .int_filter = int_filter,
             .count_only = count_only,
+            .omit_first_count = omit_first_count,
         };
         // ── Pre-allocate scatter buffers to expected size ──────────────────────────
         // With N_PARTS=128 partitions and exponential doubling from 0, each buffer
@@ -11228,6 +11277,7 @@ fn executeTwoPhaseHashAgg(
         n_eff_keys: usize,
         n_aggs: usize,
         count_only: bool,
+        omit_first_count: bool,
         morsel_src: *parallel.MorselSource,
         alloc: std.mem.Allocator,
         err: ?anyerror = null,
@@ -11308,7 +11358,12 @@ fn executeTwoPhaseHashAgg(
                                 const partial = buf[i + 1 + self.n_eff_keys .. i + rs];
                                 const slot_vals = try self.part_hts[p].getOrInsertH(key_buf[0..self.n_eff_keys], h, self.compact_init_vals);
                                 for (self.compact_kinds, 0..) |kind, ci| {
-                                    const src = partial[ci];
+                                    if (self.omit_first_count and ci == 0) {
+                                        slot_vals[ci] += 1;
+                                        continue;
+                                    }
+                                    const partial_ci = ci - @as(usize, if (self.omit_first_count) 1 else 0);
+                                    const src = partial[partial_ci];
                                     switch (kind) {
                                         .count, .u64_sum => slot_vals[ci] += src,
                                         .i64_sum => {
@@ -11358,6 +11413,7 @@ fn executeTwoPhaseHashAgg(
             .n_eff_keys = n_eff_keys,
             .n_aggs = n_aggs,
             .count_only = count_only,
+            .omit_first_count = omit_first_count,
             .morsel_src = &morsel_src2,
             .alloc = alloc,
         };
@@ -11714,6 +11770,59 @@ fn executeTwoPhaseHashAggStrKeySimple(
         // sidecar (if any) has raw int64 slice, and str_filter (if any) is on the key column.
         skip_fetch: bool = false,
 
+        fn cmpI64(op: @TypeOf(@as(IntCmpCond, undefined).op), lhs: i64, rhs: i64, rhs2: i64) bool {
+            return switch (op) {
+                .eq => lhs == rhs,
+                .neq => lhs != rhs,
+                .lt => lhs < rhs,
+                .lte => lhs <= rhs,
+                .gt => lhs > rhs,
+                .gte => lhs >= rhs,
+                .in2 => lhs == rhs or lhs == rhs2,
+            };
+        }
+
+        fn rawCondPass(self: *const @This(), cond: IntCmpCond, ci: usize, abs: usize) bool {
+            if (self.raw_ic_i16[ci]) |raw16| {
+                return cmpI64(cond.op, raw16[abs], cond.val, cond.val2);
+            }
+            if (self.raw_ic_i32[ci]) |raw32| {
+                return cmpI64(cond.op, raw32[abs], cond.val, cond.val2);
+            }
+            return false;
+        }
+
+        fn appendRawRecord(self: *@This(), ba: std.mem.Allocator, abs: usize) !void {
+            const key_off = self.raw_key_offsets.?;
+            if (self.str_filter != null and key_off[abs + 1] == key_off[abs]) return;
+            const key_bytes = self.raw_key_bytes.?;
+            const s = key_bytes[key_off[abs]..key_off[abs + 1]];
+            const h: u64 = blk: {
+                const base_h = ht.StrAggHashTable.hashStr(s);
+                if (self.raw_sidecar) |rsid| {
+                    const sv: u64 = @bitCast(rsid.getI64(abs));
+                    break :blk base_h ^ (sv *% 0x9e3779b97f4a7c15);
+                }
+                break :blk base_h;
+            };
+            const part_id = @as(usize, @truncate(h)) & (N_PARTS - 1);
+            if (self.raw_distinct) |rd| {
+                if (self.raw_sidecar) |rsid| {
+                    var rec5: [5]u64 = .{ h, @intFromPtr(s.ptr), s.len, @bitCast(rsid.getI64(abs)), @bitCast(rd.getI64(abs)) };
+                    try self.bufs[part_id].appendSlice(ba, &rec5);
+                } else {
+                    var rec4: [4]u64 = .{ h, @intFromPtr(s.ptr), s.len, @bitCast(rd.getI64(abs)) };
+                    try self.bufs[part_id].appendSlice(ba, &rec4);
+                }
+            } else if (self.raw_sidecar) |rsid| {
+                var rec4: [4]u64 = .{ h, @intFromPtr(s.ptr), s.len, @bitCast(rsid.getI64(abs)) };
+                try self.bufs[part_id].appendSlice(ba, &rec4);
+            } else {
+                var rec3: [3]u64 = .{ h, @intFromPtr(s.ptr), s.len };
+                try self.bufs[part_id].appendSlice(ba, &rec3);
+            }
+        }
+
         fn work(self: *@This(), _: *parallel.MorselSource) void {
             self.doWork() catch |e| {
                 self.err = e;
@@ -11730,6 +11839,7 @@ fn executeTwoPhaseHashAggStrKeySimple(
             const rs_mask = try tall.alloc(i16, rs_sz);
             const rs_tmp_a = try tall.alloc(i16, rs_sz);
             const rs_tmp_b = try tall.alloc(i16, rs_sz);
+            const rs_sel = try tall.alloc(u32, rs_sz);
 
             // Fast-path flags set from pre-fetched raw column data.
             const use_raw_key: bool = self.raw_key_offsets != null and self.raw_key_bytes != null;
@@ -11741,6 +11851,54 @@ fn executeTwoPhaseHashAggStrKeySimple(
             if (self.skip_fetch) {
                 while (self.morsel_src.next()) |m| {
                     const nr: usize = m.end - m.start;
+                    if (self.int_filter) |ics| selective_blk: {
+                        if (ics.len < 2) break :selective_blk;
+                        var seed_i: ?usize = null;
+                        for (ics, 0..) |cond, ci| {
+                            if (cond.op == .eq and (self.raw_ic_i16[ci] != null or self.raw_ic_i32[ci] != null)) {
+                                seed_i = ci;
+                                break;
+                            }
+                        }
+                        const si = seed_i orelse break :selective_blk;
+                        const seed = ics[si];
+                        if (self.raw_ic_i16[si]) |raw16| {
+                            const rhs: i16 = @intCast(seed.val);
+                            cmpBatchDispatch(i16, raw16[m.start .. m.start + nr], seed.op, rhs, 0, rs_tmp_a[0..nr], rs_tmp_b[0..nr]);
+                        } else if (self.raw_ic_i32[si]) |raw32| {
+                            const rhs: i32 = @intCast(seed.val);
+                            cmpBatchDispatch(i32, raw32[m.start .. m.start + nr], seed.op, rhs, 0, rs_tmp_a[0..nr], rs_tmp_b[0..nr]);
+                        } else break :selective_blk;
+                        var sel_len: usize = 0;
+                        for (rs_tmp_a[0..nr], 0..) |pass, ri| {
+                            if (pass != 0) {
+                                rs_sel[sel_len] = @intCast(ri);
+                                sel_len += 1;
+                            }
+                        }
+                        if (sel_len * 4 >= nr) break :selective_blk;
+
+                        var out_len: usize = 0;
+                        for (rs_sel[0..sel_len]) |ri_u32| {
+                            const ri: usize = @intCast(ri_u32);
+                            const abs = m.start + ri;
+                            var ok = true;
+                            for (ics, 0..) |cond, ci| {
+                                if (ci == si) continue;
+                                if (!self.rawCondPass(cond, ci, abs)) {
+                                    ok = false;
+                                    break;
+                                }
+                            }
+                            if (!ok) continue;
+                            rs_sel[out_len] = ri_u32;
+                            out_len += 1;
+                        }
+                        for (rs_sel[0..out_len]) |ri_u32| {
+                            try self.appendRawRecord(ba, m.start + @as(usize, @intCast(ri_u32)));
+                        }
+                        continue;
+                    }
                     @memset(rs_mask[0..nr], 1);
                     if (self.int_filter) |ics| {
                         for (ics, 0..) |cond, ci| {
@@ -11778,72 +11936,18 @@ fn executeTwoPhaseHashAggStrKeySimple(
                         if (!any_pass) continue;
                     }
                     const CHUNK = 32;
-                    const key_off = self.raw_key_offsets.?;
-                    const key_bytes = self.raw_key_bytes.?;
                     var r: usize = 0;
                     while (r + CHUNK <= nr) : (r += CHUNK) {
                         const v: @Vector(CHUNK, i16) = rs_mask[r..][0..CHUNK].*;
                         if (@reduce(.Or, v) == 0) continue;
                         for (r..r + CHUNK) |ri| {
                             if (rs_mask[ri] == 0) continue;
-                            const abs = m.start + ri;
-                            if (self.str_filter != null and key_off[abs + 1] == key_off[abs]) continue;
-                            const s = key_bytes[key_off[abs]..key_off[abs + 1]];
-                            const h: u64 = blk: {
-                                const base_h = ht.StrAggHashTable.hashStr(s);
-                                if (self.raw_sidecar) |rsid| {
-                                    const sv: u64 = @bitCast(rsid.getI64(abs));
-                                    break :blk base_h ^ (sv *% 0x9e3779b97f4a7c15);
-                                }
-                                break :blk base_h;
-                            };
-                            const part_id = @as(usize, @truncate(h)) & (N_PARTS - 1);
-                            if (self.raw_distinct) |rd| {
-                                if (self.raw_sidecar) |rsid| {
-                                    var rec5: [5]u64 = .{ h, @intFromPtr(s.ptr), s.len, @bitCast(rsid.getI64(abs)), @bitCast(rd.getI64(abs)) };
-                                    try self.bufs[part_id].appendSlice(ba, &rec5);
-                                } else {
-                                    var rec4: [4]u64 = .{ h, @intFromPtr(s.ptr), s.len, @bitCast(rd.getI64(abs)) };
-                                    try self.bufs[part_id].appendSlice(ba, &rec4);
-                                }
-                            } else if (self.raw_sidecar) |rsid| {
-                                var rec4: [4]u64 = .{ h, @intFromPtr(s.ptr), s.len, @bitCast(rsid.getI64(abs)) };
-                                try self.bufs[part_id].appendSlice(ba, &rec4);
-                            } else {
-                                var rec3: [3]u64 = .{ h, @intFromPtr(s.ptr), s.len };
-                                try self.bufs[part_id].appendSlice(ba, &rec3);
-                            }
+                            try self.appendRawRecord(ba, m.start + ri);
                         }
                     }
                     while (r < nr) : (r += 1) {
                         if (rs_mask[r] == 0) continue;
-                        const abs = m.start + r;
-                        if (self.str_filter != null and key_off[abs + 1] == key_off[abs]) continue;
-                        const s = key_bytes[key_off[abs]..key_off[abs + 1]];
-                        const h: u64 = blk: {
-                            const base_h = ht.StrAggHashTable.hashStr(s);
-                            if (self.raw_sidecar) |rsid| {
-                                const sv: u64 = @bitCast(rsid.getI64(abs));
-                                break :blk base_h ^ (sv *% 0x9e3779b97f4a7c15);
-                            }
-                            break :blk base_h;
-                        };
-                        const part_id = @as(usize, @truncate(h)) & (N_PARTS - 1);
-                        if (self.raw_distinct) |rd| {
-                            if (self.raw_sidecar) |rsid| {
-                                var rec5: [5]u64 = .{ h, @intFromPtr(s.ptr), s.len, @bitCast(rsid.getI64(abs)), @bitCast(rd.getI64(abs)) };
-                                try self.bufs[part_id].appendSlice(ba, &rec5);
-                            } else {
-                                var rec4: [4]u64 = .{ h, @intFromPtr(s.ptr), s.len, @bitCast(rd.getI64(abs)) };
-                                try self.bufs[part_id].appendSlice(ba, &rec4);
-                            }
-                        } else if (self.raw_sidecar) |rsid| {
-                            var rec4: [4]u64 = .{ h, @intFromPtr(s.ptr), s.len, @bitCast(rsid.getI64(abs)) };
-                            try self.bufs[part_id].appendSlice(ba, &rec4);
-                        } else {
-                            var rec3: [3]u64 = .{ h, @intFromPtr(s.ptr), s.len };
-                            try self.bufs[part_id].appendSlice(ba, &rec3);
-                        }
+                        try self.appendRawRecord(ba, m.start + r);
                     }
                 }
                 return;
@@ -12313,6 +12417,36 @@ fn executeTwoPhaseHashAggStrKeySimple(
                     // Sort by (h primary, raw_dval secondary), sweep to count distinct
                     // dvals per h-group, insert counts into part_hts[p].
                     if (self.is_count_distinct) {
+                        direct_distinct: {
+                            const rs: usize = if (self.has_sidecar) 5 else 4;
+                            var total_p: usize = 0;
+                            for (self.scatter_ctxs) |*sc| total_p += sc.bufs[p].items.len / rs;
+                            if (total_p == 0) break :direct_distinct;
+                            if (total_p > 500_000) break :direct_distinct;
+
+                            try self.part_hts[p].growTo(@max(64, total_p * 100 / 65 + 16));
+                            var dset = try hashmap.DistinctEpochSet.init(std.heap.c_allocator, @max(64, total_p));
+                            defer dset.deinit();
+                            const ivs = self.compact_init_vals;
+                            for (self.scatter_ctxs) |*sc| {
+                                const buf = sc.bufs[p].items;
+                                var i: usize = 0;
+                                while (i < buf.len) : (i += rs) {
+                                    const h = buf[i];
+                                    const dval = buf[i + rs - 1];
+                                    if (dset.needsGrow()) try dset.growDouble();
+                                    const pair_key = h ^ (dval *% 0x9e3779b97f4a7c15);
+                                    if (!dset.insertNew(pair_key)) continue;
+                                    const ptr = buf[i + 1];
+                                    const slen = buf[i + 2];
+                                    const sidecar: i64 = if (self.has_sidecar) @bitCast(buf[i + 3]) else 0;
+                                    const s: []const u8 = @as([*]const u8, @ptrFromInt(ptr))[0..slen];
+                                    const res = try self.part_hts[p].getOrInsertHashOnly(s, h, ivs, sidecar);
+                                    res.vals[0] += 1;
+                                }
+                            }
+                            continue;
+                        }
                         if (!self.has_sidecar) {
                             const CD_RS: usize = 4;
                             var total_p: usize = 0;

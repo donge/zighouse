@@ -329,9 +329,10 @@ pub fn plan_query(
             if (all_resolved and sort_keys_list.items.len > 0) {
                 const sort_keys = try sort_keys_list.toOwnedSlice(ctx.alloc);
                 if (gplan.limit != null) {
-                    const k: u64 = @intCast(gplan.limit.? + (gplan.offset orelse 0));
+                    const offset = gplan.offset orelse 0;
+                    const k: u64 = @intCast(gplan.limit.? + offset);
                     const topk = try ctx.alloc.create(PhysicalNode);
-                    topk.* = .{ .top_k = .{ .input = source, .keys = sort_keys, .k = k } };
+                    topk.* = .{ .top_k = .{ .input = source, .keys = sort_keys, .k = k, .offset = @intCast(offset) } };
                     source = topk;
                 } else {
                     const ob = try ctx.alloc.create(PhysicalNode);
@@ -596,9 +597,10 @@ pub fn plan_query(
         const sort_keys = try ctx.alloc.alloc(SortKey, 1);
         sort_keys[0] = .{ .col_idx = sort_idx, .desc = true, .nulls_first = false };
         if (has_limit) {
-            const k: u64 = @intCast(gplan.limit.? + (gplan.offset orelse 0));
+            const offset = gplan.offset orelse 0;
+            const k: u64 = @intCast(gplan.limit.? + offset);
             const topk = try ctx.alloc.create(PhysicalNode);
-            topk.* = .{ .top_k = .{ .input = source, .keys = sort_keys, .k = k } };
+            topk.* = .{ .top_k = .{ .input = source, .keys = sort_keys, .k = k, .offset = @intCast(offset) } };
             source = topk;
         } else {
             const ob = try ctx.alloc.create(PhysicalNode);
@@ -613,9 +615,10 @@ pub fn plan_query(
             const sort_keys = try ctx.alloc.alloc(SortKey, 1);
             sort_keys[0] = .{ .col_idx = col_idx, .desc = !gplan.order_by_alias_asc, .nulls_first = false };
             if (has_limit) {
-                const k: u64 = @intCast(gplan.limit.? + (gplan.offset orelse 0));
+                const offset = gplan.offset orelse 0;
+                const k: u64 = @intCast(gplan.limit.? + offset);
                 const topk = try ctx.alloc.create(PhysicalNode);
-                topk.* = .{ .top_k = .{ .input = source, .keys = sort_keys, .k = k } };
+                topk.* = .{ .top_k = .{ .input = source, .keys = sort_keys, .k = k, .offset = @intCast(offset) } };
                 source = topk;
             } else {
                 const ob = try ctx.alloc.create(PhysicalNode);
@@ -670,9 +673,10 @@ pub fn plan_query(
             if (all_found and sort_keys_list.items.len > 0) {
                 const sort_keys = try sort_keys_list.toOwnedSlice(ctx.alloc);
                 if (has_limit) {
-                    const k: u64 = @intCast(gplan.limit.? + (gplan.offset orelse 0));
+                    const offset = gplan.offset orelse 0;
+                    const k: u64 = @intCast(gplan.limit.? + offset);
                     const topk = try ctx.alloc.create(PhysicalNode);
-                    topk.* = .{ .top_k = .{ .input = source, .keys = sort_keys, .k = k } };
+                    topk.* = .{ .top_k = .{ .input = source, .keys = sort_keys, .k = k, .offset = @intCast(offset) } };
                     source = topk;
                 } else {
                     const ob = try ctx.alloc.create(PhysicalNode);
@@ -692,17 +696,20 @@ pub fn plan_query(
 
     // ── LIMIT / OFFSET ────────────────────────────────────────────────────────
     if (gplan.limit) |lim| {
-        // Skip if already consumed by top_k above.
+        // top_k consumes LIMIT by keeping k rows.  When OFFSET is present, top_k
+        // keeps limit+offset candidates, then this limit node applies the final
+        // pagination semantics.
+        const offset = gplan.offset orelse 0;
         const already_topk = switch (source.*) {
             .top_k => true,
             else   => false,
         };
-        if (!already_topk) {
+        if (!already_topk or offset > 0) {
             const lim_node = try ctx.alloc.create(PhysicalNode);
             lim_node.* = .{ .limit = .{
                 .input  = source,
                 .limit  = @intCast(lim),
-                .offset = @intCast(gplan.offset orelse 0),
+                .offset = @intCast(offset),
             }};
             source = lim_node;
         }

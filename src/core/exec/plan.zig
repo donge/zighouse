@@ -333,6 +333,7 @@ pub const TopKNode = struct {
     input: *PhysicalNode,
     keys:  []SortKey,
     k:     u64,
+    offset: u64 = 0,
 };
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
