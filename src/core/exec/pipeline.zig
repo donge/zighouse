@@ -1874,7 +1874,16 @@ fn executeHashAggScannable(
     ctx: *QueryContext,
 ) !RowList {
     if (try executeHashAggStrategy(ha.strategy, ha, sort_keys, top_k, ctx)) |rl| return rl;
-    const fallback_order = [_]plan.HashAggNode.Strategy{ .compact_int, .pair_count, .triple_count, .string_key };
+    const fallback_order = [_]plan.HashAggNode.Strategy{
+        .compact_int,
+        .single_int_count_topk,
+        .single_int_distinct_topk,
+        .pair_count,
+        .triple_count,
+        .string_key,
+        .string_distinct_topk,
+        .case_string_key_topk,
+    };
     for (fallback_order) |strategy| {
         if (strategy == ha.strategy) continue;
         if (ha.strategy == .grouped_distinct and strategy == .compact_int) continue;
@@ -1892,7 +1901,7 @@ fn executeHashAggStrategy(
 ) !?RowList {
     return switch (strategy) {
         .auto => null,
-        .compact_int, .grouped_distinct => blk: {
+        .compact_int, .single_int_count_topk, .single_int_distinct_topk, .grouped_distinct => blk: {
             if (top_k > 0 and sort_keys.len > 0) {
                 break :blk try executeHashAggParallelCompactTopK(ha.input, ha.keys, ha.aggs, sort_keys, top_k, ctx);
             }
@@ -1900,7 +1909,7 @@ fn executeHashAggStrategy(
         },
         .pair_count => try executeHashAggParallelPairCount(ha.input, ha.keys, ha.aggs, sort_keys, top_k, ctx),
         .triple_count => try executeHashAggParallelTripleCount(ha.input, ha.keys, ha.aggs, sort_keys, top_k, ctx),
-        .string_key => try executeHashAggParallelStrKey(ha.input, ha.keys, ha.aggs, sort_keys, top_k, ctx),
+        .string_key, .string_distinct_topk, .case_string_key_topk => try executeHashAggParallelStrKey(ha.input, ha.keys, ha.aggs, sort_keys, top_k, ctx),
     };
 }
 

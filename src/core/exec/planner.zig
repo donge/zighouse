@@ -180,8 +180,10 @@ pub fn findPrunedCols(node: *const PhysicalNode) []const []const u8 {
 
 fn inferHashAggStrategy(keys: []const ProjectItem, aggs: []const ProjectItem) plan.HashAggNode.Strategy {
     var str_keys: usize = 0;
+    var has_case_str_key = false;
     for (keys) |k| {
         if (k.out_type == .string) str_keys += 1;
+        if (k.expr == .case_when and k.out_type == .string) has_case_str_key = true;
     }
 
     var count_only = aggs.len > 0;
@@ -195,7 +197,13 @@ fn inferHashAggStrategy(keys: []const ProjectItem, aggs: []const ProjectItem) pl
         if (ac.distinct) has_distinct = true;
         if (ac.kind != .count_star and ac.kind != .count) count_only = false;
     }
-    if (has_distinct) return .grouped_distinct;
+    if (has_distinct) {
+        if (keys.len == 1 and str_keys == 0) return .single_int_distinct_topk;
+        if (str_keys == 1) return .string_distinct_topk;
+        return .grouped_distinct;
+    }
+    if (count_only and keys.len == 1 and str_keys == 0) return .single_int_count_topk;
+    if (count_only and has_case_str_key and str_keys >= 1) return .case_string_key_topk;
     if (str_keys == 0) return .compact_int;
     if (count_only and str_keys == 1 and keys.len == 2) return .pair_count;
     if (count_only and str_keys == 1 and keys.len == 3) return .triple_count;
@@ -2478,8 +2486,9 @@ test "inferHashAggStrategy recognizes core physical agg shapes" {
     const count_agg = ProjectItem{ .expr = .{ .agg_call = &count_call }, .alias = "c", .out_type = .uint64 };
     const distinct_agg = ProjectItem{ .expr = .{ .agg_call = &distinct_call }, .alias = "u", .out_type = .uint64 };
 
-    try std.testing.expectEqual(plan.HashAggNode.Strategy.compact_int, inferHashAggStrategy(&.{int_key}, &.{count_agg}));
-    try std.testing.expectEqual(plan.HashAggNode.Strategy.grouped_distinct, inferHashAggStrategy(&.{int_key}, &.{distinct_agg}));
+    try std.testing.expectEqual(plan.HashAggNode.Strategy.single_int_count_topk, inferHashAggStrategy(&.{int_key}, &.{count_agg}));
+    try std.testing.expectEqual(plan.HashAggNode.Strategy.single_int_distinct_topk, inferHashAggStrategy(&.{int_key}, &.{distinct_agg}));
+    try std.testing.expectEqual(plan.HashAggNode.Strategy.string_distinct_topk, inferHashAggStrategy(&.{str_key}, &.{distinct_agg}));
     try std.testing.expectEqual(plan.HashAggNode.Strategy.pair_count, inferHashAggStrategy(&.{ int_key, str_key }, &.{count_agg}));
 }
 

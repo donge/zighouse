@@ -280,9 +280,13 @@ pub const HashAggNode = struct {
     pub const Strategy = enum {
         auto,
         compact_int,
+        single_int_count_topk,
+        single_int_distinct_topk,
         pair_count,
         triple_count,
         string_key,
+        string_distinct_topk,
+        case_string_key_topk,
         grouped_distinct,
     };
 
