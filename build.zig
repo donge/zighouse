@@ -705,6 +705,8 @@ pub fn build(b: *std.Build) void {
     part_scan_bridge_mod.addImport("part",   ch_part_mod);
     part_scan_bridge_mod.link_libc = true;
     lz4ctx.link(part_scan_bridge_mod);
+    const part_scan_bridge_tests = b.addTest(.{ .root_module = part_scan_bridge_mod });
+    const part_scan_bridge_test_cmd = b.addRunArtifact(part_scan_bridge_tests);
 
      exe.root_module.addImport("ir_planner", ir_planner_mod);
      exe.root_module.addImport("core",       core_mod);
@@ -769,6 +771,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&ch_checksums_test_cmd.step);
     test_step.dependOn(&ch_string_codec_test_cmd.step);
     test_step.dependOn(&ch_part_test_cmd.step);
+    test_step.dependOn(&part_scan_bridge_test_cmd.step);
     test_step.dependOn(&row_binary_decoder_test_cmd.step);
     test_step.dependOn(&schema_config_test_cmd.step);
     test_step.dependOn(&schema_persist_test_cmd.step);
