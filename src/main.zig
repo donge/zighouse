@@ -10,7 +10,7 @@ const generic_sql = @import("generic_sql");
 const parquet = @import("parquet");
 const storage = @import("storage.zig");
 const schema = @import("schema");
-const generic_store = @import("generic_store.zig");
+const generic_store = @import("generic_store");
 
 const usage =
     \\zighouse - ClickHouse-compatible analytical database
@@ -285,7 +285,7 @@ fn runCommand(init: std.process.Init, allocator: std.mem.Allocator, args: *std.p
         const QueryRange = duckdb.QueryRange;
         const ir_planner = @import("ir_planner");
         const core = @import("core");
-        const gsb = @import("core/source/generic_store_bridge.zig");
+        const gsb = @import("generic_store_bridge");
 
         const store_dir   = args.next() orelse return error.MissingStoreDir;
         const table_name  = args.next() orelse return error.MissingTableName;
@@ -398,7 +398,7 @@ fn runCommand(init: std.process.Init, allocator: std.mem.Allocator, args: *std.p
         // Usage: zighouse query <store_dir> <table_name> <sql>
         const ir_planner2 = @import("ir_planner");
         const core2 = @import("core");
-        const gsb2 = @import("core/source/generic_store_bridge.zig");
+        const gsb2 = @import("generic_store_bridge");
         const serializer = @import("serializer");
 
         const store_dir2   = args.next() orelse return error.MissingStoreDir;

@@ -22,6 +22,8 @@ const core    = @import("core");
 const chunk   = core.chunk;
 const result  = core.result;
 const pipeline = core.exec.pipeline;
+const generic_store = @import("generic_store");
+const generic_store_bridge = @import("generic_store_bridge");
 const part_mod = @import("part");       // clickhouse_format/part.zig
 
 pub const DataChunk    = chunk.DataChunk;
@@ -29,6 +31,7 @@ pub const ColumnType   = chunk.ColumnType;
 pub const SourceIface  = pipeline.SourceIface;
 pub const QueryContext = pipeline.QueryContext;
 pub const ColMeta      = result.ColMeta;
+const plan = core.exec.plan;
 
 const RawStringCol = struct {
     offsets: []u64,
@@ -1117,4 +1120,286 @@ test "PartScanBridge combines raw views across compact parts" {
     try std.testing.expectEqualSlices(i64, &[_]i64{ 3, 4 }, ranged_fetch.columns[0].data.int64);
     try std.testing.expectEqualStrings("ccc", ranged_fetch.columns[1].data.string[0]);
     try std.testing.expectEqualStrings("", ranged_fetch.columns[1].data.string[1]);
+}
+
+const ConsistencyFixture = struct {
+    ids: []const i32,
+    user_ids: []const i64,
+    categories: []const []const u8,
+    scores: []const i32,
+};
+
+fn writeBytes(io: std.Io, alloc: std.mem.Allocator, path: []const u8, bytes: []const u8) !void {
+    const cwd = std.Io.Dir.cwd();
+    const dir = std.fs.path.dirname(path) orelse ".";
+    try cwd.createDirPath(io, dir);
+    try cwd.writeFile(io, .{ .sub_path = path, .data = bytes });
+    _ = alloc;
+}
+
+fn writeGenericInt32(io: std.Io, alloc: std.mem.Allocator, part_dir: []const u8, name: []const u8, values: []const i32) !void {
+    var bytes = try alloc.alloc(u8, values.len * 4);
+    defer alloc.free(bytes);
+    for (values, 0..) |v, i| std.mem.writeInt(i32, bytes[i * 4 ..][0..4], v, .little);
+    const path = try generic_store.columnBinPath(alloc, part_dir, name);
+    defer alloc.free(path);
+    try writeBytes(io, alloc, path, bytes);
+}
+
+fn writeGenericInt64(io: std.Io, alloc: std.mem.Allocator, part_dir: []const u8, name: []const u8, values: []const i64) !void {
+    var bytes = try alloc.alloc(u8, values.len * 8);
+    defer alloc.free(bytes);
+    for (values, 0..) |v, i| std.mem.writeInt(i64, bytes[i * 8 ..][0..8], v, .little);
+    const path = try generic_store.columnBinPath(alloc, part_dir, name);
+    defer alloc.free(path);
+    try writeBytes(io, alloc, path, bytes);
+}
+
+fn writeGenericString(io: std.Io, alloc: std.mem.Allocator, part_dir: []const u8, name: []const u8, values: []const []const u8) !void {
+    var total_bytes: usize = 0;
+    for (values) |v| total_bytes += v.len;
+    const header_len = 8 + (values.len + 1) * 8;
+    var bytes = try alloc.alloc(u8, header_len + total_bytes);
+    defer alloc.free(bytes);
+    std.mem.writeInt(u64, bytes[0..8], values.len, .little);
+    var offset: u64 = 0;
+    std.mem.writeInt(u64, bytes[8..16], offset, .little);
+    var pos = header_len;
+    for (values, 0..) |v, i| {
+        @memcpy(bytes[pos..][0..v.len], v);
+        pos += v.len;
+        offset += v.len;
+        const off_pos = 8 + (i + 1) * 8;
+        std.mem.writeInt(u64, bytes[off_pos..][0..8], offset, .little);
+    }
+    const path = try generic_store.columnStrBinPath(alloc, part_dir, name);
+    defer alloc.free(path);
+    try writeBytes(io, alloc, path, bytes);
+}
+
+fn writeGenericFixture(io: std.Io, alloc: std.mem.Allocator, store_dir: []const u8, table: schema.Table, fixture: ConsistencyFixture) ![]u8 {
+    const part_dir = try generic_store.initPart(io, store_dir, table.name, alloc);
+    try generic_store.writeColumnsTxt(io, alloc, part_dir, table);
+    try generic_store.writeCountTxt(io, alloc, part_dir, fixture.ids.len);
+    try writeGenericInt32(io, alloc, part_dir, "id", fixture.ids);
+    try writeGenericInt64(io, alloc, part_dir, "user_id", fixture.user_ids);
+    try writeGenericString(io, alloc, part_dir, "category", fixture.categories);
+    try writeGenericInt32(io, alloc, part_dir, "score", fixture.scores);
+    return part_dir;
+}
+
+fn writeCompactPart(
+    io: std.Io,
+    alloc: std.mem.Allocator,
+    part_dir: []const u8,
+    table: schema.Table,
+    fixture: ConsistencyFixture,
+    start: usize,
+    end: usize,
+) !void {
+    var cp = try part_mod.CompactPart.open(io, alloc, part_dir, table, 0x82);
+    defer cp.deinit();
+    var tmp_i64 = std.ArrayListUnmanaged(i64).empty;
+    defer tmp_i64.deinit(alloc);
+
+    tmp_i64.clearRetainingCapacity();
+    for (fixture.ids[start..end]) |v| try tmp_i64.append(alloc, v);
+    try cp.appendFixedBatch(0, tmp_i64.items);
+
+    tmp_i64.clearRetainingCapacity();
+    for (fixture.user_ids[start..end]) |v| try tmp_i64.append(alloc, v);
+    try cp.appendFixedBatch(1, tmp_i64.items);
+
+    for (fixture.categories[start..end]) |v| try cp.appendString(2, v);
+
+    tmp_i64.clearRetainingCapacity();
+    for (fixture.scores[start..end]) |v| try tmp_i64.append(alloc, v);
+    try cp.appendFixedBatch(3, tmp_i64.items);
+
+    try cp.finish();
+}
+
+fn valueEqual(a: core.Value, b: core.Value) bool {
+    if (@as(ColumnType, a) != @as(ColumnType, b)) return false;
+    return switch (a) {
+        .bool_u8 => |v| v == b.bool_u8,
+        .int64 => |v| v == b.int64,
+        .uint64 => |v| v == b.uint64,
+        .float64 => |v| v == b.float64,
+        .date_u16 => |v| v == b.date_u16,
+        .datetime64_ms => |v| v == b.datetime64_ms,
+        .string => |v| std.mem.eql(u8, v, b.string),
+        .array_string => |v| blk: {
+            if (v.len != b.array_string.len) break :blk false;
+            for (v, b.array_string) |lhs, rhs| {
+                if (!std.mem.eql(u8, lhs, rhs)) break :blk false;
+            }
+            break :blk true;
+        },
+    };
+}
+
+fn expectSameResult(generic: result.ResultSet, compact: result.ResultSet) !void {
+    try std.testing.expectEqual(generic.metas.len, compact.metas.len);
+    try std.testing.expectEqual(generic.num_rows, compact.num_rows);
+    for (generic.metas, compact.metas) |gm, cm| {
+        try std.testing.expectEqualStrings(gm.name, cm.name);
+        try std.testing.expectEqual(gm.col_type, cm.col_type);
+    }
+    for (0..generic.num_rows) |r| {
+        for (0..generic.metas.len) |ci| {
+            const gv = generic.get(ci, r);
+            const cv = compact.get(ci, r);
+            try std.testing.expectEqual(gv != null, cv != null);
+            if (gv) |v| try std.testing.expect(valueEqual(v, cv.?));
+        }
+    }
+}
+
+fn runOnSource(alloc: std.mem.Allocator, source: SourceIface, node: *const plan.PhysicalNode) !result.ResultSet {
+    var qctx = QueryContext.init(alloc, source);
+    defer qctx.deinit();
+    return pipeline.executePlan(node, &qctx);
+}
+
+fn compareGenericAndCompact(
+    alloc: std.mem.Allocator,
+    generic_source: SourceIface,
+    compact_source: SourceIface,
+    node: *const plan.PhysicalNode,
+) !void {
+    var grs = try runOnSource(alloc, generic_source, node);
+    defer grs.deinit();
+    var crs = try runOnSource(alloc, compact_source, node);
+    defer crs.deinit();
+    try expectSameResult(grs, crs);
+}
+
+fn colRef(index: usize, name: []const u8) plan.Expr {
+    return .{ .col_ref = .{ .index = index, .name = name } };
+}
+
+fn countStarExpr(agg: *plan.AggCall) plan.Expr {
+    agg.* = .{ .kind = .count_star, .arg = null, .distinct = false };
+    return .{ .agg_call = agg };
+}
+
+fn countDistinctExpr(agg: *plan.AggCall, arg: *plan.Expr) plan.Expr {
+    agg.* = .{ .kind = .count, .arg = arg.*, .distinct = true };
+    return .{ .agg_call = agg };
+}
+
+test "generic and compact sources produce consistent pipeline results" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const generic_store_dir = "/tmp/zig_test_generic_compact_consistency_generic";
+    const compact_part_dir_1 = "/tmp/zig_test_generic_compact_consistency_part_1";
+    const compact_part_dir_2 = "/tmp/zig_test_generic_compact_consistency_part_2";
+
+    {
+        var cwd = std.Io.Dir.cwd();
+        cwd.deleteTree(io, generic_store_dir) catch {};
+        cwd.deleteTree(io, compact_part_dir_1) catch {};
+        cwd.deleteTree(io, compact_part_dir_2) catch {};
+    }
+
+    const cols = [_]schema.Column{
+        .{ .name = "id", .ty = .int32 },
+        .{ .name = "user_id", .ty = .int64 },
+        .{ .name = "category", .ty = .text },
+        .{ .name = "score", .ty = .int32 },
+    };
+    const sort_keys = [_][]const u8{"id"};
+    const table = schema.Table{ .name = "events_consistency", .columns = &cols, .sort_keys = &sort_keys };
+
+    const ids = [_]i32{ 1, 2, 3, 4, 5, 6 };
+    const user_ids = [_]i64{ 10, 20, 10, 30, 20, 20 };
+    const categories = [_][]const u8{ "alpha", "", "beta", "alpha", "gamma", "beta" };
+    const scores = [_]i32{ 5, 7, 4, 9, 3, 8 };
+    const fixture = ConsistencyFixture{
+        .ids = &ids,
+        .user_ids = &user_ids,
+        .categories = &categories,
+        .scores = &scores,
+    };
+
+    const generic_part_dir = try writeGenericFixture(io, allocator, generic_store_dir, table, fixture);
+    defer allocator.free(generic_part_dir);
+    try writeCompactPart(io, allocator, compact_part_dir_1, table, fixture, 0, 3);
+    try writeCompactPart(io, allocator, compact_part_dir_2, table, fixture, 3, 6);
+
+    var generic_bridge = try generic_store_bridge.GenericStoreBridge.init(allocator, io, generic_part_dir, table, &.{});
+    defer generic_bridge.deinit();
+    try generic_bridge.preload();
+    var compact_bridge = try PartScanBridge.init(allocator, io, table, &[_][]const u8{ compact_part_dir_1, compact_part_dir_2 }, &.{});
+    defer compact_bridge.deinit();
+    const generic_source = generic_bridge.source();
+    const compact_source = compact_bridge.source();
+
+    var scan_cols = [_][]const u8{};
+    var scan = plan.PhysicalNode{ .part_scan = .{
+        .db = "default",
+        .table = table.name,
+        .columns = scan_cols[0..],
+        .filter = null,
+    }};
+
+    var count_call: plan.AggCall = undefined;
+    var count_aggs = [_]plan.ProjectItem{.{
+        .expr = countStarExpr(&count_call),
+        .alias = "count()",
+        .out_type = .uint64,
+    }};
+    var count_node = plan.PhysicalNode{ .scalar_agg = .{ .input = &scan, .aggs = count_aggs[0..] } };
+    try compareGenericAndCompact(allocator, generic_source, compact_source, &count_node);
+
+    var gt_op = plan.BinOp{ .left = colRef(3, "score"), .right = .{ .lit_i64 = 6 } };
+    var filter = plan.PhysicalNode{ .filter = .{ .input = &scan, .predicate = .{ .gt = &gt_op } } };
+    var id_project_items = [_]plan.ProjectItem{.{
+        .expr = colRef(0, "id"),
+        .alias = "id",
+        .out_type = .int64,
+    }};
+    var project_id = plan.PhysicalNode{ .project = .{ .input = &filter, .items = id_project_items[0..] } };
+    var id_sort_keys = [_]plan.SortKey{.{ .col_idx = 0, .desc = false, .nulls_first = false }};
+    var order_ids = plan.PhysicalNode{ .order_by = .{ .input = &project_id, .keys = id_sort_keys[0..] } };
+    try compareGenericAndCompact(allocator, generic_source, compact_source, &order_ids);
+
+    var neq_empty_op = plan.BinOp{ .left = colRef(2, "category"), .right = .{ .lit_str = "" } };
+    var nonempty_filter = plan.PhysicalNode{ .filter = .{ .input = &scan, .predicate = .{ .neq = &neq_empty_op } } };
+    var nonempty_count = plan.PhysicalNode{ .scalar_agg = .{ .input = &nonempty_filter, .aggs = count_aggs[0..] } };
+    try compareGenericAndCompact(allocator, generic_source, compact_source, &nonempty_count);
+
+    var group_keys = [_]plan.ProjectItem{.{
+        .expr = colRef(1, "user_id"),
+        .alias = "user_id",
+        .out_type = .int64,
+    }};
+    var grouped_count = plan.PhysicalNode{ .hash_agg = .{
+        .input = &scan,
+        .keys = group_keys[0..],
+        .aggs = count_aggs[0..],
+        .strategy = .single_int_count_topk,
+    }};
+    var count_sort_keys = [_]plan.SortKey{.{ .col_idx = 1, .desc = true, .nulls_first = false }};
+    var grouped_topk = plan.PhysicalNode{ .top_k = .{ .input = &grouped_count, .keys = count_sort_keys[0..], .k = 2 } };
+    try compareGenericAndCompact(allocator, generic_source, compact_source, &grouped_topk);
+
+    var distinct_arg = colRef(1, "user_id");
+    var distinct_call: plan.AggCall = undefined;
+    var distinct_aggs = [_]plan.ProjectItem{.{
+        .expr = countDistinctExpr(&distinct_call, &distinct_arg),
+        .alias = "uniq",
+        .out_type = .uint64,
+    }};
+    var distinct_count = plan.PhysicalNode{ .scalar_agg = .{ .input = &scan, .aggs = distinct_aggs[0..] } };
+    try compareGenericAndCompact(allocator, generic_source, compact_source, &distinct_count);
+
+    var ordered_ids_limit = plan.PhysicalNode{ .limit = .{ .input = &order_ids, .limit = 2, .offset = 2 } };
+    try compareGenericAndCompact(allocator, generic_source, compact_source, &ordered_ids_limit);
+
+    var eq_id_op = plan.BinOp{ .left = colRef(0, "id"), .right = .{ .lit_i64 = 4 } };
+    var id_eq_filter = plan.PhysicalNode{ .filter = .{ .input = &scan, .predicate = .{ .eq = &eq_id_op } } };
+    var id_eq_project = plan.PhysicalNode{ .project = .{ .input = &id_eq_filter, .items = id_project_items[0..] } };
+    try compareGenericAndCompact(allocator, generic_source, compact_source, &id_eq_project);
 }

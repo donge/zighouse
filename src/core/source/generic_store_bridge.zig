@@ -31,7 +31,7 @@ const core     = @import("core");
 const chunk    = core.chunk;
 const result   = core.result;
 const pipeline = core.exec.pipeline;
-const generic_store = @import("../../generic_store.zig");
+const generic_store = @import("generic_store");
 
 pub const DataChunk    = chunk.DataChunk;
 pub const ColumnType   = chunk.ColumnType;

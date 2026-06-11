@@ -493,6 +493,7 @@ pub fn build(b: *std.Build) void {
     });
     loader_tests.root_module.link_libc = true;
     loader_tests.root_module.addImport("parquet", parquet_mod);
+    loader_tests.root_module.addImport("generic_store", generic_store_mod);
     const loader_test_cmd = b.addRunArtifact(loader_tests);
 
     // ── Wire schema_mod + ch_part_mod + lz4 + zstd into exe and all test targets ──
@@ -512,6 +513,8 @@ pub fn build(b: *std.Build) void {
     schema_infer_tests.root_module.addImport("schema", schema_mod);
     schema_infer_tests.root_module.addImport("parquet", parquet_mod);
     generic_store_tests.root_module.addImport("schema", schema_mod);
+    exe.root_module.addImport("generic_store", generic_store_mod);
+    unit_tests.root_module.addImport("generic_store", generic_store_mod);
 
     // ── ingest module tests ─────────────────────────────────────────────────
     const row_binary_decoder_mod = b.createModule(.{
@@ -694,6 +697,16 @@ pub fn build(b: *std.Build) void {
     const ir_planner_tests   = b.addTest(.{ .root_module = ir_planner_mod });
     const ir_planner_test_cmd = b.addRunArtifact(ir_planner_tests);
 
+    // ── generic_store_bridge module (generic part → SourceIface bridge) ─────
+    const generic_store_bridge_mod = b.createModule(.{
+        .root_source_file = b.path("src/core/source/generic_store_bridge.zig"),
+        .target   = target,
+        .optimize = optimize,
+    });
+    generic_store_bridge_mod.addImport("schema", schema_mod);
+    generic_store_bridge_mod.addImport("core", core_mod);
+    generic_store_bridge_mod.addImport("generic_store", generic_store_mod);
+
     // ── part_scan_bridge module (part.zig → SourceIface bridge) ─────────────
     const part_scan_bridge_mod = b.createModule(.{
         .root_source_file = b.path("src/core/source/part_scan_bridge.zig"),
@@ -703,6 +716,8 @@ pub fn build(b: *std.Build) void {
     part_scan_bridge_mod.addImport("schema", schema_mod);
     part_scan_bridge_mod.addImport("core",   core_mod);
     part_scan_bridge_mod.addImport("part",   ch_part_mod);
+    part_scan_bridge_mod.addImport("generic_store", generic_store_mod);
+    part_scan_bridge_mod.addImport("generic_store_bridge", generic_store_bridge_mod);
     part_scan_bridge_mod.link_libc = true;
     lz4ctx.link(part_scan_bridge_mod);
     const part_scan_bridge_tests = b.addTest(.{ .root_module = part_scan_bridge_mod });
@@ -711,6 +726,8 @@ pub fn build(b: *std.Build) void {
      exe.root_module.addImport("ir_planner", ir_planner_mod);
      exe.root_module.addImport("core",       core_mod);
      exe.root_module.addImport("parallel",   parallel_mod);
+     exe.root_module.addImport("generic_store_bridge", generic_store_bridge_mod);
+     unit_tests.root_module.addImport("generic_store_bridge", generic_store_bridge_mod);
 
     // ── serializer module (ResultSet → Native block) ─────────────────────────
     const serializer_mod = b.createModule(.{
