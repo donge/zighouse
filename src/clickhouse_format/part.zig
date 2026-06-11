@@ -1163,8 +1163,11 @@ pub const CompactOpenedPart = struct {
         if (total_blocks > 0) {
             const bin_path = try std.fmt.allocPrint(allocator, "{s}/data.bin", .{part_dir});
             defer allocator.free(bin_path);
-            const bin_raw = try std.Io.Dir.cwd().readFileAlloc(io, bin_path, allocator, .limited(std.math.maxInt(usize)));
-            defer allocator.free(bin_raw);
+            const bin_file = try std.Io.Dir.cwd().openFile(io, bin_path, .{});
+            defer bin_file.close(io);
+            const stat = try bin_file.stat(io);
+            const bin_raw = try std.posix.mmap(null, stat.size, .{ .READ = true }, .{ .TYPE = .PRIVATE }, bin_file.handle, 0);
+            defer std.posix.munmap(bin_raw);
 
             var bin_r = std.Io.Reader.fixed(bin_raw);
             for (substream_data) |*sd| {

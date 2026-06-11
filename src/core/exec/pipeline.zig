@@ -1401,9 +1401,30 @@ pub const RowList = struct {
 
         const out_metas = try ra.dupe(result.ColMeta, self.metas);
         if (num_rows == 0 or num_cols == 0) {
+            var out_cols: []chunk.Column = &.{};
+            if (num_cols > 0 and num_rows == 0) {
+                out_cols = try ra.alloc(chunk.Column, num_cols);
+                for (out_cols, out_metas) |*c, meta| {
+                    c.* = .{
+                        .name = meta.name,
+                        .null_mask = &.{},
+                        .len = 0,
+                        .data = switch (meta.col_type) {
+                            .bool_u8 => .{ .bool_u8 = &.{} },
+                            .int64 => .{ .int64 = &.{} },
+                            .uint64 => .{ .uint64 = &.{} },
+                            .float64 => .{ .float64 = &.{} },
+                            .string => .{ .string = &.{} },
+                            .date_u16 => .{ .date_u16 = &.{} },
+                            .datetime64_ms => .{ .datetime64_ms = &.{} },
+                            .array_string => .{ .array_string = &.{} },
+                        },
+                    };
+                }
+            }
             return ResultSet{
                 .metas = out_metas,
-                .columns = &.{},
+                .columns = out_cols,
                 .num_rows = 0,
                 .arena = arena,
             };

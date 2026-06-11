@@ -135,8 +135,10 @@ fn workerLoop(worker_idx: usize) void {
         fn_ptr(@ptrFromInt(ctx_raw), src);
 
         _ = c.pthread_mutex_lock(&pool.mutex);
-        pool.n_busy -= 1;
-        if (pool.n_busy == 0) _ = c.pthread_cond_signal(&pool.cv_done);
+        if (pool.n_busy > 0) {
+            pool.n_busy -= 1;
+            if (pool.n_busy == 0) _ = c.pthread_cond_signal(&pool.cv_done);
+        }
         _ = c.pthread_mutex_unlock(&pool.mutex);
     }
 }
