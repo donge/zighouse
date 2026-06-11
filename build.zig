@@ -127,10 +127,10 @@ pub fn build(b: *std.Build) void {
     // -Dstatic-libs=true: link lz4 and zstd as static archives instead of dylibs.
     // Default false to preserve current dev behaviour; set true for release builds.
     const static_libs = b.option(bool, "static-libs", "Statically link lz4 and zstd") orelse false;
-    // When targeting a non-native CPU, always use vendored C sources for lz4/zstd.
-    const is_cross = target.result.cpu.arch != @import("builtin").cpu.arch or
-                     target.result.os.tag != @import("builtin").os.tag;
-    const use_vendored = static_libs and is_cross;
+    // Always use vendored C sources for lz4/zstd when static-libs is on.
+    // This ensures the build works on any machine regardless of system libraries
+    // and avoids Homebrew-specific paths on Linux CI.
+    const use_vendored = static_libs;
     const zstd_prefix_early = b.option([]const u8, "zstd-prefix", "ZSTD installation prefix") orelse "/opt/homebrew/opt/zstd";
     const zstd_include_early = b.fmt("{s}/include", .{zstd_prefix_early});
     const zstd_lib_early = b.fmt("{s}/lib", .{zstd_prefix_early});
