@@ -1047,3 +1047,74 @@ test "PartScanBridge exposes raw views for compact parts" {
     try std.testing.expectEqual(@as(usize, 2), ranged_next.num_rows);
     try std.testing.expectEqualSlices(i64, &[_]i64{ 2, 3 }, ranged_next.columns[0].data.int64);
 }
+
+test "PartScanBridge combines raw views across compact parts" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const part_dir_1 = "/tmp/zig_test_part_scan_bridge_multi_1";
+    const part_dir_2 = "/tmp/zig_test_part_scan_bridge_multi_2";
+
+    {
+        var cwd = std.Io.Dir.cwd();
+        cwd.deleteTree(io, part_dir_1) catch {};
+        cwd.deleteTree(io, part_dir_2) catch {};
+    }
+
+    const cols = [_]schema.Column{
+        .{ .name = "id", .ty = .int32 },
+        .{ .name = "name", .ty = .text },
+    };
+    const sort_keys = [_][]const u8{"id"};
+    const table = schema.Table{ .name = "multi_bridge", .columns = &cols, .sort_keys = &sort_keys };
+
+    {
+        var cp = try part_mod.CompactPart.open(io, allocator, part_dir_1, table, 0x82);
+        defer cp.deinit();
+        const ids = [_]i64{ 1, 2 };
+        try cp.appendFixedBatch(0, &ids);
+        try cp.appendString(1, "a");
+        try cp.appendString(1, "bb");
+        try cp.finish();
+    }
+    {
+        var cp = try part_mod.CompactPart.open(io, allocator, part_dir_2, table, 0x82);
+        defer cp.deinit();
+        const ids = [_]i64{ 3, 4 };
+        try cp.appendFixedBatch(0, &ids);
+        try cp.appendString(1, "ccc");
+        try cp.appendString(1, "");
+        try cp.finish();
+    }
+
+    var bridge = try PartScanBridge.init(allocator, io, table, &[_][]const u8{ part_dir_1, part_dir_2 }, &.{});
+    defer bridge.deinit();
+    const source = bridge.source();
+
+    try std.testing.expectEqual(@as(u64, 4), source.rowCount());
+    const ids_raw = source.getRawInt32Col("id") orelse return error.TestExpectedRawInt32;
+    try std.testing.expectEqualSlices(i32, &[_]i32{ 1, 2, 3, 4 }, ids_raw);
+
+    const offsets = source.getRawStrOffsets("name") orelse return error.TestExpectedRawStrOffsets;
+    const bytes = source.getRawStrBytes("name") orelse return error.TestExpectedRawStrBytes;
+    try std.testing.expectEqualSlices(u64, &[_]u64{ 0, 1, 3, 6, 6 }, offsets);
+    try std.testing.expectEqualStrings("abbccc", bytes);
+
+    var range_out: DataChunk = undefined;
+    try source.fetchRange(1, 3, &range_out, allocator);
+    defer range_out.deinit();
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 2, 3, 4 }, range_out.columns[0].data.int64);
+    try std.testing.expectEqualStrings("bb", range_out.columns[1].data.string[0]);
+    try std.testing.expectEqualStrings("ccc", range_out.columns[1].data.string[1]);
+    try std.testing.expectEqualStrings("", range_out.columns[1].data.string[2]);
+
+    source.setRowRange(2, 4);
+    defer source.setRowRange(0, 4);
+    try std.testing.expectEqual(@as(u64, 2), source.rowCount());
+
+    var ranged_fetch: DataChunk = undefined;
+    try source.fetchRange(0, 2, &ranged_fetch, allocator);
+    defer ranged_fetch.deinit();
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 3, 4 }, ranged_fetch.columns[0].data.int64);
+    try std.testing.expectEqualStrings("ccc", ranged_fetch.columns[1].data.string[0]);
+    try std.testing.expectEqualStrings("", ranged_fetch.columns[1].data.string[1]);
+}

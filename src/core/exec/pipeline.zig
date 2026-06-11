@@ -34,6 +34,9 @@ pub const ResultSink = result.ResultSink;
 /// Per-query execution context. Holds the arena for all intermediate
 /// allocations during one query's lifetime.
 pub const QueryContext = struct {
+    /// Allocator that owns final ResultSet arenas. It must outlive the query
+    /// context so callers can serialize and then deinit returned results.
+    parent_alloc: std.mem.Allocator,
     /// All transient allocations (intermediate chunks, hash tables, etc.)
     /// are made from this arena. Freed when the query finishes.
     arena: std.heap.ArenaAllocator,
@@ -42,6 +45,7 @@ pub const QueryContext = struct {
 
     pub fn init(parent_alloc: std.mem.Allocator, source: SourceIface) QueryContext {
         return .{
+            .parent_alloc = parent_alloc,
             .arena = std.heap.ArenaAllocator.init(parent_alloc),
             .source = source,
         };
@@ -53,6 +57,10 @@ pub const QueryContext = struct {
 
     pub fn allocator(self: *QueryContext) std.mem.Allocator {
         return self.arena.allocator();
+    }
+
+    pub fn resultAllocator(self: *QueryContext) std.mem.Allocator {
+        return self.parent_alloc;
     }
 };
 
@@ -1596,7 +1604,7 @@ pub fn executePlan(
     node: *const plan.PhysicalNode,
     ctx: *QueryContext,
 ) !ResultSet {
-    const alloc = ctx.allocator();
+    const result_alloc = ctx.resultAllocator();
 
     // ── Sort-key range pushdown ────────────────────────────────────────────
     // Restrict the scan range before executing so all paths (scannable and
@@ -1619,17 +1627,17 @@ pub fn executePlan(
             if (cur_inner.* != .filter) break :scan_par;
             const filt_pred = cur_inner.filter.predicate;
             if (try executeFilterProjectParallel(p.items, filt_pred, ctx)) |par_rl| {
-                return par_rl.toResultSet(alloc);
+                return par_rl.toResultSet(result_alloc);
             }
         }
-        var sink = ResultSink.init(alloc);
+        var sink = ResultSink.init(result_alloc);
         try executeScannableToSink(node, ctx, &sink);
         return sink.finish();
     }
 
     // ── Breaker path: existing RowList → ResultSet (single copy) ───────────
     var rl = try executeNode(node, ctx);
-    return rl.toResultSet(alloc);
+    return rl.toResultSet(result_alloc);
 }
 
 /// Stream a scannable node (scan/filter/project/limit) directly to a ResultSink.
@@ -1890,7 +1898,19 @@ fn executeHashAggScannable(
         if (ha.strategy == .grouped_distinct and strategy == .compact_int) continue;
         if (try executeHashAggStrategy(strategy, ha, sort_keys, top_k, top_offset, ctx)) |rl| return rl;
     }
-    return executeHashAggChunked(ha.input, ha.keys, ha.aggs, ctx);
+    const rl = try executeHashAggChunked(ha.input, ha.keys, ha.aggs, ctx);
+    if (top_k > 0 and sort_keys.len > 0) {
+        const alloc = ctx.allocator();
+        if (top_k <= 1024 and rl.rows.items.len > top_k * 4) {
+            return executeTopK(rl, sort_keys, top_k, alloc);
+        }
+        const sorted = try executeOrderBy(rl, sort_keys, alloc);
+        const take = @min(sorted.rows.items.len, top_k);
+        var out = RowList.init(sorted.metas);
+        for (sorted.rows.items[0..take]) |row| try out.append(alloc, row);
+        return out;
+    }
+    return rl;
 }
 
 fn executeHashAggStrategy(
@@ -4559,6 +4579,7 @@ fn executeFilterProjectParallel(
 
     const ParFpCtx = struct {
         source: SourceIface,
+        parent_alloc: std.mem.Allocator,
         proj_items: []const plan.ProjectItem,
         filter_pred: plan.Expr,
         morsel_src: *parallel.MorselSource,
@@ -4583,7 +4604,7 @@ fn executeFilterProjectParallel(
             // Per-thread QueryContext so FilterState.apply can lazily init its SIMD buffers.
             var fake_arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
             defer fake_arena.deinit();
-            var fake_ctx = QueryContext{ .arena = fake_arena, .source = self.source };
+            var fake_ctx = QueryContext{ .parent_alloc = self.parent_alloc, .arena = fake_arena, .source = self.source };
             var fs = FilterState{ .predicate = self.filter_pred };
 
             while (self.morsel_src.next()) |m| {
@@ -4618,6 +4639,7 @@ fn executeFilterProjectParallel(
     for (par_ctxs) |*pc| {
         pc.* = .{
             .source = ctx.source,
+            .parent_alloc = ctx.resultAllocator(),
             .proj_items = proj_items,
             .filter_pred = filter_pred,
             .morsel_src = &morsel_src,
@@ -5028,6 +5050,7 @@ fn executeTopKLateMat(
     var chunk_arena = std.heap.ArenaAllocator.init(alloc);
     defer chunk_arena.deinit();
     var fake_ctx: QueryContext = .{
+        .parent_alloc = ctx.resultAllocator(),
         .arena = std.heap.ArenaAllocator.init(chunk_arena.allocator()),
         .source = ctx.source,
     };
