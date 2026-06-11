@@ -1,0 +1,40 @@
+name: Release
+on:
+  push:
+    tags: 'v*'
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - target: aarch64-macos
+            runner: macos-14
+            suffix: macos-arm64
+          - target: x86_64-macos
+            runner: macos-13
+            suffix: macos-x86_64
+          - target: x86_64-linux-gnu
+            runner: ubuntu-latest
+            suffix: linux-x86_64
+          - target: aarch64-linux-gnu
+            runner: ubuntu-24.04-arm
+            suffix: linux-arm64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v1
+        with:
+          version: 0.14.0
+      - run: zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseFast -Dstrip=true -Dstatic-libs=true
+      - run: |
+          BIN="zighouse-${{ matrix.suffix }}"
+          cp zig-out/bin/zighouse "$BIN"
+          gzip -k "$BIN"
+          tar czf "$BIN.tar.gz" zighouse
+          rm -f "$BIN"
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: zighouse-*.tar.gz
+          generate_release_notes: true

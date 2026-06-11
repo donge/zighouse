@@ -4,19 +4,30 @@ A schema-driven columnar OLAP engine written in Zig. Ingests Parquet and ClickHo
 Native blocks into a MergeTree-compatible on-disk format and executes analytical SQL
 via an IR-pipeline executor.
 
-## Build
+## Install
 
-Requires [Zig 0.16](https://ziglang.org/download/).
+### macOS (Homebrew)
+
+```bash
+brew tap donge/zighouse
+brew install zighouse
+brew services start zighouse
+```
+
+### Linux / Docker
+
+```bash
+docker pull ghcr.io/donge/zighouse:latest
+```
+
+Binary releases are available on the [releases page](https://github.com/donge/zighouse/releases).
+
+### From source
+
+Requires [Zig 0.14+](https://ziglang.org/download/).
 
 ```sh
-# Local build
-zig build
-
-# Release (macOS)
-zig build -Doptimize=ReleaseFast -Dstrip=true
-
-# Cross-compile Linux x86-64
-zig build -Dtarget=x86_64-linux-gnu -Doptimize=ReleaseFast -Dstrip=true -Dstatic-libs=true
+zig build -Doptimize=ReleaseFast -Dstrip=true -Dstatic-libs=true
 ```
 
 No external parser dependency. All 43 ClickBench queries are handled by the native
