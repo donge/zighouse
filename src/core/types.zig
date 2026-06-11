@@ -33,14 +33,14 @@ pub const ColumnType = enum {
     /// Return a human-readable ClickHouse type name for this column type.
     pub fn chTypeName(self: ColumnType) []const u8 {
         return switch (self) {
-            .bool_u8       => "UInt8",
-            .int64         => "Int64",
-            .uint64        => "UInt64",
-            .float64       => "Float64",
-            .date_u16      => "Date",
+            .bool_u8 => "UInt8",
+            .int64 => "Int64",
+            .uint64 => "UInt64",
+            .float64 => "Float64",
+            .date_u16 => "Date",
             .datetime64_ms => "DateTime64(3)",
-            .string        => "String",
-            .array_string  => "Array(String)",
+            .string => "String",
+            .array_string => "Array(String)",
         };
     }
 
@@ -64,16 +64,16 @@ pub const ColumnType = enum {
 ///   - GROUP BY key storage
 ///   - scalar aggregate accumulators
 pub const Value = union(ColumnType) {
-    bool_u8:       u8,
-    int64:         i64,
-    uint64:        u64,
-    float64:       f64,
-    date_u16:      u16,
+    bool_u8: u8,
+    int64: i64,
+    uint64: u64,
+    float64: f64,
+    date_u16: u16,
     datetime64_ms: i64,
     /// Slice into an arena; valid for the lifetime of the query.
-    string:        []const u8,
+    string: []const u8,
     /// Slice of string slices; elements point into the same arena.
-    array_string:  [][]const u8,
+    array_string: [][]const u8,
 
     // ── Null sentinel ────────────────────────────────────────────────────────
     // NULL is NOT a Value tag — it is represented by the null_mask bitmap
@@ -84,44 +84,44 @@ pub const Value = union(ColumnType) {
 
     pub fn toI64(self: Value) ?i64 {
         return switch (self) {
-            .int64         => |v| v,
-            .uint64        => |v| @intCast(v),
-            .float64       => |v| @intFromFloat(v),
-            .date_u16      => |v| @as(i64, v),
+            .int64 => |v| v,
+            .uint64 => |v| @intCast(v),
+            .float64 => |v| @intFromFloat(v),
+            .date_u16 => |v| @as(i64, v),
             .datetime64_ms => |v| v,
-            .bool_u8       => |v| @as(i64, v),
-            else           => null,
+            .bool_u8 => |v| @as(i64, v),
+            else => null,
         };
     }
 
     pub fn toU64(self: Value) ?u64 {
         return switch (self) {
-            .uint64        => |v| v,
-            .int64         => |v| if (v >= 0) @intCast(v) else null,
-            .float64       => |v| if (v >= 0) @intFromFloat(v) else null,
-            .date_u16      => |v| @as(u64, v),
+            .uint64 => |v| v,
+            .int64 => |v| if (v >= 0) @intCast(v) else null,
+            .float64 => |v| if (v >= 0) @intFromFloat(v) else null,
+            .date_u16 => |v| @as(u64, v),
             .datetime64_ms => |v| if (v >= 0) @intCast(v) else null,
-            .bool_u8       => |v| @as(u64, v),
-            else           => null,
+            .bool_u8 => |v| @as(u64, v),
+            else => null,
         };
     }
 
     pub fn toF64(self: Value) ?f64 {
         return switch (self) {
-            .float64       => |v| v,
-            .int64         => |v| @floatFromInt(v),
-            .uint64        => |v| @floatFromInt(v),
-            .date_u16      => |v| @floatFromInt(v),
+            .float64 => |v| v,
+            .int64 => |v| @floatFromInt(v),
+            .uint64 => |v| @floatFromInt(v),
+            .date_u16 => |v| @floatFromInt(v),
             .datetime64_ms => |v| @floatFromInt(v),
-            .bool_u8       => |v| @floatFromInt(v),
-            else           => null,
+            .bool_u8 => |v| @floatFromInt(v),
+            else => null,
         };
     }
 
     pub fn toStr(self: Value) ?[]const u8 {
         return switch (self) {
             .string => |s| s,
-            else    => null,
+            else => null,
         };
     }
 
@@ -160,7 +160,7 @@ pub const Value = union(ColumnType) {
             },
             .string => |av| switch (b) {
                 .string => |bv| return std.mem.order(u8, av, bv),
-                else    => return .gt,
+                else => return .gt,
             },
             .array_string => return .lt,
         }
@@ -179,18 +179,18 @@ pub const Value = union(ColumnType) {
         const tag: u8 = @intFromEnum(@as(ColumnType, self));
         h.update(&[1]u8{tag});
         switch (self) {
-            .int64         => |v| h.update(std.mem.asBytes(&v)),
-            .uint64        => |v| h.update(std.mem.asBytes(&v)),
-            .float64       => |v| {
+            .int64 => |v| h.update(std.mem.asBytes(&v)),
+            .uint64 => |v| h.update(std.mem.asBytes(&v)),
+            .float64 => |v| {
                 // Normalise -0.0 → +0.0 so equal values hash equally.
                 const norm: f64 = if (v == 0.0) 0.0 else v;
                 h.update(std.mem.asBytes(&norm));
             },
-            .date_u16      => |v| h.update(std.mem.asBytes(&v)),
+            .date_u16 => |v| h.update(std.mem.asBytes(&v)),
             .datetime64_ms => |v| h.update(std.mem.asBytes(&v)),
-            .bool_u8       => |v| h.update(std.mem.asBytes(&v)),
-            .string        => |v| h.update(v),
-            .array_string  => |arr| {
+            .bool_u8 => |v| h.update(std.mem.asBytes(&v)),
+            .string => |v| h.update(v),
+            .array_string => |arr| {
                 for (arr) |s| h.update(s);
             },
         }
@@ -206,14 +206,14 @@ pub const Value = union(ColumnType) {
         writer: anytype,
     ) !void {
         switch (self) {
-            .bool_u8       => |v| try writer.print("{d}", .{v}),
-            .int64         => |v| try writer.print("{d}", .{v}),
-            .uint64        => |v| try writer.print("{d}", .{v}),
-            .float64       => |v| try writer.print("{d}", .{v}),
-            .date_u16      => |v| try writer.print("date({d})", .{v}),
+            .bool_u8 => |v| try writer.print("{d}", .{v}),
+            .int64 => |v| try writer.print("{d}", .{v}),
+            .uint64 => |v| try writer.print("{d}", .{v}),
+            .float64 => |v| try writer.print("{d}", .{v}),
+            .date_u16 => |v| try writer.print("date({d})", .{v}),
             .datetime64_ms => |v| try writer.print("dt({d})", .{v}),
-            .string        => |v| try writer.print("{s}", .{v}),
-            .array_string  => |arr| {
+            .string => |v| try writer.print("{s}", .{v}),
+            .array_string => |arr| {
                 try writer.writeByte('[');
                 for (arr, 0..) |s, i| {
                     if (i > 0) try writer.writeAll(", ");
@@ -231,24 +231,26 @@ pub const Value = union(ColumnType) {
 /// scalar aggregation. The accumulator is updated once per input row.
 pub const AggAccum = union(enum) {
     /// sum / count — integer accumulation
-    i64_sum:   i64,
-    u64_sum:   u64,
-    f64_sum:   f64,
+    i64_sum: i64,
+    u64_sum: u64,
+    f64_sum: f64,
     /// avg accumulator: tracks both sum and count for correct AVG finalization
-    f64_avg:   struct { sum: f64, count: u64 },
+    f64_avg: struct { sum: f64, count: u64 },
     /// count(*) / count(col)
-    count:     u64,
+    count: u64,
     /// min / max — track current extremum
-    i64_min:   i64,
-    i64_max:   i64,
-    u64_min:   u64,
-    u64_max:   u64,
-    f64_min:   f64,
-    f64_max:   f64,
-    str_min:   ?[]const u8,
-    str_max:   ?[]const u8,
+    i64_min: i64,
+    i64_max: i64,
+    u64_min: u64,
+    u64_max: u64,
+    f64_min: f64,
+    f64_max: f64,
+    str_min: ?[]const u8,
+    str_max: ?[]const u8,
     /// groupUniqArray — collect unique strings
     uniq_strs: std.StringHashMapUnmanaged(void),
+    /// groupArray — collect strings preserving input order and duplicates
+    array_strs: std.ArrayListUnmanaged([]const u8),
     /// count(distinct col) — track unique values via u64 hash set
     distinct_u64: std.AutoHashMapUnmanaged(u64, void),
     /// any() — first non-null value seen
@@ -258,22 +260,22 @@ pub const AggAccum = union(enum) {
     /// For uniq_strs/any_val(array), call toArrayValue() instead.
     pub fn toValue(self: AggAccum) error{UseToArrayValue}!Value {
         return switch (self) {
-            .i64_sum   => |v| .{ .int64   = v },
-            .u64_sum   => |v| .{ .uint64  = v },
-            .f64_sum   => |v| .{ .float64 = v },
-            .f64_avg   => |v| .{ .float64 = if (v.count > 0) v.sum / @as(f64, @floatFromInt(v.count)) else 0.0 },
-            .count     => |v| .{ .uint64  = v },
-            .i64_min   => |v| .{ .int64   = v },
-            .i64_max   => |v| .{ .int64   = v },
-            .u64_min   => |v| .{ .uint64  = v },
-            .u64_max   => |v| .{ .uint64  = v },
-            .f64_min   => |v| .{ .float64 = v },
-            .f64_max   => |v| .{ .float64 = v },
-            .str_min   => |v| .{ .string  = v orelse "" },
-            .str_max   => |v| .{ .string  = v orelse "" },
-            .uniq_strs => return error.UseToArrayValue,
+            .i64_sum => |v| .{ .int64 = v },
+            .u64_sum => |v| .{ .uint64 = v },
+            .f64_sum => |v| .{ .float64 = v },
+            .f64_avg => |v| .{ .float64 = if (v.count > 0) v.sum / @as(f64, @floatFromInt(v.count)) else 0.0 },
+            .count => |v| .{ .uint64 = v },
+            .i64_min => |v| .{ .int64 = v },
+            .i64_max => |v| .{ .int64 = v },
+            .u64_min => |v| .{ .uint64 = v },
+            .u64_max => |v| .{ .uint64 = v },
+            .f64_min => |v| .{ .float64 = v },
+            .f64_max => |v| .{ .float64 = v },
+            .str_min => |v| .{ .string = v orelse "" },
+            .str_max => |v| .{ .string = v orelse "" },
+            .uniq_strs, .array_strs => return error.UseToArrayValue,
             .distinct_u64 => |m| .{ .uint64 = m.count() },
-            .any_val   => |v| if (v) |val| blk: {
+            .any_val => |v| if (v) |val| blk: {
                 // If the stored value is an array, direct callers to toArrayValue.
                 if (val == .array_string) return error.UseToArrayValue;
                 break :blk val;
@@ -281,7 +283,7 @@ pub const AggAccum = union(enum) {
         };
     }
 
-    /// Convert a uniq_strs or any_val(array) accumulator to an array_string Value.
+    /// Convert an array accumulator to an array_string Value.
     /// Strings are duped into `alloc`.
     pub fn toArrayValue(self: AggAccum, alloc: std.mem.Allocator) !Value {
         switch (self) {
@@ -291,6 +293,13 @@ pub const AggAccum = union(enum) {
                 var i: usize = 0;
                 while (it.next()) |k| : (i += 1) {
                     arr[i] = try alloc.dupe(u8, k.*);
+                }
+                return Value{ .array_string = arr };
+            },
+            .array_strs => |list| {
+                const arr = try alloc.alloc([]const u8, list.items.len);
+                for (list.items, 0..) |s, i| {
+                    arr[i] = try alloc.dupe(u8, s);
                 }
                 return Value{ .array_string = arr };
             },
@@ -320,8 +329,8 @@ test "Value.hash stability" {
 }
 
 test "ColumnType.chTypeName" {
-    try std.testing.expectEqualStrings("UInt8",         ColumnType.bool_u8.chTypeName());
-    try std.testing.expectEqualStrings("Date",          ColumnType.date_u16.chTypeName());
+    try std.testing.expectEqualStrings("UInt8", ColumnType.bool_u8.chTypeName());
+    try std.testing.expectEqualStrings("Date", ColumnType.date_u16.chTypeName());
     try std.testing.expectEqualStrings("DateTime64(3)", ColumnType.datetime64_ms.chTypeName());
     try std.testing.expectEqualStrings("Array(String)", ColumnType.array_string.chTypeName());
 }

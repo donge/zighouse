@@ -1755,7 +1755,7 @@ fn executeNode(node: *const plan.PhysicalNode, ctx: *QueryContext) !RowList {
 
         // ── Project ───────────────────────────────────────────────────────────
         .project => |p| {
-            if (isScannable(p.input)) {
+            if (!projectItemsContainArrayJoin(p.items) and isScannable(p.input)) {
                 return executeLimitChunked(node, ctx);
             }
             // Detect: project → top_k → scannable  (e.g. SELECT col … ORDER BY col LIMIT k)
@@ -2033,13 +2033,51 @@ fn projectRowList(inner: RowList, items: []const plan.ProjectItem, alloc: std.me
 
 // ── Chunked agg helpers ───────────────────────────────────────────────────────
 
+fn exprContainsArrayJoin(expr: plan.Expr) bool {
+    return switch (expr) {
+        .fn_call => |fc| {
+            if (std.ascii.eqlIgnoreCase(fc.name, "arrayJoin")) return true;
+            for (fc.args) |arg| if (exprContainsArrayJoin(arg)) return true;
+            return false;
+        },
+        .add, .sub, .mul, .div, .mod, .eq, .neq, .lt, .lte, .gt, .gte, .@"and", .@"or", .like, .not_like, .concat => |b| {
+            return exprContainsArrayJoin(b.left) or exprContainsArrayJoin(b.right);
+        },
+        .not, .is_null, .is_not_null => |u| exprContainsArrayJoin(u.operand),
+        .case_when => |cw| {
+            for (cw.when) |e| if (exprContainsArrayJoin(e)) return true;
+            for (cw.then) |e| if (exprContainsArrayJoin(e)) return true;
+            if (cw.else_expr) |e| if (exprContainsArrayJoin(e)) return true;
+            return false;
+        },
+        .agg_call => |a| {
+            if (a.arg) |arg| if (exprContainsArrayJoin(arg)) return true;
+            if (a.post_expr) |post| if (exprContainsArrayJoin(post)) return true;
+            return false;
+        },
+        .cast => |c| exprContainsArrayJoin(c.expr),
+        .dict_call => |dc| {
+            for (dc.keys) |key| if (exprContainsArrayJoin(key)) return true;
+            if (dc.default_expr) |def| if (exprContainsArrayJoin(def)) return true;
+            return false;
+        },
+        .lambda => |l| exprContainsArrayJoin(l.body.*),
+        else => false,
+    };
+}
+
+fn projectItemsContainArrayJoin(items: []const plan.ProjectItem) bool {
+    for (items) |item| if (exprContainsArrayJoin(item.expr)) return true;
+    return false;
+}
+
 /// Returns true if node is a direct source (part_scan/mem_scan) or a
 /// filter/project/limit over a direct source — i.e. no pipeline breakers.
 fn isScannable(node: *const plan.PhysicalNode) bool {
     return switch (node.*) {
         .part_scan, .mem_scan, .chunk_source => true,
         .filter => |f| isScannable(f.input),
-        .project => |p| isScannable(p.input),
+        .project => |p| !projectItemsContainArrayJoin(p.items) and isScannable(p.input),
         .limit => |l| isScannable(l.input),
         else => false,
     };
@@ -2778,7 +2816,6 @@ fn executeScalarAggParallel(
 /// Merge accumulator `src` into `dst` in-place.
 fn mergeAccum(dst: *AggAccum, src: AggAccum, item: plan.ProjectItem, alloc: std.mem.Allocator) !void {
     _ = item;
-    _ = alloc;
     switch (dst.*) {
         .count => dst.count += src.count,
         .i64_sum => dst.i64_sum +%= src.i64_sum,
@@ -2811,8 +2848,17 @@ fn mergeAccum(dst: *AggAccum, src: AggAccum, item: plan.ProjectItem, alloc: std.
         .any_val => {
             if (dst.any_val == null) dst.any_val = src.any_val;
         },
-        // For uniq_strs (count_distinct), parallel merge is complex; skip.
-        .uniq_strs => {},
+        .uniq_strs => {
+            var it = src.uniq_strs.keyIterator();
+            while (it.next()) |k| {
+                try dst.uniq_strs.put(alloc, try alloc.dupe(u8, k.*), {});
+            }
+        },
+        .array_strs => {
+            for (src.array_strs.items) |s| {
+                try dst.array_strs.append(alloc, try alloc.dupe(u8, s));
+            }
+        },
         .distinct_u64 => {
             var it = src.distinct_u64.keyIterator();
             while (it.next()) |k| try dst.distinct_u64.put(std.heap.c_allocator, k.*, {});
@@ -3186,7 +3232,7 @@ fn executeHashAggChunked(
                 // numeric args use the appropriate numeric kind (refined at runtime).
                 .min => if (item.out_type == .string) .str_min else .i64_min,
                 .max => if (item.out_type == .string) .str_max else .i64_max,
-                .group_uniq_array, .any => break :blk null,
+                .group_uniq_array, .group_array, .any => break :blk null,
             };
         }
         break :blk kinds;
@@ -6096,31 +6142,40 @@ fn executeHashJoin(
 /// Finalize one accumulator for a ProjectItem.
 /// When the agg is group_uniq_array with a sep, joins the array into a string.
 fn finalizeAccum(acc: AggAccum, item: plan.ProjectItem, alloc: std.mem.Allocator) !?Value {
-    const sep: ?[]const u8 = switch (item.expr) {
-        .agg_call => |ac| ac.sep,
+    const ac_opt: ?*const plan.AggCall = switch (item.expr) {
+        .agg_call => |ac| ac,
         else => null,
     };
-    if (sep) |s| {
-        const arr_val = try acc.toArrayValue(alloc);
-        const elems = arr_val.array_string;
-        if (elems.len == 0) return Value{ .string = "" };
-        // Calculate total length.
-        var total: usize = 0;
-        for (elems) |e| total += e.len;
-        total += s.len * (elems.len - 1);
-        const buf = try alloc.alloc(u8, total);
-        var pos: usize = 0;
-        for (elems, 0..) |e, idx| {
-            if (idx > 0) {
-                @memcpy(buf[pos .. pos + s.len], s);
-                pos += s.len;
+    const base_val: ?Value = blk: {
+        const sep = if (ac_opt) |ac| ac.sep else null;
+        if (sep) |s| {
+            const arr_val = try acc.toArrayValue(alloc);
+            const elems = arr_val.array_string;
+            if (elems.len == 0) break :blk Value{ .string = "" };
+            var total: usize = 0;
+            for (elems) |e| total += e.len;
+            total += s.len * (elems.len - 1);
+            const buf = try alloc.alloc(u8, total);
+            var pos: usize = 0;
+            for (elems, 0..) |e, idx| {
+                if (idx > 0) {
+                    @memcpy(buf[pos .. pos + s.len], s);
+                    pos += s.len;
+                }
+                @memcpy(buf[pos .. pos + e.len], e);
+                pos += e.len;
             }
-            @memcpy(buf[pos .. pos + e.len], e);
-            pos += e.len;
+            break :blk Value{ .string = buf };
         }
-        return Value{ .string = buf };
+        break :blk acc.toValue() catch (try acc.toArrayValue(alloc));
+    };
+    if (ac_opt) |ac| {
+        if (ac.post_expr) |post| {
+            const row = [_]?Value{base_val};
+            return kernels.evalExpr(post, &row, null, alloc);
+        }
     }
-    return acc.toValue() catch (try acc.toArrayValue(alloc));
+    return base_val;
 }
 
 /// Free any heap resources owned by an accumulator.
@@ -6142,6 +6197,7 @@ fn initAccumForAgg(item: plan.ProjectItem) AggAccum {
             .min => if (item.out_type == .string) .{ .str_min = null } else .{ .i64_min = std.math.maxInt(i64) },
             .max => if (item.out_type == .string) .{ .str_max = null } else .{ .i64_max = std.math.minInt(i64) },
             .group_uniq_array => .{ .uniq_strs = .{} },
+            .group_array => .{ .array_strs = .empty },
             .any => .{ .any_val = null },
         },
         else => .{ .count = 0 },

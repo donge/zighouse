@@ -19,7 +19,8 @@ pub const AggregateFn = enum {
     sum_array_if, // sumArrayIf(arr, cond) — conditional sumArray
     uniq_exact, // uniqExact(col) — exact distinct count using string set
     uniq_exact_if, // uniqExactIf(col, cond) — conditional exact distinct
-    group_uniq_array, // groupUniqArray(col) — array of distinct values (joined as string)
+    group_uniq_array, // groupUniqArray(col) — array of distinct values
+    group_array, // groupArray(col) — array preserving row order and duplicates
     any_val, // any(col) — first non-null value
     case_when, // CASE WHEN … THEN … ELSE … END — data in case_when_data field
     cmp_expr, // comparison/boolean as value: "1 = 1" → uint8 0 or 1

@@ -158,6 +158,9 @@ expect_eq "int filter projection" $'2\n4\n6' "$(select_tsv "SELECT id FROM defau
 expect_eq "string non-empty filter" "5" "$(select_tsv "SELECT count(*) FROM default.compact_events WHERE category <> ''")"
 expect_eq "grouped string topK" $'alpha\t2\nbeta\t2\ngamma\t1' "$(select_tsv "SELECT category, count(*) AS c FROM default.compact_events WHERE category <> '' GROUP BY category ORDER BY category")"
 expect_eq "count distinct" "3" "$(select_tsv "SELECT count(distinct user_id) FROM default.compact_events")"
+expect_eq "groupArray preserves order" "alpha,beta,alpha,gamma,beta" "$(select_tsv "SELECT arrayStringConcat(groupArray(category), ',') FROM default.compact_events WHERE category <> ''")"
+expect_eq "post aggregate arraySlice" "alpha,beta,alpha" "$(select_tsv "SELECT arrayStringConcat(arraySlice(groupArray(category), 1, 3), ',') FROM default.compact_events WHERE category <> ''")"
+expect_eq "post aggregate arrayDistinct" "alpha,beta,gamma" "$(select_tsv "SELECT arrayStringConcat(arrayDistinct(groupArray(category)), ',') FROM default.compact_events WHERE category <> ''")"
 expect_eq "limit offset" $'3\n4' "$(select_tsv "SELECT id FROM default.compact_events ORDER BY id LIMIT 2 OFFSET 2")"
 expect_eq "sort-key equality" "4" "$(select_tsv "SELECT id FROM default.compact_events WHERE id = 4 ORDER BY id")"
 expect_eq "grouped count topK" $'20\t3\n10\t2' "$(select_tsv "SELECT user_id, COUNT(*) FROM default.compact_events GROUP BY user_id ORDER BY COUNT(*) DESC LIMIT 2")"
@@ -210,6 +213,48 @@ fi
 echo "PASS RowBinaryWithNamesAndTypes schema persisted"
 expect_eq "wnat count" "2" "$(select_tsv "SELECT count(*) FROM default.compact_auto")"
 expect_eq "wnat string order" $'hello\nworld' "$(select_tsv "SELECT label FROM default.compact_auto ORDER BY id")"
+
+post_sql "CREATE TABLE default.map_events (protocol String, features Map(String, Float64)) ENGINE=MergeTree() ORDER BY protocol"
+python3 - <<'PY' > /tmp/zh_compact_map_wnat.bin
+import struct, sys
+
+def varuint(n):
+    out = bytearray()
+    while True:
+        b = n & 0x7f
+        n >>= 7
+        out.append(b | 0x80 if n else b)
+        if not n:
+            return bytes(out)
+
+def string(s):
+    b = s.encode()
+    return varuint(len(b)) + b
+
+out = bytearray()
+out += varuint(2)
+out += string("protocol")
+out += string("features")
+out += string("String")
+out += string("Map(String, Float64)")
+rows = [
+    ("TCP", [("bytes", 1.5), ("pkts", 2.0)]),
+    ("TCP", [("bytes", 3.0)]),
+]
+for proto, features in rows:
+    out += string(proto)
+    out += varuint(len(features))
+    for key, value in features:
+        out += string(key)
+        out += struct.pack("<d", value)
+sys.stdout.buffer.write(out)
+PY
+post_payload "INSERT INTO default.map_events FORMAT RowBinaryWithNamesAndTypes" /tmp/zh_compact_map_wnat.bin
+expect_eq "mapKeys compact" $'[\'bytes\',\'pkts\']\n[\'bytes\']' "$(select_tsv "SELECT mapKeys(features) FROM default.map_events")"
+expect_eq "mapValues compact" $'[1.5,2]\n[3]' "$(select_tsv "SELECT mapValues(features) FROM default.map_events")"
+expect_eq "array join map keys" $'bytes\npkts\nbytes' "$(select_tsv "SELECT fk FROM default.map_events ARRAY JOIN mapKeys(features) AS fk")"
+expect_eq "array join map keys values" $'bytes\t1.5\npkts\t2\nbytes\t3' "$(select_tsv "SELECT fk, fv FROM default.map_events ARRAY JOIN mapKeys(features) AS fk, mapValues(features) AS fv")"
+expect_eq "array join group by" $'TCP\tbytes\t2\nTCP\tpkts\t1' "$(select_tsv "SELECT protocol, fk, count(*) FROM default.map_events ARRAY JOIN mapKeys(features) AS fk, mapValues(features) AS fv GROUP BY protocol, fk ORDER BY protocol, fk")"
 
 post_sql "CREATE TABLE test.values_events (id Int64, name String) ENGINE=MergeTree() ORDER BY id"
 post_sql "INSERT INTO test.values_events VALUES (42, 'hello')"

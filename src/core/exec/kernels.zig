@@ -978,6 +978,42 @@ fn evalFnCallFull(fc: *const plan.FnCall, row: []const ?Value, lambda_val: ?Valu
         }
         return Value{ .array_string = keys };
     }
+    if (std.mem.eql(u8, name, "mapValuesFloat64")) {
+        const blob = (args[0] orelse return Value{ .array_string = &.{} }).toStr() orelse return Value{ .array_string = &.{} };
+        if (blob.len == 0) return Value{ .array_string = &.{} };
+        const readVarUInt = struct {
+            fn f(data: []const u8) ?struct { val: u64, adv: usize } {
+                var v: u64 = 0;
+                var shift: u6 = 0;
+                var i: usize = 0;
+                while (i < data.len and i < 9) {
+                    const b = data[i];
+                    i += 1;
+                    v |= (@as(u64, b & 0x7F)) << shift;
+                    if (b & 0x80 == 0) return .{ .val = v, .adv = i };
+                    shift += 7;
+                }
+                return null;
+            }
+        }.f;
+        const cnt_r = readVarUInt(blob) orelse return Value{ .array_string = &.{} };
+        const count = @as(usize, @intCast(cnt_r.val));
+        var kp: usize = cnt_r.adv;
+        for (0..count) |_| {
+            const kr = readVarUInt(blob[kp..]) orelse return Value{ .array_string = &.{} };
+            const klen = @as(usize, @intCast(kr.val));
+            kp += kr.adv;
+            if (kp + klen > blob.len) return Value{ .array_string = &.{} };
+            kp += klen;
+        }
+        if (kp + count * 8 > blob.len) return Value{ .array_string = &.{} };
+        const vals = try arena.alloc([]const u8, count);
+        for (0..count) |i| {
+            const bits = std.mem.readInt(u64, blob[kp + i * 8 ..][0..8], .little);
+            vals[i] = try std.fmt.allocPrint(arena, "{d}", .{@as(f64, @bitCast(bits))});
+        }
+        return Value{ .array_string = vals };
+    }
     if (std.mem.eql(u8, name, "splitByChar")) {
         const delim = (args[0] orelse return null).toStr() orelse return null;
         const s = (args[1] orelse return null).toStr() orelse return null;
@@ -1770,6 +1806,11 @@ pub fn updateAccum(accum: *AggAccum, v: ?Value, arena: std.mem.Allocator) !void 
             if (val.toStr()) |s| {
                 const owned = try arena.dupe(u8, s);
                 try accum.uniq_strs.put(arena, owned, {});
+            }
+        },
+        .array_strs => if (v) |val| {
+            if (val.toStr()) |s| {
+                try accum.array_strs.append(arena, try arena.dupe(u8, s));
             }
         },
         .any_val => if (accum.any_val == null) {

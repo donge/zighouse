@@ -6,7 +6,6 @@
 /// as a recursive Expr tree.
 ///
 /// The plan_builder.zig then translates this AST into generic_sql.Plan.
-
 const std = @import("std");
 
 // ── Top-level statement ───────────────────────────────────────────────────────
@@ -26,6 +25,7 @@ pub const SelectStmt = struct {
     distinct: bool = false,
     projections: []Projection,
     from: ?FromClause = null,
+    array_join: []ArrayJoinItem = &.{},
     where: ?*Expr = null,
     group_by: []Expr,
     having: ?*Expr = null,
@@ -33,6 +33,11 @@ pub const SelectStmt = struct {
     limit: ?i64 = null,
     offset: ?i64 = null,
     ctes: []Cte = &.{},
+};
+
+pub const ArrayJoinItem = struct {
+    expr: Expr,
+    alias: ?[]const u8,
 };
 
 pub const Projection = struct {
@@ -43,19 +48,19 @@ pub const Projection = struct {
 pub const JoinKind = enum { inner, left, right, full };
 
 pub const JoinClause = struct {
-    kind:  JoinKind,
-    left:  *FromClause,
+    kind: JoinKind,
+    left: *FromClause,
     right: *FromClause,
-    on:    *Expr,
+    on: *Expr,
 };
 
 pub const FromClause = union(enum) {
-    table: TableRef,         // FROM table_name or db.table_name
-    subquery: SubqueryFrom,  // FROM (SELECT ...) AS alias
-    cte_ref: []const u8,     // FROM cte_name (resolved during plan build)
-    numbers: i64,            // FROM numbers(N) or system.numbers LIMIT N
-    table_func: TableFunc,   // FROM func(args) AS alias
-    join: JoinClause,        // FROM t1 [INNER|LEFT|RIGHT|FULL] JOIN t2 ON ...
+    table: TableRef, // FROM table_name or db.table_name
+    subquery: SubqueryFrom, // FROM (SELECT ...) AS alias
+    cte_ref: []const u8, // FROM cte_name (resolved during plan build)
+    numbers: i64, // FROM numbers(N) or system.numbers LIMIT N
+    table_func: TableFunc, // FROM func(args) AS alias
+    join: JoinClause, // FROM t1 [INNER|LEFT|RIGHT|FULL] JOIN t2 ON ...
 };
 
 pub const TableRef = struct {
@@ -139,7 +144,7 @@ pub const Expr = union(enum) {
 };
 
 pub const FuncExpr = struct {
-    name: []const u8,    // lowercase function name
+    name: []const u8, // lowercase function name
     args: []Expr,
     distinct: bool = false,
 };
@@ -152,15 +157,26 @@ pub const BinopExpr = struct {
 
 pub const BinOp = enum {
     // Comparisons
-    eq, neq, lt, lte, gt, gte,
+    eq,
+    neq,
+    lt,
+    lte,
+    gt,
+    gte,
     // Logical
-    and_, or_,
+    and_,
+    or_,
     // Arithmetic
-    add, sub, mul, div, mod,
+    add,
+    sub,
+    mul,
+    div,
+    mod,
     // String
     concat,
     // Other
-    like, not_like,
+    like,
+    not_like,
 };
 
 pub const InListExpr = struct {
@@ -188,7 +204,7 @@ pub const IsNullExpr = struct {
 };
 
 pub const CaseExpr = struct {
-    input: ?*Expr,        // CASE expr WHEN ... (null = searched CASE)
+    input: ?*Expr, // CASE expr WHEN ... (null = searched CASE)
     whens: []WhenClause,
     else_: ?*Expr,
 };

@@ -53,9 +53,21 @@ fn buildSelectPlan(allocator: Allocator, sel: ast.SelectStmt, ctes_from_parent: 
 
     // Build projections
     var projs = std.ArrayListUnmanaged(Expr).empty;
+    const needs_hidden_array_join = sel.array_join.len > 0 and (sel.group_by.len > 0 or selectHasAggregate(sel.projections));
     for (sel.projections) |proj| {
-        const e = try buildExpr(allocator, proj.expr, proj.alias, all_ctes);
+        const e = try buildExprWithArrayJoinAliases(allocator, proj.expr, proj.alias, all_ctes, sel.array_join, needs_hidden_array_join);
         try projs.append(allocator, e);
+    }
+    if (needs_hidden_array_join) {
+        for (sel.array_join) |aj| {
+            const aj_alias = try arrayJoinAlias(allocator, aj, all_ctes);
+            defer allocator.free(aj_alias);
+            const hidden_alias = try std.fmt.allocPrint(allocator, "__aj__{s}", .{aj_alias});
+            const expr_text = try exprToText(allocator, aj.expr, all_ctes);
+            defer allocator.free(expr_text);
+            const col = try std.fmt.allocPrint(allocator, "arrayJoin({s})", .{expr_text});
+            try projs.append(allocator, Expr{ .func = .column_ref, .column = col, .alias = hidden_alias });
+        }
     }
     const projs_owned = try projs.toOwnedSlice(allocator);
 
@@ -143,9 +155,11 @@ fn buildSelectPlan(allocator: Allocator, sel: ast.SelectStmt, ctes_from_parent: 
         var buf: std.ArrayListUnmanaged(u8) = .empty;
         for (sel.group_by, 0..) |ge, i| {
             if (i > 0) try buf.appendSlice(allocator, ", ");
-            const part = try exprToText(allocator, ge, all_ctes);
+            const raw_part = try exprToText(allocator, ge, all_ctes);
+            defer allocator.free(raw_part);
+            const part = try rewriteArrayJoinAliasText(allocator, raw_part, sel.array_join, all_ctes);
+            defer allocator.free(part);
             try buf.appendSlice(allocator, part);
-            allocator.free(part);
         }
         group_by = try buf.toOwnedSlice(allocator);
     }
@@ -169,8 +183,8 @@ fn buildSelectPlan(allocator: Allocator, sel: ast.SelectStmt, ctes_from_parent: 
         for (sel.order_by, 0..) |oi, i| {
             if (i > 0) try buf.appendSlice(allocator, ", ");
             const part = try exprToText(allocator, oi.expr, all_ctes);
+            defer allocator.free(part);
             try buf.appendSlice(allocator, part);
-            allocator.free(part);
             if (oi.desc) {
                 try buf.appendSlice(allocator, " DESC");
             } else {
@@ -193,7 +207,8 @@ fn buildSelectPlan(allocator: Allocator, sel: ast.SelectStmt, ctes_from_parent: 
                 // Use alias or column text; if the text matches a projection's
                 // .column field, use that projection's alias so that planner can
                 // resolve ORDER BY to the correct output column.
-                const alias_text = try exprToText(allocator, oi.expr, all_ctes);
+                const raw_alias_text = try exprToText(allocator, oi.expr, all_ctes);
+                const alias_text = raw_alias_text;
                 var matched_alias: ?[]const u8 = null;
                 for (projs_owned) |proj| {
                     if (proj.column != null and std.mem.eql(u8, proj.column.?, alias_text)) {
@@ -372,6 +387,105 @@ fn buildExpr(allocator: Allocator, e: ast.Expr, alias: ?[]const u8, ctes: []ast.
     }
 }
 
+fn buildExprWithArrayJoinAliases(
+    allocator: Allocator,
+    e: ast.Expr,
+    alias: ?[]const u8,
+    ctes: []ast.Cte,
+    array_join: []const ast.ArrayJoinItem,
+    hidden: bool,
+) BuildError!Expr {
+    if (e == .col) {
+        if (try arrayJoinExprForText(allocator, e.col, array_join, ctes, hidden)) |col| {
+            const alias_owned = if (alias) |a| try allocator.dupe(u8, a) else try allocator.dupe(u8, e.col);
+            return Expr{ .func = .column_ref, .column = col, .alias = alias_owned };
+        }
+    }
+    return buildExpr(allocator, e, alias, ctes);
+}
+
+fn arrayJoinAlias(allocator: Allocator, item: ast.ArrayJoinItem, ctes: []ast.Cte) BuildError![]const u8 {
+    if (item.alias) |a| return allocator.dupe(u8, a);
+    return exprToText(allocator, item.expr, ctes);
+}
+
+fn arrayJoinHiddenForText(
+    allocator: Allocator,
+    text: []const u8,
+    array_join: []const ast.ArrayJoinItem,
+    ctes: []ast.Cte,
+) BuildError!?[]const u8 {
+    for (array_join) |aj| {
+        const alias = try arrayJoinAlias(allocator, aj, ctes);
+        defer allocator.free(alias);
+        if (std.mem.eql(u8, text, alias)) {
+            return try std.fmt.allocPrint(allocator, "__aj__{s}", .{alias});
+        }
+    }
+    return null;
+}
+
+fn rewriteArrayJoinAliasText(
+    allocator: Allocator,
+    text: []const u8,
+    array_join: []const ast.ArrayJoinItem,
+    ctes: []ast.Cte,
+) BuildError![]const u8 {
+    if (try arrayJoinHiddenForText(allocator, text, array_join, ctes)) |hidden| return hidden;
+    return allocator.dupe(u8, text);
+}
+
+fn arrayJoinExprForText(
+    allocator: Allocator,
+    text: []const u8,
+    array_join: []const ast.ArrayJoinItem,
+    ctes: []ast.Cte,
+    hidden: bool,
+) BuildError!?[]const u8 {
+    for (array_join) |aj| {
+        const alias = try arrayJoinAlias(allocator, aj, ctes);
+        defer allocator.free(alias);
+        if (!std.mem.eql(u8, text, alias)) continue;
+        if (hidden) return try std.fmt.allocPrint(allocator, "__aj__{s}", .{alias});
+        const expr_text = try exprToText(allocator, aj.expr, ctes);
+        defer allocator.free(expr_text);
+        return try std.fmt.allocPrint(allocator, "arrayJoin({s})", .{expr_text});
+    }
+    return null;
+}
+
+fn selectHasAggregate(projections: []const ast.Projection) bool {
+    for (projections) |p| if (exprHasAggregate(p.expr)) return true;
+    return false;
+}
+
+fn exprHasAggregate(e: ast.Expr) bool {
+    return switch (e) {
+        .func => |f| {
+            if (isAggregateFuncName(f.name) or isArrayAggFuncName(f.name)) return true;
+            for (f.args) |arg| if (exprHasAggregate(arg)) return true;
+            return false;
+        },
+        .binop => |b| exprHasAggregate(b.left) or exprHasAggregate(b.right),
+        .not, .neg => |inner| exprHasAggregate(inner.*),
+        .subscript => |s| exprHasAggregate(s.base) or exprHasAggregate(s.index),
+        .cast => |c| exprHasAggregate(c.val),
+        .lambda => |l| exprHasAggregate(l.body),
+        else => false,
+    };
+}
+
+fn isAggregateFuncName(name: []const u8) bool {
+    return std.mem.eql(u8, name, "count") or
+        std.mem.eql(u8, name, "sum") or
+        std.mem.eql(u8, name, "avg") or
+        std.mem.eql(u8, name, "min") or
+        std.mem.eql(u8, name, "max") or
+        std.mem.eql(u8, name, "uniqexact") or
+        std.mem.eql(u8, name, "uniqexactif") or
+        std.mem.eql(u8, name, "countif");
+}
+
 fn buildFuncExpr(allocator: Allocator, f: ast.FuncExpr, alias: ?[]const u8, ctes: []ast.Cte) BuildError!Expr {
     const name = f.name; // already lowercase
 
@@ -438,6 +552,9 @@ fn buildFuncExpr(allocator: Allocator, f: ast.FuncExpr, alias: ?[]const u8, ctes
         const cond_ptr = try allocator.create(CondExpr);
         cond_ptr.* = cond;
         return Expr{ .func = .max_if, .column = col, .alias = alias, .cond = cond_ptr };
+    }
+    if (!isArrayAggFuncName(name)) {
+        if (try buildArrayAggPostExpr(allocator, f, alias, ctes)) |expr| return expr;
     }
     // uniqExact(col) / uniqExactIf(col, cond)
     if (std.mem.eql(u8, name, "uniqexact") and f.args.len == 1) {
@@ -522,10 +639,10 @@ fn buildFuncExpr(allocator: Allocator, f: ast.FuncExpr, alias: ?[]const u8, ctes
         const col = try firstArgText(allocator, f.args, ctes);
         return Expr{ .func = .any_val, .column = col, .alias = alias };
     }
-    // groupArray(col) → group_uniq_array (deduplicating approximation)
+    // groupArray(col)
     if ((std.mem.eql(u8, name, "grouparray") or std.mem.eql(u8, name, "group_array")) and f.args.len >= 1) {
         const col = try firstArgText(allocator, f.args, ctes);
-        return Expr{ .func = .group_uniq_array, .column = col, .alias = alias };
+        return Expr{ .func = .group_array, .column = col, .alias = alias };
     }
     // sumIf(col, cond) → sum(if(cond, col, 0))  — avoids pipeline changes
     if ((std.mem.eql(u8, name, "sumif") or std.mem.eql(u8, name, "sum_if")) and f.args.len == 2) {
@@ -577,6 +694,52 @@ fn buildFuncExpr(allocator: Allocator, f: ast.FuncExpr, alias: ?[]const u8, ctes
     // Everything else: render as text → column_ref
     const text = try exprToText(allocator, .{ .func = f }, ctes);
     return Expr{ .func = .column_ref, .column = text, .alias = alias };
+}
+
+fn isArrayAggFuncName(name: []const u8) bool {
+    return std.mem.eql(u8, name, "groupuniqarray") or
+        std.mem.eql(u8, name, "group_uniq_array") or
+        std.mem.eql(u8, name, "grouparray") or
+        std.mem.eql(u8, name, "group_array");
+}
+
+fn findArrayAggExpr(e: ast.Expr) ?ast.FuncExpr {
+    return switch (e) {
+        .func => |f| {
+            if (isArrayAggFuncName(f.name)) return f;
+            for (f.args) |arg| if (findArrayAggExpr(arg)) |found| return found;
+            return null;
+        },
+        .binop => |b| findArrayAggExpr(b.left) orelse findArrayAggExpr(b.right),
+        .not, .neg => |inner| findArrayAggExpr(inner.*),
+        .subscript => |s| findArrayAggExpr(s.base) orelse findArrayAggExpr(s.index),
+        .cast => |c| findArrayAggExpr(c.val),
+        .lambda => |l| findArrayAggExpr(l.body),
+        .case_when => |cw| {
+            if (cw.input) |inp| if (findArrayAggExpr(inp.*)) |found| return found;
+            for (cw.whens) |w| {
+                if (findArrayAggExpr(w.cond)) |found| return found;
+                if (findArrayAggExpr(w.then)) |found| return found;
+            }
+            if (cw.else_) |el| if (findArrayAggExpr(el.*)) |found| return found;
+            return null;
+        },
+        else => null,
+    };
+}
+
+fn buildArrayAggPostExpr(allocator: Allocator, f: ast.FuncExpr, alias: ?[]const u8, ctes: []ast.Cte) BuildError!?Expr {
+    const agg_f = findArrayAggExpr(.{ .func = f }) orelse return null;
+    if (agg_f.args.len < 1) return null;
+    const full_text = try exprToText(allocator, .{ .func = f }, ctes);
+    defer allocator.free(full_text);
+    const agg_text = try exprToText(allocator, .{ .func = agg_f }, ctes);
+    defer allocator.free(agg_text);
+    const post = try std.mem.replaceOwned(u8, allocator, full_text, agg_text, "__agg");
+    const col = try firstArgText(allocator, agg_f.args, ctes);
+    const func: AggregateFn = if (std.mem.eql(u8, agg_f.name, "grouparray") or
+        std.mem.eql(u8, agg_f.name, "group_array")) .group_array else .group_uniq_array;
+    return Expr{ .func = func, .column = col, .alias = alias, .post_fn = post };
 }
 
 fn buildCaseWhenExpr(allocator: Allocator, cw: ast.CaseExpr, alias: ?[]const u8, ctes: []ast.Cte) BuildError!Expr {

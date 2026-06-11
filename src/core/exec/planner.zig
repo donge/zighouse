@@ -379,22 +379,9 @@ pub fn plan_query(
         if (has_aj_cols) {
             // ── ARRAY JOIN + GROUP BY path ────────────────────────────────
             // Build a pre-project node that expands the arrayJoin columns.
-            // The pre-project emits: [key0, key1, ..., __aj__col0, __aj__col1, ...]
-            // Then hash_agg uses indices into the pre-project output.
-
-            // Collect pre-project items: real keys first, then __aj__ helpers.
+            // Hidden __aj__ helpers are emitted first; hash keys and aggregate
+            // arguments refer to those pre-project outputs.
             var pre_items_list: std.ArrayListUnmanaged(ProjectItem) = .empty;
-            var real_key_count: usize = 0;
-            // First pass: real (non-__aj__) key projections
-            for (projs) |p| {
-                if (isAggregate(p.func)) continue;
-                const alias = p.alias orelse p.column orelse "";
-                if (std.mem.startsWith(u8, alias, "__aj__")) continue;
-                const item = try scalarExprToProjectItem(ctx, p) orelse return null;
-                try pre_items_list.append(ctx.alloc, item);
-                real_key_count += 1;
-            }
-            // Second pass: __aj__ helper projections
             for (projs) |p| {
                 if (isAggregate(p.func)) continue;
                 const alias = p.alias orelse p.column orelse "";
@@ -402,24 +389,33 @@ pub fn plan_query(
                 const item = try scalarExprToProjectItem(ctx, p) orelse return null;
                 try pre_items_list.append(ctx.alloc, item);
             }
+
+            var hash_keys_list: std.ArrayListUnmanaged(ProjectItem) = .empty;
+            for (projs) |p| {
+                if (isAggregate(p.func)) continue;
+                const alias = p.alias orelse p.column orelse "";
+                if (std.mem.startsWith(u8, alias, "__aj__")) continue;
+                const col_name = p.column orelse "";
+                const pre_idx = findPreProjectItem(pre_items_list.items, col_name);
+                const src_idx: usize = if (pre_idx) |idx| idx else blk: {
+                    const item = try scalarExprToProjectItem(ctx, p) orelse return null;
+                    const idx = pre_items_list.items.len;
+                    try pre_items_list.append(ctx.alloc, item);
+                    break :blk idx;
+                };
+                const src = pre_items_list.items[src_idx];
+                try hash_keys_list.append(ctx.alloc, .{
+                    .expr = Expr{ .col_ref = .{ .index = src_idx, .name = src.alias } },
+                    .alias = alias,
+                    .out_type = src.out_type,
+                });
+            }
             const pre_items = try pre_items_list.toOwnedSlice(ctx.alloc);
+            const hash_keys = try hash_keys_list.toOwnedSlice(ctx.alloc);
 
             // Build pre-project node (performs arrayJoin row expansion).
             const pre_proj_node = try ctx.alloc.create(PhysicalNode);
             pre_proj_node.* = .{ .project = .{ .input = source, .items = pre_items } };
-
-            // Build hash_agg keys: real keys only, referencing pre-project output indices.
-            const hash_keys = try ctx.alloc.alloc(ProjectItem, real_key_count);
-            for (0..real_key_count) |ki| {
-                const src = pre_items[ki];
-                const ref = try ctx.alloc.create(plan.ColRef);
-                ref.* = .{ .index = ki, .name = src.alias };
-                hash_keys[ki] = .{
-                    .expr = Expr{ .col_ref = ref.* },
-                    .alias = src.alias,
-                    .out_type = src.out_type,
-                };
-            }
 
             // Build agg items: each agg arg is looked up in the pre-project output.
             for (projs) |p| {
@@ -429,7 +425,7 @@ pub fn plan_query(
                     ctx,
                     p,
                     pre_items,
-                    real_key_count,
+                    hash_keys.len,
                 ) orelse return null;
                 try agg_items_list.append(ctx.alloc, agg_item);
             }
@@ -1029,7 +1025,7 @@ fn schemaToCore(ty: schema_mod.ColumnType, ch_type: ?[]const u8) ColumnType {
 
 fn isAggregate(func: generic_sql.AggregateFn) bool {
     return switch (func) {
-        .count_star, .count_distinct, .count_if, .sum, .avg, .min, .max, .min_if, .max_if, .sum_array, .sum_array_if, .uniq_exact, .uniq_exact_if, .group_uniq_array, .any_val => true,
+        .count_star, .count_distinct, .count_if, .sum, .avg, .min, .max, .min_if, .max_if, .sum_array, .sum_array_if, .uniq_exact, .uniq_exact_if, .group_uniq_array, .group_array, .any_val => true,
         .column_ref, .int_literal, .float_literal, .case_when, .cmp_expr => false,
     };
 }
@@ -1498,23 +1494,23 @@ fn isDictFn(name: []const u8) bool {
 
 fn canonFnName(name: []const u8) []const u8 {
     const canon_names = [_][]const u8{
-        "lower",            "upper",                    "length",           "char_length",     "lowerUTF8",     "upperUTF8",
-        "toDate",           "toDateOrZero",             "toYYYYMMDD",       "toUnixTimestamp", "toFloat64",     "toUInt64",
-        "toInt64",          "toString",                 "toStartOfMinute",  "toStartOfHour",   "toStartOfDay",  "toStartOfWeek",
-        "toStartOfMonth",   "toStartOfYear",            "toYear",           "toMonth",         "toDayOfMonth",  "toDayOfWeek",
-        "toHour",           "toMinute",                 "toSecond",         "abs",             "round",         "floor",
-        "ceil",             "log",                      "log2",             "log10",           "sqrt",          "exp",
-        "not",              "isNull",                   "isNotNull",        "isIPv4String",    "isIPv6String",  "IPv4StringToNumOrDefault",
-        "IPv4NumToString",  "IPv6StringToNumOrDefault", "IPv6NumToString",  "greatest",        "least",         "intDiv",
-        "modulo",           "positionCaseInsensitive",  "splitByChar",      "concat",          "format",        "if",
-        "multiIf",          "substring",                "substr",           "startsWith",      "endsWith",      "mapGet",
-        "has",              "hasAny",                   "hasAll",           "arrayConcat",     "arrayDistinct", "arrayFlatten",
-        "arrayReverse",     "arraySlice",               "arrayMax",         "arrayMin",        "arrayMap",      "arrayFilter",
-        "arrayExists",      "arrayJoin",                "mapKeys",          "mapValues",       "tuple",         "regexp_replace",
-        "replaceRegexpOne", "now",                      "today",            "toHour",          "hour",          "toMinute",
-        "toSecond",         "sqrt",                     "arrayElement",     "arraySum",        "arrayAvg",      "array",
-        "arrayIntersect",   "toIntervalSecond",         "toIntervalMinute", "toIntervalHour",  "toIntervalDay", "toIntervalWeek",
-        "toIntervalMonth",  "toIntervalYear",
+        "lower",             "upper",                    "length",           "char_length",      "lowerUTF8",        "upperUTF8",
+        "toDate",            "toDateOrZero",             "toYYYYMMDD",       "toUnixTimestamp",  "toFloat64",        "toUInt64",
+        "toInt64",           "toString",                 "toStartOfMinute",  "toStartOfHour",    "toStartOfDay",     "toStartOfWeek",
+        "toStartOfMonth",    "toStartOfYear",            "toYear",           "toMonth",          "toDayOfMonth",     "toDayOfWeek",
+        "toHour",            "toMinute",                 "toSecond",         "abs",              "round",            "floor",
+        "ceil",              "log",                      "log2",             "log10",            "sqrt",             "exp",
+        "not",               "isNull",                   "isNotNull",        "isIPv4String",     "isIPv6String",     "IPv4StringToNumOrDefault",
+        "IPv4NumToString",   "IPv6StringToNumOrDefault", "IPv6NumToString",  "greatest",         "least",            "intDiv",
+        "modulo",            "positionCaseInsensitive",  "splitByChar",      "concat",           "format",           "if",
+        "multiIf",           "substring",                "substr",           "startsWith",       "endsWith",         "mapGet",
+        "has",               "hasAny",                   "hasAll",           "arrayConcat",      "arrayDistinct",    "arrayFlatten",
+        "arrayStringConcat", "array_to_string",          "arrayReverse",     "arraySlice",       "arrayMax",         "arrayMin",
+        "arrayMap",          "arrayFilter",              "arrayExists",      "arrayJoin",        "mapKeys",          "mapValues",
+        "tuple",             "regexp_replace",           "replaceRegexpOne", "now",              "today",            "toHour",
+        "hour",              "toMinute",                 "toSecond",         "sqrt",             "arrayElement",     "arraySum",
+        "arrayAvg",          "array",                    "arrayIntersect",   "toIntervalSecond", "toIntervalMinute", "toIntervalHour",
+        "toIntervalDay",     "toIntervalWeek",           "toIntervalMonth",  "toIntervalYear",
     };
     for (canon_names) |cn| {
         if (std.ascii.eqlIgnoreCase(cn, name)) return cn;
@@ -2034,6 +2030,8 @@ fn prattExpr(pctx: *ParseCtx, min_bp: u8) anyerror!?Expr {
                     if (args_slice.len == 2 and (std.ascii.eqlIgnoreCase(name, "substring") or
                         std.ascii.eqlIgnoreCase(name, "substr"))) break :blk2 true;
                     if (args_slice.len >= 2 and std.ascii.eqlIgnoreCase(name, "concat")) break :blk2 true;
+                    if (args_slice.len >= 1 and (std.ascii.eqlIgnoreCase(name, "arrayStringConcat") or
+                        std.ascii.eqlIgnoreCase(name, "array_to_string"))) break :blk2 true;
                     if (args_slice.len >= 1 and std.ascii.eqlIgnoreCase(name, "format")) break :blk2 true;
                     if (args_slice.len >= 1 and std.ascii.eqlIgnoreCase(name, "tuple")) break :blk2 true;
                     if (args_slice.len >= 3 and std.ascii.eqlIgnoreCase(name, "multiIf")) break :blk2 true;
@@ -2064,6 +2062,8 @@ fn prattExpr(pctx: *ParseCtx, min_bp: u8) anyerror!?Expr {
                         args_slice[0] == .lambda) break :blk2 true;
                     // arrayElement(arr, n): 2-arg
                     if (args_slice.len == 2 and std.ascii.eqlIgnoreCase(name, "arrayElement")) break :blk2 true;
+                    if ((args_slice.len == 2 or args_slice.len == 3) and
+                        std.ascii.eqlIgnoreCase(name, "arraySlice")) break :blk2 true;
                     // arrayIntersect(arr1, arr2): 2-arg
                     if (args_slice.len == 2 and std.ascii.eqlIgnoreCase(name, "arrayIntersect")) break :blk2 true;
                     // array(v1, v2, ...): N-arg constructor
@@ -2078,8 +2078,8 @@ fn prattExpr(pctx: *ParseCtx, min_bp: u8) anyerror!?Expr {
                 const fc = try pctx.arena.create(plan.FnCall);
                 // Normalize the function name to canonical casing that kernels.zig expects.
                 var canon = canonFnName(name);
-                // mapKeys/mapValues on Map(String,Float64) → use Float64 variant
-                if (std.mem.eql(u8, canon, "mapKeys") and args_slice.len == 1) {
+                // mapKeys/mapValues on Map(String,Float64) → use Float64 variants.
+                if ((std.mem.eql(u8, canon, "mapKeys") or std.mem.eql(u8, canon, "mapValues")) and args_slice.len == 1) {
                     if (args_slice[0] == .col_ref) {
                         if (pctx.plan_ctx.tbl) |tbl| {
                             if (tbl.findColumn(args_slice[0].col_ref.name)) |idx| {
@@ -2087,7 +2087,7 @@ fn prattExpr(pctx: *ParseCtx, min_bp: u8) anyerror!?Expr {
                                     if (std.mem.startsWith(u8, ch, "Map(") and
                                         (std.mem.indexOf(u8, ch, "Float64") != null or
                                             std.mem.indexOf(u8, ch, "Float32") != null))
-                                        canon = "mapKeysFloat64";
+                                        canon = if (std.mem.eql(u8, canon, "mapKeys")) "mapKeysFloat64" else "mapValuesFloat64";
                                 }
                             }
                         }
@@ -2265,12 +2265,14 @@ fn inferExprType(ctx: *PlannerCtx, expr: Expr) ColumnType {
             if (std.mem.eql(u8, fc.name, "intDiv") or std.mem.eql(u8, fc.name, "modulo")) return .int64;
             if (std.mem.eql(u8, fc.name, "positionCaseInsensitive")) return .uint64;
             if (std.mem.eql(u8, fc.name, "concat")) return .string;
+            if (std.mem.eql(u8, fc.name, "arrayStringConcat") or std.mem.eql(u8, fc.name, "array_to_string")) return .string;
             if (std.mem.eql(u8, fc.name, "risk_score")) return .float64;
             if (std.mem.eql(u8, fc.name, "splitByChar") or
                 std.mem.eql(u8, fc.name, "splitByString") or
                 std.mem.eql(u8, fc.name, "mapKeys") or
                 std.mem.eql(u8, fc.name, "mapKeysFloat64") or
                 std.mem.eql(u8, fc.name, "mapValues") or
+                std.mem.eql(u8, fc.name, "mapValuesFloat64") or
                 std.mem.eql(u8, fc.name, "arrayConcat") or
                 std.mem.eql(u8, fc.name, "arrayDistinct") or
                 std.mem.eql(u8, fc.name, "arrayFlatten")) return .array_string;
@@ -2463,12 +2465,8 @@ fn aggExprToProjectItemWithPreProject(
     // Resolve a column name against pre-project output items by alias.
     const resolvePreProjectCol = struct {
         fn resolve(items: []const ProjectItem, name: []const u8) ?Expr {
-            for (items, 0..) |item, idx| {
-                if (std.ascii.eqlIgnoreCase(item.alias, name)) {
-                    return Expr{ .col_ref = .{ .index = idx, .name = item.alias } };
-                }
-            }
-            return null;
+            const idx = findPreProjectItem(items, name) orelse return null;
+            return Expr{ .col_ref = .{ .index = idx, .name = items[idx].alias } };
         }
     }.resolve;
 
@@ -2511,8 +2509,43 @@ fn aggExprToProjectItemWithPreProject(
             agg_call.* = .{ .kind = .sum, .arg = arg_expr, .distinct = false };
             return ProjectItem{ .expr = .{ .agg_call = agg_call }, .alias = alias, .out_type = .float64 };
         },
+        .group_uniq_array, .group_array => {
+            const arg_expr = resolvePreProjectCol(pre_items, col_name) orelse
+                resolveColExpr(ctx, col_name) orelse
+                (try parseArithExpr(ctx, col_name)) orelse return null;
+            const post_expr = try buildPostAggExpr(ctx, p.post_fn);
+            agg_call.* = .{
+                .kind = if (p.func == .group_array) .group_array else .group_uniq_array,
+                .arg = arg_expr,
+                .distinct = false,
+                .sep = if (post_expr == null) p.sep else null,
+                .post_expr = post_expr,
+            };
+            const out: ColumnType = if (post_expr) |pe| inferExprType(ctx, pe) else if (p.sep != null) .string else .array_string;
+            return ProjectItem{ .expr = .{ .agg_call = agg_call }, .alias = alias, .out_type = out };
+        },
         else => return aggExprToProjectItem(ctx, p),
     }
+}
+
+fn findPreProjectItem(items: []const ProjectItem, name: []const u8) ?usize {
+    for (items, 0..) |item, idx| {
+        if (std.ascii.eqlIgnoreCase(item.alias, name)) return idx;
+        if (std.mem.startsWith(u8, item.alias, "__aj__") and
+            std.ascii.eqlIgnoreCase(item.alias["__aj__".len..], name)) return idx;
+    }
+    return null;
+}
+
+fn buildPostAggExpr(ctx: *PlannerCtx, post_fn: ?[]const u8) !?Expr {
+    const text = post_fn orelse return null;
+    const prev = ctx.virtual_cols;
+    const vcols = try ctx.alloc.alloc(VirtualCol, prev.len + 1);
+    @memcpy(vcols[0..prev.len], prev);
+    vcols[prev.len] = .{ .name = "__agg", .idx = 0, .col_type = .array_string };
+    ctx.virtual_cols = vcols;
+    defer ctx.virtual_cols = prev;
+    return (try parseArithExpr(ctx, text)) orelse null;
 }
 
 fn aggExprToProjectItem(ctx: *PlannerCtx, p: generic_sql.Expr) !?ProjectItem {
@@ -2575,14 +2608,18 @@ fn aggExprToProjectItem(ctx: *PlannerCtx, p: generic_sql.Expr) !?ProjectItem {
             agg_call.* = .{ .kind = .max, .arg = arg_expr, .distinct = false };
             return ProjectItem{ .expr = .{ .agg_call = agg_call }, .alias = alias, .out_type = col_type };
         },
-        .group_uniq_array, .uniq_exact_if => {
-            // If a post-processing function (e.g. arrayFlatten) is needed, fall back to
-            // the generic executor which handles post_fn application.
-            if (p.post_fn != null) return null;
-            const arg_expr = resolveColExpr(ctx, col_name) orelse return null;
-            agg_call.* = .{ .kind = .group_uniq_array, .arg = arg_expr, .distinct = false, .sep = p.sep };
-            // When sep is present (arrayStringConcat pattern), the result is a joined string.
-            const out: ColumnType = if (p.sep != null) .string else .array_string;
+        .group_uniq_array, .group_array, .uniq_exact_if => {
+            const arg_expr = resolveColExpr(ctx, col_name) orelse
+                (try parseArithExpr(ctx, col_name)) orelse return null;
+            const post_expr = try buildPostAggExpr(ctx, p.post_fn);
+            agg_call.* = .{
+                .kind = if (p.func == .group_array) .group_array else .group_uniq_array,
+                .arg = arg_expr,
+                .distinct = false,
+                .sep = if (post_expr == null) p.sep else null,
+                .post_expr = post_expr,
+            };
+            const out: ColumnType = if (post_expr) |pe| inferExprType(ctx, pe) else if (p.sep != null) .string else .array_string;
             return ProjectItem{ .expr = .{ .agg_call = agg_call }, .alias = alias, .out_type = out };
         },
         .any_val => {

@@ -113,6 +113,12 @@ const Parser = struct {
             from = try self.parseFromWithJoins();
         }
 
+        var array_join: []ast.ArrayJoinItem = &.{};
+        if (self.tok.eatKeyword("ARRAY")) {
+            if (!self.tok.eatKeyword("JOIN")) return error.UnexpectedToken;
+            array_join = try self.parseArrayJoinItems();
+        }
+
         // WHERE / PREWHERE (ClickHouse extension — treated identically; either order)
         var where: ?*ast.Expr = null;
         for (0..2) |_| {
@@ -178,6 +184,7 @@ const Parser = struct {
             .distinct = distinct,
             .projections = projections,
             .from = from,
+            .array_join = array_join,
             .where = where,
             .group_by = group_by,
             .having = having,
@@ -210,18 +217,29 @@ const Parser = struct {
         }
         // Implicit alias: next token is an ident/keyword that is not a clause keyword
         const t = self.tok.peek();
-        if (t.kind == .ident or (t.kind == .keyword and !isClauseStart(t.text))) {
+        if ((t.kind == .ident or t.kind == .keyword) and !isClauseStart(t.text)) {
             _ = self.tok.next();
             return t.text;
         }
         return null;
     }
 
+    fn parseArrayJoinItems(self: *Parser) ParseError![]ast.ArrayJoinItem {
+        var list = std.ArrayListUnmanaged(ast.ArrayJoinItem).empty;
+        while (true) {
+            const expr = try self.parseExpr();
+            const alias = try self.parseOptionalAlias();
+            try list.append(self.allocator, .{ .expr = expr, .alias = alias });
+            if (!self.tok.eatIf(.comma)) break;
+        }
+        return list.toOwnedSlice(self.allocator) catch error.OutOfMemory;
+    }
+
     fn isClauseStart(kw: []const u8) bool {
         const clauses = [_][]const u8{
             "from",  "where",  "group", "having", "order", "limit", "offset",
-            "union", "select", "with",  "join",   "inner", "left",  "right",
-            "outer", "cross",  "on",    "using",
+            "union", "select", "with",  "join",   "array", "inner", "left",
+            "right", "outer",  "cross", "on",     "using",
         };
         for (clauses) |c| {
             if (std.ascii.eqlIgnoreCase(kw, c)) return true;
@@ -954,6 +972,19 @@ test "parser: GROUP BY ORDER BY LIMIT" {
     try std.testing.expectEqual(@as(usize, 1), sel.order_by.len);
     try std.testing.expectEqual(true, sel.order_by[0].desc);
     try std.testing.expectEqual(@as(?i64, 10), sel.limit);
+}
+
+test "parser: ARRAY JOIN clause with lockstep aliases" {
+    const allocator = std.testing.allocator;
+    const stmt = parse(allocator, "SELECT fk, fv FROM events ARRAY JOIN mapKeys(features) AS fk, mapValues(features) AS fv GROUP BY fk, fv");
+    try std.testing.expect(stmt != null);
+    const sel = stmt.?.select;
+    try std.testing.expectEqual(@as(usize, 2), sel.array_join.len);
+    try std.testing.expectEqualStrings("fk", sel.array_join[0].alias.?);
+    try std.testing.expectEqualStrings("fv", sel.array_join[1].alias.?);
+    try std.testing.expect(sel.array_join[0].expr == .func);
+    try std.testing.expectEqualStrings("mapkeys", sel.array_join[0].expr.func.name);
+    try std.testing.expectEqual(@as(usize, 2), sel.group_by.len);
 }
 
 test "parser: CASE WHEN" {
