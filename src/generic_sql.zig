@@ -3,28 +3,35 @@ const sql_parser = @import("sql_parser");
 const plan_builder = @import("sql/plan_builder.zig");
 
 pub const AggregateFn = enum {
-    column_ref, int_literal, float_literal,
-    count_star, count_distinct,
-    count_if,         // countIf(expr) — condition stored in cond_col/cond_op/cond_val
-    sum, avg, min, max,
-    min_if, max_if,   // minIf(col, cond) / maxIf(col, cond) — conditional min/max
-    sum_array,        // sumArray(arr) — sum of all elements across rows
-    sum_array_if,     // sumArrayIf(arr, cond) — conditional sumArray
-    uniq_exact,       // uniqExact(col) — exact distinct count using string set
-    uniq_exact_if,    // uniqExactIf(col, cond) — conditional exact distinct
+    column_ref,
+    int_literal,
+    float_literal,
+    count_star,
+    count_distinct,
+    count_if, // countIf(expr) — condition stored in cond_col/cond_op/cond_val
+    sum,
+    avg,
+    min,
+    max,
+    min_if,
+    max_if, // minIf(col, cond) / maxIf(col, cond) — conditional min/max
+    sum_array, // sumArray(arr) — sum of all elements across rows
+    sum_array_if, // sumArrayIf(arr, cond) — conditional sumArray
+    uniq_exact, // uniqExact(col) — exact distinct count using string set
+    uniq_exact_if, // uniqExactIf(col, cond) — conditional exact distinct
     group_uniq_array, // groupUniqArray(col) — array of distinct values (joined as string)
-    any_val,          // any(col) — first non-null value
-    case_when,        // CASE WHEN … THEN … ELSE … END — data in case_when_data field
-    cmp_expr,         // comparison/boolean as value: "1 = 1" → uint8 0 or 1
+    any_val, // any(col) — first non-null value
+    case_when, // CASE WHEN … THEN … ELSE … END — data in case_when_data field
+    cmp_expr, // comparison/boolean as value: "1 = 1" → uint8 0 or 1
 };
 
 /// Optional inline condition for countIf / uniqExactIf:
 ///   cond_col op cond_num   (e.g. confidence >= 0.9)
 ///   cond_col op cond_str   (e.g. data['is_foreign'] = 'true')
 pub const CondExpr = struct {
-    cond_col: []const u8 = "",   // heap-allocated condition column name (empty when cond_text is set)
-    cond_op:  CmpOp = .eq,
-    cond_num: f64 = 0,       // used when cond_str and cond_text are null
+    cond_col: []const u8 = "", // heap-allocated condition column name (empty when cond_text is set)
+    cond_op: CmpOp = .eq,
+    cond_num: f64 = 0, // used when cond_str and cond_text are null
     cond_str: ?[]const u8 = null, // heap-allocated; non-null for string comparisons
     cond_text: ?[]const u8 = null, // heap-allocated; non-null for complex conditions (use evalTextBoolExpr)
 };
@@ -87,8 +94,14 @@ pub const WhereNode = union(enum) {
 pub fn freeWhereNode(allocator: std.mem.Allocator, node: *WhereNode) void {
     switch (node.*) {
         .cmp_int => |c| allocator.free(c.col),
-        .cmp_str => |c| { allocator.free(c.col); allocator.free(c.val); },
-        .like    => |l| { allocator.free(l.col); allocator.free(l.pattern); },
+        .cmp_str => |c| {
+            allocator.free(c.col);
+            allocator.free(c.val);
+        },
+        .like => |l| {
+            allocator.free(l.col);
+            allocator.free(l.pattern);
+        },
         .is_null, .is_not_null => |col| allocator.free(col),
         .and_, .or_ => |children| {
             for (children) |ch| freeWhereNode(allocator, ch);
@@ -102,13 +115,13 @@ pub const JoinKind = enum { inner, left, right, full };
 
 /// Equi-join specification: two Plans joined on equal column names.
 pub const JoinSpec = struct {
-    kind:      JoinKind,
-    left:      *Plan,
-    right:     *Plan,
+    kind: JoinKind,
+    left: *Plan,
+    right: *Plan,
     /// Left-side column names for equi-join (parallel to on_right).
-    on_left:   []const []const u8,
+    on_left: []const []const u8,
     /// Right-side column names for equi-join (parallel to on_left).
-    on_right:  []const []const u8,
+    on_right: []const []const u8,
 };
 
 pub const FilterOp = enum { equal, not_equal, greater, greater_equal, less, less_equal };
@@ -132,11 +145,11 @@ pub const Plan = struct {
     filter: ?Filter = null,
     /// Typed WHERE predicate tree (superset of `filter`).
     /// Free with freeWhereNode(allocator, where_expr) before calling deinit.
-     where_expr: ?*WhereNode = null,
-     where_text: ?[]const u8 = null,
-     group_by: ?[]const u8 = null,
-     having_expr: ?*WhereNode = null,
-     having_text: ?[]const u8 = null,
+    where_expr: ?*WhereNode = null,
+    where_text: ?[]const u8 = null,
+    group_by: ?[]const u8 = null,
+    having_expr: ?*WhereNode = null,
+    having_text: ?[]const u8 = null,
     order_by_count_desc: bool = false,
     order_by_alias: ?[]const u8 = null,
     /// When true, order_by_alias is ascending; when false (default), it is descending.
@@ -206,7 +219,10 @@ fn normalizeExtract(allocator: std.mem.Allocator, sql: []const u8) ![]const u8 {
             i += 1;
             while (i < sql.len) {
                 try result.append(allocator, sql[i]);
-                if (sql[i] == '\'') { i += 1; break; }
+                if (sql[i] == '\'') {
+                    i += 1;
+                    break;
+                }
                 i += 1;
             }
             continue;
@@ -295,10 +311,10 @@ fn normalizeInBrackets(allocator: std.mem.Allocator, sql: []const u8) ![]const u
             const prefix_end = i;
             var j: usize = prefix_end;
             // skip trailing spaces before `[`
-            while (j > 0 and (sql[j-1] == ' ' or sql[j-1] == '\t')) j -= 1;
+            while (j > 0 and (sql[j - 1] == ' ' or sql[j - 1] == '\t')) j -= 1;
             const in_keyword_end = j;
             // check for `IN` or `in` or `In`
-            if (in_keyword_end >= 2 and std.ascii.eqlIgnoreCase(sql[in_keyword_end-2..in_keyword_end], "IN")) {
+            if (in_keyword_end >= 2 and std.ascii.eqlIgnoreCase(sql[in_keyword_end - 2 .. in_keyword_end], "IN")) {
                 // Matched `IN [` → emit `(` and find closing `]` to replace with `)`
                 try result.append(allocator, '(');
                 i += 1;
@@ -326,11 +342,19 @@ fn normalizeInBrackets(allocator: std.mem.Allocator, sql: []const u8) ![]const u
 }
 
 pub fn deinit(allocator: std.mem.Allocator, plan: Plan) void {
-    if (plan.subquery_source) |sq| { deinit(allocator, sq.*); allocator.destroy(sq); }
-    if (plan.union_other) |uo| { deinit(allocator, uo.*); allocator.destroy(uo); }
+    if (plan.subquery_source) |sq| {
+        deinit(allocator, sq.*);
+        allocator.destroy(sq);
+    }
+    if (plan.union_other) |uo| {
+        deinit(allocator, uo.*);
+        allocator.destroy(uo);
+    }
     if (plan.join) |j| {
-        deinit(allocator, j.left.*); allocator.destroy(j.left);
-        deinit(allocator, j.right.*); allocator.destroy(j.right);
+        deinit(allocator, j.left.*);
+        allocator.destroy(j.left);
+        deinit(allocator, j.right.*);
+        allocator.destroy(j.right);
         allocator.free(j.on_left);
         allocator.free(j.on_right);
         allocator.destroy(j);
@@ -371,7 +395,6 @@ pub fn deinit(allocator: std.mem.Allocator, plan: Plan) void {
     }
     allocator.free(plan.projections);
 }
-
 
 pub fn parseFilter(where_body: []const u8) ?Filter {
     if (indexOfKeyword(where_body, "and")) |and_pos| {
@@ -422,8 +445,6 @@ fn indexOfKeyword(sql: []const u8, keyword: []const u8) ?usize {
     return null;
 }
 
-
-
 fn projectionAliasExists(projections: []const Expr, alias: []const u8) bool {
     for (projections) |expr| {
         if (expr.alias) |candidate| if (asciiEqlIgnoreCase(candidate, alias)) return true;
@@ -431,11 +452,9 @@ fn projectionAliasExists(projections: []const Expr, alias: []const u8) bool {
     return false;
 }
 
-
 fn isIdent(c: u8) bool {
     return std.ascii.isAlphanumeric(c) or c == '_';
 }
-
 
 fn asciiEqlIgnoreCase(a: []const u8, b: []const u8) bool {
     if (a.len != b.len) return false;
@@ -455,6 +474,13 @@ test "table name is passed through without validation" {
     const plan = (try parse(std.testing.allocator, "SELECT COUNT(*) FROM events")).?;
     defer deinit(std.testing.allocator, plan);
     try std.testing.expectEqualStrings("events", plan.table);
+    try std.testing.expectEqual(AggregateFn.count_star, plan.projections[0].func);
+}
+
+test "qualified table name is preserved" {
+    const plan = (try parse(std.testing.allocator, "SELECT COUNT(*) FROM test.t1")).?;
+    defer deinit(std.testing.allocator, plan);
+    try std.testing.expectEqualStrings("test.t1", plan.table);
     try std.testing.expectEqual(AggregateFn.count_star, plan.projections[0].func);
 }
 

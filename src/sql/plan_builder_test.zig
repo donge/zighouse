@@ -1,12 +1,11 @@
 /// Tests for plan_builder.zig — AST → generic_sql.Plan translation.
 /// Pulled in via `test { _ = @import("plan_builder_test.zig"); }` at the bottom of plan_builder.zig.
-
-const std         = @import("std");
-const sql_parser  = @import("sql_parser");
+const std = @import("std");
+const sql_parser = @import("sql_parser");
 const generic_sql = @import("../generic_sql.zig");
-const pb          = @import("plan_builder.zig");
+const pb = @import("plan_builder.zig");
 
-const buildPlan   = pb.buildPlan;
+const buildPlan = pb.buildPlan;
 const AggregateFn = generic_sql.AggregateFn;
 
 // ── Existing tests (moved from plan_builder.zig) ──────────────────────────────
@@ -25,6 +24,19 @@ test "plan_builder: simple SELECT column_ref" {
     try std.testing.expectEqualStrings("a", plan.projections[0].column.?);
     try std.testing.expect(plan.where_text != null);
     try std.testing.expectEqualStrings("x = 1", plan.where_text.?);
+}
+
+test "plan_builder: qualified table name is preserved" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const stmt = sql_parser.parse(alloc, "SELECT a FROM test.t1 WHERE id = 42");
+    try std.testing.expect(stmt != null);
+    const plan = try buildPlan(alloc, stmt.?, &.{});
+    try std.testing.expectEqualStrings("test.t1", plan.table);
+    try std.testing.expect(plan.where_text != null);
+    try std.testing.expectEqualStrings("id = 42", plan.where_text.?);
 }
 
 test "plan_builder: COUNT(*) aggregate" {
@@ -86,8 +98,7 @@ test "plan_builder: INNER JOIN equi-key extraction" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    const stmt = sql_parser.parse(alloc,
-        "SELECT t1.a, t2.b FROM t1 JOIN t2 ON t1.id = t2.id LIMIT 10");
+    const stmt = sql_parser.parse(alloc, "SELECT t1.a, t2.b FROM t1 JOIN t2 ON t1.id = t2.id LIMIT 10");
     try std.testing.expect(stmt != null);
     const plan = try buildPlan(alloc, stmt.?, &.{});
     try std.testing.expect(plan.join != null);
@@ -101,13 +112,26 @@ test "plan_builder: INNER JOIN equi-key extraction" {
     try std.testing.expectEqual(@as(?usize, 10), plan.limit);
 }
 
+test "plan_builder: qualified JOIN table names are preserved" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const stmt = sql_parser.parse(alloc, "SELECT a.id, b.id FROM db1.a JOIN db2.b ON a.id = b.id");
+    try std.testing.expect(stmt != null);
+    const plan = try buildPlan(alloc, stmt.?, &.{});
+    try std.testing.expect(plan.join != null);
+    const j = plan.join.?;
+    try std.testing.expectEqualStrings("db1.a", j.left.table);
+    try std.testing.expectEqualStrings("db2.b", j.right.table);
+}
+
 test "plan_builder: LEFT JOIN multi-key" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    const stmt = sql_parser.parse(alloc,
-        "SELECT a FROM t1 LEFT JOIN t2 ON t1.x = t2.x AND t1.y = t2.y");
+    const stmt = sql_parser.parse(alloc, "SELECT a FROM t1 LEFT JOIN t2 ON t1.x = t2.x AND t1.y = t2.y");
     try std.testing.expect(stmt != null);
     const plan = try buildPlan(alloc, stmt.?, &.{});
     try std.testing.expect(plan.join != null);

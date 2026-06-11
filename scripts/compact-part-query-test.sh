@@ -199,4 +199,16 @@ echo "PASS RowBinaryWithNamesAndTypes schema persisted"
 expect_eq "wnat count" "2" "$(select_tsv "SELECT count(*) FROM default.compact_auto")"
 expect_eq "wnat string order" $'hello\nworld' "$(select_tsv "SELECT label FROM default.compact_auto ORDER BY id")"
 
+post_sql "CREATE TABLE test.values_events (id Int64, name String) ENGINE=MergeTree() ORDER BY id"
+post_sql "INSERT INTO test.values_events VALUES (42, 'hello')"
+values_count_file="$(find "$DATA_DIR/test/values_events/parts" -name count.txt -type f | head -n 1)"
+if [[ -z "$values_count_file" || "$(cat "$values_count_file")" != "1" ]]; then
+    echo "FAIL VALUES insert did not write expected compact part row count"
+    exit 1
+fi
+echo "PASS VALUES non-default compact part created"
+expect_eq "non-default db values count" "1" "$(select_tsv "SELECT count(*) FROM test.values_events")"
+expect_eq "non-default db values id" "42" "$(select_tsv "SELECT id FROM test.values_events")"
+expect_eq "non-default db values string" "hello" "$(select_tsv "SELECT name FROM test.values_events")"
+
 echo "PASS compact part query integration"

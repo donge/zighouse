@@ -29,7 +29,6 @@
 ///   Date     -> .date
 ///   DateTime -> .timestamp
 ///   String   -> .text
-
 const std = @import("std");
 const schema = @import("schema");
 
@@ -81,12 +80,16 @@ pub const SchemaConfig = struct {
             dst.name = try a.dupe(u8, src.name);
             if (src.ch_type) |ct| dst.ch_type = try a.dupe(u8, ct);
         }
+        const sort_keys_copy = try a.alloc([]const u8, entry.table.sort_keys.len);
+        for (entry.table.sort_keys, sort_keys_copy) |src, *dst| {
+            dst.* = try a.dupe(u8, src);
+        }
         const table_name_copy = try a.dupe(u8, entry.table.name);
         const new_entry = TableEntry{
             .db = db_copy,
             .name = name_copy,
             .pk = pk_copy,
-            .table = .{ .name = table_name_copy, .columns = cols_copy },
+            .table = .{ .name = table_name_copy, .columns = cols_copy, .sort_keys = sort_keys_copy },
         };
 
         // Migrate from arena slice to dynamic list on first add.
@@ -286,8 +289,14 @@ fn parseColumnType(s: []const u8) ?schema.ColumnType {
         var depth: usize = 0;
         var i: usize = 0;
         while (i < body.len) : (i += 1) {
-            if (body[i] == '(') { depth += 1; continue; }
-            if (body[i] == ')') { if (depth > 0) depth -= 1; continue; }
+            if (body[i] == '(') {
+                depth += 1;
+                continue;
+            }
+            if (body[i] == ')') {
+                if (depth > 0) depth -= 1;
+                continue;
+            }
             if (body[i] == ',' and depth == 0) {
                 const inner = std.mem.trim(u8, body[i + 1 ..], " \t");
                 return parseColumnType(inner);
@@ -365,7 +374,8 @@ test "addEntry: deep-copies strings, original can be freed" {
     // Verify that addEntry dupes all strings into its arena so the caller
     // can free the original without corrupting the registry.
     const allocator = std.testing.allocator;
-    const json = \\{"tables": []}
+    const json =
+        \\{"tables": []}
     ;
     var cfg = try loadFromSlice(allocator, json);
     defer cfg.deinit();
@@ -403,9 +413,32 @@ test "addEntry: deep-copies strings, original can be freed" {
     try std.testing.expectEqualStrings("col2", found.table.columns[1].name);
 }
 
+test "addEntry: preserves sort keys" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"tables": []}
+    ;
+    var cfg = try loadFromSlice(allocator, json);
+    defer cfg.deinit();
+
+    const cols = [_]schema.Column{.{ .name = "id", .ty = .int64 }};
+    const sort_keys = [_][]const u8{"id"};
+    try cfg.addEntry(allocator, .{
+        .db = "test",
+        .name = "sorted",
+        .pk = "id",
+        .table = .{ .name = "sorted", .columns = &cols, .sort_keys = &sort_keys },
+    });
+
+    const found = cfg.find("test", "sorted").?;
+    try std.testing.expectEqual(@as(usize, 1), found.table.sort_keys.len);
+    try std.testing.expectEqualStrings("id", found.table.sort_keys[0]);
+}
+
 test "addEntry: replaces existing entry with same db+name" {
     const allocator = std.testing.allocator;
-    const json = \\{"tables": [{"db": "default", "name": "t", "columns": [{"name": "id", "type": "Int32"}]}]}
+    const json =
+        \\{"tables": [{"db": "default", "name": "t", "columns": [{"name": "id", "type": "Int32"}]}]}
     ;
     var cfg = try loadFromSlice(allocator, json);
     defer cfg.deinit();
@@ -430,7 +463,8 @@ test "addEntry: replaces existing entry with same db+name" {
 
 test "addEntry: multiple tables" {
     const allocator = std.testing.allocator;
-    const json = \\{"tables": []}
+    const json =
+        \\{"tables": []}
     ;
     var cfg = try loadFromSlice(allocator, json);
     defer cfg.deinit();
@@ -438,11 +472,15 @@ test "addEntry: multiple tables" {
     const cols_a = [_]schema.Column{.{ .name = "x", .ty = .int16 }};
     const cols_b = [_]schema.Column{.{ .name = "y", .ty = .text }};
     try cfg.addEntry(allocator, .{
-        .db = "db", .name = "a", .pk = null,
+        .db = "db",
+        .name = "a",
+        .pk = null,
         .table = .{ .name = "a", .columns = &cols_a },
     });
     try cfg.addEntry(allocator, .{
-        .db = "db", .name = "b", .pk = null,
+        .db = "db",
+        .name = "b",
+        .pk = null,
         .table = .{ .name = "b", .columns = &cols_b },
     });
 

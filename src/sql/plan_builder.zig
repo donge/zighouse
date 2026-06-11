@@ -11,7 +11,6 @@
 ///   (the runtime text evaluator handles it)
 /// - WHERE/HAVING typed predicates → WhereNode tree (fast path for int/str/like)
 /// - WHERE/HAVING text → where_text / having_text (fallback text evaluator)
-
 const std = @import("std");
 const generic_sql = @import("../generic_sql.zig");
 const sql_parser = @import("sql_parser");
@@ -76,7 +75,7 @@ fn buildSelectPlan(allocator: Allocator, sel: ast.SelectStmt, ctes_from_parent: 
                     subquery_source = sub;
                     table = try allocator.dupe(u8, tr.name);
                 } else {
-                    table = try allocator.dupe(u8, tr.name);
+                    table = try tableRefName(allocator, tr);
                 }
             },
             .subquery => |sq| {
@@ -115,10 +114,10 @@ fn buildSelectPlan(allocator: Allocator, sel: ast.SelectStmt, ctes_from_parent: 
                 right_ptr.* = right_sub;
                 const jspec = try allocator.create(generic_sql.JoinSpec);
                 jspec.* = .{
-                    .kind     = @enumFromInt(@intFromEnum(jc.kind)),
-                    .left     = left_ptr,
-                    .right    = right_ptr,
-                    .on_left  = try on_lefts.toOwnedSlice(allocator),
+                    .kind = @enumFromInt(@intFromEnum(jc.kind)),
+                    .left = left_ptr,
+                    .right = right_ptr,
+                    .on_left = try on_lefts.toOwnedSlice(allocator),
                     .on_right = try on_rights.toOwnedSlice(allocator),
                 };
                 join_spec_out = jspec;
@@ -186,8 +185,8 @@ fn buildSelectPlan(allocator: Allocator, sel: ast.SelectStmt, ctes_from_parent: 
             // Check if it's ORDER BY COUNT(*) / count() DESC
             const is_count_order = oi.expr == .func and std.mem.eql(u8, oi.expr.func.name, "count") and
                 (oi.expr.func.args.len == 0 or
-                 (oi.expr.func.args.len == 1 and oi.expr.func.args[0] == .star) or
-                 (oi.expr.func.args.len == 1 and oi.expr.func.args[0] == .int));
+                    (oi.expr.func.args.len == 1 and oi.expr.func.args[0] == .star) or
+                    (oi.expr.func.args.len == 1 and oi.expr.func.args[0] == .int));
             if (is_count_order) {
                 order_by_count_desc = oi.desc;
             } else {
@@ -260,16 +259,24 @@ fn findCte(ctes: []ast.Cte, name: []const u8) ?*ast.Stmt {
     return null;
 }
 
+fn tableRefName(allocator: Allocator, tr: ast.TableRef) BuildError![]const u8 {
+    if (tr.db) |db| return std.fmt.allocPrint(allocator, "{s}.{s}", .{ db, tr.name });
+    return allocator.dupe(u8, tr.name);
+}
+
 /// Build a minimal Plan from a single FromClause (used for JOIN sub-trees).
 /// For simple tables/CTEs only sets table; for join, recurses.
 fn buildFromClause(allocator: Allocator, from: ast.FromClause, ctes: []ast.Cte) BuildError!Plan {
     switch (from) {
         .table => |tr| {
-            var p = Plan{ .table = try allocator.dupe(u8, tr.name), .projections = &.{}, .owned = true };
+            var p = Plan{ .table = undefined, .projections = &.{}, .owned = true };
             if (findCte(ctes, tr.name)) |cte_stmt| {
                 const sub = try allocator.create(Plan);
                 sub.* = try buildPlan(allocator, cte_stmt, ctes);
                 p.subquery_source = sub;
+                p.table = try allocator.dupe(u8, tr.name);
+            } else {
+                p.table = try tableRefName(allocator, tr);
             }
             return p;
         },
@@ -309,10 +316,10 @@ fn buildFromClause(allocator: Allocator, from: ast.FromClause, ctes: []ast.Cte) 
             right_ptr.* = right_sub;
             const jspec = try allocator.create(generic_sql.JoinSpec);
             jspec.* = .{
-                .kind     = @enumFromInt(@intFromEnum(jc.kind)),
-                .left     = left_ptr,
-                .right    = right_ptr,
-                .on_left  = try on_lefts.toOwnedSlice(allocator),
+                .kind = @enumFromInt(@intFromEnum(jc.kind)),
+                .left = left_ptr,
+                .right = right_ptr,
+                .on_left = try on_lefts.toOwnedSlice(allocator),
                 .on_right = try on_rights.toOwnedSlice(allocator),
             };
             return Plan{ .table = try allocator.dupe(u8, left_sub.table), .projections = &.{}, .join = jspec, .owned = true };
@@ -324,7 +331,7 @@ fn buildFromClause(allocator: Allocator, from: ast.FromClause, ctes: []ast.Cte) 
 fn extractEquiKeys(
     allocator: Allocator,
     expr: ast.Expr,
-    lefts:  *std.ArrayListUnmanaged([]const u8),
+    lefts: *std.ArrayListUnmanaged([]const u8),
     rights: *std.ArrayListUnmanaged([]const u8),
 ) BuildError!void {
     switch (expr) {
@@ -371,7 +378,8 @@ fn buildFuncExpr(allocator: Allocator, f: ast.FuncExpr, alias: ?[]const u8, ctes
     // COUNT(*) / count() / count(1)
     if (std.mem.eql(u8, name, "count") and (f.args.len == 0 or
         (f.args.len == 1 and f.args[0] == .star) or
-        (f.args.len == 1 and f.args[0] == .int))) {
+        (f.args.len == 1 and f.args[0] == .int)))
+    {
         return Expr{ .func = .count_star, .alias = alias };
     }
     // COUNT(DISTINCT col)
@@ -385,7 +393,7 @@ fn buildFuncExpr(allocator: Allocator, f: ast.FuncExpr, alias: ?[]const u8, ctes
         // Detect col + constant pattern: SUM(col + 42) → .column = col, .int_offset = 42
         if (arg == .binop and arg.binop.op == .add and arg.binop.left == .col) {
             switch (arg.binop.right) {
-                .int  => |v| return Expr{ .func = .sum, .column = try allocator.dupe(u8, arg.binop.left.col), .int_offset = v, .alias = alias },
+                .int => |v| return Expr{ .func = .sum, .column = try allocator.dupe(u8, arg.binop.left.col), .int_offset = v, .alias = alias },
                 .uint => |v| return Expr{ .func = .sum, .column = try allocator.dupe(u8, arg.binop.left.col), .int_offset = @intCast(v), .alias = alias },
                 else => {},
             }
@@ -475,15 +483,17 @@ fn buildFuncExpr(allocator: Allocator, f: ast.FuncExpr, alias: ?[]const u8, ctes
 
     // uniq(col) / uniqHLL12(col) → uniqExact (exact distinct; memory tradeoff accepted)
     if ((std.mem.eql(u8, name, "uniq") or
-         std.mem.eql(u8, name, "uniqhll12") or
-         std.mem.eql(u8, name, "uniq_hll12")) and f.args.len == 1) {
+        std.mem.eql(u8, name, "uniqhll12") or
+        std.mem.eql(u8, name, "uniq_hll12")) and f.args.len == 1)
+    {
         const col = try firstArgText(allocator, f.args, ctes);
         return Expr{ .func = .uniq_exact, .column = col, .alias = alias };
     }
     // uniqHLL12(a,b,c) multi-arg → uniq_exact on concat(a,'|',b,'|',c)
     if ((std.mem.eql(u8, name, "uniqhll12") or
-         std.mem.eql(u8, name, "uniq_hll12") or
-         std.mem.eql(u8, name, "uniq")) and f.args.len >= 2) {
+        std.mem.eql(u8, name, "uniq_hll12") or
+        std.mem.eql(u8, name, "uniq")) and f.args.len >= 2)
+    {
         var buf: std.ArrayListUnmanaged(u8) = .empty;
         try buf.appendSlice(allocator, "concat(");
         for (f.args, 0..) |arg, i| {
@@ -498,8 +508,9 @@ fn buildFuncExpr(allocator: Allocator, f: ast.FuncExpr, alias: ?[]const u8, ctes
     }
     // uniqHLL12If(col,cond) → uniq_exact_if(col,cond)
     if ((std.mem.eql(u8, name, "uniqhll12if") or
-         std.mem.eql(u8, name, "uniq_hll12_if") or
-         std.mem.eql(u8, name, "uniqif")) and f.args.len == 2) {
+        std.mem.eql(u8, name, "uniq_hll12_if") or
+        std.mem.eql(u8, name, "uniqif")) and f.args.len == 2)
+    {
         const col = try exprToText(allocator, f.args[0], ctes);
         const cond = try buildCondExpr(allocator, f.args[1], ctes);
         const cond_ptr = try allocator.create(CondExpr);
@@ -518,7 +529,7 @@ fn buildFuncExpr(allocator: Allocator, f: ast.FuncExpr, alias: ?[]const u8, ctes
     }
     // sumIf(col, cond) → sum(if(cond, col, 0))  — avoids pipeline changes
     if ((std.mem.eql(u8, name, "sumif") or std.mem.eql(u8, name, "sum_if")) and f.args.len == 2) {
-        const col_text  = try exprToText(allocator, f.args[0], ctes);
+        const col_text = try exprToText(allocator, f.args[0], ctes);
         defer allocator.free(col_text);
         const cond_text = try exprToText(allocator, f.args[1], ctes);
         defer allocator.free(cond_text);
@@ -553,8 +564,8 @@ fn buildFuncExpr(allocator: Allocator, f: ast.FuncExpr, alias: ?[]const u8, ctes
         const mapped: ?[]const u8 = blk: {
             if (std.ascii.eqlIgnoreCase(col_name, "EventTime")) {
                 if (std.ascii.eqlIgnoreCase(unit, "minute")) break :blk "EventMinuteOfHour";
-                if (std.ascii.eqlIgnoreCase(unit, "hour"))   break :blk "EventHour";
-                if (std.ascii.eqlIgnoreCase(unit, "day"))    break :blk "EventDate";
+                if (std.ascii.eqlIgnoreCase(unit, "hour")) break :blk "EventHour";
+                if (std.ascii.eqlIgnoreCase(unit, "day")) break :blk "EventDate";
             }
             break :blk null;
         };
@@ -586,11 +597,11 @@ fn buildCondExpr(allocator: Allocator, e: ast.Expr, ctes: []ast.Cte) BuildError!
     if (e == .binop) {
         const bo = e.binop;
         const op = switch (bo.op) {
-            .eq  => generic_sql.CmpOp.eq,
+            .eq => generic_sql.CmpOp.eq,
             .neq => generic_sql.CmpOp.ne,
-            .lt  => generic_sql.CmpOp.lt,
+            .lt => generic_sql.CmpOp.lt,
             .lte => generic_sql.CmpOp.le,
-            .gt  => generic_sql.CmpOp.gt,
+            .gt => generic_sql.CmpOp.gt,
             .gte => generic_sql.CmpOp.ge,
             else => {
                 // Complex — store as text
@@ -601,10 +612,10 @@ fn buildCondExpr(allocator: Allocator, e: ast.Expr, ctes: []ast.Cte) BuildError!
         if (bo.left == .col) {
             const col = try allocator.dupe(u8, bo.left.col);
             switch (bo.right) {
-                .int  => |v| return CondExpr{ .cond_col = col, .cond_op = op, .cond_num = @floatFromInt(v) },
+                .int => |v| return CondExpr{ .cond_col = col, .cond_op = op, .cond_num = @floatFromInt(v) },
                 .uint => |v| return CondExpr{ .cond_col = col, .cond_op = op, .cond_num = @floatFromInt(v) },
                 .float => |v| return CondExpr{ .cond_col = col, .cond_op = op, .cond_num = v },
-                .str  => |v| {
+                .str => |v| {
                     const s = try allocator.dupe(u8, v);
                     return CondExpr{ .cond_col = col, .cond_op = op, .cond_str = s };
                 },
@@ -652,11 +663,11 @@ fn buildWhereNode(allocator: Allocator, e: ast.Expr, ctes: []ast.Cte) BuildError
                 },
                 .eq, .neq, .lt, .lte, .gt, .gte => {
                     const cmp_op = switch (bo.op) {
-                        .eq  => CmpOp.eq,
+                        .eq => CmpOp.eq,
                         .neq => CmpOp.ne,
-                        .lt  => CmpOp.lt,
+                        .lt => CmpOp.lt,
                         .lte => CmpOp.le,
-                        .gt  => CmpOp.gt,
+                        .gt => CmpOp.gt,
                         .gte => CmpOp.ge,
                         else => unreachable,
                     };
@@ -666,14 +677,22 @@ fn buildWhereNode(allocator: Allocator, e: ast.Expr, ctes: []ast.Cte) BuildError
                     else
                         exprToText(allocator, bo.left, ctes) catch return error.UnsupportedFeature;
                     switch (bo.right) {
-                        .int  => |v| { node.* = .{ .cmp_int = .{ .col = col, .op = cmp_op, .val = v } }; return node; },
-                        .uint => |v| { node.* = .{ .cmp_int = .{ .col = col, .op = cmp_op, .val = @intCast(v) } }; return node; },
-                        .str  => |v| {
+                        .int => |v| {
+                            node.* = .{ .cmp_int = .{ .col = col, .op = cmp_op, .val = v } };
+                            return node;
+                        },
+                        .uint => |v| {
+                            node.* = .{ .cmp_int = .{ .col = col, .op = cmp_op, .val = @intCast(v) } };
+                            return node;
+                        },
+                        .str => |v| {
                             const val = try allocator.dupe(u8, v);
                             node.* = .{ .cmp_str = .{ .col = col, .op = cmp_op, .val = val } };
                             return node;
                         },
-                        else => { allocator.free(col); },
+                        else => {
+                            allocator.free(col);
+                        },
                     }
                     return error.UnsupportedFeature;
                 },
@@ -699,7 +718,10 @@ fn buildWhereNode(allocator: Allocator, e: ast.Expr, ctes: []ast.Cte) BuildError
             }
         },
         .is_null => |isn| {
-            const col = try allocator.dupe(u8, (switch (isn.val) { .col => |c| c, else => return error.UnsupportedFeature }));
+            const col = try allocator.dupe(u8, (switch (isn.val) {
+                .col => |c| c,
+                else => return error.UnsupportedFeature,
+            }));
             node.* = if (isn.is_not) .{ .is_not_null = col } else .{ .is_null = col };
             return node;
         },
@@ -718,9 +740,9 @@ fn buildWhereNode(allocator: Allocator, e: ast.Expr, ctes: []ast.Cte) BuildError
             }
             for (il.items) |item| {
                 const val: i64 = switch (item) {
-                    .int  => |v| v,
+                    .int => |v| v,
                     .uint => |v| @intCast(v),
-                    else  => return error.UnsupportedFeature,
+                    else => return error.UnsupportedFeature,
                 };
                 const col_copy = try allocator.dupe(u8, il.lhs.col);
                 errdefer allocator.free(col_copy);
@@ -754,7 +776,7 @@ fn flattenAndOr(allocator: Allocator, e: ast.Expr, op: enum { and_, or_ }, out: 
         const bo = e.binop;
         const is_same = switch (op) {
             .and_ => bo.op == .and_,
-            .or_  => bo.op == .or_,
+            .or_ => bo.op == .or_,
         };
         if (is_same) {
             try flattenAndOr(allocator, bo.left, op, out, ctes);
@@ -806,7 +828,8 @@ pub fn exprToText(allocator: Allocator, e: ast.Expr, ctes: []ast.Cte) BuildError
             // count(*) / count() / count(1) → always render as count(*)
             if (std.mem.eql(u8, f.name, "count") and (f.args.len == 0 or
                 (f.args.len == 1 and f.args[0] == .star) or
-                (f.args.len == 1 and f.args[0] == .int))) {
+                (f.args.len == 1 and f.args[0] == .int)))
+            {
                 return allocator.dupe(u8, "count(*)");
             }
             var buf: std.ArrayListUnmanaged(u8) = .empty;
@@ -828,31 +851,29 @@ pub fn exprToText(allocator: Allocator, e: ast.Expr, ctes: []ast.Cte) BuildError
             const rtext = try exprToText(allocator, bo.right, ctes);
             defer allocator.free(rtext);
             const op_str: []const u8 = switch (bo.op) {
-                .eq     => "=",
-                .neq    => "<>",
-                .lt     => "<",
-                .lte    => "<=",
-                .gt     => ">",
-                .gte    => ">=",
-                .and_   => "AND",
-                .or_    => "OR",
-                .add    => "+",
-                .sub    => "-",
-                .mul    => "*",
-                .div    => "/",
-                .mod    => "%",
+                .eq => "=",
+                .neq => "<>",
+                .lt => "<",
+                .lte => "<=",
+                .gt => ">",
+                .gte => ">=",
+                .and_ => "AND",
+                .or_ => "OR",
+                .add => "+",
+                .sub => "-",
+                .mul => "*",
+                .div => "/",
+                .mod => "%",
                 .concat => "||",
-                .like   => "LIKE",
+                .like => "LIKE",
                 .not_like => "NOT LIKE",
             };
             // Only arithmetic operators need parentheses for precedence.
             // Comparison and logical operators are rendered without parens so
             // that where_text can be passed to parseFilter correctly.
             return switch (bo.op) {
-                .add, .sub, .mul, .div, .mod, .concat =>
-                    std.fmt.allocPrint(allocator, "({s} {s} {s})", .{ ltext, op_str, rtext }),
-                else =>
-                    std.fmt.allocPrint(allocator, "{s} {s} {s}", .{ ltext, op_str, rtext }),
+                .add, .sub, .mul, .div, .mod, .concat => std.fmt.allocPrint(allocator, "({s} {s} {s})", .{ ltext, op_str, rtext }),
+                else => std.fmt.allocPrint(allocator, "{s} {s} {s}", .{ ltext, op_str, rtext }),
             };
         },
         .not => |inner| {
