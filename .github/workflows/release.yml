@@ -26,13 +26,13 @@ jobs:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v1
         with:
-          version: 0.14.0
+          version: 0.16.0
       - run: zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseFast -Dstrip=true -Dstatic-libs=true
       - run: |
           BIN="zighouse-${{ matrix.suffix }}"
           cp zig-out/bin/zighouse "$BIN"
+          chmod +x "$BIN"
           gzip -k "$BIN"
-          tar czf "$BIN.tar.gz" zighouse
           rm -f "$BIN"
       - uses: softprops/action-gh-release@v2
         with:
