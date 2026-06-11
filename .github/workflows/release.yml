@@ -3,6 +3,9 @@ on:
   push:
     tags: 'v*'
 
+permissions:
+  contents: write
+
 jobs:
   build:
     name: Build ${{ matrix.target }}
@@ -44,4 +47,4 @@ jobs:
       - uses: softprops/action-gh-release@v2
         with:
           files: zighouse-*.tar.gz
-          generate_release_notes: true
+          fail_on_unmatched_files: false
