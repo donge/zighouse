@@ -34,7 +34,7 @@ pub const ServerCtx = struct {
 
 // ── Protocol constants ──────────────────────────────────────────────────────
 
-const REVISION: u64 = 54460;
+const REVISION: u64 = 54455; // below 54456 (PROFILE_EVENTS_IN_INSERT) to skip profile-events-after-insert
 const DBMS_MIN_REVISION_WITH_CUSTOM_SERIALIZATION: u64 = 54454;
 const DBMS_MIN_PROTOCOL_VERSION_WITH_ADDENDUM: u64 = 54458;
 const DBMS_MIN_PROTOCOL_VERSION_WITH_PARAMETERS: u64 = 54459;
@@ -241,7 +241,7 @@ fn chTypeName(col: schema.Column) []const u8 {
 
 // ── Read ClientQuery packet (packet byte already consumed) ──────────────────
 
-fn readClientQuery(a: std.mem.Allocator, rd: TcpReader, client_rev: u64) ![]u8 {
+fn readClientQuery(a: std.mem.Allocator, rd: TcpReader, used_revision: u64) ![]u8 {
     try rd.skipString(); // query_id
 
     // client_info
@@ -249,7 +249,7 @@ fn readClientQuery(a: std.mem.Allocator, rd: TcpReader, client_rev: u64) ![]u8 {
     try rd.skipString(); // initial_user
     try rd.skipString(); // initial_query_id
     try rd.skipString(); // initial_address
-    if (client_rev >= 54449) _ = try rd.readInt(i64, .little); // initial_query_start_time_us
+    if (used_revision >= 54449) _ = try rd.readInt(i64, .little); // initial_query_start_time_us
     _ = try rd.readByte(); // interface
     try rd.skipString(); // os_user
     try rd.skipString(); // client_hostname
@@ -257,10 +257,10 @@ fn readClientQuery(a: std.mem.Allocator, rd: TcpReader, client_rev: u64) ![]u8 {
     _ = try rd.readUVarInt(); // version_major
     _ = try rd.readUVarInt(); // version_minor
     _ = try rd.readUVarInt(); // tcp_protocol_version
-    if (client_rev >= 54060) try rd.skipString(); // quota_key in client_info
-    if (client_rev >= 54448) _ = try rd.readUVarInt(); // distributed_depth
-    if (client_rev >= 54401) _ = try rd.readUVarInt(); // version_patch
-    if (client_rev >= 54442) {
+    if (used_revision >= 54060) try rd.skipString(); // quota_key in client_info
+    if (used_revision >= 54448) _ = try rd.readUVarInt(); // distributed_depth
+    if (used_revision >= 54401) _ = try rd.readUVarInt(); // version_patch
+    if (used_revision >= 54442) {
         const has_trace = try rd.readByte();
         if (has_trace != 0) {
             try rd.skipBytes(16 + 8, .{}); // trace_id + span_id
@@ -268,7 +268,7 @@ fn readClientQuery(a: std.mem.Allocator, rd: TcpReader, client_rev: u64) ![]u8 {
             _ = try rd.readByte(); // trace_flags
         }
     }
-    if (client_rev >= 54453) {
+    if (used_revision >= 54453) {
         _ = try rd.readUVarInt(); _ = try rd.readUVarInt(); _ = try rd.readUVarInt();
     }
 
@@ -281,13 +281,13 @@ fn readClientQuery(a: std.mem.Allocator, rd: TcpReader, client_rev: u64) ![]u8 {
         try rd.skipString();
     }
 
-    if (client_rev >= 54441) try rd.skipString(); // interserver secret
+    if (used_revision >= 54441) try rd.skipString(); // interserver secret
 
     _ = try rd.readByte(); // state
     _ = try rd.readByte(); // compression
     const sql = try rd.readString(a);
 
-    if (client_rev >= DBMS_MIN_PROTOCOL_VERSION_WITH_PARAMETERS) {
+    if (used_revision >= DBMS_MIN_PROTOCOL_VERSION_WITH_PARAMETERS) {
         while (true) {
             const pk = try rd.readString(a);
             defer a.free(pk);
@@ -342,7 +342,8 @@ fn wireKind(ch_type: []const u8) WireKind {
     if (std.ascii.eqlIgnoreCase(ch_type, "Int8") or std.ascii.eqlIgnoreCase(ch_type, "UInt8")) return .fixed1;
     if (std.ascii.eqlIgnoreCase(ch_type, "Int16") or std.ascii.eqlIgnoreCase(ch_type, "UInt16")) return .fixed2;
     if (std.ascii.eqlIgnoreCase(ch_type, "Int32") or std.ascii.eqlIgnoreCase(ch_type, "UInt32") or
-        std.ascii.eqlIgnoreCase(ch_type, "Float32") or std.ascii.eqlIgnoreCase(ch_type, "Date")) return .fixed4;
+        std.ascii.eqlIgnoreCase(ch_type, "Float32")) return .fixed4;
+    if (std.ascii.eqlIgnoreCase(ch_type, "Date")) return .fixed2;
     if (std.ascii.eqlIgnoreCase(ch_type, "Int64") or std.ascii.eqlIgnoreCase(ch_type, "UInt64") or
         std.ascii.eqlIgnoreCase(ch_type, "Float64")) return .fixed8;
     if (std.ascii.startsWithIgnoreCase(ch_type, "DateTime64")) return .fixed8;
@@ -674,8 +675,10 @@ fn handleConn(ctx: *ServerCtx, stream: net.Stream) !void {
 
     try sendHello(a, w);
 
-    // Addendum
-    if (client_rev >= DBMS_MIN_PROTOCOL_VERSION_WITH_ADDENDUM) {
+    const used_revision = @min(client_rev, REVISION);
+
+    // Addendum (quota_key) — sent by client AFTER hello exchange, conditional on used_revision
+    if (used_revision >= DBMS_MIN_PROTOCOL_VERSION_WITH_ADDENDUM) {
         try rd.skipString(); // quota_key
     }
 
@@ -688,7 +691,7 @@ fn handleConn(ctx: *ServerCtx, stream: net.Stream) !void {
         switch (pkt) {
             CLIENT_PING => try sendPong(w),
             CLIENT_QUERY => {
-                const sql = try readClientQuery(a, rd, client_rev);
+                const sql = try readClientQuery(a, rd, used_revision);
                 defer a.free(sql);
                 // Consume trailing empty ClientData
                 const trailing = rd.readByte() catch 0xFF;

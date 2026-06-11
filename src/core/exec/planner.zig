@@ -9,18 +9,18 @@
 ///   var rs    = try pipeline.executePlan(node, ctx);
 const std = @import("std");
 const generic_sql = @import("generic_sql");
-const schema_mod  = @import("schema");
-const core        = @import("core");
-const plan        = core.exec.plan;
-const core_types  = core.types;
+const schema_mod = @import("schema");
+const core = @import("core");
+const plan = core.exec.plan;
+const core_types = core.types;
 
-pub const ColumnType    = core_types.ColumnType;
-pub const PhysicalNode  = plan.PhysicalNode;
-pub const ProjectItem   = plan.ProjectItem;
-pub const Expr          = plan.Expr;
-pub const ColRef        = plan.ColRef;
-pub const AggCall       = plan.AggCall;
-pub const SortKey       = plan.SortKey;
+pub const ColumnType = core_types.ColumnType;
+pub const PhysicalNode = plan.PhysicalNode;
+pub const ProjectItem = plan.ProjectItem;
+pub const Expr = plan.Expr;
+pub const ColRef = plan.ColRef;
+pub const AggCall = plan.AggCall;
+pub const SortKey = plan.SortKey;
 
 // ── PlannerCtx ────────────────────────────────────────────────────────────────
 
@@ -35,6 +35,8 @@ pub const PlannerCtx = struct {
     /// Virtual columns from the agg output (alias → output index).
     /// Used to resolve __ha__* references in post-agg scalar projections.
     virtual_cols: []const VirtualCol = &.{},
+    /// User-defined functions: name → lambda string "(params) -> body"
+    user_functions: ?*const std.StringHashMap([]const u8) = null,
 
     pub fn init(alloc: std.mem.Allocator, tbl: ?schema_mod.Table) PlannerCtx {
         return .{ .alloc = alloc, .tbl = tbl };
@@ -46,11 +48,10 @@ pub const PlannerCtx = struct {
 /// Collect all col_ref indices used in an Expr tree into a bitset.
 fn collectExprCols(expr: Expr, used: *std.bit_set.IntegerBitSet(256)) void {
     switch (expr) {
-        .col_ref => |r| { if (r.index < 256) used.set(r.index); },
-        .add, .sub, .mul, .div, .mod,
-        .eq, .neq, .lt, .lte, .gt, .gte,
-        .@"and", .@"or",
-        .like, .not_like, .concat => |b| {
+        .col_ref => |r| {
+            if (r.index < 256) used.set(r.index);
+        },
+        .add, .sub, .mul, .div, .mod, .eq, .neq, .lt, .lte, .gt, .gte, .@"and", .@"or", .like, .not_like, .concat => |b| {
             collectExprCols(b.left, used);
             collectExprCols(b.right, used);
         },
@@ -74,8 +75,8 @@ fn collectExprCols(expr: Expr, used: *std.bit_set.IntegerBitSet(256)) void {
 /// Walk the plan tree and collect all col_ref indices into `used`.
 fn collectPlanCols(node: *const PhysicalNode, used: *std.bit_set.IntegerBitSet(256)) void {
     switch (node.*) {
-        .part_scan  => {},  // leaf — no exprs
-        .mem_scan   => {},
+        .part_scan => {}, // leaf — no exprs
+        .mem_scan => {},
         .chunk_source => |cs| collectPlanCols(cs.input, used),
         .filter => |f| {
             collectPlanCols(f.input, used);
@@ -166,15 +167,15 @@ fn pushdownColumns(
 /// plan (e.g. a VALUES literal) or when column pruning was not applied.
 pub fn findPrunedCols(node: *const PhysicalNode) []const []const u8 {
     return switch (node.*) {
-        .part_scan  => |ps| ps.columns,
-        .filter     => |f|  findPrunedCols(f.input),
-        .project    => |p|  findPrunedCols(p.input),
-        .hash_agg   => |a|  findPrunedCols(a.input),
-        .scalar_agg => |a|  findPrunedCols(a.input),
-        .top_k      => |t|  findPrunedCols(t.input),
-        .limit      => |l|  findPrunedCols(l.input),
-        .order_by   => |o|  findPrunedCols(o.input),
-        else        =>      &.{},
+        .part_scan => |ps| ps.columns,
+        .filter => |f| findPrunedCols(f.input),
+        .project => |p| findPrunedCols(p.input),
+        .hash_agg => |a| findPrunedCols(a.input),
+        .scalar_agg => |a| findPrunedCols(a.input),
+        .top_k => |t| findPrunedCols(t.input),
+        .limit => |l| findPrunedCols(l.input),
+        .order_by => |o| findPrunedCols(o.input),
+        else => &.{},
     };
 }
 
@@ -218,7 +219,7 @@ pub fn plan_query(
     var source: *PhysicalNode = blk: {
         if (gplan.join) |js| {
             // JOIN: recursively plan each side and create a hash_join node.
-            const left_node  = try plan_query(ctx, js.left.*)  orelse return null;
+            const left_node = try plan_query(ctx, js.left.*) orelse return null;
             const right_node = try plan_query(ctx, js.right.*) orelse return null;
             // Resolve key column names to indices in the respective sub-plan outputs.
             // For now, use the table schema (ctx.tbl) for name→index lookup on both sides.
@@ -233,18 +234,18 @@ pub fn plan_query(
             const equi_keys = try equi_list.toOwnedSlice(ctx.alloc);
             const join_type: plan.HashJoinNode.JoinType = switch (js.kind) {
                 .inner => .inner,
-                .left  => .left,
+                .left => .left,
                 .right => .right,
-                .full  => .full,
+                .full => .full,
             };
             const n = try ctx.alloc.create(PhysicalNode);
             n.* = .{ .hash_join = .{
-                .left      = left_node,
-                .right     = right_node,
+                .left = left_node,
+                .right = right_node,
                 .join_type = join_type,
                 .equi_keys = equi_keys,
-                .filter    = null,
-            }};
+                .filter = null,
+            } };
             break :blk n;
         } else if (gplan.subquery_source) |sq| {
             // Subquery in FROM.
@@ -256,11 +257,11 @@ pub fn plan_query(
             const n = try ctx.alloc.create(PhysicalNode);
             const tbl_name = try ctx.alloc.dupe(u8, gplan.table);
             n.* = .{ .part_scan = .{
-                .db      = "",
-                .table   = tbl_name,
+                .db = "",
+                .table = tbl_name,
                 .columns = &.{},
-                .filter  = null,
-            }};
+                .filter = null,
+            } };
             break :blk n;
         }
     };
@@ -289,7 +290,10 @@ pub fn plan_query(
     // Determine if there are any aggregate functions.
     var has_agg = false;
     for (projs) |p| {
-        if (isAggregate(p.func)) { has_agg = true; break; }
+        if (isAggregate(p.func)) {
+            has_agg = true;
+            break;
+        }
     }
 
     var order_by_text_handled = false; // track if ORDER BY was consumed by sort-before-project
@@ -312,13 +316,16 @@ pub fn plan_query(
                 var desc = false;
                 const col_part = if (std.ascii.endsWithIgnoreCase(item, " desc")) blk: {
                     desc = true;
-                    break :blk std.mem.trimEnd(u8, item[0..item.len - 5], " \t");
+                    break :blk std.mem.trimEnd(u8, item[0 .. item.len - 5], " \t");
                 } else if (std.ascii.endsWithIgnoreCase(item, " asc")) blk: {
-                    break :blk std.mem.trimEnd(u8, item[0..item.len - 4], " \t");
+                    break :blk std.mem.trimEnd(u8, item[0 .. item.len - 4], " \t");
                 } else item;
                 // Only simple schema column idents (no parens, spaces, commas within a single item).
                 const is_simple = std.mem.indexOfAny(u8, col_part, " \t(") == null;
-                if (!is_simple) { all_resolved = false; break; }
+                if (!is_simple) {
+                    all_resolved = false;
+                    break;
+                }
                 if (tbl.findColumn(col_part)) |schema_idx| {
                     try sort_keys_list.append(ctx.alloc, .{ .col_idx = schema_idx, .desc = desc, .nulls_first = false });
                 } else {
@@ -354,8 +361,8 @@ pub fn plan_query(
         // Also detect "__aj__*" helper columns produced by rewriteArrayJoin:
         // these are arrayJoin expansion columns that serve as agg arguments
         // but should NOT be GROUP BY keys themselves.
-        var key_items_list:  std.ArrayListUnmanaged(ProjectItem) = .empty;
-        var agg_items_list:  std.ArrayListUnmanaged(ProjectItem) = .empty;
+        var key_items_list: std.ArrayListUnmanaged(ProjectItem) = .empty;
+        var agg_items_list: std.ArrayListUnmanaged(ProjectItem) = .empty;
 
         // Check whether any non-agg projection has an "__aj__" alias (ARRAY JOIN helper).
         var has_aj_cols = false;
@@ -408,8 +415,8 @@ pub fn plan_query(
                 const ref = try ctx.alloc.create(plan.ColRef);
                 ref.* = .{ .index = ki, .name = src.alias };
                 hash_keys[ki] = .{
-                    .expr     = Expr{ .col_ref = ref.* },
-                    .alias    = src.alias,
+                    .expr = Expr{ .col_ref = ref.* },
+                    .alias = src.alias,
                     .out_type = src.out_type,
                 };
             }
@@ -419,7 +426,10 @@ pub fn plan_query(
                 if (!isAggregate(p.func)) continue;
                 // Build agg item with resolved arg from pre-project output.
                 const agg_item = try aggExprToProjectItemWithPreProject(
-                    ctx, p, pre_items, real_key_count,
+                    ctx,
+                    p,
+                    pre_items,
+                    real_key_count,
                 ) orelse return null;
                 try agg_items_list.append(ctx.alloc, agg_item);
             }
@@ -427,11 +437,11 @@ pub fn plan_query(
 
             const agg_node = try ctx.alloc.create(PhysicalNode);
             agg_node.* = .{ .hash_agg = .{
-                .input    = pre_proj_node,
-                .keys     = hash_keys,
-                .aggs     = agg_items,
+                .input = pre_proj_node,
+                .keys = hash_keys,
+                .aggs = agg_items,
                 .strategy = inferHashAggStrategy(hash_keys, agg_items),
-            }};
+            } };
             source = agg_node;
         } else {
             // ── Normal aggregation (no ARRAY JOIN helpers) ────────────────
@@ -469,11 +479,11 @@ pub fn plan_query(
                 agg_node.* = .{ .scalar_agg = .{ .input = source, .aggs = agg_items } };
             } else {
                 agg_node.* = .{ .hash_agg = .{
-                    .input    = source,
-                    .keys     = key_items,
-                    .aggs     = agg_items,
+                    .input = source,
+                    .keys = key_items,
+                    .aggs = agg_items,
                     .strategy = inferHashAggStrategy(key_items, agg_items),
-                }};
+                } };
             }
             source = agg_node;
 
@@ -499,7 +509,9 @@ pub fn plan_query(
                     });
                 }
                 ctx.virtual_cols = try vcols_list.toOwnedSlice(ctx.alloc);
-                defer { ctx.virtual_cols = &.{}; } // reset after this block
+                defer {
+                    ctx.virtual_cols = &.{};
+                } // reset after this block
 
                 // Build post-project items: all key_items (as pass-through col refs)
                 // plus the post-agg scalar expressions (which reference __ha__* cols).
@@ -647,9 +659,9 @@ pub fn plan_query(
                 var desc = false;
                 const col_part = if (std.ascii.endsWithIgnoreCase(item, " desc")) blk: {
                     desc = true;
-                    break :blk std.mem.trimEnd(u8, item[0..item.len - 5], " \t");
+                    break :blk std.mem.trimEnd(u8, item[0 .. item.len - 5], " \t");
                 } else if (std.ascii.endsWithIgnoreCase(item, " asc")) blk: {
-                    break :blk std.mem.trimEnd(u8, item[0..item.len - 4], " \t");
+                    break :blk std.mem.trimEnd(u8, item[0 .. item.len - 4], " \t");
                 } else item;
 
                 if (findOutputColIdx(source, col_part)) |col_idx| {
@@ -702,15 +714,15 @@ pub fn plan_query(
         const offset = gplan.offset orelse 0;
         const already_topk = switch (source.*) {
             .top_k => true,
-            else   => false,
+            else => false,
         };
         if (!already_topk or offset > 0) {
             const lim_node = try ctx.alloc.create(PhysicalNode);
             lim_node.* = .{ .limit = .{
-                .input  = source,
-                .limit  = @intCast(lim),
+                .input = source,
+                .limit = @intCast(lim),
                 .offset = @intCast(offset),
-            }};
+            } };
             source = lim_node;
         }
     }
@@ -729,11 +741,11 @@ pub fn plan_query(
 
 fn findOutputColIdx(node: *const PhysicalNode, name: []const u8) ?usize {
     switch (node.*) {
-        .project    => |p| {
+        .project => |p| {
             for (p.items, 0..) |item, i| if (std.mem.eql(u8, item.alias, name)) return i;
             return null;
         },
-        .hash_agg   => |ha| {
+        .hash_agg => |ha| {
             for (ha.keys, 0..) |item, i| if (std.mem.eql(u8, item.alias, name)) return i;
             for (ha.aggs, 0..) |item, i| if (std.mem.eql(u8, item.alias, name)) return ha.keys.len + i;
             return null;
@@ -742,24 +754,24 @@ fn findOutputColIdx(node: *const PhysicalNode, name: []const u8) ?usize {
             for (sa.aggs, 0..) |item, i| if (std.mem.eql(u8, item.alias, name)) return i;
             return null;
         },
-        .top_k      => |tk| return findOutputColIdx(tk.input, name),
-        .order_by   => |ob| return findOutputColIdx(ob.input, name),
-        .limit      => |lm| return findOutputColIdx(lm.input, name),
-        .filter     => |f|  return findOutputColIdx(f.input, name),
-        else        => return null,
+        .top_k => |tk| return findOutputColIdx(tk.input, name),
+        .order_by => |ob| return findOutputColIdx(ob.input, name),
+        .limit => |lm| return findOutputColIdx(lm.input, name),
+        .filter => |f| return findOutputColIdx(f.input, name),
+        else => return null,
     }
 }
 
 fn outputLen(node: *const PhysicalNode) usize {
     switch (node.*) {
-        .project    => |p|  return p.items.len,
-        .hash_agg   => |ha| return ha.keys.len + ha.aggs.len,
+        .project => |p| return p.items.len,
+        .hash_agg => |ha| return ha.keys.len + ha.aggs.len,
         .scalar_agg => |sa| return sa.aggs.len,
-        .top_k      => |tk| return outputLen(tk.input),
-        .order_by   => |ob| return outputLen(ob.input),
-        .limit      => |lm| return outputLen(lm.input),
-        .filter     => |f|  return outputLen(f.input),
-        else        => return 0,
+        .top_k => |tk| return outputLen(tk.input),
+        .order_by => |ob| return outputLen(ob.input),
+        .limit => |lm| return outputLen(lm.input),
+        .filter => |f| return outputLen(f.input),
+        else => return 0,
     }
 }
 
@@ -791,8 +803,8 @@ fn aggCanonName(expr: plan.Expr) ?[]const u8 {
     const ac = expr.agg_call;
     return switch (ac.kind) {
         .count_star => "count_star()",
-        .count      => "count()",
-        else        => null,
+        .count => "count()",
+        else => null,
     };
 }
 
@@ -804,7 +816,12 @@ fn parseDateStrToI64(s: []const u8) ?i64 {
     const d = std.fmt.parseInt(u32, s[8..10], 10) catch return null;
     var yr: i32 = y;
     var mo: i32 = @intCast(m);
-    if (mo <= 2) { yr -= 1; mo += 9; } else { mo -= 3; }
+    if (mo <= 2) {
+        yr -= 1;
+        mo += 9;
+    } else {
+        mo -= 3;
+    }
     const era: i32 = @divFloor(yr, 400);
     const yoe: i32 = yr - era * 400;
     const doy: i32 = @divFloor(153 * mo + 2, 5) + @as(i32, @intCast(d)) - 1;
@@ -820,15 +837,15 @@ fn whereNodeToExpr(ctx: *PlannerCtx, wn: *const generic_sql.WhereNode) ?Expr {
                 (parseArithExpr(ctx, c.col) catch null) orelse return null;
             const binop = ctx.alloc.create(plan.BinOp) catch return null;
             binop.* = .{
-                .left  = col_expr,
+                .left = col_expr,
                 .right = .{ .lit_i64 = c.val },
             };
             return switch (c.op) {
-                .eq => Expr{ .eq  = binop },
+                .eq => Expr{ .eq = binop },
                 .ne => Expr{ .neq = binop },
-                .lt => Expr{ .lt  = binop },
+                .lt => Expr{ .lt = binop },
                 .le => Expr{ .lte = binop },
-                .gt => Expr{ .gt  = binop },
+                .gt => Expr{ .gt = binop },
                 .ge => Expr{ .gte = binop },
             };
         },
@@ -845,26 +862,26 @@ fn whereNodeToExpr(ctx: *PlannerCtx, wn: *const generic_sql.WhereNode) ?Expr {
                     const binop2 = ctx.alloc.create(plan.BinOp) catch return null;
                     binop2.* = .{ .left = col_expr, .right = .{ .lit_i64 = days } };
                     return switch (c.op) {
-                        .eq => Expr{ .eq  = binop2 },
+                        .eq => Expr{ .eq = binop2 },
                         .ne => Expr{ .neq = binop2 },
-                        .lt => Expr{ .lt  = binop2 },
+                        .lt => Expr{ .lt = binop2 },
                         .le => Expr{ .lte = binop2 },
-                        .gt => Expr{ .gt  = binop2 },
+                        .gt => Expr{ .gt = binop2 },
                         .ge => Expr{ .gte = binop2 },
                     };
                 }
             }
             const binop = ctx.alloc.create(plan.BinOp) catch return null;
             binop.* = .{
-                .left  = col_expr,
+                .left = col_expr,
                 .right = .{ .lit_str = c.val },
             };
             return switch (c.op) {
-                .eq => Expr{ .eq  = binop },
+                .eq => Expr{ .eq = binop },
                 .ne => Expr{ .neq = binop },
-                .lt => Expr{ .lt  = binop },
+                .lt => Expr{ .lt = binop },
                 .le => Expr{ .lte = binop },
-                .gt => Expr{ .gt  = binop },
+                .gt => Expr{ .gt = binop },
                 .ge => Expr{ .gte = binop },
             };
         },
@@ -873,8 +890,8 @@ fn whereNodeToExpr(ctx: *PlannerCtx, wn: *const generic_sql.WhereNode) ?Expr {
             const binop = ctx.alloc.create(plan.BinOp) catch return null;
             binop.* = .{ .left = col_expr, .right = .{ .lit_str = l.pattern } };
             return switch (l.op) {
-                .like, .ilike => Expr{ .like     = binop },
-                .not_like     => Expr{ .not_like = binop },
+                .like, .ilike => Expr{ .like = binop },
+                .not_like => Expr{ .not_like = binop },
             };
         },
         .is_null => |col| {
@@ -940,22 +957,22 @@ fn resolveColExpr(ctx: *PlannerCtx, col: []const u8) ?Expr {
     }
     // Column reference
     if (ctx.tbl) |tbl| {
-         if (tbl.findColumn(col)) |idx| {
-             const ct = schemaColType(ctx, col);
-             if (ct == .array_string) {
-                 // Only Array(String) columns are supported in IR.
-                 // Map(String,*) is .string type now (custom blob format).
-                 // Non-string Arrays (Array(Float64) etc.) are not supported.
-                 if (tbl.columns[idx].ch_type) |ch| {
-                     if (!std.mem.startsWith(u8, ch, "Array(String)") and
-                         !std.mem.startsWith(u8, ch, "Array(LowCardinality(String))"))
-                         return null;
-                 } else {
-                     return null;
-                 }
-             }
-             return Expr{ .col_ref = .{ .index = idx, .name = col } };
-         }
+        if (tbl.findColumn(col)) |idx| {
+            const ct = schemaColType(ctx, col);
+            if (ct == .array_string) {
+                // Only Array(String) columns are supported in IR.
+                // Map(String,*) is .string type now (custom blob format).
+                // Non-string Arrays (Array(Float64) etc.) are not supported.
+                if (tbl.columns[idx].ch_type) |ch| {
+                    if (!std.mem.startsWith(u8, ch, "Array(String)") and
+                        !std.mem.startsWith(u8, ch, "Array(LowCardinality(String))"))
+                        return null;
+                } else {
+                    return null;
+                }
+            }
+            return Expr{ .col_ref = .{ .index = idx, .name = col } };
+        }
     }
     // Unknown column — check virtual columns (agg output) before giving up.
     for (ctx.virtual_cols) |vc| {
@@ -982,7 +999,7 @@ fn schemaToCore(ty: schema_mod.ColumnType, ch_type: ?[]const u8) ColumnType {
         // Map(String,*) stays as .string (custom blob, not array_string)
     }
     return switch (ty) {
-        .int8  => blk: {
+        .int8 => blk: {
             // UInt8 / Bool → bool_u8 (unsigned byte output)
             // Int8 (signed) → int64 to preserve negative values
             if (ch_type) |ct| if (std.mem.startsWith(u8, ct, "Int")) break :blk .int64;
@@ -1001,7 +1018,7 @@ fn schemaToCore(ty: schema_mod.ColumnType, ch_type: ?[]const u8) ColumnType {
             if (ch_type) |ct| if (std.mem.startsWith(u8, ct, "U")) break :blk .uint64;
             break :blk .int64;
         },
-        .date      => .date_u16,
+        .date => .date_u16,
         .timestamp => .datetime64_ms,
         .float32, .float64 => .float64,
         .text, .char, .low_card => .string,
@@ -1012,11 +1029,7 @@ fn schemaToCore(ty: schema_mod.ColumnType, ch_type: ?[]const u8) ColumnType {
 
 fn isAggregate(func: generic_sql.AggregateFn) bool {
     return switch (func) {
-        .count_star, .count_distinct, .count_if,
-        .sum, .avg, .min, .max,
-        .min_if, .max_if, .sum_array, .sum_array_if,
-        .uniq_exact, .uniq_exact_if,
-        .group_uniq_array, .any_val => true,
+        .count_star, .count_distinct, .count_if, .sum, .avg, .min, .max, .min_if, .max_if, .sum_array, .sum_array_if, .uniq_exact, .uniq_exact_if, .group_uniq_array, .any_val => true,
         .column_ref, .int_literal, .float_literal, .case_when, .cmp_expr => false,
     };
 }
@@ -1024,7 +1037,8 @@ fn isAggregate(func: generic_sql.AggregateFn) bool {
 fn buildProjectItems(ctx: *PlannerCtx, projs: []const generic_sql.Expr) !?[]ProjectItem {
     // Check for SELECT * (single column_ref with null column or column=="*").
     if (projs.len == 1 and projs[0].func == .column_ref and
-        (projs[0].column == null or std.mem.eql(u8, projs[0].column orelse "", "*"))) {
+        (projs[0].column == null or std.mem.eql(u8, projs[0].column orelse "", "*")))
+    {
         const tbl = ctx.tbl orelse return null;
         const ncols = tbl.columns.len;
         if (ncols == 0) return null;
@@ -1032,8 +1046,8 @@ fn buildProjectItems(ctx: *PlannerCtx, projs: []const generic_sql.Expr) !?[]Proj
         for (tbl.columns, 0..) |col, i| {
             const ct = schemaToCore(col.ty, col.ch_type);
             items[i] = ProjectItem{
-                .expr     = Expr{ .col_ref = .{ .index = i, .name = col.name } },
-                .alias    = col.name,
+                .expr = Expr{ .col_ref = .{ .index = i, .name = col.name } },
+                .alias = col.name,
                 .out_type = ct,
             };
         }
@@ -1050,21 +1064,18 @@ fn scalarExprToProjectItem(ctx: *PlannerCtx, p: generic_sql.Expr) !?ProjectItem 
     const alias = p.alias orelse p.column orelse "?";
     const col_name = p.column orelse "";
     return switch (p.func) {
-         .column_ref => blk: {
+        .column_ref => blk: {
             const col_expr = resolveColExpr(ctx, col_name) orelse {
                 // col_name might be a function call like "lower(protocol)" — try to
                 // parse it as a known scalar fn and build an fn_call Expr.
-                 const item = try tryParseFnCallItem(ctx, col_name, alias) orelse {
+                const item = try tryParseFnCallItem(ctx, col_name, alias) orelse {
                     // Last resort: try parseArithExpr for multi-arg fns like date_part.
                     const expr = try parseArithExpr(ctx, col_name) orelse synth: {
                         // Synthetic ClickBench columns: plan_builder maps
                         // date_part('unit', EventTime) → EventMinuteOfHour / EventHour / EventDate.
                         // When these are not physical schema columns, synthesize fn_call{date_part}.
                         const unit_str: ?[]const u8 =
-                            if (std.mem.eql(u8, col_name, "EventMinuteOfHour")) "minute"
-                            else if (std.mem.eql(u8, col_name, "EventHour")) "hour"
-                            else if (std.mem.eql(u8, col_name, "EventDate")) "day"
-                            else null;
+                            if (std.mem.eql(u8, col_name, "EventMinuteOfHour")) "minute" else if (std.mem.eql(u8, col_name, "EventHour")) "hour" else if (std.mem.eql(u8, col_name, "EventDate")) "day" else null;
                         if (unit_str) |unit| {
                             // Resolve EventTime column in schema.
                             const et_expr = resolveColExpr(ctx, "EventTime") orelse break :synth null;
@@ -1085,8 +1096,8 @@ fn scalarExprToProjectItem(ctx: *PlannerCtx, p: generic_sql.Expr) !?ProjectItem 
                         else => .string,
                     };
                     break :blk ProjectItem{
-                        .expr     = expr,
-                        .alias    = alias,
+                        .expr = expr,
+                        .alias = alias,
                         .out_type = synth_out_type,
                     };
                 };
@@ -1113,20 +1124,20 @@ fn scalarExprToProjectItem(ctx: *PlannerCtx, p: generic_sql.Expr) !?ProjectItem 
                 break :expr if (p.int_offset > 0) Expr{ .add = binop } else Expr{ .sub = binop };
             } else col_expr;
             break :blk ProjectItem{
-                .expr     = final_expr,
-                .alias    = alias,
+                .expr = final_expr,
+                .alias = alias,
                 .out_type = out_type,
-                .ch_type  = ch_type_override,
+                .ch_type = ch_type_override,
             };
         },
         .int_literal => ProjectItem{
-            .expr     = .{ .lit_i64 = p.int_offset },
-            .alias    = alias,
+            .expr = .{ .lit_i64 = p.int_offset },
+            .alias = alias,
             .out_type = .int64,
         },
         .float_literal => ProjectItem{
-            .expr     = .{ .lit_f64 = p.float_val },
-            .alias    = alias,
+            .expr = .{ .lit_f64 = p.float_val },
+            .alias = alias,
             .out_type = .float64,
         },
         .case_when => blk: {
@@ -1144,12 +1155,13 @@ fn scalarExprToProjectItem(ctx: *PlannerCtx, p: generic_sql.Expr) !?ProjectItem 
             }
             const else_expr: ?plan.Expr = if (cwd.else_text) |et|
                 (resolveColExpr(ctx, et) orelse (parseArithExpr(ctx, et) catch null))
-            else null;
+            else
+                null;
             const cw = ctx.alloc.create(plan.CaseWhen) catch break :blk null;
             cw.* = .{ .when = when_exprs, .then = then_exprs, .else_expr = else_expr };
             break :blk ProjectItem{
-                .expr     = Expr{ .case_when = cw },
-                .alias    = alias,
+                .expr = Expr{ .case_when = cw },
+                .alias = alias,
                 .out_type = .string, // CASE WHEN output is typically string
             };
         },
@@ -1181,66 +1193,73 @@ fn scalarExprToProjectItem(ctx: *PlannerCtx, p: generic_sql.Expr) !?ProjectItem 
 /// Known single-argument scalar functions → output ColumnType.
 const ScalarFn = struct { name: []const u8, out: ColumnType };
 const scalar_fns = [_]ScalarFn{
-    .{ .name = "lower",          .out = .string        },
-    .{ .name = "upper",          .out = .string        },
-    .{ .name = "lowerUTF8",      .out = .string        },
-    .{ .name = "upperUTF8",      .out = .string        },
-    .{ .name = "length",         .out = .int64         },
-    .{ .name = "char_length",    .out = .int64         },
-    .{ .name = "toString",       .out = .string        },
-    .{ .name = "trim",           .out = .string        },
-    .{ .name = "trimLeft",       .out = .string        },
-    .{ .name = "trimRight",      .out = .string        },
-    .{ .name = "ltrim",          .out = .string        },
-    .{ .name = "rtrim",          .out = .string        },
-    .{ .name = "abs",            .out = .float64       },
-    .{ .name = "floor",          .out = .int64         },
-    .{ .name = "ceil",           .out = .int64         },
-    .{ .name = "ceiling",        .out = .int64         },
-    .{ .name = "round",          .out = .float64       },
-    .{ .name = "toInt64",        .out = .int64         },
-    .{ .name = "toInt32",        .out = .int64         },
-    .{ .name = "toFloat64",      .out = .float64       },
-    .{ .name = "toFloat32",      .out = .float64       },
-    .{ .name = "toInt64OrZero",  .out = .int64         },
-    .{ .name = "toDate",         .out = .date_u16      },
-    .{ .name = "toDateOrZero",   .out = .date_u16      },
-    .{ .name = "toYYYYMMDD",     .out = .int64         },
-    .{ .name = "toyyyymmdd",     .out = .int64         }, // duckdb_parse lowercases it
-    .{ .name = "toStartOfHour",  .out = .datetime64_ms },
-    .{ .name = "toStartOfDay",   .out = .datetime64_ms },
-     .{ .name = "toStartOfMinute",.out = .datetime64_ms },
-     .{ .name = "isIPv4String",    .out = .bool_u8       },
-     .{ .name = "isIPv6String",    .out = .bool_u8       },
-     .{ .name = "IPv4StringToNumOrDefault", .out = .uint64 },
-     .{ .name = "IPv4NumToString", .out = .string        },
-     .{ .name = "IPv6StringToNumOrDefault", .out = .uint64 },
-     .{ .name = "IPv6NumToString", .out = .string        },
-     // Time component extractors
-     .{ .name = "toHour",                .out = .int64         },
-     .{ .name = "hour",                  .out = .int64         },
-     .{ .name = "toMinute",              .out = .int64         },
-     .{ .name = "toSecond",              .out = .int64         },
-     // Math
-     .{ .name = "sqrt",                  .out = .float64       },
-     // Array scalar aggregates
-     .{ .name = "arraySum",              .out = .float64       },
-     .{ .name = "arrayAvg",              .out = .float64       },
-     // Interval constructors (return ms as int64)
-     .{ .name = "toIntervalSecond",      .out = .int64         },
-     .{ .name = "toIntervalMinute",      .out = .int64         },
-     .{ .name = "toIntervalHour",        .out = .int64         },
-     .{ .name = "toIntervalDay",         .out = .int64         },
-     .{ .name = "toIntervalWeek",        .out = .int64         },
-     .{ .name = "toIntervalMonth",       .out = .int64         },
-     .{ .name = "toIntervalYear",        .out = .int64         },
+    .{ .name = "lower", .out = .string },
+    .{ .name = "upper", .out = .string },
+    .{ .name = "lowerUTF8", .out = .string },
+    .{ .name = "upperUTF8", .out = .string },
+    .{ .name = "length", .out = .int64 },
+    .{ .name = "char_length", .out = .int64 },
+    .{ .name = "toString", .out = .string },
+    .{ .name = "trim", .out = .string },
+    .{ .name = "trimLeft", .out = .string },
+    .{ .name = "trimRight", .out = .string },
+    .{ .name = "ltrim", .out = .string },
+    .{ .name = "rtrim", .out = .string },
+    .{ .name = "abs", .out = .float64 },
+    .{ .name = "floor", .out = .int64 },
+    .{ .name = "ceil", .out = .int64 },
+    .{ .name = "ceiling", .out = .int64 },
+    .{ .name = "round", .out = .float64 },
+    .{ .name = "toInt64", .out = .int64 },
+    .{ .name = "toInt32", .out = .int64 },
+    .{ .name = "toUInt64", .out = .uint64 },
+    .{ .name = "toUInt32", .out = .uint64 },
+    .{ .name = "toUInt16", .out = .uint64 },
+    .{ .name = "toUInt8", .out = .uint64 },
+    .{ .name = "toFloat64", .out = .float64 },
+    .{ .name = "toFloat32", .out = .float64 },
+    .{ .name = "toInt64OrZero", .out = .int64 },
+    .{ .name = "toUInt64OrZero", .out = .uint64 },
+    .{ .name = "toUInt32OrZero", .out = .uint64 },
+    .{ .name = "toUInt8OrZero", .out = .uint64 },
+    .{ .name = "toDate", .out = .date_u16 },
+    .{ .name = "toDateOrZero", .out = .date_u16 },
+    .{ .name = "toYYYYMMDD", .out = .int64 },
+    .{ .name = "toyyyymmdd", .out = .int64 }, // duckdb_parse lowercases it
+    .{ .name = "toStartOfHour", .out = .datetime64_ms },
+    .{ .name = "toStartOfDay", .out = .datetime64_ms },
+    .{ .name = "toStartOfMinute", .out = .datetime64_ms },
+    .{ .name = "isIPv4String", .out = .bool_u8 },
+    .{ .name = "isIPv6String", .out = .bool_u8 },
+    .{ .name = "IPv4StringToNumOrDefault", .out = .uint64 },
+    .{ .name = "IPv4NumToString", .out = .string },
+    .{ .name = "IPv6StringToNumOrDefault", .out = .uint64 },
+    .{ .name = "IPv6NumToString", .out = .string },
+    // Time component extractors
+    .{ .name = "toHour", .out = .int64 },
+    .{ .name = "hour", .out = .int64 },
+    .{ .name = "toMinute", .out = .int64 },
+    .{ .name = "toSecond", .out = .int64 },
+    // Math
+    .{ .name = "sqrt", .out = .float64 },
+    // Array scalar aggregates
+    .{ .name = "arraySum", .out = .float64 },
+    .{ .name = "arrayAvg", .out = .float64 },
+    // Interval constructors (return ms as int64)
+    .{ .name = "toIntervalSecond", .out = .int64 },
+    .{ .name = "toIntervalMinute", .out = .int64 },
+    .{ .name = "toIntervalHour", .out = .int64 },
+    .{ .name = "toIntervalDay", .out = .int64 },
+    .{ .name = "toIntervalWeek", .out = .int64 },
+    .{ .name = "toIntervalMonth", .out = .int64 },
+    .{ .name = "toIntervalYear", .out = .int64 },
 };
 
 /// Map date_trunc unit string → kernels function name and output ColumnType.
 const DateTruncUnit = struct { unit: []const u8, fn_name: []const u8, out: ColumnType };
 const date_trunc_units = [_]DateTruncUnit{
-    .{ .unit = "hour",   .fn_name = "toStartOfHour",   .out = .datetime64_ms },
-    .{ .unit = "day",    .fn_name = "toStartOfDay",    .out = .datetime64_ms },
+    .{ .unit = "hour", .fn_name = "toStartOfHour", .out = .datetime64_ms },
+    .{ .unit = "day", .fn_name = "toStartOfDay", .out = .datetime64_ms },
     .{ .unit = "minute", .fn_name = "toStartOfMinute", .out = .datetime64_ms },
 };
 
@@ -1263,59 +1282,61 @@ const date_trunc_units = [_]DateTruncUnit{
 
 /// Token kinds produced by the lexer.
 const TokKind = enum {
-    num_int,     // integer literal
-    num_float,   // float literal
-    str_lit,     // 'quoted string'
-    ident,       // identifier / column name
-    lparen,      // (
-    rparen,      // )
-    comma,       // ,
-    plus,        // +
-    minus,       // -
-    star,        // *
-    slash,       // /
-    percent,     // %
-    eq,          // =
-    neq,         // <> or !=
-    lt,          // <
-    lte,         // <=
-    gt,          // >
-    gte,         // >=
-    kw_and,      // AND
-    kw_or,       // OR
-    kw_not,      // NOT
-    kw_cast,     // CAST
-    kw_as,       // AS
-    kw_case,     // CASE
-    kw_when,     // WHEN
-    kw_then,     // THEN
-    kw_else,     // ELSE
-    kw_end,      // END
-    kw_is,       // IS
-    kw_null,     // NULL
-    kw_between,  // BETWEEN
-    kw_in,       // IN
-    lbracket,    // [
-    rbracket,    // ]
-    arrow,       // ->
+    num_int, // integer literal
+    num_float, // float literal
+    str_lit, // 'quoted string'
+    ident, // identifier / column name
+    lparen, // (
+    rparen, // )
+    comma, // ,
+    plus, // +
+    minus, // -
+    star, // *
+    slash, // /
+    percent, // %
+    eq, // =
+    neq, // <> or !=
+    lt, // <
+    lte, // <=
+    gt, // >
+    gte, // >=
+    kw_and, // AND
+    kw_or, // OR
+    kw_not, // NOT
+    kw_cast, // CAST
+    kw_as, // AS
+    kw_case, // CASE
+    kw_when, // WHEN
+    kw_then, // THEN
+    kw_else, // ELSE
+    kw_end, // END
+    kw_is, // IS
+    kw_null, // NULL
+    kw_between, // BETWEEN
+    kw_in, // IN
+    lbracket, // [
+    rbracket, // ]
+    arrow, // ->
     eof,
 };
 
 const Token = struct {
     kind: TokKind,
-    text: []const u8,  // slice into original input
+    text: []const u8, // slice into original input
 };
 
 /// Minimal lexer: produces one token at a time from a []const u8 cursor.
 const Lexer = struct {
-    src:  []const u8,
-    pos:  usize,
+    src: []const u8,
+    pos: usize,
 
-    fn init(src: []const u8) Lexer { return .{ .src = src, .pos = 0 }; }
+    fn init(src: []const u8) Lexer {
+        return .{ .src = src, .pos = 0 };
+    }
 
     fn skipWs(self: *Lexer) void {
         while (self.pos < self.src.len and
-               (self.src[self.pos] == ' ' or self.src[self.pos] == '\t' or
+            (self.src[self.pos] == ' ' or self.src[self.pos] == '\t' or
                 self.src[self.pos] == '\r' or self.src[self.pos] == '\n'))
             self.pos += 1;
     }
@@ -1333,10 +1354,22 @@ const Lexer = struct {
 
         // Single-char tokens
         switch (ch) {
-            '(' => { self.pos += 1; return .{ .kind = .lparen,  .text = self.src[start..self.pos] }; },
-            ')' => { self.pos += 1; return .{ .kind = .rparen,  .text = self.src[start..self.pos] }; },
-            ',' => { self.pos += 1; return .{ .kind = .comma,   .text = self.src[start..self.pos] }; },
-            '+' => { self.pos += 1; return .{ .kind = .plus,    .text = self.src[start..self.pos] }; },
+            '(' => {
+                self.pos += 1;
+                return .{ .kind = .lparen, .text = self.src[start..self.pos] };
+            },
+            ')' => {
+                self.pos += 1;
+                return .{ .kind = .rparen, .text = self.src[start..self.pos] };
+            },
+            ',' => {
+                self.pos += 1;
+                return .{ .kind = .comma, .text = self.src[start..self.pos] };
+            },
+            '+' => {
+                self.pos += 1;
+                return .{ .kind = .plus, .text = self.src[start..self.pos] };
+            },
             '-' => {
                 self.pos += 1;
                 if (self.pos < self.src.len and self.src[self.pos] == '>') {
@@ -1345,12 +1378,30 @@ const Lexer = struct {
                 }
                 return .{ .kind = .minus, .text = self.src[start..self.pos] };
             },
-            '*' => { self.pos += 1; return .{ .kind = .star,    .text = self.src[start..self.pos] }; },
-            '/' => { self.pos += 1; return .{ .kind = .slash,    .text = self.src[start..self.pos] }; },
-            '%' => { self.pos += 1; return .{ .kind = .percent,  .text = self.src[start..self.pos] }; },
-            '=' => { self.pos += 1; return .{ .kind = .eq,       .text = self.src[start..self.pos] }; },
-            '[' => { self.pos += 1; return .{ .kind = .lbracket, .text = self.src[start..self.pos] }; },
-            ']' => { self.pos += 1; return .{ .kind = .rbracket, .text = self.src[start..self.pos] }; },
+            '*' => {
+                self.pos += 1;
+                return .{ .kind = .star, .text = self.src[start..self.pos] };
+            },
+            '/' => {
+                self.pos += 1;
+                return .{ .kind = .slash, .text = self.src[start..self.pos] };
+            },
+            '%' => {
+                self.pos += 1;
+                return .{ .kind = .percent, .text = self.src[start..self.pos] };
+            },
+            '=' => {
+                self.pos += 1;
+                return .{ .kind = .eq, .text = self.src[start..self.pos] };
+            },
+            '[' => {
+                self.pos += 1;
+                return .{ .kind = .lbracket, .text = self.src[start..self.pos] };
+            },
+            ']' => {
+                self.pos += 1;
+                return .{ .kind = .rbracket, .text = self.src[start..self.pos] };
+            },
             '!' => {
                 self.pos += 1;
                 if (self.pos < self.src.len and self.src[self.pos] == '=') self.pos += 1;
@@ -1359,17 +1410,20 @@ const Lexer = struct {
             '<' => {
                 self.pos += 1;
                 if (self.pos < self.src.len and self.src[self.pos] == '=') {
-                    self.pos += 1; return .{ .kind = .lte, .text = self.src[start..self.pos] };
+                    self.pos += 1;
+                    return .{ .kind = .lte, .text = self.src[start..self.pos] };
                 }
                 if (self.pos < self.src.len and self.src[self.pos] == '>') {
-                    self.pos += 1; return .{ .kind = .neq, .text = self.src[start..self.pos] };
+                    self.pos += 1;
+                    return .{ .kind = .neq, .text = self.src[start..self.pos] };
                 }
                 return .{ .kind = .lt, .text = self.src[start..self.pos] };
             },
             '>' => {
                 self.pos += 1;
                 if (self.pos < self.src.len and self.src[self.pos] == '=') {
-                    self.pos += 1; return .{ .kind = .gte, .text = self.src[start..self.pos] };
+                    self.pos += 1;
+                    return .{ .kind = .gte, .text = self.src[start..self.pos] };
                 }
                 return .{ .kind = .gt, .text = self.src[start..self.pos] };
             },
@@ -1406,24 +1460,24 @@ const Lexer = struct {
         // Identifier: starts with letter or underscore, may contain digits and dots
         if (std.ascii.isAlphabetic(ch) or ch == '_') {
             while (self.pos < self.src.len and
-                   (std.ascii.isAlphanumeric(self.src[self.pos]) or
+                (std.ascii.isAlphanumeric(self.src[self.pos]) or
                     self.src[self.pos] == '_' or self.src[self.pos] == '.'))
                 self.pos += 1;
             const word = self.src[start..self.pos];
-            if (std.ascii.eqlIgnoreCase(word, "AND"))     return .{ .kind = .kw_and,     .text = word };
-            if (std.ascii.eqlIgnoreCase(word, "OR"))      return .{ .kind = .kw_or,      .text = word };
-            if (std.ascii.eqlIgnoreCase(word, "NOT"))     return .{ .kind = .kw_not,     .text = word };
-            if (std.ascii.eqlIgnoreCase(word, "CAST"))    return .{ .kind = .kw_cast,    .text = word };
-            if (std.ascii.eqlIgnoreCase(word, "AS"))      return .{ .kind = .kw_as,      .text = word };
-            if (std.ascii.eqlIgnoreCase(word, "CASE"))    return .{ .kind = .kw_case,    .text = word };
-            if (std.ascii.eqlIgnoreCase(word, "WHEN"))    return .{ .kind = .kw_when,    .text = word };
-            if (std.ascii.eqlIgnoreCase(word, "THEN"))    return .{ .kind = .kw_then,    .text = word };
-            if (std.ascii.eqlIgnoreCase(word, "ELSE"))    return .{ .kind = .kw_else,    .text = word };
-            if (std.ascii.eqlIgnoreCase(word, "END"))     return .{ .kind = .kw_end,     .text = word };
-            if (std.ascii.eqlIgnoreCase(word, "IS"))      return .{ .kind = .kw_is,      .text = word };
-            if (std.ascii.eqlIgnoreCase(word, "NULL"))    return .{ .kind = .kw_null,    .text = word };
+            if (std.ascii.eqlIgnoreCase(word, "AND")) return .{ .kind = .kw_and, .text = word };
+            if (std.ascii.eqlIgnoreCase(word, "OR")) return .{ .kind = .kw_or, .text = word };
+            if (std.ascii.eqlIgnoreCase(word, "NOT")) return .{ .kind = .kw_not, .text = word };
+            if (std.ascii.eqlIgnoreCase(word, "CAST")) return .{ .kind = .kw_cast, .text = word };
+            if (std.ascii.eqlIgnoreCase(word, "AS")) return .{ .kind = .kw_as, .text = word };
+            if (std.ascii.eqlIgnoreCase(word, "CASE")) return .{ .kind = .kw_case, .text = word };
+            if (std.ascii.eqlIgnoreCase(word, "WHEN")) return .{ .kind = .kw_when, .text = word };
+            if (std.ascii.eqlIgnoreCase(word, "THEN")) return .{ .kind = .kw_then, .text = word };
+            if (std.ascii.eqlIgnoreCase(word, "ELSE")) return .{ .kind = .kw_else, .text = word };
+            if (std.ascii.eqlIgnoreCase(word, "END")) return .{ .kind = .kw_end, .text = word };
+            if (std.ascii.eqlIgnoreCase(word, "IS")) return .{ .kind = .kw_is, .text = word };
+            if (std.ascii.eqlIgnoreCase(word, "NULL")) return .{ .kind = .kw_null, .text = word };
             if (std.ascii.eqlIgnoreCase(word, "BETWEEN")) return .{ .kind = .kw_between, .text = word };
-            if (std.ascii.eqlIgnoreCase(word, "IN"))      return .{ .kind = .kw_in,      .text = word };
+            if (std.ascii.eqlIgnoreCase(word, "IN")) return .{ .kind = .kw_in, .text = word };
             return .{ .kind = .ident, .text = word };
         }
 
@@ -1437,41 +1491,30 @@ const Lexer = struct {
 /// canonical casing used by kernels.zig. Falls back to the original if unknown.
 fn isDictFn(name: []const u8) bool {
     return std.ascii.eqlIgnoreCase(name, "dictHas") or
-           std.ascii.eqlIgnoreCase(name, "dictGet") or
-           std.ascii.eqlIgnoreCase(name, "dictGetOrDefault") or
-           std.ascii.eqlIgnoreCase(name, "dictGetOrNull");
+        std.ascii.eqlIgnoreCase(name, "dictGet") or
+        std.ascii.eqlIgnoreCase(name, "dictGetOrDefault") or
+        std.ascii.eqlIgnoreCase(name, "dictGetOrNull");
 }
 
 fn canonFnName(name: []const u8) []const u8 {
     const canon_names = [_][]const u8{
-        "lower", "upper", "length", "char_length", "lowerUTF8", "upperUTF8",
-        "toDate", "toDateOrZero", "toYYYYMMDD", "toUnixTimestamp", "toFloat64",
-        "toUInt64", "toInt64", "toString", "toStartOfMinute", "toStartOfHour",
-        "toStartOfDay", "toStartOfWeek", "toStartOfMonth", "toStartOfYear",
-        "toYear", "toMonth", "toDayOfMonth", "toDayOfWeek", "toHour", "toMinute", "toSecond",
-        "abs", "round", "floor", "ceil", "log", "log2", "log10", "sqrt", "exp",
-        "not", "isNull", "isNotNull", "isIPv4String", "isIPv6String",
-        "IPv4StringToNumOrDefault", "IPv4NumToString",
-        "IPv6StringToNumOrDefault", "IPv6NumToString",
-        "greatest", "least", "intDiv", "modulo",
-        "positionCaseInsensitive", "splitByChar", "concat", "format",
-        "if", "multiIf",
-        "substring", "substr", "startsWith", "endsWith",
-        "mapGet",
-        "has", "hasAny", "hasAll",
-        "arrayConcat", "arrayDistinct", "arrayFlatten", "arrayReverse",
-        "arraySlice", "arrayMax", "arrayMin",
-        "arrayMap", "arrayFilter", "arrayExists",
-        "arrayJoin",
-        "mapKeys", "mapValues",
-        "tuple",
-        "regexp_replace", "replaceRegexpOne",
-        "now", "today",
-        "toHour", "hour", "toMinute", "toSecond",
-        "sqrt",
-        "arrayElement", "arraySum", "arrayAvg", "array", "arrayIntersect",
-        "toIntervalSecond", "toIntervalMinute", "toIntervalHour",
-        "toIntervalDay", "toIntervalWeek", "toIntervalMonth", "toIntervalYear",
+        "lower",            "upper",                    "length",           "char_length",     "lowerUTF8",     "upperUTF8",
+        "toDate",           "toDateOrZero",             "toYYYYMMDD",       "toUnixTimestamp", "toFloat64",     "toUInt64",
+        "toInt64",          "toString",                 "toStartOfMinute",  "toStartOfHour",   "toStartOfDay",  "toStartOfWeek",
+        "toStartOfMonth",   "toStartOfYear",            "toYear",           "toMonth",         "toDayOfMonth",  "toDayOfWeek",
+        "toHour",           "toMinute",                 "toSecond",         "abs",             "round",         "floor",
+        "ceil",             "log",                      "log2",             "log10",           "sqrt",          "exp",
+        "not",              "isNull",                   "isNotNull",        "isIPv4String",    "isIPv6String",  "IPv4StringToNumOrDefault",
+        "IPv4NumToString",  "IPv6StringToNumOrDefault", "IPv6NumToString",  "greatest",        "least",         "intDiv",
+        "modulo",           "positionCaseInsensitive",  "splitByChar",      "concat",          "format",        "if",
+        "multiIf",          "substring",                "substr",           "startsWith",      "endsWith",      "mapGet",
+        "has",              "hasAny",                   "hasAll",           "arrayConcat",     "arrayDistinct", "arrayFlatten",
+        "arrayReverse",     "arraySlice",               "arrayMax",         "arrayMin",        "arrayMap",      "arrayFilter",
+        "arrayExists",      "arrayJoin",                "mapKeys",          "mapValues",       "tuple",         "regexp_replace",
+        "replaceRegexpOne", "now",                      "today",            "toHour",          "hour",          "toMinute",
+        "toSecond",         "sqrt",                     "arrayElement",     "arraySum",        "arrayAvg",      "array",
+        "arrayIntersect",   "toIntervalSecond",         "toIntervalMinute", "toIntervalHour",  "toIntervalDay", "toIntervalWeek",
+        "toIntervalMonth",  "toIntervalYear",
     };
     for (canon_names) |cn| {
         if (std.ascii.eqlIgnoreCase(cn, name)) return cn;
@@ -1483,11 +1526,11 @@ fn canonFnName(name: []const u8) []const u8 {
 /// Higher number = binds tighter.
 fn infixBP(kind: TokKind) ?u8 {
     return switch (kind) {
-        .kw_or                           =>  5,
-        .kw_and                          =>  7,
-        .eq, .neq, .lt, .lte, .gt, .gte =>  9,
-        .plus, .minus                    => 10,
-        .star, .slash, .percent          => 20,
+        .kw_or => 5,
+        .kw_and => 7,
+        .eq, .neq, .lt, .lte, .gt, .gte => 9,
+        .plus, .minus => 10,
+        .star, .slash, .percent => 20,
         else => null,
     };
 }
@@ -1513,6 +1556,38 @@ fn parseArithExpr(ctx: *PlannerCtx, text: []const u8) !?Expr {
     pctx.lex.skipWs();
     if (pctx.lex.pos != pctx.lex.src.len) return null; // trailing garbage
     return expr;
+}
+
+fn isIdentByte(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or c == '_';
+}
+
+fn substituteIdentifier(allocator: std.mem.Allocator, text: []const u8, ident: []const u8, replacement: []const u8) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    var i: usize = 0;
+    while (i < text.len) {
+        if (text[i] == '\'') {
+            const start = i;
+            i += 1;
+            while (i < text.len and text[i] != '\'') i += 1;
+            if (i < text.len) i += 1;
+            try out.appendSlice(allocator, text[start..i]);
+            continue;
+        }
+        const matches = i + ident.len <= text.len and
+            std.mem.eql(u8, text[i .. i + ident.len], ident) and
+            (i == 0 or !isIdentByte(text[i - 1])) and
+            (i + ident.len == text.len or !isIdentByte(text[i + ident.len]));
+        if (matches) {
+            try out.appendSlice(allocator, replacement);
+            i += ident.len;
+        } else {
+            try out.append(allocator, text[i]);
+            i += 1;
+        }
+    }
+    return out.toOwnedSlice(allocator);
 }
 
 /// Pratt parser: parse an expression with minimum binding power `min_bp`.
@@ -1554,9 +1629,9 @@ fn prattExpr(pctx: *ParseCtx, min_bp: u8) anyerror!?Expr {
                     const rp = pctx.lex.next();
                     if (rp.kind != .rparen) return null;
                     break :blk_as switch (type_tok.kind) {
-                        .ident   => type_tok.text,
-                        .str_lit => if (type_tok.text.len >= 2) type_tok.text[1..type_tok.text.len - 1] else type_tok.text,
-                        else     => return null,
+                        .ident => type_tok.text,
+                        .str_lit => if (type_tok.text.len >= 2) type_tok.text[1 .. type_tok.text.len - 1] else type_tok.text,
+                        else => return null,
                     };
                 },
                 .comma => blk_comma: {
@@ -1564,9 +1639,9 @@ fn prattExpr(pctx: *ParseCtx, min_bp: u8) anyerror!?Expr {
                     const rp = pctx.lex.next();
                     if (rp.kind != .rparen) return null;
                     break :blk_comma switch (type_tok.kind) {
-                        .str_lit => if (type_tok.text.len >= 2) type_tok.text[1..type_tok.text.len - 1] else type_tok.text,
-                        .ident   => type_tok.text,
-                        else     => return null,
+                        .str_lit => if (type_tok.text.len >= 2) type_tok.text[1 .. type_tok.text.len - 1] else type_tok.text,
+                        .ident => type_tok.text,
+                        else => return null,
                     };
                 },
                 else => return null,
@@ -1575,15 +1650,39 @@ fn prattExpr(pctx: *ParseCtx, min_bp: u8) anyerror!?Expr {
             if (std.mem.startsWith(u8, type_name, "Array(") or
                 std.ascii.eqlIgnoreCase(type_name, "LIST") or
                 std.ascii.eqlIgnoreCase(type_name, "LIST[]") or
-                std.mem.endsWith(u8, type_name, "[]")) {
+                std.mem.endsWith(u8, type_name, "[]"))
+            {
                 break :blk_cast inner;
             }
             // Map target type to a kernels function
             const fn_name: []const u8 = if (std.ascii.eqlIgnoreCase(type_name, "DATE"))
                 "toDate"
-            else if (std.ascii.eqlIgnoreCase(type_name, "VARCHAR") or
-                     std.ascii.eqlIgnoreCase(type_name, "String"))
+            else if (std.ascii.eqlIgnoreCase(type_name, "VARCHAR") or std.ascii.eqlIgnoreCase(type_name, "String"))
                 "toString"
+            else if (std.ascii.eqlIgnoreCase(type_name, "Int64") or std.ascii.eqlIgnoreCase(type_name, "BIGINT"))
+                "toInt64"
+            else if (std.ascii.eqlIgnoreCase(type_name, "Int32") or
+                std.ascii.eqlIgnoreCase(type_name, "Int16") or
+                std.ascii.eqlIgnoreCase(type_name, "Int8") or
+                std.ascii.eqlIgnoreCase(type_name, "INT") or
+                std.ascii.eqlIgnoreCase(type_name, "INTEGER"))
+                "toInt32"
+            else if (std.ascii.eqlIgnoreCase(type_name, "UInt64"))
+                "toUInt64"
+            else if (std.ascii.eqlIgnoreCase(type_name, "UInt32"))
+                "toUInt32"
+            else if (std.ascii.eqlIgnoreCase(type_name, "UInt16"))
+                "toUInt16"
+            else if (std.ascii.eqlIgnoreCase(type_name, "UInt8"))
+                "toUInt8"
+            else if (std.ascii.eqlIgnoreCase(type_name, "Float64") or
+                std.ascii.eqlIgnoreCase(type_name, "DOUBLE") or
+                std.ascii.eqlIgnoreCase(type_name, "DOUBLE PRECISION"))
+                "toFloat64"
+            else if (std.ascii.eqlIgnoreCase(type_name, "Float32") or
+                std.ascii.eqlIgnoreCase(type_name, "FLOAT") or
+                std.ascii.eqlIgnoreCase(type_name, "REAL"))
+                "toFloat32"
             else
                 return null; // unsupported cast type
             const fc = try pctx.arena.create(plan.FnCall);
@@ -1610,10 +1709,10 @@ fn prattExpr(pctx: *ParseCtx, min_bp: u8) anyerror!?Expr {
                 const p2 = t3.text;
                 const saved_p1 = pctx.lambda_param;
                 const saved_p2 = pctx.lambda_param2;
-                pctx.lambda_param  = p1;
+                pctx.lambda_param = p1;
                 pctx.lambda_param2 = p2;
                 const body_expr = try prattExpr(pctx, 0) orelse return null;
-                pctx.lambda_param  = saved_p1;
+                pctx.lambda_param = saved_p1;
                 pctx.lambda_param2 = saved_p2;
                 const body_ptr = try pctx.arena.create(Expr);
                 body_ptr.* = body_expr;
@@ -1650,7 +1749,7 @@ fn prattExpr(pctx: *ParseCtx, min_bp: u8) anyerror!?Expr {
                 };
                 switch (elem) {
                     .lit_str => |s| try str_elems.append(pctx.arena, s),
-                    else     => all_str = false,
+                    else => all_str = false,
                 }
                 try expr_elems.append(pctx.arena, elem);
                 const sep = pctx.lex.peek();
@@ -1722,7 +1821,7 @@ fn prattExpr(pctx: *ParseCtx, min_bp: u8) anyerror!?Expr {
 
         // String literal: 'value'  → lit_str (strip quotes)
         .str_lit => blk: {
-            const s = if (tok.text.len >= 2) tok.text[1..tok.text.len - 1] else tok.text;
+            const s = if (tok.text.len >= 2) tok.text[1 .. tok.text.len - 1] else tok.text;
             break :blk Expr{ .lit_str = s };
         },
 
@@ -1832,24 +1931,24 @@ fn prattExpr(pctx: *ParseCtx, min_bp: u8) anyerror!?Expr {
                         }
                     }.do;
 
-                     // Helper: resolve CAST([], 'Array(String)') → lit_array &.{}
-                     // The Pratt parser now handles CAST([], ...) → lit_array directly.
-                     // This is a pass-through; kept for any fallback cases.
-                     const resolveDefault = struct {
-                         fn do(e: Expr) Expr {
-                             return e;
-                         }
-                     }.do;
+                    // Helper: resolve CAST([], 'Array(String)') → lit_array &.{}
+                    // The Pratt parser now handles CAST([], ...) → lit_array directly.
+                    // This is a pass-through; kept for any fallback cases.
+                    const resolveDefault = struct {
+                        fn do(e: Expr) Expr {
+                            return e;
+                        }
+                    }.do;
 
                     const dc = try pctx.arena.create(plan.DictCall);
                     if (std.ascii.eqlIgnoreCase(name, "dictHas")) {
                         // dictHas(dict, key_or_tuple)
                         const keys = try unwrapKeys(pctx.arena, args_slice[1]);
                         dc.* = .{
-                            .fn_name      = "dictHas",
-                            .dict_name    = dict_name,
-                            .attr_name    = null,
-                            .keys         = keys,
+                            .fn_name = "dictHas",
+                            .dict_name = dict_name,
+                            .attr_name = null,
+                            .keys = keys,
                             .default_expr = null,
                         };
                     } else if (std.ascii.eqlIgnoreCase(name, "dictGetOrDefault") and args_slice.len >= 4) {
@@ -1861,10 +1960,10 @@ fn prattExpr(pctx: *ParseCtx, min_bp: u8) anyerror!?Expr {
                         const keys = try unwrapKeys(pctx.arena, args_slice[2]);
                         const default_e = resolveDefault(args_slice[args_slice.len - 1]);
                         dc.* = .{
-                            .fn_name      = "dictGetOrDefault",
-                            .dict_name    = dict_name,
-                            .attr_name    = attr,
-                            .keys         = keys,
+                            .fn_name = "dictGetOrDefault",
+                            .dict_name = dict_name,
+                            .attr_name = attr,
+                            .keys = keys,
                             .default_expr = default_e,
                         };
                     } else {
@@ -1876,10 +1975,10 @@ fn prattExpr(pctx: *ParseCtx, min_bp: u8) anyerror!?Expr {
                         const key_idx: usize = if (args_slice.len >= 3) 2 else 1;
                         const keys = try unwrapKeys(pctx.arena, args_slice[key_idx]);
                         dc.* = .{
-                            .fn_name      = name,
-                            .dict_name    = dict_name,
-                            .attr_name    = attr,
-                            .keys         = keys,
+                            .fn_name = name,
+                            .dict_name = dict_name,
+                            .attr_name = attr,
+                            .keys = keys,
                             .default_expr = null,
                         };
                     }
@@ -1932,16 +2031,14 @@ fn prattExpr(pctx: *ParseCtx, min_bp: u8) anyerror!?Expr {
                             std.ascii.eqlIgnoreCase(name, "replaceRegexpOne")) break :blk2 true;
                     }
                     // substring/substr with 2 args (no length) — from position to end
-                    if (args_slice.len == 2 and (
-                        std.ascii.eqlIgnoreCase(name, "substring") or
+                    if (args_slice.len == 2 and (std.ascii.eqlIgnoreCase(name, "substring") or
                         std.ascii.eqlIgnoreCase(name, "substr"))) break :blk2 true;
                     if (args_slice.len >= 2 and std.ascii.eqlIgnoreCase(name, "concat")) break :blk2 true;
                     if (args_slice.len >= 1 and std.ascii.eqlIgnoreCase(name, "format")) break :blk2 true;
                     if (args_slice.len >= 1 and std.ascii.eqlIgnoreCase(name, "tuple")) break :blk2 true;
                     if (args_slice.len >= 3 and std.ascii.eqlIgnoreCase(name, "multiIf")) break :blk2 true;
                     // Array functions (2-arg)
-                    if (args_slice.len == 2 and (
-                        std.ascii.eqlIgnoreCase(name, "has") or
+                    if (args_slice.len == 2 and (std.ascii.eqlIgnoreCase(name, "has") or
                         std.ascii.eqlIgnoreCase(name, "hasAny") or
                         std.ascii.eqlIgnoreCase(name, "hasAll") or
                         std.ascii.eqlIgnoreCase(name, "arrayMax") or
@@ -1951,16 +2048,14 @@ fn prattExpr(pctx: *ParseCtx, min_bp: u8) anyerror!?Expr {
                     // arrayDistinct: 1 or 2 args
                     if (args_slice.len >= 1 and args_slice.len <= 2 and
                         std.ascii.eqlIgnoreCase(name, "arrayDistinct")) break :blk2 true;
-                    if (args_slice.len == 1 and (
-                        std.ascii.eqlIgnoreCase(name, "mapKeys") or
+                    if (args_slice.len == 1 and (std.ascii.eqlIgnoreCase(name, "mapKeys") or
                         std.ascii.eqlIgnoreCase(name, "mapValues") or
                         std.ascii.eqlIgnoreCase(name, "arrayFlatten") or
                         std.ascii.eqlIgnoreCase(name, "arrayJoin") or
                         std.ascii.eqlIgnoreCase(name, "arrayMax") or
                         std.ascii.eqlIgnoreCase(name, "arrayMin"))) break :blk2 true;
                     // Lambda-based array functions: arrayMap(x -> expr, arr), arrayFilter, arrayExists
-                    if (args_slice.len == 2 and (
-                        std.ascii.eqlIgnoreCase(name, "arrayMap") or
+                    if (args_slice.len == 2 and (std.ascii.eqlIgnoreCase(name, "arrayMap") or
                         std.ascii.eqlIgnoreCase(name, "arrayFilter") or
                         std.ascii.eqlIgnoreCase(name, "arrayExists")) and
                         args_slice[0] == .lambda) break :blk2 true;
@@ -1974,8 +2069,7 @@ fn prattExpr(pctx: *ParseCtx, min_bp: u8) anyerror!?Expr {
                     // array(v1, v2, ...): N-arg constructor
                     if (args_slice.len >= 1 and std.ascii.eqlIgnoreCase(name, "array")) break :blk2 true;
                     // Zero-arg functions: now(), today()
-                    if (args_slice.len == 0 and (
-                        std.ascii.eqlIgnoreCase(name, "now") or
+                    if (args_slice.len == 0 and (std.ascii.eqlIgnoreCase(name, "now") or
                         std.ascii.eqlIgnoreCase(name, "today"))) break :blk2 true;
                     break :blk2 false;
                 };
@@ -1992,7 +2086,7 @@ fn prattExpr(pctx: *ParseCtx, min_bp: u8) anyerror!?Expr {
                                 if (tbl.columns[idx].ch_type) |ch| {
                                     if (std.mem.startsWith(u8, ch, "Map(") and
                                         (std.mem.indexOf(u8, ch, "Float64") != null or
-                                         std.mem.indexOf(u8, ch, "Float32") != null))
+                                            std.mem.indexOf(u8, ch, "Float32") != null))
                                         canon = "mapKeysFloat64";
                                 }
                             }
@@ -2078,7 +2172,7 @@ fn prattExpr(pctx: *ParseCtx, min_bp: u8) anyerror!?Expr {
             if (key_tok.kind != .str_lit) return null;
             const rb = pctx.lex.next();
             if (rb.kind != .rbracket) return null;
-            const key_str = if (key_tok.text.len >= 2) key_tok.text[1..key_tok.text.len - 1] else key_tok.text;
+            const key_str = if (key_tok.text.len >= 2) key_tok.text[1 .. key_tok.text.len - 1] else key_tok.text;
             const fc = try pctx.arena.create(plan.FnCall);
             const fc_args = try pctx.arena.alloc(Expr, 2);
             fc_args[0] = lhs;
@@ -2091,7 +2185,7 @@ fn prattExpr(pctx: *ParseCtx, min_bp: u8) anyerror!?Expr {
                             if (tbl.columns[idx].ch_type) |ch| {
                                 if (std.mem.startsWith(u8, ch, "Map(") and
                                     (std.mem.indexOf(u8, ch, "Float64") != null or
-                                     std.mem.indexOf(u8, ch, "Float32") != null))
+                                        std.mem.indexOf(u8, ch, "Float32") != null))
                                     break :blk "mapGetFloat64";
                             }
                         }
@@ -2125,18 +2219,18 @@ fn prattExpr(pctx: *ParseCtx, min_bp: u8) anyerror!?Expr {
         binop.* = .{ .left = lhs, .right = rhs };
 
         lhs = switch (op.kind) {
-            .plus    => Expr{ .add = binop },
-            .minus   => Expr{ .sub = binop },
-            .star    => Expr{ .mul = binop },
-            .slash   => Expr{ .div = binop },
+            .plus => Expr{ .add = binop },
+            .minus => Expr{ .sub = binop },
+            .star => Expr{ .mul = binop },
+            .slash => Expr{ .div = binop },
             .percent => Expr{ .mod = binop },
-            .eq      => Expr{ .eq  = binop },
-            .neq     => Expr{ .neq = binop },
-            .lt      => Expr{ .lt  = binop },
-            .lte     => Expr{ .lte = binop },
-            .gt      => Expr{ .gt  = binop },
-            .gte     => Expr{ .gte = binop },
-            else     => unreachable,
+            .eq => Expr{ .eq = binop },
+            .neq => Expr{ .neq = binop },
+            .lt => Expr{ .lt = binop },
+            .lte => Expr{ .lte = binop },
+            .gt => Expr{ .gt = binop },
+            .gte => Expr{ .gte = binop },
+            else => unreachable,
         };
     }
 
@@ -2147,11 +2241,11 @@ fn prattExpr(pctx: *ParseCtx, min_bp: u8) anyerror!?Expr {
 fn inferExprType(ctx: *PlannerCtx, expr: Expr) ColumnType {
     return switch (expr) {
         .lit_i64, .lit_u64 => .int64,
-        .lit_f64            => .float64,
-        .lit_str            => .string,
-        .lit_bool           => .bool_u8,
-        .lit_null           => .int64,
-        .lit_array          => .array_string,
+        .lit_f64 => .float64,
+        .lit_str => .string,
+        .lit_bool => .bool_u8,
+        .lit_null => .int64,
+        .lit_array => .array_string,
         .col_ref => |ref| schemaColType(ctx, ref.name),
         .add, .sub, .mul => |op| {
             const lt = inferExprType(ctx, op.left);
@@ -2159,7 +2253,7 @@ fn inferExprType(ctx: *PlannerCtx, expr: Expr) ColumnType {
             if (lt == .float64 or rt == .float64) return .float64;
             return .int64;
         },
-        .div => .float64,  // integer division may produce fraction
+        .div => .float64, // integer division may produce fraction
         .mod => .int64,
         // Comparison operators yield bool_u8
         .eq, .neq, .lt, .lte, .gt, .gte => .bool_u8,
@@ -2250,7 +2344,7 @@ fn tryParseFnCallItem(ctx: *PlannerCtx, text: []const u8, alias: []const u8) !?P
         // args_text looks like: 'hour', timestamp
         const comma = std.mem.indexOfScalar(u8, args_text, ',') orelse return null;
         const unit_raw = std.mem.trim(u8, args_text[0..comma], " \t'\"");
-        const col_raw  = std.mem.trim(u8, args_text[comma + 1..], " \t");
+        const col_raw = std.mem.trim(u8, args_text[comma + 1 ..], " \t");
         // col_raw must be a simple column (no parens)
         if (std.mem.indexOfScalar(u8, col_raw, '(') != null) return null;
         const arg_expr = resolveColExpr(ctx, col_raw) orelse return null;
@@ -2276,7 +2370,7 @@ fn tryParseFnCallItem(ctx: *PlannerCtx, text: []const u8, alias: []const u8) !?P
         if (std.mem.indexOfScalar(u8, args_text, '(') == null) {
             const comma = std.mem.indexOfScalar(u8, args_text, ',') orelse return null;
             const a0_raw = std.mem.trim(u8, args_text[0..comma], " \t");
-            const a1_raw = std.mem.trim(u8, args_text[comma+1..], " \t");
+            const a1_raw = std.mem.trim(u8, args_text[comma + 1 ..], " \t");
             if (std.mem.indexOfScalar(u8, a1_raw, ',') == null) {
                 const a0_expr = resolveColExpr(ctx, a0_raw) orelse return null;
                 const a1_expr = resolveColExpr(ctx, a1_raw) orelse return null;
@@ -2310,7 +2404,29 @@ fn tryParseFnCallItem(ctx: *PlannerCtx, text: []const u8, alias: []const u8) !?P
             break;
         }
     }
-    if (!found) return null;
+    if (!found) {
+        // Check user-defined functions (dynamically created via CREATE FUNCTION).
+        // Format: "(param) -> body" with single param.
+        if (ctx.user_functions) |uf| {
+            if (uf.get(fn_name)) |lambda_src| {
+                // Parse lambda: "(param) -> body"
+                // Find opening and closing parens
+                const lp = std.mem.indexOfScalar(u8, lambda_src, '(') orelse return null;
+                const rp = std.mem.indexOfScalar(u8, lambda_src, ')') orelse return null;
+                if (rp < lp + 1) return null;
+                const param_raw = std.mem.trim(u8, lambda_src[lp + 1 .. rp], " \t\r\n");
+                const after_rp = std.mem.trim(u8, lambda_src[rp + 1 ..], " \t\r\n");
+                const arrow = std.mem.indexOf(u8, after_rp, "->") orelse return null;
+                const body_raw = std.mem.trim(u8, after_rp[arrow + 2 ..], " \t\r\n");
+                const substituted = try substituteIdentifier(ctx.alloc, body_raw, param_raw, arg_text);
+                defer ctx.alloc.free(substituted);
+                const expr = try parseArithExpr(ctx, substituted) orelse return null;
+                const uf_out_type = inferExprType(ctx, expr);
+                return ProjectItem{ .expr = expr, .alias = alias, .out_type = uf_out_type };
+            }
+        }
+        return null;
+    }
 
     // Resolve the argument.
     const arg_expr = resolveColExpr(ctx, arg_text) orelse return null;
@@ -2322,12 +2438,11 @@ fn tryParseFnCallItem(ctx: *PlannerCtx, text: []const u8, alias: []const u8) !?P
     fc.* = .{ .name = fn_name, .args = fc_args };
 
     return ProjectItem{
-        .expr     = .{ .fn_call = fc },
-        .alias    = alias,
+        .expr = .{ .fn_call = fc },
+        .alias = alias,
         .out_type = out_type,
     };
 }
-
 
 /// Build an agg ProjectItem where the aggregate argument is looked up in the
 /// pre-project output (used for ARRAY JOIN + GROUP BY queries).
@@ -2337,7 +2452,7 @@ fn tryParseFnCallItem(ctx: *PlannerCtx, text: []const u8, alias: []const u8) !?P
 /// be resolved to the corresponding pre-project output index.
 fn aggExprToProjectItemWithPreProject(
     ctx: *PlannerCtx,
-    p:   generic_sql.Expr,
+    p: generic_sql.Expr,
     pre_items: []const ProjectItem,
     real_key_count: usize,
 ) !?ProjectItem {
@@ -2435,8 +2550,8 @@ fn aggExprToProjectItem(ctx: *PlannerCtx, p: generic_sql.Expr) !?ProjectItem {
             agg_call.* = .{ .kind = .sum, .arg = arg_expr, .distinct = false };
             const out_type: ColumnType = switch (col_type) {
                 .float64 => .float64,
-                .int64   => .int64,
-                else     => .uint64,
+                .int64 => .int64,
+                else => .uint64,
             };
             return ProjectItem{ .expr = .{ .agg_call = agg_call }, .alias = alias, .out_type = out_type };
         },

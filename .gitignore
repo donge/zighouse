@@ -27,3 +27,7 @@ src/bench_*
 nocodb/
 data/*.duckdb
 data/*.ddb
+
+# SQL conformance testing suite
+sqltest/
+clickhouse-test-results/

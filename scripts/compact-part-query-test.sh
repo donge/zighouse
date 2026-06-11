@@ -161,6 +161,18 @@ expect_eq "count distinct" "3" "$(select_tsv "SELECT count(distinct user_id) FRO
 expect_eq "limit offset" $'3\n4' "$(select_tsv "SELECT id FROM default.compact_events ORDER BY id LIMIT 2 OFFSET 2")"
 expect_eq "sort-key equality" "4" "$(select_tsv "SELECT id FROM default.compact_events WHERE id = 4 ORDER BY id")"
 expect_eq "grouped count topK" $'20\t3\n10\t2' "$(select_tsv "SELECT user_id, COUNT(*) FROM default.compact_events GROUP BY user_id ORDER BY COUNT(*) DESC LIMIT 2")"
+expect_eq "system one" "1" "$(select_tsv "SELECT 1 FROM system.one")"
+expect_eq "cast comma type" "1" "$(select_tsv "SELECT CAST(id, 'Int64') FROM default.compact_events ORDER BY id LIMIT 1")"
+expect_eq "cast standard uint" "1" "$(select_tsv "SELECT CAST(id AS UInt64) FROM default.compact_events ORDER BY id LIMIT 1")"
+expect_eq "union all tsv" $'1\n2' "$(select_tsv "SELECT id FROM default.compact_events WHERE id = 1 UNION ALL SELECT id FROM default.compact_events WHERE id = 2")"
+union_json="$(select_tsv "SELECT id FROM default.compact_events WHERE id = 1 UNION ALL SELECT id FROM default.compact_events WHERE id = 2 FORMAT JSON")"
+if [[ "$union_json" != *'"rows":2'* || "$union_json" != *'"id":1'* || "$union_json" != *'"id":2'* ]]; then
+    echo "FAIL union all json"
+    echo "actual:"
+    printf '%s\n' "$union_json"
+    exit 1
+fi
+echo "PASS union all json"
 
 python3 - <<'PY' > /tmp/zh_compact_wnat.bin
 import struct, sys

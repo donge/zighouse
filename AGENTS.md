@@ -122,3 +122,24 @@ memory-mapped storage directly.
 
 `vendor/` contains lz4 and zstd compiled as static libraries via `build.zig`.
 No external package manager.
+
+## SQL Standard Conformance (sqltest)
+
+Run SQL:2016 conformance tests (from [ClickHouse/sqltest](https://github.com/ClickHouse/sqltest)):
+
+```bash
+pip3 install pyyaml requests
+bash scripts/run-sqltest.sh
+```
+
+Overall: **282 / 1464 (19%)** mandatory features pass.
+
+| Category | Pass Rate | Notes |
+|----------|-----------|-------|
+| **E011** Numeric | 69/112 (61%) | Negatives/literals work; `+5` fails; CREAT TABLE with INT fails |
+| **E021** Strings | 16/58 (27%) | `||`, `LOWER`, `UPPER`, `TRIM` work; `CHAR`/`VARCHAR` types fail |
+| **F051** Date/Time | 40/42 (95%) | DATE/TIME/TIMESTAMP literals and comparisons work |
+| **F261** CASE | 14/20 (70%) | Simple/searched CASE work; multi-value WHEN fails |
+| **E031-E161, F031-F481** | 0% | All require DDL with standard types (INT, INTEGER etc.) |
+
+**Root cause**: DDL parser (`ingest/ddl_parser.zig`) only recognises ClickHouse-native type names (`Int32`, `String`, etc.), not SQL standard aliases (`INT`, `VARCHAR`, `FLOAT`). Most failures are `DDL parse error: UnsupportedColumnType`.

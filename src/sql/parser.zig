@@ -15,7 +15,6 @@
 /// Functions like splitByChar, has, hasAll, hasAny, concat, substring,
 /// JSONExtractString, etc. are parsed as generic FuncExpr nodes; the
 /// plan_builder then renders them as raw text for the runtime evaluator.
-
 const std = @import("std");
 const ast = @import("ast.zig");
 const tok_mod = @import("tokenizer.zig");
@@ -76,7 +75,7 @@ const Parser = struct {
                 .left = left,
                 .right = right,
                 .all = all,
-            }};
+            } };
             return node;
         }
 
@@ -117,7 +116,7 @@ const Parser = struct {
         // WHERE / PREWHERE (ClickHouse extension — treated identically; either order)
         var where: ?*ast.Expr = null;
         for (0..2) |_| {
-            const is_where    = self.tok.eatKeyword("WHERE");
+            const is_where = self.tok.eatKeyword("WHERE");
             const is_prewhere = if (!is_where) self.tok.eatKeyword("PREWHERE") else false;
             if (!is_where and !is_prewhere) break;
             const e = try self.parseExpr();
@@ -186,7 +185,7 @@ const Parser = struct {
             .limit = limit,
             .offset = offset,
             .ctes = ctes,
-        }};
+        } };
         return node;
     }
 
@@ -220,9 +219,9 @@ const Parser = struct {
 
     fn isClauseStart(kw: []const u8) bool {
         const clauses = [_][]const u8{
-            "from", "where", "group", "having", "order", "limit", "offset",
-            "union", "select", "with", "join", "inner", "left", "right",
-            "outer", "cross", "on", "using",
+            "from",  "where",  "group", "having", "order", "limit", "offset",
+            "union", "select", "with",  "join",   "inner", "left",  "right",
+            "outer", "cross",  "on",    "using",
         };
         for (clauses) |c| {
             if (std.ascii.eqlIgnoreCase(kw, c)) return true;
@@ -280,11 +279,11 @@ const Parser = struct {
             on_ptr.* = on_expr;
 
             left = .{ .join = .{
-                .kind  = kind,
-                .left  = left_ptr,
+                .kind = kind,
+                .left = left_ptr,
                 .right = right_ptr,
-                .on    = on_ptr,
-            }};
+                .on = on_ptr,
+            } };
         }
 
         return left;
@@ -491,12 +490,12 @@ const Parser = struct {
         _ = self;
         switch (t.kind) {
             .keyword => {
-                if (std.ascii.eqlIgnoreCase(t.text, "OR"))      return 1;
-                if (std.ascii.eqlIgnoreCase(t.text, "AND"))     return 2;
-                if (std.ascii.eqlIgnoreCase(t.text, "IS"))      return 4;
-                if (std.ascii.eqlIgnoreCase(t.text, "NOT"))     return 4; // NOT IN / NOT LIKE / NOT BETWEEN
-                if (std.ascii.eqlIgnoreCase(t.text, "IN"))      return 4;
-                if (std.ascii.eqlIgnoreCase(t.text, "LIKE"))    return 4;
+                if (std.ascii.eqlIgnoreCase(t.text, "OR")) return 1;
+                if (std.ascii.eqlIgnoreCase(t.text, "AND")) return 2;
+                if (std.ascii.eqlIgnoreCase(t.text, "IS")) return 4;
+                if (std.ascii.eqlIgnoreCase(t.text, "NOT")) return 4; // NOT IN / NOT LIKE / NOT BETWEEN
+                if (std.ascii.eqlIgnoreCase(t.text, "IN")) return 4;
+                if (std.ascii.eqlIgnoreCase(t.text, "LIKE")) return 4;
                 if (std.ascii.eqlIgnoreCase(t.text, "BETWEEN")) return 4;
                 return null;
             },
@@ -512,21 +511,21 @@ const Parser = struct {
     fn tokenToBinOp(self: *Parser, t: Token) ?ast.BinOp {
         _ = self;
         switch (t.kind) {
-            .eq     => return .eq,
-            .neq    => return .neq,
-            .lt     => return .lt,
-            .lte    => return .lte,
-            .gt     => return .gt,
-            .gte    => return .gte,
-            .plus   => return .add,
-            .minus  => return .sub,
-            .star   => return .mul,
-            .slash  => return .div,
+            .eq => return .eq,
+            .neq => return .neq,
+            .lt => return .lt,
+            .lte => return .lte,
+            .gt => return .gt,
+            .gte => return .gte,
+            .plus => return .add,
+            .minus => return .sub,
+            .star => return .mul,
+            .slash => return .div,
             .percent => return .mod,
             .concat => return .concat,
             .keyword => {
                 if (std.ascii.eqlIgnoreCase(t.text, "AND")) return .and_;
-                if (std.ascii.eqlIgnoreCase(t.text, "OR"))  return .or_;
+                if (std.ascii.eqlIgnoreCase(t.text, "OR")) return .or_;
                 return null;
             },
             else => return null,
@@ -728,7 +727,7 @@ const Parser = struct {
                     .name = fn_name_lower,
                     .args = args_owned,
                     .distinct = fn_distinct,
-                }};
+                } };
             }
 
             // Qualified name: db.table.col or table.col
@@ -854,14 +853,22 @@ const Parser = struct {
         if (self.tok.peek().kind != .lparen) return error.UnexpectedToken;
         _ = self.tok.next(); // (
         const val = try self.parseExpr();
-        if (!self.tok.eatKeyword("AS")) return error.UnexpectedToken;
-        // Type name may be multi-word: UNSIGNED INT, etc. We grab until ')'
+        // Support both CAST(expr AS type) and CAST(expr, 'type')
+        const use_as = self.tok.eatKeyword("AS");
+        if (!use_as and !self.tok.eatIf(.comma)) return error.UnexpectedToken;
+        // Type name may be multi-word: UNSIGNED INT, Array(String), etc. We grab until ')'
         var type_parts: std.ArrayListUnmanaged(u8) = .empty;
         defer type_parts.deinit(self.allocator);
         while (self.tok.peek().kind != .rparen and self.tok.peek().kind != .eof) {
             const tp = self.tok.next();
             if (type_parts.items.len > 0) try type_parts.append(self.allocator, ' ');
-            try type_parts.appendSlice(self.allocator, tp.text);
+            // Strip surrounding single quotes from string literal tokens
+            const raw = tp.text;
+            const clean = if (raw.len >= 2 and raw[0] == '\'' and raw[raw.len - 1] == '\'')
+                raw[1 .. raw.len - 1]
+            else
+                raw;
+            try type_parts.appendSlice(self.allocator, clean);
         }
         if (self.tok.peek().kind != .rparen) return error.UnexpectedToken;
         _ = self.tok.next(); // )
@@ -922,6 +929,20 @@ test "parser: UNION ALL" {
     const stmt = parse(allocator, "SELECT a FROM t1 UNION ALL SELECT b FROM t2");
     try std.testing.expect(stmt != null);
     try std.testing.expect(stmt.?.* == .union_all);
+}
+
+test "parser: CAST supports AS and comma type forms" {
+    const allocator = std.testing.allocator;
+
+    const standard = parse(allocator, "SELECT CAST(a AS Int64) FROM t");
+    try std.testing.expect(standard != null);
+    try std.testing.expect(standard.?.select.projections[0].expr == .cast);
+    try std.testing.expectEqualStrings("Int64", standard.?.select.projections[0].expr.cast.type_name);
+
+    const clickhouse = parse(allocator, "SELECT CAST(a, 'Int64') FROM t");
+    try std.testing.expect(clickhouse != null);
+    try std.testing.expect(clickhouse.?.select.projections[0].expr == .cast);
+    try std.testing.expectEqualStrings("Int64", clickhouse.?.select.projections[0].expr.cast.type_name);
 }
 
 test "parser: GROUP BY ORDER BY LIMIT" {

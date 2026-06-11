@@ -1,13 +1,12 @@
 /// Tests for planner.zig — SQL plan → PhysicalNode IR translation.
 /// Pulled in via `test { _ = @import("planner_test.zig"); }` at the bottom of planner.zig.
-
-const std         = @import("std");
+const std = @import("std");
 const generic_sql = @import("generic_sql");
-const schema_mod  = @import("schema");
+const schema_mod = @import("schema");
 const planner_mod = @import("planner.zig");
 
-const PlannerCtx  = planner_mod.PlannerCtx;
-const plan_query  = planner_mod.plan_query;
+const PlannerCtx = planner_mod.PlannerCtx;
+const plan_query = planner_mod.plan_query;
 
 // ── Existing tests (moved from planner.zig) ───────────────────────────────────
 
@@ -24,13 +23,13 @@ test "planner: simple scan" {
     var ctx = PlannerCtx.init(alloc, tbl);
 
     const proj_expr = generic_sql.Expr{
-        .func   = .column_ref,
+        .func = .column_ref,
         .column = "n",
-        .alias  = "n",
+        .alias = "n",
     };
     const projs = [_]generic_sql.Expr{proj_expr};
     const gplan = generic_sql.Plan{
-        .table       = "t",
+        .table = "t",
         .projections = &projs,
     };
 
@@ -44,7 +43,7 @@ test "planner: count(*) scalar agg" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    const cols = [_]schema_mod.Column{ .{ .name = "n", .ty = .int64 } };
+    const cols = [_]schema_mod.Column{.{ .name = "n", .ty = .int64 }};
     const tbl = schema_mod.Table{ .name = "t", .columns = &cols };
     var ctx = PlannerCtx.init(alloc, tbl);
 
@@ -60,7 +59,10 @@ test "planner: count(*) scalar agg" {
         switch (n.*) {
             .scalar_agg => break,
             .limit => |lm| n = lm.input,
-            else => { try std.testing.expect(false); break; },
+            else => {
+                try std.testing.expect(false);
+                break;
+            },
         }
     }
 }
@@ -83,15 +85,42 @@ test "planner: 2-param lambda parse" {
     // The expression "(x,y)->x" as a lambda — plan_builder emits this as a
     // column_ref whose .column string is the full arrayMap call text.
     const proj_expr = generic_sql.Expr{
-        .func   = .column_ref,
+        .func = .column_ref,
         .column = "arrayMap((x,y)->x, col1, col2)",
-        .alias  = "r",
+        .alias = "r",
     };
     const projs = [_]generic_sql.Expr{proj_expr};
     const gplan = generic_sql.Plan{ .table = "t", .projections = &projs };
 
     // plan_query must succeed (non-null) — confirms the pratt parser handled
     // the "(x,y)->" 2-param lambda syntax without returning null or erroring.
+    const node = try plan_query(&ctx, gplan);
+    try std.testing.expect(node != null);
+}
+
+test "planner: user function substitution respects identifier boundaries" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const cols = [_]schema_mod.Column{
+        .{ .name = "n", .ty = .int64 },
+        .{ .name = "x1", .ty = .int64 },
+    };
+    const tbl = schema_mod.Table{ .name = "t", .columns = &cols };
+    var ctx = PlannerCtx.init(alloc, tbl);
+    var functions = std.StringHashMap([]const u8).init(alloc);
+    try functions.put("bump", "(x) -> x + x1");
+    ctx.user_functions = &functions;
+
+    const proj_expr = generic_sql.Expr{
+        .func = .column_ref,
+        .column = "bump(n)",
+        .alias = "r",
+    };
+    const projs = [_]generic_sql.Expr{proj_expr};
+    const gplan = generic_sql.Plan{ .table = "t", .projections = &projs };
+
     const node = try plan_query(&ctx, gplan);
     try std.testing.expect(node != null);
 }
