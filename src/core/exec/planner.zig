@@ -99,10 +99,29 @@ fn collectPlanCols(node: *const PhysicalNode, used: *std.bit_set.IntegerBitSet(2
             collectPlanCols(hj.left, used);
             collectPlanCols(hj.right, used);
         },
-        .order_by => |ob| collectPlanCols(ob.input, used),
-        .top_k => |tk| collectPlanCols(tk.input, used),
+        .order_by => |ob| {
+            collectPlanCols(ob.input, used);
+            if (sortKeysReferenceInputColumns(ob.input)) {
+                for (ob.keys) |key| if (key.col_idx < 256) used.set(key.col_idx);
+            }
+        },
+        .top_k => |tk| {
+            collectPlanCols(tk.input, used);
+            if (sortKeysReferenceInputColumns(tk.input)) {
+                for (tk.keys) |key| if (key.col_idx < 256) used.set(key.col_idx);
+            }
+        },
         .limit => |lm| collectPlanCols(lm.input, used),
     }
+}
+
+fn sortKeysReferenceInputColumns(node: *const PhysicalNode) bool {
+    return switch (node.*) {
+        .part_scan, .mem_scan, .chunk_source => true,
+        .filter => |f| sortKeysReferenceInputColumns(f.input),
+        .limit => |l| sortKeysReferenceInputColumns(l.input),
+        .project, .hash_agg, .scalar_agg, .hash_join, .order_by, .top_k => false,
+    };
 }
 
 /// Find the PartScanNode and push down a column list.
@@ -215,6 +234,9 @@ pub fn plan_query(
     ctx: *PlannerCtx,
     gplan: generic_sql.Plan,
 ) !?*PhysicalNode {
+    const saved_virtual_cols = ctx.virtual_cols;
+    defer ctx.virtual_cols = saved_virtual_cols;
+
     // ── Source node ───────────────────────────────────────────────────────────
     var source: *PhysicalNode = blk: {
         if (gplan.join) |js| {
@@ -249,7 +271,9 @@ pub fn plan_query(
             break :blk n;
         } else if (gplan.subquery_source) |sq| {
             // Subquery in FROM.
+            ctx.virtual_cols = &.{};
             const inner = try plan_query(ctx, sq.*) orelse return null;
+            ctx.virtual_cols = try outputVirtualCols(ctx, inner);
             const n = try ctx.alloc.create(PhysicalNode);
             n.* = .{ .chunk_source = .{ .input = inner } };
             break :blk n;
@@ -290,7 +314,7 @@ pub fn plan_query(
     // Determine if there are any aggregate functions.
     var has_agg = false;
     for (projs) |p| {
-        if (isAggregate(p.func)) {
+        if (isAggregate(p.func) or exprTextHasAggregate(p.column)) {
             has_agg = true;
             break;
         }
@@ -326,7 +350,9 @@ pub fn plan_query(
                     all_resolved = false;
                     break;
                 }
-                if (tbl.findColumn(col_part)) |schema_idx| {
+                if (findVirtualCol(ctx.virtual_cols, col_part)) |vc| {
+                    try sort_keys_list.append(ctx.alloc, .{ .col_idx = vc.idx, .desc = desc, .nulls_first = false });
+                } else if (tbl.findColumn(col_part)) |schema_idx| {
                     try sort_keys_list.append(ctx.alloc, .{ .col_idx = schema_idx, .desc = desc, .nulls_first = false });
                 } else {
                     all_resolved = false;
@@ -451,6 +477,10 @@ pub fn plan_query(
                 } else {
                     // Check if column text contains "__ha__" (post-agg scalar reference).
                     const col_text = p.column orelse "";
+                    if (try rewriteAggregatePostAgg(ctx, p, &agg_items_list)) |pp| {
+                        try post_agg_projs_list.append(ctx.alloc, pp);
+                        continue;
+                    }
                     const has_ha = std.mem.indexOf(u8, col_text, "__ha__") != null;
                     if (has_ha) {
                         try post_agg_projs_list.append(ctx.alloc, p);
@@ -461,16 +491,20 @@ pub fn plan_query(
                 }
             }
 
+            var hidden_key_count: usize = 0;
+            if (key_items_list.items.len == 0) {
+                if (try appendHiddenGroupKeys(ctx, gplan.group_by, &key_items_list)) |n| {
+                    hidden_key_count = n;
+                } else if (gplan.group_by != null) {
+                    return null;
+                }
+            }
+
             const key_items = try key_items_list.toOwnedSlice(ctx.alloc);
             const agg_items = try agg_items_list.toOwnedSlice(ctx.alloc);
             const post_agg_projs = try post_agg_projs_list.toOwnedSlice(ctx.alloc);
 
             const agg_node = try ctx.alloc.create(PhysicalNode);
-            if (key_items.len == 0 and gplan.group_by != null) {
-                // GROUP BY is present but no key projections found in SELECT:
-                // fall back to generic executor which can evaluate complex GROUP BY expressions.
-                return null;
-            }
             if (key_items.len == 0) {
                 agg_node.* = .{ .scalar_agg = .{ .input = source, .aggs = agg_items } };
             } else {
@@ -487,7 +521,7 @@ pub fn plan_query(
             // build a post-project node after the agg_node.
             // The agg output columns are: [key_items..., agg_items...].
             // We populate virtual_cols so resolveColExpr can find them by name.
-            if (post_agg_projs.len > 0) {
+            if (post_agg_projs.len > 0 or hidden_key_count > 0) {
                 // Build virtual column list from agg output.
                 var vcols_list: std.ArrayListUnmanaged(VirtualCol) = .empty;
                 for (key_items, 0..) |ki, i| {
@@ -514,6 +548,7 @@ pub fn plan_query(
                 var post_items_list: std.ArrayListUnmanaged(ProjectItem) = .empty;
                 // Pass through key_items (GROUP BY cols) first.
                 for (key_items, 0..) |ki, i| {
+                    if (isHiddenGroupAlias(ki.alias)) continue;
                     const ref = try ctx.alloc.create(plan.ColRef);
                     ref.* = .{ .index = i, .name = ki.alias };
                     try post_items_list.append(ctx.alloc, .{
@@ -754,8 +789,48 @@ fn findOutputColIdx(node: *const PhysicalNode, name: []const u8) ?usize {
         .order_by => |ob| return findOutputColIdx(ob.input, name),
         .limit => |lm| return findOutputColIdx(lm.input, name),
         .filter => |f| return findOutputColIdx(f.input, name),
+        .chunk_source => |cs| return findOutputColIdx(cs.input, name),
         else => return null,
     }
+}
+
+fn outputVirtualCols(ctx: *PlannerCtx, node: *const PhysicalNode) ![]const VirtualCol {
+    var out: std.ArrayListUnmanaged(VirtualCol) = .empty;
+    switch (node.*) {
+        .project => |p| {
+            for (p.items, 0..) |item, i| try out.append(ctx.alloc, .{
+                .name = item.alias,
+                .idx = i,
+                .col_type = item.out_type,
+            });
+        },
+        .hash_agg => |ha| {
+            for (ha.keys, 0..) |item, i| try out.append(ctx.alloc, .{
+                .name = item.alias,
+                .idx = i,
+                .col_type = item.out_type,
+            });
+            for (ha.aggs, 0..) |item, i| try out.append(ctx.alloc, .{
+                .name = item.alias,
+                .idx = ha.keys.len + i,
+                .col_type = item.out_type,
+            });
+        },
+        .scalar_agg => |sa| {
+            for (sa.aggs, 0..) |item, i| try out.append(ctx.alloc, .{
+                .name = item.alias,
+                .idx = i,
+                .col_type = item.out_type,
+            });
+        },
+        .chunk_source => |cs| return outputVirtualCols(ctx, cs.input),
+        .top_k => |tk| return outputVirtualCols(ctx, tk.input),
+        .order_by => |ob| return outputVirtualCols(ctx, ob.input),
+        .limit => |lm| return outputVirtualCols(ctx, lm.input),
+        .filter => |f| return outputVirtualCols(ctx, f.input),
+        else => {},
+    }
+    return out.toOwnedSlice(ctx.alloc);
 }
 
 fn outputLen(node: *const PhysicalNode) usize {
@@ -763,6 +838,7 @@ fn outputLen(node: *const PhysicalNode) usize {
         .project => |p| return p.items.len,
         .hash_agg => |ha| return ha.keys.len + ha.aggs.len,
         .scalar_agg => |sa| return sa.aggs.len,
+        .chunk_source => |cs| return outputLen(cs.input),
         .top_k => |tk| return outputLen(tk.input),
         .order_by => |ob| return outputLen(ob.input),
         .limit => |lm| return outputLen(lm.input),
@@ -801,6 +877,216 @@ fn aggCanonName(expr: plan.Expr) ?[]const u8 {
         .count_star => "count_star()",
         .count => "count()",
         else => null,
+    };
+}
+
+fn isHiddenGroupAlias(alias: []const u8) bool {
+    return std.mem.startsWith(u8, alias, "__gb__");
+}
+
+fn groupByIsOrdinalOnly(text: []const u8) bool {
+    var it = std.mem.splitScalar(u8, text, ',');
+    while (it.next()) |part| {
+        const trimmed = std.mem.trim(u8, part, " \t\r\n");
+        if (trimmed.len == 0) continue;
+        _ = std.fmt.parseUnsigned(usize, trimmed, 10) catch return false;
+    }
+    return true;
+}
+
+fn splitTopLevelComma(
+    allocator: std.mem.Allocator,
+    text: []const u8,
+) ![]const []const u8 {
+    var out: std.ArrayListUnmanaged([]const u8) = .empty;
+    var start: usize = 0;
+    var depth: usize = 0;
+    var in_str = false;
+    var i: usize = 0;
+    while (i < text.len) : (i += 1) {
+        const c = text[i];
+        if (in_str) {
+            if (c == '\'' and i + 1 < text.len and text[i + 1] == '\'') {
+                i += 1;
+            } else if (c == '\'') {
+                in_str = false;
+            }
+            continue;
+        }
+        switch (c) {
+            '\'' => in_str = true,
+            '(' => depth += 1,
+            ')' => {
+                if (depth > 0) depth -= 1;
+            },
+            ',' => if (depth == 0) {
+                const part = std.mem.trim(u8, text[start..i], " \t\r\n");
+                if (part.len > 0) try out.append(allocator, part);
+                start = i + 1;
+            },
+            else => {},
+        }
+    }
+    const tail = std.mem.trim(u8, text[start..], " \t\r\n");
+    if (tail.len > 0) try out.append(allocator, tail);
+    return out.toOwnedSlice(allocator);
+}
+
+fn appendHiddenGroupKeys(
+    ctx: *PlannerCtx,
+    group_by: ?[]const u8,
+    key_items: *std.ArrayListUnmanaged(ProjectItem),
+) !?usize {
+    const text = group_by orelse return 0;
+    if (groupByIsOrdinalOnly(text)) return 0;
+    const parts = try splitTopLevelComma(ctx.alloc, text);
+    var added: usize = 0;
+    for (parts) |part| {
+        const expr = (try parseArithExpr(ctx, part)) orelse return null;
+        const alias = try std.fmt.allocPrint(ctx.alloc, "__gb__{d}", .{added});
+        try key_items.append(ctx.alloc, .{
+            .expr = expr,
+            .alias = alias,
+            .out_type = inferExprType(ctx, expr),
+        });
+        added += 1;
+    }
+    return added;
+}
+
+fn exprColRefName(expr: Expr) ?[]const u8 {
+    return switch (expr) {
+        .col_ref => |c| c.name,
+        else => null,
+    };
+}
+
+fn findAggAliasForCall(agg_items: []const ProjectItem, kind: AggCall.Kind, arg_text: []const u8) ?[]const u8 {
+    const trimmed = std.mem.trim(u8, arg_text, " \t\r\n");
+    for (agg_items) |item| {
+        if (item.expr != .agg_call) continue;
+        const ac = item.expr.agg_call;
+        if (ac.kind != kind) continue;
+        if (kind == .count_star and ac.arg == null) return item.alias;
+        if (ac.arg) |arg| {
+            if (exprColRefName(arg)) |name| {
+                if (std.mem.eql(u8, name, trimmed)) return item.alias;
+            }
+        }
+    }
+    return null;
+}
+
+fn ensureHiddenMaxAgg(
+    ctx: *PlannerCtx,
+    arg_text: []const u8,
+    agg_items: *std.ArrayListUnmanaged(ProjectItem),
+) !?[]const u8 {
+    if (findAggAliasForCall(agg_items.items, .max, arg_text)) |alias| return alias;
+    const alias = try std.fmt.allocPrint(ctx.alloc, "__ha__max_{d}", .{agg_items.items.len});
+    const item = try aggExprToProjectItem(ctx, .{
+        .func = .max,
+        .column = arg_text,
+        .alias = alias,
+    }) orelse return null;
+    try agg_items.append(ctx.alloc, item);
+    return alias;
+}
+
+fn findMatchingParen(text: []const u8, open_idx: usize) ?usize {
+    var depth: usize = 0;
+    var in_str = false;
+    var i = open_idx;
+    while (i < text.len) : (i += 1) {
+        const c = text[i];
+        if (in_str) {
+            if (c == '\'' and i + 1 < text.len and text[i + 1] == '\'') {
+                i += 1;
+            } else if (c == '\'') {
+                in_str = false;
+            }
+            continue;
+        }
+        switch (c) {
+            '\'' => in_str = true,
+            '(' => depth += 1,
+            ')' => {
+                if (depth == 0) return null;
+                depth -= 1;
+                if (depth == 0) return i;
+            },
+            else => {},
+        }
+    }
+    return null;
+}
+
+fn rewriteAggregatePostAgg(
+    ctx: *PlannerCtx,
+    p: generic_sql.Expr,
+    agg_items: *std.ArrayListUnmanaged(ProjectItem),
+) !?generic_sql.Expr {
+    const col_text = p.column orelse return null;
+
+    const hidden_alias = "__ha__count_star";
+    if (std.mem.indexOf(u8, col_text, "count(*)") != null or
+        std.mem.indexOf(u8, col_text, "count_star()") != null)
+    {
+        var already = false;
+        for (agg_items.items) |item| {
+            if (std.mem.eql(u8, item.alias, hidden_alias)) {
+                already = true;
+                break;
+            }
+        }
+        if (!already) {
+            const agg_call = try ctx.alloc.create(AggCall);
+            agg_call.* = .{ .kind = .count_star, .arg = null, .distinct = false };
+            try agg_items.append(ctx.alloc, .{
+                .expr = .{ .agg_call = agg_call },
+                .alias = hidden_alias,
+                .out_type = .uint64,
+            });
+        }
+
+        const step1 = try std.mem.replaceOwned(u8, ctx.alloc, col_text, "count(*)", hidden_alias);
+        const step2 = try std.mem.replaceOwned(u8, ctx.alloc, step1, "count_star()", hidden_alias);
+        return generic_sql.Expr{
+            .func = .column_ref,
+            .column = step2,
+            .alias = p.alias orelse col_text,
+        };
+    }
+
+    var result: std.ArrayListUnmanaged(u8) = .empty;
+    var changed = false;
+    var i: usize = 0;
+    while (i < col_text.len) {
+        if (i + 4 <= col_text.len and std.ascii.eqlIgnoreCase(col_text[i .. i + 4], "max(")) {
+            const before_ok = i == 0 or !std.ascii.isAlphanumeric(col_text[i - 1]) and col_text[i - 1] != '_';
+            if (before_ok) {
+                const close_idx = findMatchingParen(col_text, i + 3) orelse {
+                    try result.append(ctx.alloc, col_text[i]);
+                    i += 1;
+                    continue;
+                };
+                const arg_text = col_text[i + 4 .. close_idx];
+                const alias = try ensureHiddenMaxAgg(ctx, arg_text, agg_items) orelse return null;
+                try result.appendSlice(ctx.alloc, alias);
+                changed = true;
+                i = close_idx + 1;
+                continue;
+            }
+        }
+        try result.append(ctx.alloc, col_text[i]);
+        i += 1;
+    }
+
+    if (!changed) return null;
+    return generic_sql.Expr{
+        .func = .column_ref,
+        .column = try result.toOwnedSlice(ctx.alloc),
+        .alias = p.alias orelse col_text,
     };
 }
 
@@ -971,10 +1257,15 @@ fn resolveColExpr(ctx: *PlannerCtx, col: []const u8) ?Expr {
         }
     }
     // Unknown column — check virtual columns (agg output) before giving up.
-    for (ctx.virtual_cols) |vc| {
-        if (std.mem.eql(u8, vc.name, col)) {
-            return Expr{ .col_ref = .{ .index = vc.idx, .name = col } };
-        }
+    if (findVirtualCol(ctx.virtual_cols, col)) |vc| {
+        return Expr{ .col_ref = .{ .index = vc.idx, .name = col } };
+    }
+    return null;
+}
+
+fn findVirtualCol(vcols: []const VirtualCol, name: []const u8) ?VirtualCol {
+    for (vcols) |vc| {
+        if (std.mem.eql(u8, vc.name, name)) return vc;
     }
     return null;
 }
@@ -1028,6 +1319,12 @@ fn isAggregate(func: generic_sql.AggregateFn) bool {
         .count_star, .count_distinct, .count_if, .sum, .avg, .min, .max, .min_if, .max_if, .sum_array, .sum_array_if, .uniq_exact, .uniq_exact_if, .group_uniq_array, .group_array, .any_val => true,
         .column_ref, .int_literal, .float_literal, .case_when, .cmp_expr => false,
     };
+}
+
+fn exprTextHasAggregate(text_opt: ?[]const u8) bool {
+    const text = text_opt orelse return false;
+    return std.mem.indexOf(u8, text, "count(*)") != null or
+        std.mem.indexOf(u8, text, "count_star()") != null;
 }
 
 fn buildProjectItems(ctx: *PlannerCtx, projs: []const generic_sql.Expr) !?[]ProjectItem {
@@ -1086,10 +1383,10 @@ fn scalarExprToProjectItem(ctx: *PlannerCtx, p: generic_sql.Expr) !?ProjectItem 
                     } orelse {
                         break :blk null;
                     };
-                    // date_part(minute/hour) → int64; date_trunc → datetime64_ms
+                    // date_part(minute/hour) → int64; otherwise infer from the parsed expression.
                     const synth_out_type: ColumnType = switch (expr) {
-                        .fn_call => |fc| if (std.mem.eql(u8, fc.name, "date_part")) .int64 else .datetime64_ms,
-                        else => .string,
+                        .fn_call => |fc| if (std.mem.eql(u8, fc.name, "date_part")) .int64 else inferExprType(ctx, expr),
+                        else => inferExprType(ctx, expr),
                     };
                     break :blk ProjectItem{
                         .expr = expr,
@@ -1099,7 +1396,7 @@ fn scalarExprToProjectItem(ctx: *PlannerCtx, p: generic_sql.Expr) !?ProjectItem 
                 };
                 break :blk item;
             };
-            const out_type = schemaColType(ctx, col_name);
+            const out_type = inferExprType(ctx, col_expr);
             // Look up narrow wire type override (e.g. UInt16, UInt32) from schema.
             const ch_type_override: ?[]const u8 = ch_blk: {
                 if (ctx.tbl) |tbl| {
@@ -1158,7 +1455,7 @@ fn scalarExprToProjectItem(ctx: *PlannerCtx, p: generic_sql.Expr) !?ProjectItem 
             break :blk ProjectItem{
                 .expr = Expr{ .case_when = cw },
                 .alias = alias,
-                .out_type = .string, // CASE WHEN output is typically string
+                .out_type = inferCaseWhenType(ctx, cw.*),
             };
         },
         .cmp_expr => null, // handled by generic_executor path; planner doesn't process this
@@ -1494,28 +1791,111 @@ fn isDictFn(name: []const u8) bool {
 
 fn canonFnName(name: []const u8) []const u8 {
     const canon_names = [_][]const u8{
-        "lower",             "upper",                    "length",           "char_length",      "lowerUTF8",        "upperUTF8",
-        "toDate",            "toDateOrZero",             "toYYYYMMDD",       "toUnixTimestamp",  "toFloat64",        "toUInt64",
-        "toInt64",           "toString",                 "toStartOfMinute",  "toStartOfHour",    "toStartOfDay",     "toStartOfWeek",
-        "toStartOfMonth",    "toStartOfYear",            "toYear",           "toMonth",          "toDayOfMonth",     "toDayOfWeek",
-        "toHour",            "toMinute",                 "toSecond",         "abs",              "round",            "floor",
-        "ceil",              "log",                      "log2",             "log10",            "sqrt",             "exp",
-        "not",               "isNull",                   "isNotNull",        "isIPv4String",     "isIPv6String",     "IPv4StringToNumOrDefault",
-        "IPv4NumToString",   "IPv6StringToNumOrDefault", "IPv6NumToString",  "greatest",         "least",            "intDiv",
-        "modulo",            "positionCaseInsensitive",  "splitByChar",      "concat",           "format",           "if",
-        "multiIf",           "substring",                "substr",           "startsWith",       "endsWith",         "mapGet",
-        "has",               "hasAny",                   "hasAll",           "arrayConcat",      "arrayDistinct",    "arrayFlatten",
-        "arrayStringConcat", "array_to_string",          "arrayReverse",     "arraySlice",       "arrayMax",         "arrayMin",
-        "arrayMap",          "arrayFilter",              "arrayExists",      "arrayJoin",        "mapKeys",          "mapValues",
-        "tuple",             "regexp_replace",           "replaceRegexpOne", "now",              "today",            "toHour",
-        "hour",              "toMinute",                 "toSecond",         "sqrt",             "arrayElement",     "arraySum",
-        "arrayAvg",          "array",                    "arrayIntersect",   "toIntervalSecond", "toIntervalMinute", "toIntervalHour",
-        "toIntervalDay",     "toIntervalWeek",           "toIntervalMonth",  "toIntervalYear",
+        "lower",             "upper",                    "length",           "char_length",      "lowerUTF8",         "upperUTF8",
+        "toDate",            "toDateOrZero",             "toYYYYMMDD",       "toUnixTimestamp",  "toFloat64",         "toUInt64",
+        "toInt64",           "toString",                 "toStartOfMinute",  "toStartOfHour",    "toStartOfDay",      "toStartOfWeek",
+        "toStartOfMonth",    "toStartOfYear",            "toYear",           "toMonth",          "toDayOfMonth",      "toDayOfWeek",
+        "toHour",            "toMinute",                 "toSecond",         "abs",              "round",             "floor",
+        "ceil",              "log",                      "log2",             "log10",            "sqrt",              "exp",
+        "not",               "isNull",                   "isNotNull",        "isIPv4String",     "isIPv6String",      "IPv4StringToNumOrDefault",
+        "IPv4NumToString",   "IPv6StringToNumOrDefault", "IPv6NumToString",  "greatest",         "least",             "intDiv",
+        "modulo",            "positionCaseInsensitive",  "splitByChar",      "concat",           "format",            "if",
+        "multiIf",           "substring",                "substr",           "startsWith",       "endsWith",          "mapGet",
+        "has",               "hasAny",                   "hasAll",           "arrayConcat",      "arrayDistinct",     "arrayFlatten",
+        "arrayStringConcat", "array_to_string",          "arrayReverse",     "arraySlice",       "arrayMax",          "arrayMin",
+        "arrayMap",          "arrayFilter",              "arrayExists",      "arrayJoin",        "mapKeys",           "mapValues",
+        "tuple",             "regexp_replace",           "replaceRegexpOne", "now",              "today",             "toHour",
+        "hour",              "toMinute",                 "toSecond",         "sqrt",             "arrayElement",      "arraySum",
+        "arrayAvg",          "array",                    "arrayIntersect",   "toIntervalSecond", "toIntervalMinute",  "toIntervalHour",
+        "toIntervalDay",     "toIntervalWeek",           "toIntervalMonth",  "toIntervalYear",   "CAST_array_string",
     };
     for (canon_names) |cn| {
         if (std.ascii.eqlIgnoreCase(cn, name)) return cn;
     }
     return name;
+}
+
+fn normalizeCastTypeName(raw: []const u8) []const u8 {
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len >= 2 and trimmed[0] == '\'' and trimmed[trimmed.len - 1] == '\'') {
+        return trimmed[1 .. trimmed.len - 1];
+    }
+    return trimmed;
+}
+
+fn isArrayStringType(raw: []const u8) bool {
+    const ty = normalizeCastTypeName(raw);
+    const eqNoWs = struct {
+        fn f(a: []const u8, b: []const u8) bool {
+            var ai: usize = 0;
+            var bi: usize = 0;
+            while (true) {
+                while (ai < a.len and std.ascii.isWhitespace(a[ai])) ai += 1;
+                while (bi < b.len and std.ascii.isWhitespace(b[bi])) bi += 1;
+                if (ai == a.len or bi == b.len) return ai == a.len and bi == b.len;
+                if (std.ascii.toLower(a[ai]) != std.ascii.toLower(b[bi])) return false;
+                ai += 1;
+                bi += 1;
+            }
+        }
+    }.f;
+    return eqNoWs(ty, "Array(String)") or
+        eqNoWs(ty, "Array(LowCardinality(String))") or
+        std.ascii.eqlIgnoreCase(ty, "LIST") or
+        std.ascii.eqlIgnoreCase(ty, "LIST[]") or
+        std.ascii.eqlIgnoreCase(ty, "String[]");
+}
+
+fn castFnForType(raw: []const u8) ?[]const u8 {
+    const type_name = normalizeCastTypeName(raw);
+    if (isArrayStringType(type_name)) return "CAST_array_string";
+    if (std.ascii.eqlIgnoreCase(type_name, "DATE")) return "toDate";
+    if (std.ascii.eqlIgnoreCase(type_name, "VARCHAR") or std.ascii.eqlIgnoreCase(type_name, "String")) return "toString";
+    if (std.ascii.eqlIgnoreCase(type_name, "Int64") or std.ascii.eqlIgnoreCase(type_name, "BIGINT")) return "toInt64";
+    if (std.ascii.eqlIgnoreCase(type_name, "Int32") or
+        std.ascii.eqlIgnoreCase(type_name, "Int16") or
+        std.ascii.eqlIgnoreCase(type_name, "Int8") or
+        std.ascii.eqlIgnoreCase(type_name, "INT") or
+        std.ascii.eqlIgnoreCase(type_name, "INTEGER")) return "toInt32";
+    if (std.ascii.eqlIgnoreCase(type_name, "UInt64")) return "toUInt64";
+    if (std.ascii.eqlIgnoreCase(type_name, "UInt32")) return "toUInt32";
+    if (std.ascii.eqlIgnoreCase(type_name, "UInt16")) return "toUInt16";
+    if (std.ascii.eqlIgnoreCase(type_name, "UInt8")) return "toUInt8";
+    if (std.ascii.eqlIgnoreCase(type_name, "Float64") or
+        std.ascii.eqlIgnoreCase(type_name, "DOUBLE") or
+        std.ascii.eqlIgnoreCase(type_name, "DOUBLE PRECISION")) return "toFloat64";
+    if (std.ascii.eqlIgnoreCase(type_name, "Float32") or
+        std.ascii.eqlIgnoreCase(type_name, "FLOAT") or
+        std.ascii.eqlIgnoreCase(type_name, "REAL")) return "toFloat32";
+    return null;
+}
+
+fn parseCastTarget(lex: *Lexer) ?[]const u8 {
+    lex.skipWs();
+    const start = lex.pos;
+    var depth: usize = 0;
+    var in_str = false;
+    while (lex.pos < lex.src.len) : (lex.pos += 1) {
+        const ch = lex.src[lex.pos];
+        if (ch == '\'') {
+            in_str = !in_str;
+            continue;
+        }
+        if (in_str) continue;
+        if (ch == '(') {
+            depth += 1;
+            continue;
+        }
+        if (ch == ')') {
+            if (depth == 0) {
+                const raw = std.mem.trim(u8, lex.src[start..lex.pos], " \t\r\n");
+                lex.pos += 1;
+                return raw;
+            }
+            depth -= 1;
+        }
+    }
+    return null;
 }
 
 /// Operator precedence for binary infix operators (Pratt binding power).
@@ -1619,68 +1999,9 @@ fn prattExpr(pctx: *ParseCtx, min_bp: u8) anyerror!?Expr {
             //   CAST(expr AS type)       — SQL standard
             //   CAST(expr, 'type')       — ClickHouse shorthand
             const sep_tok = pctx.lex.next();
-            const type_name: []const u8 = switch (sep_tok.kind) {
-                .kw_as => blk_as: {
-                    const type_tok = pctx.lex.next();
-                    const rp = pctx.lex.next();
-                    if (rp.kind != .rparen) return null;
-                    break :blk_as switch (type_tok.kind) {
-                        .ident => type_tok.text,
-                        .str_lit => if (type_tok.text.len >= 2) type_tok.text[1 .. type_tok.text.len - 1] else type_tok.text,
-                        else => return null,
-                    };
-                },
-                .comma => blk_comma: {
-                    const type_tok = pctx.lex.next();
-                    const rp = pctx.lex.next();
-                    if (rp.kind != .rparen) return null;
-                    break :blk_comma switch (type_tok.kind) {
-                        .str_lit => if (type_tok.text.len >= 2) type_tok.text[1 .. type_tok.text.len - 1] else type_tok.text,
-                        .ident => type_tok.text,
-                        else => return null,
-                    };
-                },
-                else => return null,
-            };
-            // CAST(x, 'Array(String)') or CAST(x AS LIST) → pass inner expression through as-is
-            if (std.mem.startsWith(u8, type_name, "Array(") or
-                std.ascii.eqlIgnoreCase(type_name, "LIST") or
-                std.ascii.eqlIgnoreCase(type_name, "LIST[]") or
-                std.mem.endsWith(u8, type_name, "[]"))
-            {
-                break :blk_cast inner;
-            }
-            // Map target type to a kernels function
-            const fn_name: []const u8 = if (std.ascii.eqlIgnoreCase(type_name, "DATE"))
-                "toDate"
-            else if (std.ascii.eqlIgnoreCase(type_name, "VARCHAR") or std.ascii.eqlIgnoreCase(type_name, "String"))
-                "toString"
-            else if (std.ascii.eqlIgnoreCase(type_name, "Int64") or std.ascii.eqlIgnoreCase(type_name, "BIGINT"))
-                "toInt64"
-            else if (std.ascii.eqlIgnoreCase(type_name, "Int32") or
-                std.ascii.eqlIgnoreCase(type_name, "Int16") or
-                std.ascii.eqlIgnoreCase(type_name, "Int8") or
-                std.ascii.eqlIgnoreCase(type_name, "INT") or
-                std.ascii.eqlIgnoreCase(type_name, "INTEGER"))
-                "toInt32"
-            else if (std.ascii.eqlIgnoreCase(type_name, "UInt64"))
-                "toUInt64"
-            else if (std.ascii.eqlIgnoreCase(type_name, "UInt32"))
-                "toUInt32"
-            else if (std.ascii.eqlIgnoreCase(type_name, "UInt16"))
-                "toUInt16"
-            else if (std.ascii.eqlIgnoreCase(type_name, "UInt8"))
-                "toUInt8"
-            else if (std.ascii.eqlIgnoreCase(type_name, "Float64") or
-                std.ascii.eqlIgnoreCase(type_name, "DOUBLE") or
-                std.ascii.eqlIgnoreCase(type_name, "DOUBLE PRECISION"))
-                "toFloat64"
-            else if (std.ascii.eqlIgnoreCase(type_name, "Float32") or
-                std.ascii.eqlIgnoreCase(type_name, "FLOAT") or
-                std.ascii.eqlIgnoreCase(type_name, "REAL"))
-                "toFloat32"
-            else
-                return null; // unsupported cast type
+            if (sep_tok.kind != .kw_as and sep_tok.kind != .comma) return null;
+            const type_name = parseCastTarget(&pctx.lex) orelse return null;
+            const fn_name = castFnForType(type_name) orelse return null;
             const fc = try pctx.arena.create(plan.FnCall);
             const fc_args = try pctx.arena.alloc(Expr, 1);
             fc_args[0] = inner;
@@ -2246,7 +2567,12 @@ fn inferExprType(ctx: *PlannerCtx, expr: Expr) ColumnType {
         .lit_bool => .bool_u8,
         .lit_null => .int64,
         .lit_array => .array_string,
-        .col_ref => |ref| schemaColType(ctx, ref.name),
+        .col_ref => |ref| blk: {
+            for (ctx.virtual_cols) |vc| {
+                if (std.mem.eql(u8, vc.name, ref.name)) break :blk vc.col_type;
+            }
+            break :blk schemaColType(ctx, ref.name);
+        },
         .add, .sub, .mul => |op| {
             const lt = inferExprType(ctx, op.left);
             const rt = inferExprType(ctx, op.right);
@@ -2257,6 +2583,7 @@ fn inferExprType(ctx: *PlannerCtx, expr: Expr) ColumnType {
         .mod => .int64,
         // Comparison operators yield bool_u8
         .eq, .neq, .lt, .lte, .gt, .gte => .bool_u8,
+        .case_when => |cw| inferCaseWhenType(ctx, cw.*),
         .fn_call => |fc| {
             for (scalar_fns) |sf| {
                 if (std.mem.eql(u8, sf.name, fc.name)) return sf.out;
@@ -2275,7 +2602,8 @@ fn inferExprType(ctx: *PlannerCtx, expr: Expr) ColumnType {
                 std.mem.eql(u8, fc.name, "mapValuesFloat64") or
                 std.mem.eql(u8, fc.name, "arrayConcat") or
                 std.mem.eql(u8, fc.name, "arrayDistinct") or
-                std.mem.eql(u8, fc.name, "arrayFlatten")) return .array_string;
+                std.mem.eql(u8, fc.name, "arrayFlatten") or
+                std.mem.eql(u8, fc.name, "CAST_array_string")) return .array_string;
             if (std.mem.eql(u8, fc.name, "has") or
                 std.mem.eql(u8, fc.name, "hasAny") or
                 std.mem.eql(u8, fc.name, "hasAll")) return .bool_u8;
@@ -2284,6 +2612,7 @@ fn inferExprType(ctx: *PlannerCtx, expr: Expr) ColumnType {
             if (std.mem.eql(u8, fc.name, "mapGet")) return .string;
             if (std.mem.eql(u8, fc.name, "mapGetFloat64")) return .float64;
             if (std.mem.eql(u8, fc.name, "arrayExists")) return .bool_u8;
+            if (std.mem.eql(u8, fc.name, "arrayMax") or std.mem.eql(u8, fc.name, "arrayMin")) return .string;
             if (std.mem.eql(u8, fc.name, "arrayJoin")) return .string;
             if (std.mem.eql(u8, fc.name, "arrayMap") or std.mem.eql(u8, fc.name, "arrayFilter")) return .array_string;
             if (std.mem.eql(u8, fc.name, "and") or std.mem.eql(u8, fc.name, "or")) return .uint64;
@@ -2292,9 +2621,8 @@ fn inferExprType(ctx: *PlannerCtx, expr: Expr) ColumnType {
             if (std.mem.eql(u8, fc.name, "arrayElement")) return .string;
             if (std.mem.eql(u8, fc.name, "arrayIntersect") or
                 std.mem.eql(u8, fc.name, "array")) return .array_string;
-            if (std.mem.eql(u8, fc.name, "if") or std.mem.eql(u8, fc.name, "multiIf")) {
-                if (fc.args.len >= 2) return inferExprType(ctx, fc.args[1]);
-            }
+            if (std.mem.eql(u8, fc.name, "if") or std.mem.eql(u8, fc.name, "multiIf"))
+                return inferConditionalType(ctx, fc.name, fc.args);
             if (std.mem.eql(u8, fc.name, "regexp_replace") or
                 std.mem.eql(u8, fc.name, "replaceRegexpOne") or
                 std.mem.eql(u8, fc.name, "replaceAll") or
@@ -2309,15 +2637,54 @@ fn inferExprType(ctx: *PlannerCtx, expr: Expr) ColumnType {
         },
         .dict_call => |dc| {
             if (std.ascii.eqlIgnoreCase(dc.fn_name, "dictHas")) return .bool_u8;
-            // If the default expression is an array, the result is array_string
+            if (dc.attr_name) |attr| {
+                if (std.ascii.eqlIgnoreCase(attr, "score")) return .float64;
+                if (std.ascii.eqlIgnoreCase(attr, "tags")) return .array_string;
+            }
             if (dc.default_expr) |de| {
                 const dt = inferExprType(ctx, de);
-                if (dt == .array_string) return .array_string;
+                if (dt == .array_string or dt == .float64 or dt == .string) return dt;
             }
             return .string;
         },
         else => .float64,
     };
+}
+
+fn mergeConditionalType(cur: ColumnType, next: ColumnType) ColumnType {
+    if (cur == .array_string or next == .array_string) return .array_string;
+    if (cur == .string and next == .string) return .string;
+    if (cur == .string and next != .float64) return .string;
+    if (next == .string and cur != .float64) return .string;
+    if (cur == .float64 or next == .float64) return .float64;
+    if (cur == .uint64 or next == .uint64) return .uint64;
+    return cur;
+}
+
+fn inferCaseWhenType(ctx: *PlannerCtx, cw: plan.CaseWhen) ColumnType {
+    if (cw.then.len == 0) return if (cw.else_expr) |e| inferExprType(ctx, e) else .string;
+    var out = inferExprType(ctx, cw.then[0]);
+    for (cw.then[1..]) |expr| out = mergeConditionalType(out, inferExprType(ctx, expr));
+    if (cw.else_expr) |expr| out = mergeConditionalType(out, inferExprType(ctx, expr));
+    return out;
+}
+
+fn inferConditionalType(ctx: *PlannerCtx, name: []const u8, args: []const Expr) ColumnType {
+    if (std.mem.eql(u8, name, "if")) {
+        if (args.len < 2) return .string;
+        var out = inferExprType(ctx, args[1]);
+        if (args.len >= 3) out = mergeConditionalType(out, inferExprType(ctx, args[2]));
+        return out;
+    }
+
+    if (args.len < 3) return .string;
+    var out = inferExprType(ctx, args[1]);
+    var i: usize = 3;
+    while (i < args.len) : (i += 2) {
+        out = mergeConditionalType(out, inferExprType(ctx, args[i]));
+    }
+    if (args.len % 2 == 1) out = mergeConditionalType(out, inferExprType(ctx, args[args.len - 1]));
+    return out;
 }
 
 /// Try to parse `text` as `fn_name(arg)` where fn_name is in scalar_fns and

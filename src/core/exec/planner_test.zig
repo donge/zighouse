@@ -98,6 +98,90 @@ test "planner: 2-param lambda parse" {
     try std.testing.expect(node != null);
 }
 
+test "planner: Array(String) cast forms plan as array_string scalar" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const cols = [_]schema_mod.Column{.{ .name = "n", .ty = .int64 }};
+    const tbl = schema_mod.Table{ .name = "t", .columns = &cols };
+
+    const cases = [_][]const u8{
+        "CAST([], 'Array(String)')",
+        "CAST([] AS Array(String))",
+    };
+    for (cases) |expr_text| {
+        var ctx = PlannerCtx.init(alloc, tbl);
+        const proj_expr = generic_sql.Expr{
+            .func = .column_ref,
+            .column = expr_text,
+            .alias = "a",
+        };
+        const projs = [_]generic_sql.Expr{proj_expr};
+        const gplan = generic_sql.Plan{ .table = "t", .projections = &projs };
+        const node = try plan_query(&ctx, gplan);
+        try std.testing.expect(node != null);
+        try std.testing.expect(node.?.* == .project);
+        const item = node.?.project.items[0];
+        try std.testing.expectEqual(planner_mod.ColumnType.array_string, item.out_type);
+        try std.testing.expect(item.expr == .fn_call);
+        try std.testing.expectEqualStrings("CAST_array_string", item.expr.fn_call.name);
+    }
+}
+
+test "planner: dict score conditional infers Float64" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const cols = [_]schema_mod.Column{
+        .{ .name = "dst_ip", .ty = .text, .ch_type = "IPv6" },
+    };
+    const tbl = schema_mod.Table{ .name = "detect_events", .columns = &cols };
+    var ctx = PlannerCtx.init(alloc, tbl);
+
+    const ip = "if(startsWith(toString(dst_ip), '::ffff:'), substring(toString(dst_ip), 8), toString(dst_ip))";
+    const expr = try std.fmt.allocPrint(alloc,
+        "if(isIPv4String({0s}), dictGetOrDefault('vprobe.dict_ip_reputation_trie', 'score', tuple(IPv4StringToNumOrDefault({0s})), 0.0), if(isIPv6String({0s}), dictGetOrDefault('vprobe.dict_ip_reputation_trie', 'score', tuple(IPv6StringToNumOrDefault({0s})), 0.0), 0.0))",
+        .{ip},
+    );
+    const projs = [_]generic_sql.Expr{.{
+        .func = .column_ref,
+        .column = expr,
+        .alias = "intel_score",
+    }};
+    const gplan = generic_sql.Plan{ .table = "detect_events", .projections = &projs };
+
+    const node = try plan_query(&ctx, gplan) orelse return error.NullPlan;
+    try std.testing.expect(node.* == .project);
+    try std.testing.expectEqual(planner_mod.ColumnType.float64, node.project.items[0].out_type);
+}
+
+test "planner: parsed dict score conditional infers Float64" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const cols = [_]schema_mod.Column{
+        .{ .name = "dst_ip", .ty = .text, .ch_type = "IPv6" },
+    };
+    const tbl = schema_mod.Table{ .name = "detect_events", .columns = &cols };
+    var ctx = PlannerCtx.init(alloc, tbl);
+
+    const sql =
+        "SELECT if(isIPv4String(if(startsWith(toString(dst_ip), '::ffff:'), substring(toString(dst_ip), 8), toString(dst_ip))), " ++
+        "dictGetOrDefault('vprobe.dict_ip_reputation_trie', 'score', tuple(IPv4StringToNumOrDefault(if(startsWith(toString(dst_ip), '::ffff:'), substring(toString(dst_ip), 8), toString(dst_ip)))), 0.0), " ++
+        "if(isIPv6String(if(startsWith(toString(dst_ip), '::ffff:'), substring(toString(dst_ip), 8), toString(dst_ip))), " ++
+        "dictGetOrDefault('vprobe.dict_ip_reputation_trie', 'score', tuple(IPv6StringToNumOrDefault(if(startsWith(toString(dst_ip), '::ffff:'), substring(toString(dst_ip), 8), toString(dst_ip)))), 0.0), 0.0)) AS intel_score " ++
+        "FROM detect_events";
+    const gplan = (try generic_sql.parse(alloc, sql)) orelse return error.ParseFailed;
+    defer generic_sql.deinit(alloc, gplan);
+
+    const node = try plan_query(&ctx, gplan) orelse return error.NullPlan;
+    try std.testing.expect(node.* == .project);
+    try std.testing.expectEqual(planner_mod.ColumnType.float64, node.project.items[0].out_type);
+}
+
 test "planner: user function substitution respects identifier boundaries" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

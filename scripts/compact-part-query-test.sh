@@ -157,6 +157,7 @@ expect_eq "count" "6" "$(select_tsv "SELECT count(*) FROM default.compact_events
 expect_eq "int filter projection" $'2\n4\n6' "$(select_tsv "SELECT id FROM default.compact_events WHERE score > 6 ORDER BY id")"
 expect_eq "string non-empty filter" "5" "$(select_tsv "SELECT count(*) FROM default.compact_events WHERE category <> ''")"
 expect_eq "grouped string topK" $'alpha\t2\nbeta\t2\ngamma\t1' "$(select_tsv "SELECT category, count(*) AS c FROM default.compact_events WHERE category <> '' GROUP BY category ORDER BY category")"
+expect_eq "group by multiIf post agg" $'10\tcold\n20\thot\n30\tcold' "$(select_tsv "SELECT user_id, multiIf(count(*) > 2, 'hot', 'cold') FROM default.compact_events GROUP BY user_id ORDER BY user_id")"
 expect_eq "count distinct" "3" "$(select_tsv "SELECT count(distinct user_id) FROM default.compact_events")"
 expect_eq "groupArray preserves order" "alpha,beta,alpha,gamma,beta" "$(select_tsv "SELECT arrayStringConcat(groupArray(category), ',') FROM default.compact_events WHERE category <> ''")"
 expect_eq "post aggregate arraySlice" "alpha,beta,alpha" "$(select_tsv "SELECT arrayStringConcat(arraySlice(groupArray(category), 1, 3), ',') FROM default.compact_events WHERE category <> ''")"
@@ -167,6 +168,11 @@ expect_eq "grouped count topK" $'20\t3\n10\t2' "$(select_tsv "SELECT user_id, CO
 expect_eq "system one" "1" "$(select_tsv "SELECT 1 FROM system.one")"
 expect_eq "cast comma type" "1" "$(select_tsv "SELECT CAST(id, 'Int64') FROM default.compact_events ORDER BY id LIMIT 1")"
 expect_eq "cast standard uint" "1" "$(select_tsv "SELECT CAST(id AS UInt64) FROM default.compact_events ORDER BY id LIMIT 1")"
+expect_eq "cast empty array comma" "0" "$(select_tsv "SELECT length(CAST([], 'Array(String)')) FROM default.compact_events LIMIT 1")"
+expect_eq "cast empty array standard" "0" "$(select_tsv "SELECT length(CAST([] AS Array(String))) FROM default.compact_events LIMIT 1")"
+expect_eq "dict default array cast" "0" "$(select_tsv "SELECT length(dictGetOrDefault('missing_dict', 'tags', tuple(category), CAST([], 'Array(String)'))) FROM default.compact_events LIMIT 1")"
+expect_eq "arrayMax over arrayMap lambda" "20" "$(select_tsv "SELECT arrayMax(arrayMap(x -> x, ['1','20','3'])) FROM default.compact_events LIMIT 1")"
+expect_eq "numeric groupUniqArray arrayMax" "9" "$(select_tsv "SELECT arrayMax(arrayMap(x -> x, groupUniqArray(score))) FROM default.compact_events")"
 expect_eq "union all tsv" $'1\n2' "$(select_tsv "SELECT id FROM default.compact_events WHERE id = 1 UNION ALL SELECT id FROM default.compact_events WHERE id = 2")"
 union_json="$(select_tsv "SELECT id FROM default.compact_events WHERE id = 1 UNION ALL SELECT id FROM default.compact_events WHERE id = 2 FORMAT JSON")"
 if [[ "$union_json" != *'"rows":2'* || "$union_json" != *'"id":1'* || "$union_json" != *'"id":2'* ]]; then
@@ -255,6 +261,10 @@ expect_eq "mapValues compact" $'[1.5,2]\n[3]' "$(select_tsv "SELECT mapValues(fe
 expect_eq "array join map keys" $'bytes\npkts\nbytes' "$(select_tsv "SELECT fk FROM default.map_events ARRAY JOIN mapKeys(features) AS fk")"
 expect_eq "array join map keys values" $'bytes\t1.5\npkts\t2\nbytes\t3' "$(select_tsv "SELECT fk, fv FROM default.map_events ARRAY JOIN mapKeys(features) AS fk, mapValues(features) AS fv")"
 expect_eq "array join group by" $'TCP\tbytes\t2\nTCP\tpkts\t1' "$(select_tsv "SELECT protocol, fk, count(*) FROM default.map_events ARRAY JOIN mapKeys(features) AS fk, mapValues(features) AS fv GROUP BY protocol, fk ORDER BY protocol, fk")"
+
+post_sql "CREATE TABLE default.final_events (rule_id String, version UInt64) ENGINE=ReplacingMergeTree(version) ORDER BY rule_id"
+post_sql "INSERT INTO default.final_events VALUES ('old', 1), ('new', 2)"
+expect_eq "FINAL hidden sort column" $'new\nold' "$(select_tsv "SELECT rule_id FROM default.final_events FINAL")"
 
 post_sql "CREATE TABLE test.values_events (id Int64, name String) ENGINE=MergeTree() ORDER BY id"
 post_sql "INSERT INTO test.values_events VALUES (42, 'hello')"

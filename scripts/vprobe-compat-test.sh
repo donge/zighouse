@@ -14,6 +14,7 @@ set -euo pipefail
 
 ZH=./zig-out/bin/zighouse
 PORT=19900
+HTTP_PORT=$((PORT + 1))
 DATA=/tmp/zh_vprobe_compat
 FAIL=0
 PASS_COUNT=0
@@ -31,7 +32,7 @@ ddl() {
   enc=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "$sql")
   local code
   code=$(curl --noproxy 127.0.0.1 -s -o /tmp/zh_compat_resp.txt -w "%{http_code}" \
-    "http://127.0.0.1:$PORT/?query=$enc")
+    "http://127.0.0.1:$HTTP_PORT/?query=$enc")
   if [ "$code" = "200" ]; then
     pass "$desc"
   else
@@ -46,7 +47,7 @@ select_eq() {
   local enc
   enc=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "$sql")
   local resp
-  resp=$(curl --noproxy 127.0.0.1 -s "http://127.0.0.1:$PORT/?query=$enc" | tail -1 | tr -d '[:space:]')
+  resp=$(curl --noproxy 127.0.0.1 -s "http://127.0.0.1:$HTTP_PORT/?query=$enc" | tail -1 | tr -d '[:space:]')
   if [ "$resp" = "$expected" ]; then
     pass "$desc (=$expected)"
   else
@@ -203,7 +204,7 @@ PYEOF
 
 INSERT_CODE=$(curl --noproxy 127.0.0.1 -s -o /tmp/zh_insert_resp.txt -w "%{http_code}" \
   --data-binary @/tmp/zh_heartbeats.bin \
-  "http://127.0.0.1:$PORT/?query=INSERT+INTO+vprobe.probe_heartbeats+FORMAT+RowBinaryWithNamesAndTypes")
+  "http://127.0.0.1:$HTTP_PORT/?query=INSERT+INTO+vprobe.probe_heartbeats+FORMAT+RowBinaryWithNamesAndTypes")
 if [ "$INSERT_CODE" = "200" ]; then
   pass "INSERT probe_heartbeats (3 rows)"
 else
@@ -268,7 +269,7 @@ PYEOF
 
 INSERT_CODE=$(curl --noproxy 127.0.0.1 -s -o /tmp/zh_insert_resp.txt -w "%{http_code}" \
   --data-binary @/tmp/zh_scoring.bin \
-  "http://127.0.0.1:$PORT/?query=INSERT+INTO+vprobe.scoring_rules+FORMAT+RowBinaryWithNamesAndTypes")
+  "http://127.0.0.1:$HTTP_PORT/?query=INSERT+INTO+vprobe.scoring_rules+FORMAT+RowBinaryWithNamesAndTypes")
 if [ "$INSERT_CODE" = "200" ]; then
   pass "INSERT scoring_rules (1 row)"
 else
@@ -404,7 +405,7 @@ PYEOF
 
 INSERT_CODE=$(curl --noproxy 127.0.0.1 -s -o /tmp/zh_insert_resp.txt -w "%{http_code}" \
   --data-binary @/tmp/zh_detect.bin \
-  "http://127.0.0.1:$PORT/?query=INSERT+INTO+vprobe.detect_events+FORMAT+RowBinaryWithNamesAndTypes")
+  "http://127.0.0.1:$HTTP_PORT/?query=INSERT+INTO+vprobe.detect_events+FORMAT+RowBinaryWithNamesAndTypes")
 if [ "$INSERT_CODE" = "200" ]; then
   pass "INSERT detect_events (2 rows)"
 else

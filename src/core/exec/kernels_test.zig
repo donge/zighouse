@@ -125,6 +125,47 @@ test "evalFnCall: multiIf" {
     try std.testing.expectEqualStrings("mid", v.?.string);
 }
 
+test "evalFnCall: CAST_array_string" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var empty_fc = plan.FnCall{
+        .name = "CAST_array_string",
+        .args = @constCast(&[_]plan.Expr{.{ .lit_str = "" }}),
+    };
+    const empty = try evalExpr(.{ .fn_call = &empty_fc }, &.{}, null, arena.allocator());
+    try std.testing.expectEqual(@as(usize, 0), empty.?.array_string.len);
+
+    var one_fc = plan.FnCall{
+        .name = "CAST_array_string",
+        .args = @constCast(&[_]plan.Expr{.{ .lit_str = "x" }}),
+    };
+    const one = try evalExpr(.{ .fn_call = &one_fc }, &.{}, null, arena.allocator());
+    try std.testing.expectEqual(@as(usize, 1), one.?.array_string.len);
+    try std.testing.expectEqualStrings("x", one.?.array_string[0]);
+}
+
+test "evalFnCall: arrayMax over arrayMap numeric strings" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var body = plan.Expr.lambda_param;
+    const lam = plan.Lambda{ .param = "x", .body = &body };
+    var map_fc = plan.FnCall{
+        .name = "arrayMap",
+        .args = @constCast(&[_]plan.Expr{
+            .{ .lambda = lam },
+            .{ .lit_array = @constCast(&[_][]const u8{ "1", "20", "3" }) },
+        }),
+    };
+    var max_fc = plan.FnCall{
+        .name = "arrayMax",
+        .args = @constCast(&[_]plan.Expr{.{ .fn_call = &map_fc }}),
+    };
+    const v = try evalExpr(.{ .fn_call = &max_fc }, &.{}, null, arena.allocator());
+    try std.testing.expectEqualStrings("20", v.?.string);
+}
+
 test "evalFnCall: IPv4StringToNumOrDefault" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

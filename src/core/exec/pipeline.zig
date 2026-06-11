@@ -4749,7 +4749,7 @@ fn executeLimitChunked(node: *const plan.PhysicalNode, ctx: *QueryContext) !RowL
     const schema_metas = ctx.source.schema();
     const out_metas: []result.ColMeta = if (project_items) |items| blk: {
         const m = try alloc.alloc(result.ColMeta, items.len);
-        for (items, 0..) |item, i| m[i] = .{ .name = item.alias, .col_type = item.out_type };
+        for (items, 0..) |item, i| m[i] = .{ .name = item.alias, .col_type = item.out_type, .ch_type = item.ch_type };
         break :blk m;
     } else try alloc.dupe(result.ColMeta, schema_metas);
     var rl = RowList.init(out_metas);
@@ -5457,11 +5457,9 @@ fn executeTopKLateMat(
             try ctx.source.fetchRange(entry.global_row, 1, &full_chunk, alloc);
             const full_row = try full_chunk.readRow(0, alloc);
             if (project_items) |items| {
-                // Non-select*: project full_row[schema_idx] → row[output_idx].
                 const proj_row = try alloc.alloc(?Value, items.len);
                 for (items, 0..) |item, pi| {
-                    const sidx: usize = if (item.expr == .col_ref) item.expr.col_ref.index else pi;
-                    proj_row[pi] = if (sidx < full_row.len) full_row[sidx] else null;
+                    proj_row[pi] = try kernels.evalExpr(item.expr, full_row, null, alloc);
                 }
                 try rl2.append(alloc, proj_row);
             } else {
@@ -5700,7 +5698,15 @@ fn executeTopKLateMat(
         var full_chunk: DataChunk = undefined;
         try ctx.source.fetchRange(entry.global_row, 1, &full_chunk, alloc);
         const row = try full_chunk.readRow(0, alloc);
-        try rl.append(alloc, row);
+        if (project_items) |items| {
+            const proj_row = try alloc.alloc(?Value, items.len);
+            for (items, 0..) |item, pi| {
+                proj_row[pi] = try kernels.evalExpr(item.expr, row, null, alloc);
+            }
+            try rl.append(alloc, proj_row);
+        } else {
+            try rl.append(alloc, row);
+        }
     }
     return rl;
 }
@@ -5739,7 +5745,7 @@ fn executeTopKFromScannable(
     const schema_metas = ctx.source.schema();
     const out_metas: []result.ColMeta = if (project_items) |items| blk: {
         const m = try alloc.alloc(result.ColMeta, items.len);
-        for (items, 0..) |item, i| m[i] = .{ .name = item.alias, .col_type = item.out_type };
+        for (items, 0..) |item, i| m[i] = .{ .name = item.alias, .col_type = item.out_type, .ch_type = item.ch_type };
         break :blk m;
     } else try alloc.dupe(result.ColMeta, schema_metas);
 

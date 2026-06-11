@@ -874,12 +874,22 @@ const Parser = struct {
         // Support both CAST(expr AS type) and CAST(expr, 'type')
         const use_as = self.tok.eatKeyword("AS");
         if (!use_as and !self.tok.eatIf(.comma)) return error.UnexpectedToken;
-        // Type name may be multi-word: UNSIGNED INT, Array(String), etc. We grab until ')'
+        // Type name may be multi-word or nested: UNSIGNED INT, Array(String), etc.
         var type_parts: std.ArrayListUnmanaged(u8) = .empty;
         defer type_parts.deinit(self.allocator);
-        while (self.tok.peek().kind != .rparen and self.tok.peek().kind != .eof) {
+        var depth: usize = 0;
+        while (self.tok.peek().kind != .eof) {
+            if (self.tok.peek().kind == .rparen and depth == 0) break;
             const tp = self.tok.next();
-            if (type_parts.items.len > 0) try type_parts.append(self.allocator, ' ');
+            if (tp.kind == .lparen) depth += 1;
+            if (tp.kind == .rparen) {
+                if (depth == 0) break;
+                depth -= 1;
+            }
+            const needs_space = type_parts.items.len > 0 and
+                tp.kind != .lparen and tp.kind != .rparen and
+                type_parts.items[type_parts.items.len - 1] != '(';
+            if (needs_space) try type_parts.append(self.allocator, ' ');
             // Strip surrounding single quotes from string literal tokens
             const raw = tp.text;
             const clean = if (raw.len >= 2 and raw[0] == '\'' and raw[raw.len - 1] == '\'')
@@ -961,6 +971,11 @@ test "parser: CAST supports AS and comma type forms" {
     try std.testing.expect(clickhouse != null);
     try std.testing.expect(clickhouse.?.select.projections[0].expr == .cast);
     try std.testing.expectEqualStrings("Int64", clickhouse.?.select.projections[0].expr.cast.type_name);
+
+    const array_cast = parse(allocator, "SELECT CAST([], 'Array(String)'), CAST([] AS Array(String)) FROM t");
+    try std.testing.expect(array_cast != null);
+    try std.testing.expectEqualStrings("Array(String)", array_cast.?.select.projections[0].expr.cast.type_name);
+    try std.testing.expectEqualStrings("Array(String)", array_cast.?.select.projections[1].expr.cast.type_name);
 }
 
 test "parser: GROUP BY ORDER BY LIMIT" {

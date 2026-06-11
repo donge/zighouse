@@ -552,6 +552,23 @@ fn evalFnCallFull(fc: *const plan.FnCall, row: []const ?Value, lambda_val: ?Valu
         const out = try std.fmt.allocPrint(arena, "{}", .{v});
         return Value{ .string = out };
     }
+    if (std.mem.eql(u8, name, "CAST_array_string")) {
+        const v = args[0] orelse return Value{ .array_string = &.{} };
+        switch (v) {
+            .array_string => |arr| return Value{ .array_string = arr },
+            .string => |s| {
+                if (s.len == 0) return Value{ .array_string = &.{} };
+                const out = try arena.alloc([]const u8, 1);
+                out[0] = s;
+                return Value{ .array_string = out };
+            },
+            else => {
+                const out = try arena.alloc([]const u8, 1);
+                out[0] = try std.fmt.allocPrint(arena, "{}", .{v});
+                return Value{ .array_string = out };
+            },
+        }
+    }
     if (std.mem.eql(u8, name, "toInt64") or std.mem.eql(u8, name, "toInt32")) {
         const v = args[0] orelse return null;
         return Value{ .int64 = v.toI64() orelse 0 };
@@ -1562,10 +1579,30 @@ fn evalFnCallFull(fc: *const plan.FnCall, row: []const ?Value, lambda_val: ?Valu
         switch (arr) {
             .array_string => |elems| {
                 if (elems.len == 0) return null;
-                var best: []const u8 = elems[0];
-                for (elems[1..]) |e| if (std.mem.lessThan(u8, best, e)) {
-                    best = e;
+                var all_numeric = true;
+                var best_num = std.fmt.parseFloat(f64, elems[0]) catch blk: {
+                    all_numeric = false;
+                    break :blk 0.0;
                 };
+                var best: []const u8 = elems[0];
+                if (all_numeric) {
+                    for (elems[1..]) |e| {
+                        const n = std.fmt.parseFloat(f64, e) catch {
+                            all_numeric = false;
+                            break;
+                        };
+                        if (n > best_num) {
+                            best_num = n;
+                            best = e;
+                        }
+                    }
+                }
+                if (!all_numeric) {
+                    best = elems[0];
+                    for (elems[1..]) |e| if (std.mem.lessThan(u8, best, e)) {
+                        best = e;
+                    };
+                }
                 return Value{ .string = best };
             },
             else => return null,
@@ -1733,6 +1770,20 @@ fn castValue(v: Value, to: ColumnType, arena: std.mem.Allocator) !?Value {
     };
 }
 
+fn valueToArrayString(v: Value, arena: std.mem.Allocator) ![]const u8 {
+    if (v.toStr()) |s| return s;
+    return switch (v) {
+        .bool_u8 => |b| if (b != 0) "1" else "0",
+        .int64 => |i| try std.fmt.allocPrint(arena, "{d}", .{i}),
+        .uint64 => |u| try std.fmt.allocPrint(arena, "{d}", .{u}),
+        .float64 => |f| try std.fmt.allocPrint(arena, "{d}", .{f}),
+        .date_u16 => |d| try std.fmt.allocPrint(arena, "{d}", .{d}),
+        .datetime64_ms => |ts| try std.fmt.allocPrint(arena, "{d}", .{ts}),
+        .array_string => "",
+        .string => unreachable,
+    };
+}
+
 // ── Aggregate update ──────────────────────────────────────────────────────────
 
 /// Update a single accumulator with a new value `v`.
@@ -1803,15 +1854,13 @@ pub fn updateAccum(accum: *AggAccum, v: ?Value, arena: std.mem.Allocator) !void 
             }
         },
         .uniq_strs => if (v) |val| {
-            if (val.toStr()) |s| {
-                const owned = try arena.dupe(u8, s);
-                try accum.uniq_strs.put(arena, owned, {});
-            }
+            const s = try valueToArrayString(val, arena);
+            const owned = try arena.dupe(u8, s);
+            try accum.uniq_strs.put(arena, owned, {});
         },
         .array_strs => if (v) |val| {
-            if (val.toStr()) |s| {
-                try accum.array_strs.append(arena, try arena.dupe(u8, s));
-            }
+            const s = try valueToArrayString(val, arena);
+            try accum.array_strs.append(arena, try arena.dupe(u8, s));
         },
         .any_val => if (accum.any_val == null) {
             accum.any_val = v;
@@ -1878,6 +1927,11 @@ fn evalDictCall(dc: *const plan.DictCall, row: []const ?Value, lambda_val: ?Valu
 
     if (result_ptr) |ptr| {
         const s = std.mem.sliceTo(ptr, 0);
+        if (dc.attr_name) |attr| {
+            if (std.ascii.eqlIgnoreCase(attr, "score")) {
+                return Value{ .float64 = std.fmt.parseFloat(f64, s) catch 0.0 };
+            }
+        }
         const out = try arena.dupe(u8, s);
         return Value{ .string = out };
     }
