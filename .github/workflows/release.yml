@@ -13,20 +13,27 @@ jobs:
           - target: aarch64-macos
             runner: macos-14
             suffix: macos-arm64
+            zig-url: https://ziglang.org/download/0.16.0/zig-macos-aarch64-0.16.0.tar.xz
           - target: x86_64-macos
             runner: macos-13
             suffix: macos-x86_64
+            zig-url: https://ziglang.org/download/0.16.0/zig-macos-x86_64-0.16.0.tar.xz
           - target: x86_64-linux-gnu
             runner: ubuntu-latest
             suffix: linux-x86_64
+            zig-url: https://ziglang.org/download/0.16.0/zig-linux-x86_64-0.16.0.tar.xz
           - target: aarch64-linux-gnu
             runner: ubuntu-24.04-arm
             suffix: linux-arm64
+            zig-url: https://ziglang.org/download/0.16.0/zig-linux-aarch64-0.16.0.tar.xz
     steps:
       - uses: actions/checkout@v4
-      - uses: mlugg/setup-zig@v1
-        with:
-          version: 0.16.0
+      - name: Install zig ${{ matrix.zig-url }}
+        run: |
+          curl -LO "${{ matrix.zig-url }}"
+          tar xf "$(basename '${{ matrix.zig-url }}')"
+          DIR="$(basename '${{ matrix.zig-url }}' .tar.xz)"
+          echo "$GITHUB_WORKSPACE/$DIR" >> $GITHUB_PATH
       - run: zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseFast -Dstrip=true -Dstatic-libs=true
       - run: |
           BIN="zighouse-${{ matrix.suffix }}"
