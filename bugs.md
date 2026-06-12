@@ -46,3 +46,8 @@ Possible cause: the hash aggregation pipeline's LIMIT pushdown depends on the ke
 **Actual:** Raw binary data (`\x00\x00\x00...`) mixed with some readable strings
 
 Affects ORDER BY paths that sort scanned rows (not GROUP BY results). GROUP BY + ORDER BY on strings works correctly (Q7-Q19). The corruption suggests the string column's internal offset-based storage format is misinterpreted during the sort-and-limit path when there's no hash aggregation involved.
+
+## 5. `POSITION('x' IN y)` standard syntax not working
+
+**Query:** `SELECT POSITION('foo' IN 'bar')` — returns ParseFailed.
+Functional form `position(a, b)` works. Standard form enters parser's `parsePositionFunc` but plan_builder → planner chain fails. Parser correctly produces `func("position", [haystack, needle])` AST but planner integration incomplete.
