@@ -306,6 +306,14 @@ pub const Server = struct {
             }
             // Other DDL (SYSTEM, SET, DROP PARTITION, etc.) — no-op
             try sendResponse(request, out, .ok, "");
+        } else if (asciiStartsWith(trimmed, "START") or
+            asciiStartsWith(trimmed, "COMMIT") or
+            asciiStartsWith(trimmed, "ROLLBACK") or
+            asciiStartsWith(trimmed, "GRANT") or
+            asciiStartsWith(trimmed, "REVOKE"))
+        {
+            // Transaction and privilege statements — no-op (non-transactional).
+            try sendResponse(request, out, .ok, "");
         } else {
             try sendResponse(request, out, .bad_request, "Only CREATE TABLE, INSERT and SELECT are supported\n");
         }
@@ -457,6 +465,23 @@ pub const Server = struct {
                 };
                 try self.mat_views.put(mv_key, parsed_mv);
             }
+            try respondOk(self, request, out, native_path);
+            return;
+        }
+        // CREATE SCHEMA — no-op (schemas are implicit in zighouse).
+        if (std.ascii.eqlIgnoreCase(second, "SCHEMA")) {
+            try respondOk(self, request, out, native_path);
+            return;
+        }
+        // CREATE ROLE / DOMAIN / TYPE / SEQUENCE / COLLATION / CHARACTER SET / TRANSLATION — no-op.
+        if (std.ascii.eqlIgnoreCase(second, "ROLE") or
+            std.ascii.eqlIgnoreCase(second, "DOMAIN") or
+            std.ascii.eqlIgnoreCase(second, "TYPE") or
+            std.ascii.eqlIgnoreCase(second, "SEQUENCE") or
+            std.ascii.eqlIgnoreCase(second, "COLLATION") or
+            (std.ascii.eqlIgnoreCase(second, "CHARACTER") and std.ascii.eqlIgnoreCase(third, "SET")) or
+            std.ascii.eqlIgnoreCase(second, "TRANSLATION"))
+        {
             try respondOk(self, request, out, native_path);
             return;
         }

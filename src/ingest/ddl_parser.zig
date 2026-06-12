@@ -95,10 +95,16 @@ pub fn parse(allocator: std.mem.Allocator, sql: []const u8) !ParseResult {
         const col_name_raw = tok.next() orelse return error.UnexpectedEndInColumnList;
         // Could be ')' as a token string — handle edge case
         if (col_name_raw.len == 1 and col_name_raw[0] == ')') break;
-        // Skip "PRIMARY KEY (...)" inside column list (ClickHouse syntax variant)
-        if (std.ascii.eqlIgnoreCase(col_name_raw, "PRIMARY")) {
-            try expectKeyword(&tok, "KEY");
-            _ = tok.next(); // consume key column
+        // Skip table-level constraint keywords (PRIMARY KEY, FOREIGN KEY, CONSTRAINT, CHECK, INDEX)
+        if (std.ascii.eqlIgnoreCase(col_name_raw, "PRIMARY") or
+            std.ascii.eqlIgnoreCase(col_name_raw, "FOREIGN") or
+            std.ascii.eqlIgnoreCase(col_name_raw, "CONSTRAINT") or
+            std.ascii.eqlIgnoreCase(col_name_raw, "CHECK") or
+            std.ascii.eqlIgnoreCase(col_name_raw, "UNIQUE") or
+            std.ascii.eqlIgnoreCase(col_name_raw, "REFERENCES") or
+            std.ascii.eqlIgnoreCase(col_name_raw, "INDEX"))
+        {
+            tok.skipToColumnDelimiter();
             continue;
         }
 
@@ -242,8 +248,11 @@ pub fn parse(allocator: std.mem.Allocator, sql: []const u8) !ParseResult {
 
         const col_ty = parseColumnType(col_type_raw) orelse return error.UnsupportedColumnType;
 
-        // Skip optional DEFAULT <expr> clause (any tokens up to the next top-level ',' or ')')
-        if (tok.peekKeyword("DEFAULT") or tok.peekKeyword("MATERIALIZED") or tok.peekKeyword("ALIAS") or tok.peekKeyword("COMMENT") or tok.peekKeyword("CODEC")) {
+        // Skip optional column-level constraints: DEFAULT, NOT NULL, UNIQUE, PRIMARY KEY,
+        // REFERENCES, CHECK, MATERIALIZED, ALIAS, COMMENT, CODEC, etc.
+        if (tok.peekKeyword("DEFAULT") or tok.peekKeyword("MATERIALIZED") or tok.peekKeyword("ALIAS") or tok.peekKeyword("COMMENT") or tok.peekKeyword("CODEC") or
+            tok.peekKeyword("NOT") or tok.peekKeyword("UNIQUE") or tok.peekKeyword("PRIMARY") or tok.peekKeyword("REFERENCES") or tok.peekKeyword("CHECK"))
+        {
             tok.skipToColumnDelimiter();
         }
 
