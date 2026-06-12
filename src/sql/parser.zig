@@ -952,9 +952,8 @@ const Parser = struct {
     }
 
     fn parseSubstringFunc(self: *Parser) ParseError!ast.Expr {
-        // SQL standard form: SUBSTRING(str FROM start [FOR len] [USING ...])
-        // Functional form: substring(str, start, len) — detected by comma after first expr
-        const first = try self.parseExpr();
+        // Parse at prec 5 to avoid keywords being consumed as postfix predicates
+        const first = try self.parsePrec(5);
         // Check for functional form (comma-separated args)
         if (self.tok.eatIf(.comma)) {
             var args = std.ArrayListUnmanaged(ast.Expr).empty;
@@ -993,21 +992,8 @@ const Parser = struct {
     }
 
     fn parsePositionFunc(self: *Parser) ParseError!ast.Expr {
-        // Functional form: position(haystack, needle) — comma-separated args
-        const first = try self.parseExpr();
-        if (self.tok.eatIf(.comma)) {
-            var args = std.ArrayListUnmanaged(ast.Expr).empty;
-            try args.append(self.allocator, first);
-            while (true) {
-                try args.append(self.allocator, try self.parseExpr());
-                if (!self.tok.eatIf(.comma)) break;
-            }
-            if (self.tok.peek().kind != .rparen) return error.UnexpectedToken;
-            _ = self.tok.next(); // )
-            const fn_name = try self.allocator.dupe(u8, "position");
-            return .{ .func = .{ .name = fn_name, .args = try args.toOwnedSlice(self.allocator) } };
-        }
-        // SQL standard form: POSITION(needle IN haystack)
+        // Parse at prec 5 to avoid IN being consumed as a postfix predicate
+        const first = try self.parsePrec(5);
         if (!self.tok.eatKeyword("IN")) return error.UnexpectedToken;
         const haystack = try self.parseExpr();
         // Skip optional USING CHARACTERS / USING OCTETS
