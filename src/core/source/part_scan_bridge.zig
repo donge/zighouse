@@ -251,39 +251,54 @@ const ScanState = struct {
     }
 
     fn findIntRange(self: *ScanState, col_name: []const u8, value: i64) !?SourceIface.RowRange {
-        if (self.part_dirs.len != 1) return null;
         if (self.table.sort_keys.len == 0 or !std.mem.eql(u8, self.table.sort_keys[0], col_name)) return null;
         const ci = self.colIndex(col_name) orelse return null;
         const col = self.table.columns[ci];
         if (col.ty != .int16 and col.ty != .int32 and col.ty != .int64 and col.ty != .date and col.ty != .timestamp) return null;
 
-        const pk_values = part_mod.readCompactPrimaryFixedValues(self.io, self.alloc, self.part_dirs[0], col.ty) catch return null;
-        defer self.alloc.free(pk_values);
-        if (pk_values.len == 0) return null;
-        const expected_granules: usize = @intCast((self.row_count + part_mod.GRANULE_SIZE - 1) / part_mod.GRANULE_SIZE);
-        if (pk_values.len != expected_granules) return null;
+        var global_base: u64 = 0;
+        var range_lo: ?u64 = null;
+        var range_hi: u64 = 0;
 
-        const lb = lowerBoundI64(pk_values, value);
-        const start_granule = if (lb == 0) 0 else lb - 1;
-        var end_granule = upperBoundI64(pk_values, value);
-        if (end_granule <= start_granule) end_granule = start_granule + 1;
-        end_granule = @min(end_granule, pk_values.len);
+        for (self.part_dirs) |dir| {
+            const part_rows = try readPartCount(self.alloc, self.io, dir);
+            defer global_base += part_rows;
+            if (part_rows == 0) continue;
 
-        const start_row = @as(u64, @intCast(start_granule)) * part_mod.GRANULE_SIZE;
-        const end_row = @min(self.row_count, @as(u64, @intCast(end_granule)) * part_mod.GRANULE_SIZE);
-        if (end_row <= start_row) return SourceIface.RowRange{ .lo = 0, .hi = 0 };
+            const pk_values = part_mod.readCompactPrimaryFixedValues(self.io, self.alloc, dir, col.ty) catch return null;
+            defer self.alloc.free(pk_values);
+            const expected_granules: usize = @intCast((part_rows + part_mod.GRANULE_SIZE - 1) / part_mod.GRANULE_SIZE);
+            if (pk_values.len != expected_granules) return null;
 
-        const n: usize = @intCast(end_row - start_row);
-        const vals = try self.alloc.alloc(i64, n);
-        defer self.alloc.free(vals);
-        try self.readFixedRange(ci, start_row, n, vals);
+            const lb = lowerBoundI64(pk_values, value);
+            const start_granule = if (lb == 0) 0 else lb - 1;
+            var end_granule = upperBoundI64(pk_values, value);
+            if (end_granule <= start_granule) end_granule = start_granule + 1;
+            end_granule = @min(end_granule, pk_values.len);
 
-        const exact_lo = lowerBoundI64(vals, value);
-        const exact_hi = upperBoundI64(vals, value);
-        return .{
-            .lo = start_row + exact_lo,
-            .hi = start_row + exact_hi,
-        };
+            const local_start = @as(u64, @intCast(start_granule)) * part_mod.GRANULE_SIZE;
+            const local_end = @min(part_rows, @as(u64, @intCast(end_granule)) * part_mod.GRANULE_SIZE);
+            if (local_end <= local_start) continue;
+
+            const n: usize = @intCast(local_end - local_start);
+            const vals = try self.alloc.alloc(i64, n);
+            defer self.alloc.free(vals);
+            try self.readFixedRange(ci, global_base + local_start, n, vals);
+
+            const exact_lo = lowerBoundI64(vals, value);
+            const exact_hi = upperBoundI64(vals, value);
+            if (exact_hi > exact_lo) {
+                const global_lo = global_base + local_start + exact_lo;
+                const global_hi = global_base + local_start + exact_hi;
+                if (range_lo == null or global_lo < range_lo.?) range_lo = global_lo;
+                if (global_hi > range_hi) range_hi = global_hi;
+            }
+        }
+
+        return if (range_lo) |lo|
+            .{ .lo = lo, .hi = range_hi }
+        else
+            .{ .lo = 0, .hi = 0 };
     }
 
     fn lockRaw(self: *ScanState) void {
@@ -1291,6 +1306,49 @@ test "PartScanBridge finds compact int sort-key range via primary index" {
     const hit = source.findIntRange("id", 42) orelse return error.TestExpectedRange;
     try std.testing.expectEqual(@as(u64, 5000), hit.lo);
     try std.testing.expectEqual(@as(u64, 12000), hit.hi);
+
+    const miss = source.findIntRange("id", 7) orelse return error.TestExpectedEmptyRange;
+    try std.testing.expectEqual(miss.lo, miss.hi);
+}
+
+test "PartScanBridge finds compact int sort-key range across parts" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const part_dir_1 = "/tmp/zig_test_part_scan_bridge_primary_range_part_1";
+    const part_dir_2 = "/tmp/zig_test_part_scan_bridge_primary_range_part_2";
+
+    {
+        var cwd = std.Io.Dir.cwd();
+        cwd.deleteTree(io, part_dir_1) catch {};
+        cwd.deleteTree(io, part_dir_2) catch {};
+    }
+
+    const cols = [_]schema.Column{.{ .name = "id", .ty = .int32 }};
+    const sort_keys = [_][]const u8{"id"};
+    const table = schema.Table{ .name = "primary_range_multi", .columns = &cols, .sort_keys = &sort_keys };
+
+    {
+        var cp = try part_mod.CompactPart.open(io, allocator, part_dir_1, table, 0x82);
+        defer cp.deinit();
+        const ids = [_]i64{ 1, 42, 42 };
+        try cp.appendFixedBatch(0, &ids);
+        try cp.finish();
+    }
+    {
+        var cp = try part_mod.CompactPart.open(io, allocator, part_dir_2, table, 0x82);
+        defer cp.deinit();
+        const ids = [_]i64{ 42, 99 };
+        try cp.appendFixedBatch(0, &ids);
+        try cp.finish();
+    }
+
+    var bridge = try PartScanBridge.init(allocator, io, table, &[_][]const u8{ part_dir_1, part_dir_2 }, &.{});
+    defer bridge.deinit();
+    const source = bridge.source();
+
+    const hit = source.findIntRange("id", 42) orelse return error.TestExpectedRange;
+    try std.testing.expectEqual(@as(u64, 1), hit.lo);
+    try std.testing.expectEqual(@as(u64, 4), hit.hi);
 
     const miss = source.findIntRange("id", 7) orelse return error.TestExpectedEmptyRange;
     try std.testing.expectEqual(miss.lo, miss.hi);

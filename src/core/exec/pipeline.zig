@@ -1537,8 +1537,8 @@ fn collectEqPredicates(expr: plan.Expr, schema_metas: []const result.ColMeta, ou
 }
 
 /// If the plan has a filter containing equality predicates on a sort key column,
-/// perform binary search on the mmap'd int32 column to restrict the scan range.
-/// No-ops if the source doesn't support setRowRange / getRawInt32Col / getSortKeys.
+/// ask the source for an exact sorted-key range, falling back to raw int32 search.
+/// No-ops if the source doesn't support range pruning for the sorted key.
 fn tryPushdownSortKeyRange(node: *const plan.PhysicalNode, ctx: *QueryContext) void {
     // Find the filter predicate (may be wrapped in project/limit/top_k).
     var predicate: ?plan.Expr = null;
