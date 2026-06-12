@@ -244,6 +244,22 @@ fn buildSelectPlan(allocator: Allocator, sel: ast.SelectStmt, ctes_from_parent: 
     // Derive legacy Filter from where_text (mirrors duckdb_parse.zig behaviour).
     const filter: ?generic_sql.Filter = if (where_text) |wt| generic_sql.parseFilter(wt) else null;
 
+    // SELECT DISTINCT: convert to GROUP BY on all non-aggregate projections
+    if (sel.distinct and group_by == null) {
+        var gb_buf: std.ArrayListUnmanaged(u8) = .empty;
+        var first_gb: bool = true;
+        for (projs_owned) |proj| {
+            if (isAggregate(proj.func)) continue;
+            const col = proj.alias orelse proj.column orelse continue;
+            if (!first_gb) try gb_buf.appendSlice(allocator, ", ");
+            first_gb = false;
+            try gb_buf.appendSlice(allocator, col);
+        }
+        if (gb_buf.items.len > 0) {
+            group_by = try gb_buf.toOwnedSlice(allocator);
+        }
+    }
+
     return Plan{
         .table = table,
         .projections = projs_owned,
@@ -272,6 +288,13 @@ fn findCte(ctes: []ast.Cte, name: []const u8) ?*ast.Stmt {
         if (std.ascii.eqlIgnoreCase(cte.name, name)) return cte.stmt;
     }
     return null;
+}
+
+fn isAggregate(fn_: generic_sql.AggregateFn) bool {
+    return switch (fn_) {
+        .column_ref, .int_literal, .float_literal, .case_when, .cmp_expr => false,
+        else => true,
+    };
 }
 
 fn tableRefName(allocator: Allocator, tr: ast.TableRef) BuildError![]const u8 {
@@ -863,7 +886,8 @@ fn buildWhereNode(allocator: Allocator, e: ast.Expr, ctes: []ast.Cte) BuildError
                     if (bo.left == .col and bo.right == .str) {
                         const col = try allocator.dupe(u8, bo.left.col);
                         const pat = try allocator.dupe(u8, bo.right.str);
-                        node.* = .{ .like = .{ .col = col, .op = .like, .pattern = pat } };
+                        const esc = if (bo.escape) |esc_val| try allocator.dupe(u8, esc_val) else null;
+                        node.* = .{ .like = .{ .col = col, .op = .like, .pattern = pat, .escape = esc } };
                         return node;
                     }
                     return error.UnsupportedFeature;
@@ -872,7 +896,8 @@ fn buildWhereNode(allocator: Allocator, e: ast.Expr, ctes: []ast.Cte) BuildError
                     if (bo.left == .col and bo.right == .str) {
                         const col = try allocator.dupe(u8, bo.left.col);
                         const pat = try allocator.dupe(u8, bo.right.str);
-                        node.* = .{ .like = .{ .col = col, .op = .not_like, .pattern = pat } };
+                        const esc = if (bo.escape) |esc_val| try allocator.dupe(u8, esc_val) else null;
+                        node.* = .{ .like = .{ .col = col, .op = .not_like, .pattern = pat, .escape = esc } };
                         return node;
                     }
                     return error.UnsupportedFeature;
@@ -1034,10 +1059,19 @@ pub fn exprToText(allocator: Allocator, e: ast.Expr, ctes: []ast.Cte) BuildError
             // Only arithmetic operators need parentheses for precedence.
             // Comparison and logical operators are rendered without parens so
             // that where_text can be passed to parseFilter correctly.
-            return switch (bo.op) {
-                .add, .sub, .mul, .div, .mod, .concat => std.fmt.allocPrint(allocator, "({s} {s} {s})", .{ ltext, op_str, rtext }),
-                else => std.fmt.allocPrint(allocator, "{s} {s} {s}", .{ ltext, op_str, rtext }),
+            const base = switch (bo.op) {
+                .add, .sub, .mul, .div, .mod, .concat => try std.fmt.allocPrint(allocator, "({s} {s} {s})", .{ ltext, op_str, rtext }),
+                else => try std.fmt.allocPrint(allocator, "{s} {s} {s}", .{ ltext, op_str, rtext }),
             };
+            errdefer allocator.free(base);
+            if (bo.escape) |esc| {
+                if (esc.len > 0) {
+                    const with_esc = try std.fmt.allocPrint(allocator, "{s} ESCAPE '{c}'", .{ base, esc[0] });
+                    allocator.free(base);
+                    return with_esc;
+                }
+            }
+            return base;
         },
         .not => |inner| {
             const s = try exprToText(allocator, inner.*, ctes);

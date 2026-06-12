@@ -154,8 +154,8 @@ fn evalExprFull(expr: Expr, row: []const ?Value, lambda_val: ?Value, lambda_val2
         },
 
         // String
-        .like => |op| return strLike(try evalExprFull(op.left, row, lambda_val, lambda_val2, arena), try evalExprFull(op.right, row, lambda_val, lambda_val2, arena), false),
-        .not_like => |op| return strLike(try evalExprFull(op.left, row, lambda_val, lambda_val2, arena), try evalExprFull(op.right, row, lambda_val, lambda_val2, arena), true),
+        .like => |op| return strLike(try evalExprFull(op.left, row, lambda_val, lambda_val2, arena), try evalExprFull(op.right, row, lambda_val, lambda_val2, arena), false, op.escape),
+        .not_like => |op| return strLike(try evalExprFull(op.left, row, lambda_val, lambda_val2, arena), try evalExprFull(op.right, row, lambda_val, lambda_val2, arena), true, op.escape),
         .concat => |op| {
             const l = (try evalExprFull(op.left, row, lambda_val, lambda_val2, arena)) orelse return null;
             const r = (try evalExprFull(op.right, row, lambda_val, lambda_val2, arena)) orelse return null;
@@ -248,24 +248,36 @@ fn cmpOp(l_opt: ?Value, r_opt: ?Value, op: CmpOp) ?Value {
 
 // ── LIKE pattern matching ─────────────────────────────────────────────────────
 
-fn strLike(l_opt: ?Value, r_opt: ?Value, negate: bool) ?Value {
+fn strLike(l_opt: ?Value, r_opt: ?Value, negate: bool, escape: ?[]const u8) ?Value {
     const l = l_opt orelse return null;
     const r = r_opt orelse return null;
     const s = l.toStr() orelse return null;
     const pat = r.toStr() orelse return null;
-    const matched = likeMatch(s, pat);
+    const esc = if (escape != null and escape.?.len > 0) escape.?[0] else null;
+    const matched = likeMatch(s, pat, esc);
     return Value{ .bool_u8 = if (matched != negate) 1 else 0 };
 }
 
 /// Simple SQL LIKE matcher: `%` matches any sequence, `_` matches any char.
-pub fn likeMatch(s: []const u8, pattern: []const u8) bool {
+/// If `escape` is non-null, the escape character makes the next char literal
+/// (e.g. `LIKE '50\%' ESCAPE '\'` matches `50%`).
+pub fn likeMatch(s: []const u8, pattern: []const u8, escape: ?u8) bool {
     var si: usize = 0;
     var pi: usize = 0;
     var star_pi: usize = std.math.maxInt(usize);
     var star_si: usize = 0;
 
     while (si < s.len) {
-        if (pi < pattern.len and pattern[pi] != '%' and (pattern[pi] == '_' or pattern[pi] == s[si])) {
+        if (pi < pattern.len and escape != null and pattern[pi] == escape.?) {
+            pi += 1;
+            if (pi < pattern.len and pattern[pi] == s[si]) {
+                si += 1; pi += 1;
+            } else if (star_pi != std.math.maxInt(usize)) {
+                star_si += 1; si = star_si; pi = star_pi + 1;
+            } else {
+                return false;
+            }
+        } else if (pi < pattern.len and pattern[pi] != '%' and (pattern[pi] == '_' or pattern[pi] == s[si])) {
             si += 1;
             pi += 1;
         } else if (pi < pattern.len and pattern[pi] == '%') {
@@ -293,10 +305,15 @@ pub const LikeMatcher = struct {
     needle: []const u8, // for .contains / .prefix / .suffix
     // Boyer-Moore-Horspool skip table for .contains with needle.len >= 2.
     bmh_skip: [256]usize,
+    // ESCAPE character (nil if none). Fast paths skipped when escape is set.
+    escape: ?u8 = null,
 
     pub const Kind = enum { contains, prefix, suffix, generic };
 
-    pub fn compile(pattern: []const u8) LikeMatcher {
+    pub fn compile(pattern: []const u8, escape: ?u8) LikeMatcher {
+        if (escape != null) {
+            return .{ .pattern = pattern, .kind = .generic, .needle = "", .bmh_skip = undefined, .escape = escape };
+        }
         // '%needle%' — contains search (no wildcards in needle)
         if (pattern.len >= 2 and pattern[0] == '%' and pattern[pattern.len - 1] == '%') {
             const inner = pattern[1 .. pattern.len - 1];
@@ -371,7 +388,7 @@ pub const LikeMatcher = struct {
             },
             .prefix => return std.mem.startsWith(u8, s, self.needle),
             .suffix => return std.mem.endsWith(u8, s, self.needle),
-            .generic => return likeMatch(s, self.pattern),
+            .generic => return likeMatch(s, self.pattern, self.escape),
         }
     }
 };

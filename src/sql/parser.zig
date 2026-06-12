@@ -447,8 +447,18 @@ const Parser = struct {
                 }
                 if (self.tok.eatKeyword("LIKE")) {
                     const pattern = try self.parsePrec(prec + 1);
+                    var escape: ?[]const u8 = null;
+                    if (self.tok.eatKeyword("ESCAPE")) {
+                        const esc_tok = self.tok.peek();
+                        if (esc_tok.kind == .string) {
+                            _ = self.tok.next();
+                            const raw = esc_tok.text;
+                            const inner = if (raw.len >= 2) raw[1 .. raw.len - 1] else raw;
+                            if (inner.len > 0) escape = inner;
+                        }
+                    }
                     const e = try self.alloc(ast.BinopExpr);
-                    e.* = .{ .op = .not_like, .left = left, .right = pattern };
+                    e.* = .{ .op = .not_like, .left = left, .right = pattern, .escape = escape };
                     left = .{ .binop = e };
                     continue;
                 }
@@ -468,8 +478,18 @@ const Parser = struct {
             if (t.kind == .keyword and std.ascii.eqlIgnoreCase(t.text, "LIKE")) {
                 _ = self.tok.next(); // LIKE
                 const pattern = try self.parsePrec(prec + 1);
+                var escape: ?[]const u8 = null;
+                if (self.tok.eatKeyword("ESCAPE")) {
+                    const esc_tok = self.tok.peek();
+                    if (esc_tok.kind == .string) {
+                        _ = self.tok.next();
+                        const raw = esc_tok.text;
+                        const inner = if (raw.len >= 2) raw[1 .. raw.len - 1] else raw;
+                        if (inner.len > 0) escape = inner;
+                    }
+                }
                 const e = try self.alloc(ast.BinopExpr);
-                e.* = .{ .op = .like, .left = left, .right = pattern };
+                e.* = .{ .op = .like, .left = left, .right = pattern, .escape = escape };
                 left = .{ .binop = e };
                 continue;
             }
@@ -683,6 +703,16 @@ const Parser = struct {
 
             // Identifier — might be a function call or column reference
             const name = self.tok.next().text;
+
+            // SQL-standard special function syntax: SUBSTRING, POSITION, TRIM
+            if (std.ascii.eqlIgnoreCase(name, "substring") or
+                std.ascii.eqlIgnoreCase(name, "position") or
+                std.ascii.eqlIgnoreCase(name, "trim"))
+            {
+                if (self.tok.peek().kind != .lparen) return error.UnexpectedToken;
+                _ = self.tok.next(); // (
+                return self.parseSpecialFunc(name);
+            }
 
             // Check for lambda params: single ident followed by -> (without parens)
             if (self.tok.peek().kind == .arrow) {
@@ -904,6 +934,80 @@ const Parser = struct {
         const ce = try self.alloc(ast.CastExpr);
         ce.* = .{ .val = val, .type_name = type_name };
         return .{ .cast = ce };
+    }
+
+    /// Parse SQL-standard special function syntax:
+    ///   SUBSTRING(str FROM start [FOR len])
+    ///   POSITION(needle IN haystack)
+    ///   TRIM([[LEADING|TRAILING|BOTH] [char] FROM] str)
+    fn parseSpecialFunc(self: *Parser, name: []const u8) ParseError!ast.Expr {
+        if (std.ascii.eqlIgnoreCase(name, "substring")) return self.parseSubstringFunc();
+        if (std.ascii.eqlIgnoreCase(name, "position")) return self.parsePositionFunc();
+        if (std.ascii.eqlIgnoreCase(name, "trim")) return self.parseTrimFunc();
+        return error.UnexpectedToken;
+    }
+
+    fn parseSubstringFunc(self: *Parser) ParseError!ast.Expr {
+        const str_expr = try self.parseExpr();
+        var start_expr: ?ast.Expr = null;
+        var len_expr: ?ast.Expr = null;
+        if (self.tok.eatKeyword("FROM")) {
+            start_expr = try self.parseExpr();
+        }
+        if (self.tok.eatKeyword("FOR")) {
+            len_expr = try self.parseExpr();
+        }
+        if (self.tok.peek().kind != .rparen) return error.UnexpectedToken;
+        _ = self.tok.next(); // )
+        var args = std.ArrayListUnmanaged(ast.Expr).empty;
+        try args.append(self.allocator, str_expr);
+        if (start_expr) |s| try args.append(self.allocator, s);
+        if (len_expr) |l| try args.append(self.allocator, l);
+        const args_slice = try args.toOwnedSlice(self.allocator);
+        const fn_name = try self.allocator.dupe(u8, "substring");
+        return .{ .func = .{ .name = fn_name, .args = args_slice } };
+    }
+
+    fn parsePositionFunc(self: *Parser) ParseError!ast.Expr {
+        const needle = try self.parseExpr();
+        if (!self.tok.eatKeyword("IN")) return error.UnexpectedToken;
+        const haystack = try self.parseExpr();
+        if (self.tok.peek().kind != .rparen) return error.UnexpectedToken;
+        _ = self.tok.next(); // )
+        var args = std.ArrayListUnmanaged(ast.Expr).empty;
+        try args.append(self.allocator, haystack);
+        try args.append(self.allocator, needle);
+        const args_slice = try args.toOwnedSlice(self.allocator);
+        const fn_name = try self.allocator.dupe(u8, "position");
+        return .{ .func = .{ .name = fn_name, .args = args_slice } };
+    }
+
+    fn parseTrimFunc(self: *Parser) ParseError!ast.Expr {
+        const spec: enum { default, both, leading, trailing } = if (self.tok.eatKeyword("LEADING"))
+            .leading
+        else if (self.tok.eatKeyword("TRAILING"))
+            .trailing
+        else if (self.tok.eatKeyword("BOTH"))
+            .both
+        else
+            .default;
+        // Skip optional trim character string (only when spec is set and next token is a string)
+        if (spec != .default and !self.tok.peekKeyword("FROM") and self.tok.peek().kind != .rparen) {
+            if (self.tok.peek().kind == .string) _ = self.tok.next();
+        }
+        _ = self.tok.eatKeyword("FROM");
+        const str_expr = try self.parseExpr();
+        if (self.tok.peek().kind != .rparen) return error.UnexpectedToken;
+        _ = self.tok.next(); // )
+        const fn_name = switch (spec) {
+            .leading => try self.allocator.dupe(u8, "trimLeft"),
+            .trailing => try self.allocator.dupe(u8, "trimRight"),
+            .both, .default => try self.allocator.dupe(u8, "trim"),
+        };
+        var args = std.ArrayListUnmanaged(ast.Expr).empty;
+        try args.append(self.allocator, str_expr);
+        const args_slice = try args.toOwnedSlice(self.allocator);
+        return .{ .func = .{ .name = fn_name, .args = args_slice } };
     }
 };
 

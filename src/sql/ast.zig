@@ -153,6 +153,8 @@ pub const BinopExpr = struct {
     op: BinOp,
     left: Expr,
     right: Expr,
+    /// ESCAPE character for LIKE/NOT LIKE (nil if no ESCAPE clause).
+    escape: ?[]const u8 = null,
 };
 
 pub const BinOp = enum {

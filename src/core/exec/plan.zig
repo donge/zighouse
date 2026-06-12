@@ -103,6 +103,8 @@ pub const ColRef = struct {
 pub const BinOp = struct {
     left: Expr,
     right: Expr,
+    /// ESCAPE character for LIKE/NOT LIKE (nil if no ESCAPE clause).
+    escape: ?[]const u8 = null,
 };
 
 pub const UnOp = struct {

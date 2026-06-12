@@ -322,7 +322,7 @@ pub fn plan_query(
 
     var order_by_text_handled = false; // track if ORDER BY was consumed by sort-before-project
 
-    if (!has_agg) {
+    if (!has_agg and gplan.group_by == null and !gplan.distinct) {
         // ── Pure projection / scan ─────────────────────────────────────────
         // If ORDER BY references a schema column not in SELECT output, we must
         // sort the raw scan BEFORE projection (sort-before-project).
@@ -1170,7 +1170,7 @@ fn whereNodeToExpr(ctx: *PlannerCtx, wn: *const generic_sql.WhereNode) ?Expr {
         .like => |l| {
             const col_expr = resolveColExpr(ctx, l.col) orelse return null;
             const binop = ctx.alloc.create(plan.BinOp) catch return null;
-            binop.* = .{ .left = col_expr, .right = .{ .lit_str = l.pattern } };
+            binop.* = .{ .left = col_expr, .right = .{ .lit_str = l.pattern }, .escape = l.escape };
             return switch (l.op) {
                 .like, .ilike => Expr{ .like = binop },
                 .not_like => Expr{ .not_like = binop },

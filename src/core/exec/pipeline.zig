@@ -1152,7 +1152,7 @@ fn collectLikeGuards(expr: plan.Expr, guards: *std.ArrayListUnmanaged(LikeGuard)
                     .col_idx = op.left.col_ref.index,
                     .pattern = op.right.lit_str,
                     .negate = expr == .not_like,
-                    .matcher = kernels.LikeMatcher.compile(op.right.lit_str),
+                    .matcher = kernels.LikeMatcher.compile(op.right.lit_str, if (op.escape) |e| if (e.len > 0) e[0] else null else null),
                 }) catch {};
             }
         },
@@ -2244,7 +2244,7 @@ fn executeScalarAggParallel(
                     if (ctx.source.getRawStrOffsets(col_name)) |raw_offsets| {
                         if (ctx.source.getRawStrBytes(col_name)) |raw_bytes| {
                             // We have raw data — run specialized count loop without fetchRange.
-                            const matcher = kernels.LikeMatcher.compile(op.right.lit_str);
+                            const matcher = kernels.LikeMatcher.compile(op.right.lit_str, if (op.escape) |e| if (e.len > 0) e[0] else null else null);
                             const negate = pred == .not_like;
 
                             const RawParCtx = struct {
@@ -9554,7 +9554,7 @@ fn executeHashAggParallelCompactTopK(
                             .like, .not_like => |op| if (op.left == .col_ref and op.right == .lit_str) {
                                 const col_idx2 = op.left.col_ref.index;
                                 if (col_idx2 < c.columns.len and c.columns[col_idx2].data == .string) {
-                                    const matcher = kernels.LikeMatcher.compile(op.right.lit_str);
+                                    const matcher = kernels.LikeMatcher.compile(op.right.lit_str, if (op.escape) |e| if (e.len > 0) e[0] else null else null);
                                     const negate = (fp == .not_like);
                                     const col2 = c.columns[col_idx2];
                                     for (0..c.num_rows) |r| {

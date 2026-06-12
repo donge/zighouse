@@ -81,7 +81,7 @@ pub const WhereNode = union(enum) {
     /// col op 'str'  (e.g. SearchPhrase <> '', URL = 'foo')
     cmp_str: struct { col: []const u8, op: CmpOp, val: []const u8 },
     /// col LIKE / NOT LIKE / ILIKE 'pattern'
-    like: struct { col: []const u8, op: LikeOp, pattern: []const u8 },
+    like: struct { col: []const u8, op: LikeOp, pattern: []const u8, escape: ?[]const u8 = null },
     /// col IS NULL
     is_null: []const u8,
     /// col IS NOT NULL
@@ -102,6 +102,7 @@ pub fn freeWhereNode(allocator: std.mem.Allocator, node: *WhereNode) void {
         .like => |l| {
             allocator.free(l.col);
             allocator.free(l.pattern);
+            if (l.escape) |e| allocator.free(e);
         },
         .is_null, .is_not_null => |col| allocator.free(col),
         .and_, .or_ => |children| {
