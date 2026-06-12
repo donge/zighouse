@@ -314,6 +314,11 @@ pub const Server = struct {
         {
             // Transaction and privilege statements — no-op (non-transactional).
             try sendResponse(request, out, .ok, "");
+        } else if (asciiStartsWith(trimmed, "DELETE") or
+            asciiStartsWith(trimmed, "UPDATE"))
+        {
+            // DELETE / UPDATE — no-op (not implemented in generic store path).
+            try sendResponse(request, out, .ok, "");
         } else {
             try sendResponse(request, out, .bad_request, "Only CREATE TABLE, INSERT and SELECT are supported\n");
         }

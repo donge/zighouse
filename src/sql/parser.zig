@@ -877,9 +877,23 @@ const Parser = struct {
         var whens = std.ArrayListUnmanaged(ast.WhenClause).empty;
         while (self.tok.eatKeyword("WHEN")) {
             const cond = try self.parseExpr();
-            if (!self.tok.eatKeyword("THEN")) return error.UnexpectedToken;
-            const then = try self.parseExpr();
-            try whens.append(self.allocator, .{ .cond = cond, .then = then });
+            // Handle comma-separated WHEN values: WHEN 2, 3 THEN 1
+            if (self.tok.eatIf(.comma)) {
+                // Collect all comma-separated conds, duplicate THEN for each
+                var conds = std.ArrayListUnmanaged(ast.Expr).empty;
+                try conds.append(self.allocator, cond);
+                while (true) {
+                    try conds.append(self.allocator, try self.parseExpr());
+                    if (!self.tok.eatIf(.comma)) break;
+                }
+                if (!self.tok.eatKeyword("THEN")) return error.UnexpectedToken;
+                const then = try self.parseExpr();
+                for (conds.items) |c| try whens.append(self.allocator, .{ .cond = c, .then = then });
+            } else {
+                if (!self.tok.eatKeyword("THEN")) return error.UnexpectedToken;
+                const then = try self.parseExpr();
+                try whens.append(self.allocator, .{ .cond = cond, .then = then });
+            }
         }
 
         var else_: ?*ast.Expr = null;
