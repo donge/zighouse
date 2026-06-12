@@ -1537,7 +1537,7 @@ fn collectEqPredicates(expr: plan.Expr, schema_metas: []const result.ColMeta, ou
 }
 
 /// If the plan has a filter containing equality predicates on a sort key column,
-/// ask the source for an exact sorted-key range, falling back to raw int32 search.
+/// ask the source for an exact sorted-key range.
 /// No-ops if the source doesn't support range pruning for the sorted key.
 fn tryPushdownSortKeyRange(node: *const plan.PhysicalNode, ctx: *QueryContext) void {
     // Find the filter predicate (may be wrapped in project/limit/top_k).
@@ -1599,37 +1599,6 @@ fn tryPushdownSortKeyRange(node: *const plan.PhysicalNode, ctx: *QueryContext) v
         if (ctx.source.findIntRange(sk, val)) |range| {
             ctx.source.setRowRange(range.lo, range.hi);
             return;
-        }
-
-        if (ctx.source.getRawInt32Col(sk)) |col_slice| {
-            if (col_slice.len == 0) continue;
-            const target: i32 = @intCast(val); // CounterID fits i32
-
-            // Binary search for first index >= target.
-            var lo: usize = 0;
-            var hi: usize = col_slice.len;
-            while (lo < hi) {
-                const mid = lo + (hi - lo) / 2;
-                if (col_slice[mid] < target) lo = mid + 1 else hi = mid;
-            }
-            const range_lo = lo;
-
-            // Binary search for first index > target.
-            hi = col_slice.len;
-            lo = range_lo;
-            while (lo < hi) {
-                const mid = lo + (hi - lo) / 2;
-                if (col_slice[mid] <= target) lo = mid + 1 else hi = mid;
-            }
-            const range_hi = lo;
-
-            if (range_lo >= range_hi) {
-                // No matching rows — set an empty range.
-                ctx.source.setRowRange(0, 0);
-            } else {
-                ctx.source.setRowRange(range_lo, range_hi);
-            }
-            return; // Only one sort-key pushdown at a time.
         }
     }
 }

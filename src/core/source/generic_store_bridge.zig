@@ -901,6 +901,38 @@ pub const GenericStoreBridge = struct {
         return null;
     }
 
+    fn lowerBoundI32(values: []const i32, target: i32) usize {
+        var lo: usize = 0;
+        var hi: usize = values.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (values[mid] < target) lo = mid + 1 else hi = mid;
+        }
+        return lo;
+    }
+
+    fn upperBoundI32(values: []const i32, target: i32) usize {
+        var lo: usize = 0;
+        var hi: usize = values.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (values[mid] <= target) lo = mid + 1 else hi = mid;
+        }
+        return lo;
+    }
+
+    fn findIntRangeFn(ptr: *anyopaque, col_name: []const u8, value: i64) ?SourceIface.RowRange {
+        const self: *GenericStoreBridge = @ptrCast(@alignCast(ptr));
+        const s = self.state;
+        if (s.table.sort_keys.len == 0 or !std.mem.eql(u8, s.table.sort_keys[0], col_name)) return null;
+        const col_slice = getRawInt32ColFn(ptr, col_name) orelse return null;
+        if (value < std.math.minInt(i32) or value > std.math.maxInt(i32)) return .{ .lo = 0, .hi = 0 };
+        const target: i32 = @intCast(value);
+        const lo = lowerBoundI32(col_slice, target);
+        const hi = upperBoundI32(col_slice, target);
+        return .{ .lo = lo, .hi = hi };
+    }
+
     fn setRowRangeFn(ptr: *anyopaque, lo: u64, hi: u64) void {
         const self: *GenericStoreBridge = @ptrCast(@alignCast(ptr));
         self.state.scan_lo = lo;
@@ -927,5 +959,6 @@ pub const GenericStoreBridge = struct {
         .getRawInt32Col         = getRawInt32ColFn,
         .setRowRange            = setRowRangeFn,
         .getSortKeys            = getSortKeysFn,
+        .findIntRange           = findIntRangeFn,
     };
 };
