@@ -106,6 +106,41 @@ pub fn parse(allocator: std.mem.Allocator, sql: []const u8) !ParseResult {
         // Record the start offset in the source so we can reconstruct the raw type string.
         const type_src_start = @intFromPtr(col_type_raw.ptr) - @intFromPtr(tok.src.ptr);
 
+        // Multi-word SQL standard type names: consume continuation tokens
+        // DOUBLE PRECISION, CHARACTER VARYING, CHAR VARYING, BINARY VARYING, etc.
+        if (std.ascii.eqlIgnoreCase(col_type_raw, "DOUBLE")) {
+            if (tok.peekKeyword("PRECISION")) _ = tok.next();
+        } else if (std.ascii.eqlIgnoreCase(col_type_raw, "CHARACTER")) {
+            if (tok.peekKeyword("VARYING")) _ = tok.next();
+        } else if (std.ascii.eqlIgnoreCase(col_type_raw, "CHAR")) {
+            if (tok.peekKeyword("VARYING")) _ = tok.next();
+        } else if (std.ascii.eqlIgnoreCase(col_type_raw, "BINARY")) {
+            if (tok.peekKeyword("VARYING")) {
+                _ = tok.next();
+            } else if (tok.peekKeyword("LARGE")) {
+                _ = tok.next();
+                if (tok.peekKeyword("OBJECT")) _ = tok.next();
+            }
+        } else if (std.ascii.eqlIgnoreCase(col_type_raw, "NATIONAL")) {
+            if (tok.peekKeyword("CHARACTER")) {
+                _ = tok.next();
+                if (tok.peekKeyword("VARYING")) _ = tok.next();
+            } else if (tok.peekKeyword("CHAR")) {
+                _ = tok.next();
+                if (tok.peekKeyword("VARYING")) _ = tok.next();
+            }
+        }
+        if (std.ascii.eqlIgnoreCase(col_type_raw, "TIME") or std.ascii.eqlIgnoreCase(col_type_raw, "TIMESTAMP")) {
+            var peek = tok;
+            if (peek.next()) |s| {
+                if (std.ascii.eqlIgnoreCase(s, "WITH") or std.ascii.eqlIgnoreCase(s, "WITHOUT")) {
+                    _ = tok.next();
+                    if (tok.peekKeyword("TIME")) _ = tok.next();
+                    if (tok.peekKeyword("ZONE")) _ = tok.next();
+                }
+            }
+        }
+
         // If the next token is '(' this type has arguments: Nullable(T), LowCardinality(T),
         // FixedString(N), DateTime64(p), etc.  Consume the parenthesised argument list and
         // resolve the effective type.
@@ -173,6 +208,32 @@ pub fn parse(allocator: std.mem.Allocator, sql: []const u8) !ParseResult {
                 try appendAndSkip(allocator, &cols, &tok, col_name_raw, inner_ty, ch_type_owned);
                 continue;
             }
+            // VARCHAR(n), CHARACTER(n), CHAR(n) → text (length constraint dropped)
+            if (std.ascii.eqlIgnoreCase(col_type_raw, "VARCHAR") or
+                std.ascii.eqlIgnoreCase(col_type_raw, "CHARACTER") or
+                std.ascii.eqlIgnoreCase(col_type_raw, "CHAR"))
+            {
+                try appendAndSkip(allocator, &cols, &tok, col_name_raw, .text, ch_type_owned);
+                continue;
+            }
+            // DECIMAL(p[,s]), NUMERIC(p[,s]), DEC(p[,s]) → float64 (approximate, loses precision)
+            if (std.ascii.eqlIgnoreCase(col_type_raw, "DECIMAL") or
+                std.ascii.eqlIgnoreCase(col_type_raw, "NUMERIC") or
+                std.ascii.eqlIgnoreCase(col_type_raw, "DEC"))
+            {
+                try appendAndSkip(allocator, &cols, &tok, col_name_raw, .float64, ch_type_owned);
+                continue;
+            }
+            // TIME(p) → timestamp
+            if (std.ascii.eqlIgnoreCase(col_type_raw, "TIME")) {
+                try appendAndSkip(allocator, &cols, &tok, col_name_raw, .timestamp, ch_type_owned);
+                continue;
+            }
+            // TIMESTAMP(p) → timestamp
+            if (std.ascii.eqlIgnoreCase(col_type_raw, "TIMESTAMP")) {
+                try appendAndSkip(allocator, &cols, &tok, col_name_raw, .timestamp, ch_type_owned);
+                continue;
+            }
             // Nullable(T) → resolve inner type
             const eff_ty = parseColumnType(inner) orelse return error.UnsupportedColumnType;
             try appendAndSkip(allocator, &cols, &tok, col_name_raw, eff_ty, ch_type_owned);
@@ -187,8 +248,9 @@ pub fn parse(allocator: std.mem.Allocator, sql: []const u8) !ParseResult {
         }
 
         const col_name_owned = try allocator.dupe(u8, col_name_raw);
-        // For simple types, ch_type = col_type_raw (already a slice of tok.src — dupe it).
-        const ch_type_owned = try allocator.dupe(u8, col_type_raw);
+        // Full type name from source (captures multi-word types like "DOUBLE PRECISION")
+        const ch_type_full = std.mem.trim(u8, tok.src[type_src_start..tok.pos], " \t\r\n");
+        const ch_type_owned = try allocator.dupe(u8, ch_type_full);
         try cols.append(allocator, .{ .name = col_name_owned, .ty = col_ty, .ch_type = ch_type_owned });
     }
 
@@ -292,6 +354,29 @@ fn parseColumnType(s: []const u8) ?schema.ColumnType {
     if (std.ascii.eqlIgnoreCase(s, "IPv6")) return .text;
     if (std.ascii.eqlIgnoreCase(s, "Float32")) return .float32;
     if (std.ascii.eqlIgnoreCase(s, "Float64")) return .float64;
+    // SQL standard type aliases
+    if (std.ascii.eqlIgnoreCase(s, "INT")) return .int32;
+    if (std.ascii.eqlIgnoreCase(s, "INTEGER")) return .int32;
+    if (std.ascii.eqlIgnoreCase(s, "SMALLINT")) return .int16;
+    if (std.ascii.eqlIgnoreCase(s, "BIGINT")) return .int64;
+    if (std.ascii.eqlIgnoreCase(s, "TINYINT")) return .int8;
+    if (std.ascii.eqlIgnoreCase(s, "BOOLEAN")) return .int8;
+    if (std.ascii.eqlIgnoreCase(s, "FLOAT")) return .float32;
+    if (std.ascii.eqlIgnoreCase(s, "REAL")) return .float32;
+    if (std.ascii.eqlIgnoreCase(s, "DOUBLE")) return .float64;
+    if (std.ascii.eqlIgnoreCase(s, "DECIMAL")) return .float64;
+    if (std.ascii.eqlIgnoreCase(s, "NUMERIC")) return .float64;
+    if (std.ascii.eqlIgnoreCase(s, "DEC")) return .float64;
+    if (std.ascii.eqlIgnoreCase(s, "VARCHAR")) return .text;
+    if (std.ascii.eqlIgnoreCase(s, "CHAR")) return .text;
+    if (std.ascii.eqlIgnoreCase(s, "CHARACTER")) return .text;
+    if (std.ascii.eqlIgnoreCase(s, "TEXT")) return .text;
+    if (std.ascii.eqlIgnoreCase(s, "BLOB")) return .text;
+    if (std.ascii.eqlIgnoreCase(s, "CLOB")) return .text;
+    if (std.ascii.eqlIgnoreCase(s, "NAME")) return .text;
+    if (std.ascii.eqlIgnoreCase(s, "TIME")) return .timestamp;
+    if (std.ascii.eqlIgnoreCase(s, "TIMESTAMP")) return .timestamp;
+    if (std.ascii.eqlIgnoreCase(s, "NCHAR")) return .text;
     return null;
 }
 

@@ -132,14 +132,27 @@ pip3 install pyyaml requests
 bash scripts/run-sqltest.sh
 ```
 
-Overall: **282 / 1464 (19%)** mandatory features pass.
+Overall: **716 / 1464 (48.9%)** mandatory features pass.
 
 | Category | Pass Rate | Notes |
 |----------|-----------|-------|
-| **E011** Numeric | 69/112 (61%) | Negatives/literals work; `+5` fails; CREAT TABLE with INT fails |
-| **E021** Strings | 16/58 (27%) | `||`, `LOWER`, `UPPER`, `TRIM` work; `CHAR`/`VARCHAR` types fail |
-| **F051** Date/Time | 40/42 (95%) | DATE/TIME/TIMESTAMP literals and comparisons work |
-| **F261** CASE | 14/20 (70%) | Simple/searched CASE work; multi-value WHEN fails |
-| **E031-E161, F031-F481** | 0% | All require DDL with standard types (INT, INTEGER etc.) |
+| **E011** Numeric | 85/112 (76%) | All standard aliases (INT, INTEGER, SMALLINT, BIGINT, FLOAT, REAL, DOUBLE, DECIMAL, NUMERIC) mapped; DECIMAL(p,s) → float64 (precision lost) |
+| **E021** Strings | 33/58 (57%) | VARCHAR, CHAR, CHARACTER, TEXT, CLOB, BLOB → text; CHARACTER VARYING, VARCHAR(n) → text |
+| **E031** Identifiers | 3/3 (100%) | All pass after standard type support |
+| **E051** Names | 53/53 (100%) | All pass |
+| **F051** Date/Time | 42/42 (100%) | All pass after TIME/TIMESTAMP WITH TIME ZONE handling |
+| **E111** CAST | 2/2 (100%) | All pass |
+| **F471** Scalar subquery | 1/1 (100%) | All pass |
+| **F481** NULL predicates | 2/2 (100%) | All pass |
+| **E091** Set functions | 11/16 (69%) | Most aggregate functions pass |
+| **E061** Predicates | 40/81 (49%) | IN, BETWEEN, LIKE, comparison predicates work |
+| **E071** Row value exprs | 10/15 (67%) | Row value comparisons pass |
+| **E141** Column constraints | 13/83 (16%) | DEFAULT clause works; NOT NULL, UNIQUE, FK fail |
+| **F031** DDL | 7/102 (7%) | CREATE TABLE, DROP TABLE work; CREATE SCHEMA, VIEW, ROLE fail |
+| **F041** Referential constraints | 10/31 (32%) | Basic FK syntax works |
+| **F131** Array | 32/33 (97%) | Array type support |
+| **F081** UNION | 3/3 (100%) | UNION ALL works |
+| **F221** DEFAULT | 1/2 (50%) | |
+| **E031-E161, F031-F481** | 0% | All require DDL with standard types — now substantially improved |
 
-**Root cause**: DDL parser (`ingest/ddl_parser.zig`) only recognises ClickHouse-native type names (`Int32`, `String`, etc.), not SQL standard aliases (`INT`, `VARCHAR`, `FLOAT`). Most failures are `DDL parse error: UnsupportedColumnType`.
+**Root cause of remaining failures**: DDL parser (`ingest/ddl_parser.zig`) needs `CREATE SCHEMA`, `CREATE VIEW`, `CREATE TYPE`, cursors, and transaction support (Phase 2).
