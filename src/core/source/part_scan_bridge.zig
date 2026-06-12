@@ -33,6 +33,9 @@ pub const QueryContext = pipeline.QueryContext;
 pub const ColMeta      = result.ColMeta;
 const plan = core.exec.plan;
 
+const RAW_MATERIALIZE_MAX_COMPACT_BYTES: u64 = 256 * 1024 * 1024;
+const RAW_MATERIALIZE_MAX_COMPACT_ROWS: u64 = 2_000_000;
+
 const RawStringCol = struct {
     offsets: []u64,
     bytes: []u8,
@@ -98,6 +101,7 @@ const ScanState = struct {
     row_count:   u64,                            // total rows across all parts
     col_readers: []?part_mod.ColumnReader,       // one per table column; null if unopened
     raw_cols:    []RawColData,                   // lazy all-part raw views
+    raw_materialize_allowed: bool,
     raw_lock:    std.atomic.Value(u32),
     metas:       []ColMeta,                      // schema metas (allocated once)
     /// If non-null, only columns marked `true` are read from disk.
@@ -132,8 +136,13 @@ const ScanState = struct {
         @memset(raw_cols, .none);
 
         var total_rows: u64 = 0;
+        var raw_materialize_allowed = true;
         for (part_dirs) |dir| {
-            total_rows += try readPartCount(alloc, io, dir);
+            const part_rows = try readPartCount(alloc, io, dir);
+            total_rows += part_rows;
+            if (try isLargeCompactPart(alloc, io, dir, part_rows)) {
+                raw_materialize_allowed = false;
+            }
         }
 
         // Build needed_cols mask if pruned list is provided.
@@ -159,6 +168,7 @@ const ScanState = struct {
             .row_count   = total_rows,
             .col_readers = col_readers,
             .raw_cols    = raw_cols,
+            .raw_materialize_allowed = raw_materialize_allowed,
             .raw_lock    = .init(0),
             .metas       = metas,
             .needed_cols = needed_cols,
@@ -253,6 +263,7 @@ const ScanState = struct {
     }
 
     fn ensureRawFixed(self: *ScanState, ci: usize) !void {
+        if (!self.raw_materialize_allowed) return;
         if (self.raw_cols[ci] != .none) return;
         self.lockRaw();
         defer self.unlockRaw();
@@ -290,6 +301,7 @@ const ScanState = struct {
     }
 
     fn ensureRawString(self: *ScanState, ci: usize) !void {
+        if (!self.raw_materialize_allowed) return;
         if (self.raw_cols[ci] != .none) return;
         self.lockRaw();
         defer self.unlockRaw();
@@ -840,6 +852,25 @@ fn readPartCount(alloc: std.mem.Allocator, io: std.Io, part_dir: []const u8) !u6
     return try std.fmt.parseInt(u64, std.mem.trim(u8, raw, " \t\r\n"), 10);
 }
 
+fn isLargeCompactPart(alloc: std.mem.Allocator, io: std.Io, part_dir: []const u8, row_count: u64) !bool {
+    const cmrk_path = try std.fmt.allocPrint(alloc, "{s}/data.cmrk4", .{part_dir});
+    defer alloc.free(cmrk_path);
+    var cmrk = std.Io.Dir.cwd().openFile(io, cmrk_path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    cmrk.close(io);
+
+    if (row_count > RAW_MATERIALIZE_MAX_COMPACT_ROWS) return true;
+
+    const data_path = try std.fmt.allocPrint(alloc, "{s}/data.bin", .{part_dir});
+    defer alloc.free(data_path);
+    var data_file = try std.Io.Dir.cwd().openFile(io, data_path, .{});
+    defer data_file.close(io);
+    const stat = try data_file.stat(io);
+    return stat.size > RAW_MATERIALIZE_MAX_COMPACT_BYTES;
+}
+
 // ── PartScanBridge — public API ───────────────────────────────────────────────
 
 pub const PartScanBridge = struct {
@@ -1117,6 +1148,50 @@ test "PartScanBridge exposes raw views for compact parts" {
     defer ranged_next.deinit();
     try std.testing.expectEqual(@as(usize, 2), ranged_next.num_rows);
     try std.testing.expectEqualSlices(i64, &[_]i64{ 2, 3 }, ranged_next.columns[0].data.int64);
+}
+
+test "PartScanBridge disables raw materialization for large compact parts" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const part_dir = "/tmp/zig_test_part_scan_bridge_large_raw_guard";
+
+    {
+        var cwd = std.Io.Dir.cwd();
+        cwd.deleteTree(io, part_dir) catch {};
+    }
+
+    const cols = [_]schema.Column{
+        .{ .name = "id", .ty = .int32 },
+        .{ .name = "name", .ty = .text },
+    };
+    const sort_keys = [_][]const u8{"id"};
+    const table = schema.Table{ .name = "large_raw_guard", .columns = &cols, .sort_keys = &sort_keys };
+
+    {
+        var cp = try part_mod.CompactPart.open(io, allocator, part_dir, table, 0x82);
+        defer cp.deinit();
+        const ids = [_]i64{ 1, 2, 3 };
+        try cp.appendFixedBatch(0, &ids);
+        try cp.appendString(1, "a");
+        try cp.appendString(1, "bb");
+        try cp.appendString(1, "ccc");
+        try cp.finish();
+    }
+
+    const data_path = try std.fmt.allocPrint(allocator, "{s}/data.bin", .{part_dir});
+    defer allocator.free(data_path);
+    var data_file = try std.Io.Dir.cwd().openFile(io, data_path, .{ .mode = .read_write });
+    defer data_file.close(io);
+    try data_file.writePositionalAll(io, &[_]u8{0}, RAW_MATERIALIZE_MAX_COMPACT_BYTES + 1);
+
+    var bridge = try PartScanBridge.init(allocator, io, table, &[_][]const u8{part_dir}, &.{});
+    defer bridge.deinit();
+    const source = bridge.source();
+
+    try std.testing.expectEqual(@as(u64, 3), source.rowCount());
+    try std.testing.expect(source.getRawInt32Col("id") == null);
+    try std.testing.expect(source.getRawStrOffsets("name") == null);
+    try std.testing.expect(source.getRawStrBytes("name") == null);
 }
 
 test "PartScanBridge combines raw views across compact parts" {
