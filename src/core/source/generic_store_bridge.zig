@@ -975,3 +975,74 @@ pub const GenericStoreBridge = struct {
         .findIntRange           = findIntRangeFn,
     };
 };
+
+fn writeGenericFixedForTest(
+    comptime T: type,
+    io: std.Io,
+    alloc: std.mem.Allocator,
+    part_dir: []const u8,
+    name: []const u8,
+    values: []const T,
+) !void {
+    const path = try generic_store.columnBinPath(alloc, part_dir, name);
+    defer alloc.free(path);
+    var writer = try generic_store.ColumnBinWriter.open(io, path);
+    defer writer.close();
+    for (values) |v| switch (T) {
+        i16 => try writer.writeI16(v),
+        i32 => try writer.writeI32(v),
+        i64 => try writer.writeI64(v),
+        else => @compileError("unsupported test column type"),
+    };
+}
+
+test "GenericStoreBridge findIntRange supports sorted int widths" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const root = "/tmp/zig_test_generic_find_range";
+
+    {
+        var cwd = std.Io.Dir.cwd();
+        cwd.deleteTree(io, root) catch {};
+    }
+    defer {
+        var cwd = std.Io.Dir.cwd();
+        cwd.deleteTree(io, root) catch {};
+    }
+
+    const Case = struct {
+        fn run(
+            comptime T: type,
+            table_name: []const u8,
+            col_ty: schema.ColumnType,
+            values: []const T,
+            target: i64,
+            expected_lo: u64,
+            expected_hi: u64,
+        ) !void {
+            const cols = [_]schema.Column{.{ .name = "id", .ty = col_ty }};
+            const sort_keys = [_][]const u8{"id"};
+            const table = schema.Table{ .name = table_name, .columns = &cols, .sort_keys = &sort_keys };
+            const part_dir = try generic_store.initPart(io, root, table_name, allocator);
+            defer allocator.free(part_dir);
+            try generic_store.writeColumnsTxt(io, allocator, part_dir, table);
+            try generic_store.writeCountTxt(io, allocator, part_dir, values.len);
+            try writeGenericFixedForTest(T, io, allocator, part_dir, "id", values);
+
+            var bridge = try GenericStoreBridge.init(allocator, io, part_dir, table, &.{});
+            defer bridge.deinit();
+            const range = bridge.source().findIntRange("id", target) orelse return error.TestExpectedRange;
+            try std.testing.expectEqual(expected_lo, range.lo);
+            try std.testing.expectEqual(expected_hi, range.hi);
+        }
+    }.run;
+
+    const vals16 = [_]i16{ 1, 2, 2, 9 };
+    try Case(i16, "t16", .int16, &vals16, 2, 1, 3);
+
+    const vals32 = [_]i32{ 3, 5, 5, 5, 8 };
+    try Case(i32, "t32", .int32, &vals32, 5, 1, 4);
+
+    const vals64 = [_]i64{ 7, 7, 11, 99 };
+    try Case(i64, "t64", .int64, &vals64, 7, 0, 2);
+}

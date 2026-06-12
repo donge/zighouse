@@ -706,6 +706,8 @@ pub fn build(b: *std.Build) void {
     generic_store_bridge_mod.addImport("schema", schema_mod);
     generic_store_bridge_mod.addImport("core", core_mod);
     generic_store_bridge_mod.addImport("generic_store", generic_store_mod);
+    const generic_store_bridge_tests = b.addTest(.{ .root_module = generic_store_bridge_mod });
+    const generic_store_bridge_test_cmd = b.addRunArtifact(generic_store_bridge_tests);
 
     // ── part_scan_bridge module (part.zig → SourceIface bridge) ─────────────
     const part_scan_bridge_mod = b.createModule(.{
@@ -788,6 +790,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&ch_checksums_test_cmd.step);
     test_step.dependOn(&ch_string_codec_test_cmd.step);
     test_step.dependOn(&ch_part_test_cmd.step);
+    test_step.dependOn(&generic_store_bridge_test_cmd.step);
     test_step.dependOn(&part_scan_bridge_test_cmd.step);
     test_step.dependOn(&row_binary_decoder_test_cmd.step);
     test_step.dependOn(&schema_config_test_cmd.step);
