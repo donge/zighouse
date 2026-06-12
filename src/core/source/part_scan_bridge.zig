@@ -380,6 +380,77 @@ const ScanState = struct {
         return self.col_readers[ci].?.readFixed(out);
     }
 
+    fn readStringRange(self: *ScanState, ci: usize, start: u64, n: usize, out: [][]const u8, alloc: std.mem.Allocator) !void {
+        const Ctx = struct {
+            out: [][]const u8,
+            idx: usize,
+            alloc: std.mem.Allocator,
+        };
+        var global_base: u64 = 0;
+        var dst: usize = 0;
+        for (self.part_dirs) |dir| {
+            const part_rows = try readPartCount(self.alloc, self.io, dir);
+            defer global_base += part_rows;
+            if (start >= global_base + part_rows) continue;
+            if (start + n <= global_base) break;
+
+            const local_start: u64 = if (start > global_base) start - global_base else 0;
+            const available: usize = @intCast(part_rows - local_start);
+            const want = @min(n - dst, available);
+
+            var op = try part_mod.OpenedPartAny.open(self.io, self.alloc, dir, self.table);
+            defer op.deinit();
+            var cr = try op.columnReaderRange(ci, local_start, want);
+            defer cr.deinit();
+
+            var ctx = Ctx{ .out = out, .idx = dst, .alloc = alloc };
+            _ = try cr.readStrings(want, &ctx, struct {
+                fn cb(c: *Ctx, str: []const u8) !void {
+                    c.out[c.idx] = try c.alloc.dupe(u8, str);
+                    c.idx += 1;
+                }
+            }.cb);
+            dst = ctx.idx;
+            if (dst >= n) break;
+        }
+        while (dst < n) : (dst += 1) out[dst] = "";
+    }
+
+    fn readStringNonEmptyRange(self: *ScanState, ci: usize, start: u64, n: usize, out: []u8) !void {
+        const Ctx = struct {
+            out: []u8,
+            idx: usize,
+        };
+        var global_base: u64 = 0;
+        var dst: usize = 0;
+        for (self.part_dirs) |dir| {
+            const part_rows = try readPartCount(self.alloc, self.io, dir);
+            defer global_base += part_rows;
+            if (start >= global_base + part_rows) continue;
+            if (start + n <= global_base) break;
+
+            const local_start: u64 = if (start > global_base) start - global_base else 0;
+            const available: usize = @intCast(part_rows - local_start);
+            const want = @min(n - dst, available);
+
+            var op = try part_mod.OpenedPartAny.open(self.io, self.alloc, dir, self.table);
+            defer op.deinit();
+            var cr = try op.columnReaderRange(ci, local_start, want);
+            defer cr.deinit();
+
+            var ctx = Ctx{ .out = out, .idx = dst };
+            _ = try cr.readStrings(want, &ctx, struct {
+                fn cb(c: *Ctx, str: []const u8) !void {
+                    c.out[c.idx] = if (str.len != 0) 1 else 0;
+                    c.idx += 1;
+                }
+            }.cb);
+            dst = ctx.idx;
+            if (dst >= n) break;
+        }
+        if (dst < n) @memset(out[dst..n], 0);
+    }
+
     fn readArrayRange(self: *ScanState, ci: usize, start: u64, n: usize, out: [][][]const u8, alloc: std.mem.Allocator) !void {
         var global_base: u64 = 0;
         var dst: usize = 0;
@@ -426,7 +497,6 @@ const ScanState = struct {
         const chunk_alloc = out.arena.allocator();
         out.columns = try chunk_alloc.alloc(chunk.Column, self.table.columns.len);
         const null_words = chunk.nullMaskWords(n);
-        const base: usize = @intCast(start);
 
         for (self.table.columns, 0..) |col, ci| {
             const null_mask = try chunk_alloc.alloc(u64, null_words);
@@ -500,17 +570,7 @@ const ScanState = struct {
                         if (is_pruned) {
                             @memset(bbuf, 0);
                         } else {
-                            try self.ensureRawString(ci);
-                            switch (self.raw_cols[ci]) {
-                                .string => |s| {
-                                    for (0..n) |i| {
-                                        bbuf[i] = if (s.offsets[base + i + 1] > s.offsets[base + i]) 1 else 0;
-                                    }
-                                },
-                                else => {
-                                    @memset(bbuf, 0);
-                                },
-                            }
+                            try self.readStringNonEmptyRange(ci, start, n, bbuf);
                         }
                         break :blk .{ .bool_u8 = bbuf };
                     }
@@ -518,19 +578,7 @@ const ScanState = struct {
                     if (is_pruned) {
                         @memset(sbuf, "");
                     } else {
-                        try self.ensureRawString(ci);
-                        switch (self.raw_cols[ci]) {
-                            .string => |s| {
-                                for (0..n) |i| {
-                                    const lo: usize = @intCast(s.offsets[base + i]);
-                                    const hi: usize = @intCast(s.offsets[base + i + 1]);
-                                    sbuf[i] = s.bytes[lo..hi];
-                                }
-                            },
-                            else => {
-                                @memset(sbuf, "");
-                            },
-                        }
+                        try self.readStringRange(ci, start, n, sbuf, chunk_alloc);
                     }
                     break :blk .{ .string = sbuf };
                 },

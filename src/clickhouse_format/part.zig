@@ -1930,6 +1930,65 @@ test "CompactOpenedPart range reader keeps LowCardinality dictionary" {
     }
 }
 
+test "CompactOpenedPart range reader reads fixed and string across granules" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const part_dir = "/tmp/zig_test_compact_range_fixed_string";
+
+    const cols = [_]schema.Column{
+        .{ .name = "id", .ty = .int32 },
+        .{ .name = "name", .ty = .text },
+    };
+    const table = schema.Table{ .name = "test_compact_range_fixed_string", .columns = &cols };
+    const rows: usize = GRANULE_SIZE + 5;
+
+    {
+        var cp = try CompactPart.open(io, allocator, part_dir, table, 0x82);
+        defer cp.deinit();
+
+        const ids = try allocator.alloc(i64, rows);
+        defer allocator.free(ids);
+        for (ids, 0..) |*v, i| v.* = @intCast(i);
+        try cp.appendFixedBatch(0, ids);
+        for (0..rows) |i| {
+            const name = try std.fmt.allocPrint(allocator, "name-{d}", .{i});
+            defer allocator.free(name);
+            try cp.appendString(1, name);
+        }
+        try cp.finish();
+    }
+
+    {
+        var cop = try CompactOpenedPart.open(io, allocator, part_dir, table);
+        defer cop.deinit();
+
+        var id_cr = try cop.columnReaderRange(0, GRANULE_SIZE - 2, 5);
+        defer id_cr.deinit();
+        var ids: [5]i64 = undefined;
+        const n_ids = try id_cr.readFixed(&ids);
+        try std.testing.expectEqual(@as(usize, 5), n_ids);
+        try std.testing.expectEqual(@as(i64, GRANULE_SIZE - 2), ids[0]);
+        try std.testing.expectEqual(@as(i64, GRANULE_SIZE + 2), ids[4]);
+
+        var name_cr = try cop.columnReaderRange(1, GRANULE_SIZE - 2, 5);
+        defer name_cr.deinit();
+        const Ctx = struct {
+            items: [5][]const u8 = undefined,
+            idx: usize = 0,
+        };
+        var ctx = Ctx{};
+        const n_names = try name_cr.readStrings(5, &ctx, struct {
+            fn cb(c: *Ctx, s: []const u8) !void {
+                c.items[c.idx] = s;
+                c.idx += 1;
+            }
+        }.cb);
+        try std.testing.expectEqual(@as(usize, 5), n_names);
+        try std.testing.expectEqualStrings("name-8190", ctx.items[0]);
+        try std.testing.expectEqualStrings("name-8194", ctx.items[4]);
+    }
+}
+
 test "CompactOpenedPart reads CH-written compact part" {
     // This test reads the part created by the CH server in the integration setup.
     // It is skipped if the part directory doesn't exist.
