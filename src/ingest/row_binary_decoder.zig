@@ -212,8 +212,8 @@ pub const RowBinaryDecoder = struct {
         .text, .char, .low_card => {
                         // Dispatch based on ch_type for special encodings.
                         // Note: ch_ty already declared in outer scope; reuse it here.
-                        if (chTypeEql(ch_ty, "IPv6")) {
-                            // IPv6: fixed 16 bytes raw
+                        if (chTypeEql(ch_ty, "IPv6") or chTypeEql(ch_ty, "UUID")) {
+                            // IPv6/UUID: fixed 16 bytes raw
                             if (pos + 16 > data.len) return error.UnexpectedEndOfData;
                             const start = buf.str_bytes.items.len;
                             try buf.str_bytes.appendSlice(self.allocator, data[pos..][0..16]);
@@ -282,7 +282,7 @@ fn skipRowBinaryValue(col: schema.Column, ch_ty: []const u8, data: []const u8, p
         .float32 => pos += 4,
         .float64 => pos += 8,
         .text, .char, .low_card => {
-            if (chTypeEql(inner_ch_ty, "IPv6")) {
+            if (chTypeEql(inner_ch_ty, "IPv6") or chTypeEql(inner_ch_ty, "UUID")) {
                 pos += 16;
             } else if (chTypeEql(inner_ch_ty, "IPv4")) {
                 pos += 4;
@@ -665,6 +665,11 @@ pub fn decodeNativeBlock(allocator: std.mem.Allocator, data: []const u8) !WithHe
 /// Map a ClickHouse type string to our schema.ColumnType.
 /// Handles Nullable(T) and LowCardinality(T) wrappers.
 fn parseChType(s: []const u8) ?schema.ColumnType {
+    if (chTypeStartsWith(s, "SimpleAggregateFunction(")) {
+        const inner = simpleAggregateInnerType(s) orelse return .text;
+        return parseChType(inner);
+    }
+    if (chTypeStartsWith(s, "AggregateFunction(")) return .text;
     if (chTypeEql(s, "Int8")) return .int8;
     if (chTypeEql(s, "Int16")) return .int16;
     if (chTypeEql(s, "Int32")) return .int32;
@@ -682,8 +687,10 @@ fn parseChType(s: []const u8) ?schema.ColumnType {
     if (chTypeEql(s, "FixedString")) return .text;
     if (chTypeEql(s, "IPv4")) return .text;
     if (chTypeEql(s, "IPv6")) return .text;
+    if (chTypeEql(s, "UUID")) return .text;
     if (chTypeEql(s, "Float32")) return .float32;
     if (chTypeEql(s, "Float64")) return .float64;
+    if (chTypeEql(s, "Bool") or chTypeEql(s, "Boolean")) return .int8;
     // Nullable(T) / LowCardinality(T)
     if (chTypeStartsWith(s, "Nullable(") or chTypeStartsWith(s, "LowCardinality(")) {
         const inner = extractInner(s);
@@ -718,13 +725,28 @@ fn parseChType(s: []const u8) ?schema.ColumnType {
     return null;
 }
 
+fn simpleAggregateInnerType(s: []const u8) ?[]const u8 {
+    const body = extractInner(s);
+    if (body.ptr == s.ptr) return null;
+    var depth: usize = 0;
+    for (body, 0..) |c, i| {
+        if (c == '(') {
+            depth += 1;
+        } else if (c == ')') {
+            if (depth > 0) depth -= 1;
+        } else if (c == ',' and depth == 0) {
+            return std.mem.trim(u8, body[i + 1 ..], " \t\r\n");
+        }
+    }
+    return null;
+}
+
 fn chTypeEql(a: []const u8, b: []const u8) bool {
-    if (a.len != b.len) return false;
-    return std.mem.eql(u8, a, b);
+    return std.ascii.eqlIgnoreCase(a, b);
 }
 
 fn chTypeStartsWith(s: []const u8, prefix: []const u8) bool {
-    return std.mem.startsWith(u8, s, prefix);
+    return std.ascii.startsWithIgnoreCase(s, prefix);
 }
 
 fn extractInner(s: []const u8) []const u8 {
@@ -744,8 +766,10 @@ pub fn chTypeFixedWidth(type_str: []const u8) ?usize {
 fn nativeTextFixedWidth(type_str: []const u8) ?usize {
     if (chTypeEql(type_str, "IPv4")) return 4;
     if (chTypeEql(type_str, "IPv6")) return 16;
+    if (chTypeEql(type_str, "UUID")) return 16;
     // Numeric fixed-width types (used as Map values, etc.)
-    if (chTypeEql(type_str, "UInt8")  or chTypeEql(type_str, "Int8"))  return 1;
+    if (chTypeEql(type_str, "UInt8")  or chTypeEql(type_str, "Int8") or
+        chTypeEql(type_str, "Bool") or chTypeEql(type_str, "Boolean")) return 1;
     if (chTypeEql(type_str, "UInt16") or chTypeEql(type_str, "Int16")) return 2;
     if (chTypeEql(type_str, "UInt32") or chTypeEql(type_str, "Int32")  or
         chTypeEql(type_str, "Float32") or chTypeEql(type_str, "Date") or
@@ -774,8 +798,7 @@ fn measureNativeValue(type_str: []const u8, data: []const u8, pos: usize) !usize
     }
     // String
     if (chTypeEql(type_str, "String") or
-        chTypeStartsWith(type_str, "Nullable(") or
-        chTypeEql(type_str, "UUID"))
+        chTypeStartsWith(type_str, "Nullable("))
     {
         const len, const lb = readVarUInt(data[pos..]) orelse return error.UnexpectedEndOfData;
         if (pos + lb + len > data.len) return error.UnexpectedEndOfData;
@@ -918,8 +941,8 @@ fn consumeNativeTextRows(
     num_rows: usize,
     col_buf: *ColumnBuffer,
 ) !void {
-    // Plain String / UUID: read varUInt(len) + content; store ONLY content.
-    const is_plain_string = chTypeEql(type_str, "String") or chTypeEql(type_str, "UUID");
+    // Plain String: read varUInt(len) + content; store ONLY content.
+    const is_plain_string = chTypeEql(type_str, "String");
     if (is_plain_string) {
         {
             var scan = pos.*;
@@ -1157,6 +1180,40 @@ test "decodeWithHeader: Int32 + String two rows" {
     try std.testing.expectEqual(@as(i64, 8), result.decoder.columns[0].fixed_vals.items[1]);
     try std.testing.expectEqualSlices(u8, "alice", result.decoder.columns[1].str_vals.items[0]);
     try std.testing.expectEqualSlices(u8, "bob",   result.decoder.columns[1].str_vals.items[1]);
+}
+
+test "decodeWithHeader: UUID Bool and SimpleAggregateFunction" {
+    const allocator = std.testing.allocator;
+
+    var buf: [256]u8 = undefined;
+    var pos: usize = 0;
+
+    buf[pos] = 3; pos += 1;
+    const names = [_][]const u8{ "id", "ok", "total" };
+    for (names) |name| {
+        buf[pos] = @intCast(name.len); pos += 1;
+        @memcpy(buf[pos..][0..name.len], name); pos += name.len;
+    }
+    const types = [_][]const u8{ "UUID", "Bool", "SimpleAggregateFunction(sum, UInt64)" };
+    for (types) |ty| {
+        buf[pos] = @intCast(ty.len); pos += 1;
+        @memcpy(buf[pos..][0..ty.len], ty); pos += ty.len;
+    }
+
+    const uuid = [_]u8{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
+    @memcpy(buf[pos..][0..uuid.len], &uuid); pos += uuid.len;
+    buf[pos] = 1; pos += 1;
+    std.mem.writeInt(u64, buf[pos..][0..8], 42, .little); pos += 8;
+
+    var result = try decodeWithHeader(allocator, buf[0..pos]);
+    defer result.deinit(allocator);
+
+    try std.testing.expectEqual(schema.ColumnType.text, result.table.columns[0].ty);
+    try std.testing.expectEqual(schema.ColumnType.int8, result.table.columns[1].ty);
+    try std.testing.expectEqual(schema.ColumnType.int64, result.table.columns[2].ty);
+    try std.testing.expectEqualSlices(u8, &uuid, result.decoder.columns[0].str_vals.items[0]);
+    try std.testing.expectEqual(@as(i64, 1), result.decoder.columns[1].fixed_vals.items[0]);
+    try std.testing.expectEqual(@as(i64, 42), result.decoder.columns[2].fixed_vals.items[0]);
 }
 
 test "decodeWithHeader: truncated header triggers errdefer (no leak)" {
