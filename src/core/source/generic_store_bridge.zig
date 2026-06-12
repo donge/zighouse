@@ -831,6 +831,7 @@ pub const GenericStoreBridge = struct {
     fn getRawInt16ColFn(ptr: *anyopaque, col_name: []const u8) ?[]const i16 {
         const self: *GenericStoreBridge = @ptrCast(@alignCast(ptr));
         const s = self.state;
+        s.loadColumns() catch return null;
         for (s.table.columns, 0..) |col, ci| {
             if (!std.mem.eql(u8, col.name, col_name)) continue;
             if (col.ty != .int16) return null; // only int16 (not int8)
