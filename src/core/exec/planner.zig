@@ -1279,6 +1279,15 @@ fn schemaColType(ctx: *PlannerCtx, col_name: []const u8) ColumnType {
     return .string;
 }
 
+/// Resolve a string as a column ref, a string literal, or try parseArithExpr.
+fn resolveExprOrLit(ctx: *PlannerCtx, text: []const u8) ?Expr {
+    if (resolveColExpr(ctx, text)) |e| return e;
+    if (text.len >= 2 and text[0] == '\'' and text[text.len - 1] == '\'') {
+        return Expr{ .lit_str = text[1 .. text.len - 1] };
+    }
+    return null;
+}
+
 fn schemaToCore(ty: schema_mod.ColumnType, ch_type: ?[]const u8) ColumnType {
     if (ch_type) |ct| {
         if (std.mem.startsWith(u8, ct, "Array("))
@@ -1800,7 +1809,7 @@ fn canonFnName(name: []const u8) []const u8 {
         "not",               "isNull",                   "isNotNull",        "isIPv4String",     "isIPv6String",      "IPv4StringToNumOrDefault",
         "IPv4NumToString",   "IPv6StringToNumOrDefault", "IPv6NumToString",  "greatest",         "least",             "intDiv",
         "modulo",            "positionCaseInsensitive",  "splitByChar",      "concat",           "format",            "if",
-        "multiIf",           "substring",                "substr",           "startsWith",       "endsWith",          "mapGet",
+        "position",          "locate",                   "multiIf",           "substring",        "substr",           "startsWith",       "endsWith",          "mapGet",
         "has",               "hasAny",                   "hasAll",           "arrayConcat",      "arrayDistinct",     "arrayFlatten",
         "arrayStringConcat", "array_to_string",          "arrayReverse",     "arraySlice",       "arrayMax",          "arrayMin",
         "arrayMap",          "arrayFilter",              "arrayExists",      "arrayJoin",        "mapKeys",           "mapValues",
@@ -2734,15 +2743,18 @@ fn tryParseFnCallItem(ctx: *PlannerCtx, text: []const u8, alias: []const u8) !?P
     if (std.mem.eql(u8, fn_name, "greatest") or
         std.mem.eql(u8, fn_name, "least") or
         std.mem.eql(u8, fn_name, "intDiv") or
-        std.mem.eql(u8, fn_name, "modulo"))
+        std.mem.eql(u8, fn_name, "modulo") or
+        std.mem.eql(u8, fn_name, "position") or
+        std.mem.eql(u8, fn_name, "locate") or
+        std.mem.eql(u8, fn_name, "positionCaseInsensitive"))
     {
         if (std.mem.indexOfScalar(u8, args_text, '(') == null) {
             const comma = std.mem.indexOfScalar(u8, args_text, ',') orelse return null;
             const a0_raw = std.mem.trim(u8, args_text[0..comma], " \t");
             const a1_raw = std.mem.trim(u8, args_text[comma + 1 ..], " \t");
             if (std.mem.indexOfScalar(u8, a1_raw, ',') == null) {
-                const a0_expr = resolveColExpr(ctx, a0_raw) orelse return null;
-                const a1_expr = resolveColExpr(ctx, a1_raw) orelse return null;
+                const a0_expr = resolveExprOrLit(ctx, a0_raw) orelse return null;
+                const a1_expr = resolveExprOrLit(ctx, a1_raw) orelse return null;
                 const fc = try ctx.alloc.create(plan.FnCall);
                 const fc_args = try ctx.alloc.alloc(Expr, 2);
                 fc_args[0] = a0_expr;

@@ -230,6 +230,14 @@ pub fn parse(allocator: std.mem.Allocator, sql: []const u8) !ParseResult {
                 try appendAndSkip(allocator, &cols, &tok, col_name_raw, .float64, ch_type_owned);
                 continue;
             }
+            // FLOAT(p), REAL(p), DOUBLE(p) → float64 (precision parameter discarded)
+            if (std.ascii.eqlIgnoreCase(col_type_raw, "FLOAT") or
+                std.ascii.eqlIgnoreCase(col_type_raw, "REAL") or
+                std.ascii.eqlIgnoreCase(col_type_raw, "DOUBLE"))
+            {
+                try appendAndSkip(allocator, &cols, &tok, col_name_raw, .float64, ch_type_owned);
+                continue;
+            }
             // TIME(p) → timestamp
             if (std.ascii.eqlIgnoreCase(col_type_raw, "TIME")) {
                 try appendAndSkip(allocator, &cols, &tok, col_name_raw, .timestamp, ch_type_owned);

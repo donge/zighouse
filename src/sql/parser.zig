@@ -729,7 +729,11 @@ const Parser = struct {
             if (self.tok.peek().kind == .lparen) {
                 _ = self.tok.next(); // (
                 var fn_distinct = false;
-                if (self.tok.eatKeyword("DISTINCT")) fn_distinct = true;
+                if (self.tok.eatKeyword("DISTINCT")) {
+                    fn_distinct = true;
+                } else {
+                    _ = self.tok.eatKeyword("ALL");
+                }
 
                 var args = std.ArrayListUnmanaged(ast.Expr).empty;
                 if (self.tok.peek().kind != .rparen) {
@@ -948,7 +952,23 @@ const Parser = struct {
     }
 
     fn parseSubstringFunc(self: *Parser) ParseError!ast.Expr {
-        const str_expr = try self.parseExpr();
+        // SQL standard form: SUBSTRING(str FROM start [FOR len] [USING ...])
+        // Functional form: substring(str, start, len) — detected by comma after first expr
+        const first = try self.parseExpr();
+        // Check for functional form (comma-separated args)
+        if (self.tok.eatIf(.comma)) {
+            var args = std.ArrayListUnmanaged(ast.Expr).empty;
+            try args.append(self.allocator, first);
+            while (true) {
+                try args.append(self.allocator, try self.parseExpr());
+                if (!self.tok.eatIf(.comma)) break;
+            }
+            if (self.tok.peek().kind != .rparen) return error.UnexpectedToken;
+            _ = self.tok.next(); // )
+            const fn_name = try self.allocator.dupe(u8, "substring");
+            return .{ .func = .{ .name = fn_name, .args = try args.toOwnedSlice(self.allocator) } };
+        }
+        // Standard FROM/FOR form
         var start_expr: ?ast.Expr = null;
         var len_expr: ?ast.Expr = null;
         if (self.tok.eatKeyword("FROM")) {
@@ -957,10 +977,14 @@ const Parser = struct {
         if (self.tok.eatKeyword("FOR")) {
             len_expr = try self.parseExpr();
         }
+        // Skip optional USING CHARACTERS / USING OCTETS
+        if (self.tok.eatKeyword("USING")) {
+            _ = self.tok.next(); // CHARACTERS or OCTETS
+        }
         if (self.tok.peek().kind != .rparen) return error.UnexpectedToken;
         _ = self.tok.next(); // )
         var args = std.ArrayListUnmanaged(ast.Expr).empty;
-        try args.append(self.allocator, str_expr);
+        try args.append(self.allocator, first);
         if (start_expr) |s| try args.append(self.allocator, s);
         if (len_expr) |l| try args.append(self.allocator, l);
         const args_slice = try args.toOwnedSlice(self.allocator);
@@ -969,14 +993,32 @@ const Parser = struct {
     }
 
     fn parsePositionFunc(self: *Parser) ParseError!ast.Expr {
-        const needle = try self.parseExpr();
+        // Functional form: position(haystack, needle) — comma-separated args
+        const first = try self.parseExpr();
+        if (self.tok.eatIf(.comma)) {
+            var args = std.ArrayListUnmanaged(ast.Expr).empty;
+            try args.append(self.allocator, first);
+            while (true) {
+                try args.append(self.allocator, try self.parseExpr());
+                if (!self.tok.eatIf(.comma)) break;
+            }
+            if (self.tok.peek().kind != .rparen) return error.UnexpectedToken;
+            _ = self.tok.next(); // )
+            const fn_name = try self.allocator.dupe(u8, "position");
+            return .{ .func = .{ .name = fn_name, .args = try args.toOwnedSlice(self.allocator) } };
+        }
+        // SQL standard form: POSITION(needle IN haystack)
         if (!self.tok.eatKeyword("IN")) return error.UnexpectedToken;
         const haystack = try self.parseExpr();
+        // Skip optional USING CHARACTERS / USING OCTETS
+        if (self.tok.eatKeyword("USING")) {
+            _ = self.tok.next(); // CHARACTERS or OCTETS
+        }
         if (self.tok.peek().kind != .rparen) return error.UnexpectedToken;
         _ = self.tok.next(); // )
         var args = std.ArrayListUnmanaged(ast.Expr).empty;
         try args.append(self.allocator, haystack);
-        try args.append(self.allocator, needle);
+        try args.append(self.allocator, first); // needle (swap: haystack first for kernel)
         const args_slice = try args.toOwnedSlice(self.allocator);
         const fn_name = try self.allocator.dupe(u8, "position");
         return .{ .func = .{ .name = fn_name, .args = args_slice } };
@@ -991,9 +1033,43 @@ const Parser = struct {
             .both
         else
             .default;
-        // Skip optional trim character string (only when spec is set and next token is a string)
-        if (spec != .default and !self.tok.peekKeyword("FROM") and self.tok.peek().kind != .rparen) {
-            if (self.tok.peek().kind == .string) _ = self.tok.next();
+        // Functional form: trim(str) — no LEADING/TRAILING/BOTH, and no FROM after first expr
+        if (spec == .default) {
+            var peek = self.tok;
+            const ft = peek.next(); // peek at first potential type arg
+            if (!std.ascii.eqlIgnoreCase(ft.text, "FROM") and !std.ascii.eqlIgnoreCase(ft.text, "LEADING") and
+                !std.ascii.eqlIgnoreCase(ft.text, "TRAILING") and !std.ascii.eqlIgnoreCase(ft.text, "BOTH"))
+            {
+                // Functional form: trim(expr) or trim(expr, expr, ...)
+                const str_expr = try self.parseExpr();
+                if (self.tok.peek().kind == .rparen) {
+                    _ = self.tok.next();
+                    const fn_name = try self.allocator.dupe(u8, "trim");
+                    const args = try self.allocator.alloc(ast.Expr, 1);
+                    args[0] = str_expr;
+                    return .{ .func = .{ .name = fn_name, .args = args } };
+                }
+                if (self.tok.eatIf(.comma)) {
+                    var args = std.ArrayListUnmanaged(ast.Expr).empty;
+                    try args.append(self.allocator, str_expr);
+                    while (true) {
+                        try args.append(self.allocator, try self.parseExpr());
+                        if (!self.tok.eatIf(.comma)) break;
+                    }
+                    if (self.tok.peek().kind != .rparen) return error.UnexpectedToken;
+                    _ = self.tok.next();
+                    const fn_name = try self.allocator.dupe(u8, "trim");
+                    return .{ .func = .{ .name = fn_name, .args = try args.toOwnedSlice(self.allocator) } };
+                }
+            }
+        }
+        // Skip optional trim character string (when next token is a string followed by FROM)
+        var peek2 = self.tok;
+        if (!self.tok.peekKeyword("FROM") and self.tok.peek().kind != .rparen and self.tok.peek().kind == .string) {
+            _ = peek2.next(); // peek at potential trim char
+            if (peek2.peekKeyword("FROM")) {
+                _ = self.tok.next(); // consume the trim char string
+            }
         }
         _ = self.tok.eatKeyword("FROM");
         const str_expr = try self.parseExpr();
