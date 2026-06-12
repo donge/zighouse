@@ -73,6 +73,11 @@ pub const SourceIface = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
 
+    pub const RowRange = struct {
+        lo: u64,
+        hi: u64,
+    };
+
     pub const VTable = struct {
         /// Fill `out` with the next chunk of rows. Returns false when exhausted.
         nextChunk: *const fn (ptr: *anyopaque, out: *DataChunk, ctx: *QueryContext) anyerror!bool,
@@ -109,6 +114,8 @@ pub const SourceIface = struct {
         setRowRange: ?*const fn (ptr: *anyopaque, lo: u64, hi: u64) void = null,
         /// Optional: return the table's declared sort-key column names.
         getSortKeys: ?*const fn (ptr: *anyopaque) []const []const u8 = null,
+        /// Optional: find the exact row range for an equality on a sorted int key.
+        findIntRange: ?*const fn (ptr: *anyopaque, col_name: []const u8, value: i64) ?RowRange = null,
     };
 
     pub fn nextChunk(self: SourceIface, out: *DataChunk, ctx: *QueryContext) !bool {
@@ -188,6 +195,11 @@ pub const SourceIface = struct {
     pub fn getSortKeys(self: SourceIface) []const []const u8 {
         const f = self.vtable.getSortKeys orelse return &.{};
         return f(self.ptr);
+    }
+
+    pub fn findIntRange(self: SourceIface, col_name: []const u8, value: i64) ?RowRange {
+        const f = self.vtable.findIntRange orelse return null;
+        return f(self.ptr, col_name, value);
     }
 };
 
@@ -1584,37 +1596,41 @@ fn tryPushdownSortKeyRange(node: *const plan.PhysicalNode, ctx: *QueryContext) v
         }
         const val = match_val orelse continue;
 
-        // Fetch the raw int32 column slice.
-        const col_slice = ctx.source.getRawInt32Col(sk) orelse continue;
-        if (col_slice.len == 0) continue;
-
-        const target: i32 = @intCast(val); // CounterID fits i32
-
-        // Binary search for first index >= target.
-        var lo: usize = 0;
-        var hi: usize = col_slice.len;
-        while (lo < hi) {
-            const mid = lo + (hi - lo) / 2;
-            if (col_slice[mid] < target) lo = mid + 1 else hi = mid;
+        if (ctx.source.findIntRange(sk, val)) |range| {
+            ctx.source.setRowRange(range.lo, range.hi);
+            return;
         }
-        const range_lo = lo;
 
-        // Binary search for first index > target.
-        hi = col_slice.len;
-        lo = range_lo;
-        while (lo < hi) {
-            const mid = lo + (hi - lo) / 2;
-            if (col_slice[mid] <= target) lo = mid + 1 else hi = mid;
-        }
-        const range_hi = lo;
+        if (ctx.source.getRawInt32Col(sk)) |col_slice| {
+            if (col_slice.len == 0) continue;
+            const target: i32 = @intCast(val); // CounterID fits i32
 
-        if (range_lo >= range_hi) {
-            // No matching rows — set an empty range.
-            ctx.source.setRowRange(0, 0);
-        } else {
-            ctx.source.setRowRange(range_lo, range_hi);
+            // Binary search for first index >= target.
+            var lo: usize = 0;
+            var hi: usize = col_slice.len;
+            while (lo < hi) {
+                const mid = lo + (hi - lo) / 2;
+                if (col_slice[mid] < target) lo = mid + 1 else hi = mid;
+            }
+            const range_lo = lo;
+
+            // Binary search for first index > target.
+            hi = col_slice.len;
+            lo = range_lo;
+            while (lo < hi) {
+                const mid = lo + (hi - lo) / 2;
+                if (col_slice[mid] <= target) lo = mid + 1 else hi = mid;
+            }
+            const range_hi = lo;
+
+            if (range_lo >= range_hi) {
+                // No matching rows — set an empty range.
+                ctx.source.setRowRange(0, 0);
+            } else {
+                ctx.source.setRowRange(range_lo, range_hi);
+            }
+            return; // Only one sort-key pushdown at a time.
         }
-        return; // Only one sort-key pushdown at a time.
     }
 }
 

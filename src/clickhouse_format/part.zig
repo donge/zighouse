@@ -32,6 +32,40 @@ const block = @import("block.zig");
 const low_card = @import("low_card.zig");
 
 pub const GRANULE_SIZE: u64 = 8192;
+
+pub fn readCompactPrimaryFixedValues(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    part_dir: []const u8,
+    ty: schema.ColumnType,
+) ![]i64 {
+    const width = types.chFixedWidth(ty) orelse return error.UnsupportedPrimaryKeyType;
+    if (width != 2 and width != 4 and width != 8) return error.UnsupportedPrimaryKeyType;
+
+    const path = try std.fmt.allocPrint(allocator, "{s}/primary.cidx", .{part_dir});
+    defer allocator.free(path);
+    const compressed = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(std.math.maxInt(usize)));
+    defer allocator.free(compressed);
+
+    var reader = std.Io.Reader.fixed(compressed);
+    const raw = try block.readBlock(allocator, &reader);
+    errdefer allocator.free(raw);
+    if (raw.len % width != 0) return error.InvalidPrimaryIndex;
+
+    const values = try allocator.alloc(i64, raw.len / width);
+    errdefer allocator.free(values);
+    for (values, 0..) |*out, i| {
+        const bytes = raw[i * width ..][0..width];
+        out.* = switch (ty) {
+            .int16, .date => std.mem.readInt(i16, bytes[0..2], .little),
+            .int32 => std.mem.readInt(i32, bytes[0..4], .little),
+            .int64, .timestamp => std.mem.readInt(i64, bytes[0..8], .little),
+            else => return error.UnsupportedPrimaryKeyType,
+        };
+    }
+    allocator.free(raw);
+    return values;
+}
 /// Maximum uncompressed bytes per LZ4 block (~1 MiB, matching CH default).
 pub const MAX_BLOCK_BYTES: usize = 1 * 1024 * 1024;
 
@@ -1397,6 +1431,7 @@ pub const CompactPart = struct {
     /// For LowCardinality columns: per-column DictBuilder pointer (null for non-LC cols).
     lc_builders: []?*low_card.DictBuilder,
     row_count: u64,
+    pk_col_idx: usize,
     /// Compression codec for data.bin.
     codec: u8 = block.METHOD_LZ4,
 
@@ -1411,6 +1446,15 @@ pub const CompactPart = struct {
         errdefer allocator.free(dir);
 
         try std.Io.Dir.cwd().createDirPath(io, part_dir);
+
+        const resolved_pk_col_idx: usize = blk: {
+            if (table.sort_keys.len > 0) {
+                for (table.columns, 0..) |col, i| {
+                    if (std.mem.eql(u8, col.name, table.sort_keys[0])) break :blk i;
+                }
+            }
+            break :blk 0;
+        };
 
         const col_bufs = try allocator.alloc(ManagedList, table.columns.len);
         for (col_bufs) |*b| b.* = ManagedList.init(allocator);
@@ -1443,6 +1487,7 @@ pub const CompactPart = struct {
             .size_bufs = size_bufs,
             .lc_builders = lc_builders,
             .row_count = 0,
+            .pk_col_idx = resolved_pk_col_idx,
             .codec = codec,
         };
     }
@@ -1667,12 +1712,12 @@ pub const CompactPart = struct {
         {
             var pk_aw = std.Io.Writer.Allocating.init(self.allocator);
             defer pk_aw.deinit();
-            const pk_col = self.table.columns[0];
+            const pk_col = self.table.columns[self.pk_col_idx];
             const width = types.chFixedWidth(pk_col.ty) orelse 0;
             var pk_raw = std.ArrayList(u8).empty;
             defer pk_raw.deinit(self.allocator);
             if (width > 0) {
-                const cd = self.col_bufs[0].items;
+                const cd = self.col_bufs[self.pk_col_idx].items;
                 for (0..n_gran) |g| {
                     const off = g * GRANULE_SIZE * width;
                     if (off + width <= cd.len)
@@ -1881,6 +1926,48 @@ test "CompactPart write + read round-trip" {
         try std.testing.expectEqual(@as(usize, 3), n3);
         try std.testing.expectEqual(@as(usize, 3), url_count3);
     }
+}
+
+test "CompactPart primary.cidx uses leading sort key column" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const part_dir = "/tmp/zig_test_compact_primary_sort_key";
+
+    {
+        var cwd = std.Io.Dir.cwd();
+        cwd.deleteTree(io, part_dir) catch {};
+    }
+
+    const cols = [_]schema.Column{
+        .{ .name = "WatchID", .ty = .int64 },
+        .{ .name = "CounterID", .ty = .int32 },
+    };
+    const sort_keys = [_][]const u8{"CounterID"};
+    const table = schema.Table{ .name = "test_compact_primary_sort_key", .columns = &cols, .sort_keys = &sort_keys };
+
+    {
+        var cp = try CompactPart.open(io, allocator, part_dir, table, 0x82);
+        defer cp.deinit();
+
+        const rows = GRANULE_SIZE + 1;
+        const watch_ids = try allocator.alloc(i64, rows);
+        defer allocator.free(watch_ids);
+        const counter_ids = try allocator.alloc(i64, rows);
+        defer allocator.free(counter_ids);
+        for (watch_ids, counter_ids, 0..) |*watch, *counter, i| {
+            watch.* = 10_000 + @as(i64, @intCast(i));
+            counter.* = if (i < GRANULE_SIZE) 42 else 99;
+        }
+        try cp.appendFixedBatch(0, watch_ids);
+        try cp.appendFixedBatch(1, counter_ids);
+        try cp.finish();
+    }
+
+    const pk = try readCompactPrimaryFixedValues(io, allocator, part_dir, .int32);
+    defer allocator.free(pk);
+    try std.testing.expectEqual(@as(usize, 2), pk.len);
+    try std.testing.expectEqual(@as(i64, 42), pk[0]);
+    try std.testing.expectEqual(@as(i64, 99), pk[1]);
 }
 
 test "CompactOpenedPart range reader keeps LowCardinality dictionary" {

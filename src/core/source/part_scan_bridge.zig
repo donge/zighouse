@@ -230,6 +230,62 @@ const ScanState = struct {
         return null;
     }
 
+    fn lowerBoundI64(values: []const i64, target: i64) usize {
+        var lo: usize = 0;
+        var hi: usize = values.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (values[mid] < target) lo = mid + 1 else hi = mid;
+        }
+        return lo;
+    }
+
+    fn upperBoundI64(values: []const i64, target: i64) usize {
+        var lo: usize = 0;
+        var hi: usize = values.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (values[mid] <= target) lo = mid + 1 else hi = mid;
+        }
+        return lo;
+    }
+
+    fn findIntRange(self: *ScanState, col_name: []const u8, value: i64) !?SourceIface.RowRange {
+        if (self.part_dirs.len != 1) return null;
+        if (self.table.sort_keys.len == 0 or !std.mem.eql(u8, self.table.sort_keys[0], col_name)) return null;
+        const ci = self.colIndex(col_name) orelse return null;
+        const col = self.table.columns[ci];
+        if (col.ty != .int16 and col.ty != .int32 and col.ty != .int64 and col.ty != .date and col.ty != .timestamp) return null;
+
+        const pk_values = part_mod.readCompactPrimaryFixedValues(self.io, self.alloc, self.part_dirs[0], col.ty) catch return null;
+        defer self.alloc.free(pk_values);
+        if (pk_values.len == 0) return null;
+        const expected_granules: usize = @intCast((self.row_count + part_mod.GRANULE_SIZE - 1) / part_mod.GRANULE_SIZE);
+        if (pk_values.len != expected_granules) return null;
+
+        const lb = lowerBoundI64(pk_values, value);
+        const start_granule = if (lb == 0) 0 else lb - 1;
+        var end_granule = upperBoundI64(pk_values, value);
+        if (end_granule <= start_granule) end_granule = start_granule + 1;
+        end_granule = @min(end_granule, pk_values.len);
+
+        const start_row = @as(u64, @intCast(start_granule)) * part_mod.GRANULE_SIZE;
+        const end_row = @min(self.row_count, @as(u64, @intCast(end_granule)) * part_mod.GRANULE_SIZE);
+        if (end_row <= start_row) return SourceIface.RowRange{ .lo = 0, .hi = 0 };
+
+        const n: usize = @intCast(end_row - start_row);
+        const vals = try self.alloc.alloc(i64, n);
+        defer self.alloc.free(vals);
+        try self.readFixedRange(ci, start_row, n, vals);
+
+        const exact_lo = lowerBoundI64(vals, value);
+        const exact_hi = upperBoundI64(vals, value);
+        return .{
+            .lo = start_row + exact_lo,
+            .hi = start_row + exact_hi,
+        };
+    }
+
     fn lockRaw(self: *ScanState) void {
         while (self.raw_lock.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) {
             std.atomic.spinLoopHint();
@@ -971,6 +1027,11 @@ pub const PartScanBridge = struct {
         self.state.reset();
     }
 
+    fn findIntRangeFn(ptr: *anyopaque, col_name: []const u8, value: i64) ?SourceIface.RowRange {
+        const self: *PartScanBridge = @ptrCast(@alignCast(ptr));
+        return self.state.findIntRange(col_name, value) catch null;
+    }
+
     fn getRawInt16ColFn(ptr: *anyopaque, col_name: []const u8) ?[]const i16 {
         const self: *PartScanBridge = @ptrCast(@alignCast(ptr));
         const ci = self.state.colIndex(col_name) orelse return null;
@@ -1045,6 +1106,7 @@ pub const PartScanBridge = struct {
         .getRawStrBytes        = getRawStrBytesFn,
         .setRowRange           = setRowRangeFn,
         .getSortKeys           = getSortKeysFn,
+        .findIntRange          = findIntRangeFn,
     };
 };
 
@@ -1192,6 +1254,46 @@ test "PartScanBridge disables raw materialization for large compact parts" {
     try std.testing.expect(source.getRawInt32Col("id") == null);
     try std.testing.expect(source.getRawStrOffsets("name") == null);
     try std.testing.expect(source.getRawStrBytes("name") == null);
+}
+
+test "PartScanBridge finds compact int sort-key range via primary index" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const part_dir = "/tmp/zig_test_part_scan_bridge_primary_range";
+
+    {
+        var cwd = std.Io.Dir.cwd();
+        cwd.deleteTree(io, part_dir) catch {};
+    }
+
+    const cols = [_]schema.Column{.{ .name = "id", .ty = .int32 }};
+    const sort_keys = [_][]const u8{"id"};
+    const table = schema.Table{ .name = "primary_range", .columns = &cols, .sort_keys = &sort_keys };
+
+    const n_rows = part_mod.GRANULE_SIZE * 2 + 2048;
+    const ids = try allocator.alloc(i64, n_rows);
+    defer allocator.free(ids);
+    for (ids, 0..) |*id, i| {
+        id.* = if (i < 5000) 1 else if (i < 12000) 42 else 99;
+    }
+
+    {
+        var cp = try part_mod.CompactPart.open(io, allocator, part_dir, table, 0x82);
+        defer cp.deinit();
+        try cp.appendFixedBatch(0, ids);
+        try cp.finish();
+    }
+
+    var bridge = try PartScanBridge.init(allocator, io, table, &[_][]const u8{part_dir}, &.{});
+    defer bridge.deinit();
+    const source = bridge.source();
+
+    const hit = source.findIntRange("id", 42) orelse return error.TestExpectedRange;
+    try std.testing.expectEqual(@as(u64, 5000), hit.lo);
+    try std.testing.expectEqual(@as(u64, 12000), hit.hi);
+
+    const miss = source.findIntRange("id", 7) orelse return error.TestExpectedEmptyRange;
+    try std.testing.expectEqual(miss.lo, miss.hi);
 }
 
 test "PartScanBridge combines raw views across compact parts" {
