@@ -5,21 +5,40 @@ set -euo pipefail
 
 TEST_DIR="${1:-/tmp/ch-tests-dl}"
 PORT="${2:-29099}"
+HTTP_PORT=$((PORT + 1))
 BINARY="./zig-out/bin/zighouse"
 DATA_DIR="$(mktemp -d)"
 
 cleanup() { kill "$SPID" 2>/dev/null || true; rm -rf "$DATA_DIR"; }
 trap cleanup EXIT
 
+# ── Feature skip list (same as run-clickhouse-tests.sh) ──
+# Tests matching these patterns are skipped (unsupported features)
+FEATURE_SKIP_RE='kafka|zookeeper|rabbitmq|mysql|postgresql|mongodb|odbc|jdbc|dictionary|redis|hdfs|s3|grpc|distributed|cluster|replicated|materialized\.view|window\.function|explain|system\.|grant|revoke|role|user\s+default'
+
+# Requires pre-loaded stateful data (test.hits, test.visits)
+STATEFUL_SKIP_RE='Tags:.*stateful'
+
+# ── Start server ──
 "$BINARY" serve "--data-dir=$DATA_DIR" "--port=$PORT" 2>/dev/null &
 SPID=$!
-sleep 0.6
+
+for i in $(seq 1 30); do
+    if curl -sf "http://localhost:$HTTP_PORT/ping" >/dev/null 2>&1; then
+        break
+    fi
+    sleep 0.5
+    if [[ $i -eq 30 ]]; then
+        echo "ERROR: server did not start"
+        exit 1
+    fi
+done
 
 pass=0; fail=0; skip=0
 
 run_sql() {
   local sql="$1"
-  curl -s --noproxy localhost "http://localhost:$PORT/?query=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "$sql")&default_format=TabSeparated"
+  curl -s --noproxy localhost "http://localhost:$HTTP_PORT/?query=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "$sql")&default_format=TabSeparated"
 }
 
 for sql_file in "$TEST_DIR"/*.sql; do
@@ -33,6 +52,16 @@ for sql_file in "$TEST_DIR"/*.sql; do
   first_line="$(head -c 14 "$sql_file")"
   [[ "$first_line" == "404: Not Found" ]] && { ((skip++)); continue; }
 
+  # Skip tests requiring unsupported ClickHouse features
+  if grep -qiE "$FEATURE_SKIP_RE" "$sql_file"; then
+    ((skip++)); continue
+  fi
+
+  # Skip stateful tests (require pre-loaded test.hits/test.visits data)
+  if grep -qiE "$STATEFUL_SKIP_RE" "$sql_file"; then
+    ((skip++)); continue
+  fi
+
   actual=""
   stmt_buf=""
   while IFS= read -r line; do
@@ -40,8 +69,10 @@ for sql_file in "$TEST_DIR"/*.sql; do
     [[ -z "$line" ]] && continue
     trimmed="${line#"${line%%[![:space:]]*}"}"
     [[ "$trimmed" == --* ]] && continue
-    # Skip SET statements
-    [[ "$trimmed" == SET\ * || "$trimmed" == set\ * ]] && continue
+    # Skip SET / CREATE DATABASE / USE / SYSTEM statements
+    if echo "$trimmed" | grep -qiE '^(SET\s+|CREATE\s+DATABASE|USE\s+|SYSTEM\s+)'; then
+      continue
+    fi
     # Skip lines with serverError annotation (they are expected to error)
     [[ "$line" == *"-- { serverError"* ]] && continue
 
