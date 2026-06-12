@@ -1051,6 +1051,7 @@ fn handleSelect(ctx: *ServerCtx, a: std.mem.Allocator, w: *Io.Writer, sql: []con
             break :ir_exec null;
         };
         if (node == null) {
+            std.log.warn("tcp IR unsupported: {s}", .{sql});
             arena.deinit();
             break :ir_exec null;
         }
@@ -1086,6 +1087,7 @@ fn handleSelect(ctx: *ServerCtx, a: std.mem.Allocator, w: *Io.Writer, sql: []con
     }
 
     // IR returned null — unsupported shape, return empty result.
+    std.log.warn("tcp returning empty block for unsupported SELECT: {s}", .{sql});
     try sendEmptyBlock(a, w);
 }
 
