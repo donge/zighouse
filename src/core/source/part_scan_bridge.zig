@@ -346,6 +346,40 @@ const ScanState = struct {
         }};
     }
 
+    fn readFixedRange(self: *ScanState, ci: usize, start: u64, n: usize, out: []i64) !void {
+        var global_base: u64 = 0;
+        var dst: usize = 0;
+        for (self.part_dirs) |dir| {
+            const part_rows = try readPartCount(self.alloc, self.io, dir);
+            defer global_base += part_rows;
+            if (start >= global_base + part_rows) continue;
+            if (start + n <= global_base) break;
+
+            const local_start: u64 = if (start > global_base) start - global_base else 0;
+            const available: usize = @intCast(part_rows - local_start);
+            const want = @min(n - dst, available);
+
+            var op = try part_mod.OpenedPartAny.open(self.io, self.alloc, dir, self.table);
+            defer op.deinit();
+            var cr = try op.columnReaderRange(ci, local_start, want);
+            defer cr.deinit();
+            const got = try cr.readFixed(out[dst .. dst + want]);
+            if (got < want) @memset(out[dst + got .. dst + want], 0);
+            dst += want;
+            if (dst >= n) break;
+        }
+        if (dst < n) @memset(out[dst..n], 0);
+    }
+
+    fn readFixedFromCurrentPart(self: *ScanState, op: *part_mod.OpenedPartAny, use_range_reader: bool, ci: usize, n: u64, out: []i64) !usize {
+        if (use_range_reader) {
+            var cr = try op.columnReaderRange(ci, self.rows_read, @intCast(n));
+            defer cr.deinit();
+            return cr.readFixed(out);
+        }
+        return self.col_readers[ci].?.readFixed(out);
+    }
+
     fn readArrayRange(self: *ScanState, ci: usize, start: u64, n: usize, out: [][][]const u8, alloc: std.mem.Allocator) !void {
         var global_base: u64 = 0;
         var dst: usize = 0;
@@ -355,15 +389,15 @@ const ScanState = struct {
             if (start >= global_base + part_rows) continue;
             if (start + n <= global_base) break;
 
-            var op = try part_mod.OpenedPartAny.open(self.io, self.alloc, dir, self.table);
-            defer op.deinit();
-            var cr = try op.columnReader(ci);
-            defer cr.deinit();
-
-            const local_start: usize = if (start > global_base) @intCast(start - global_base) else 0;
-            if (local_start > 0) _ = try cr.skipArrayStrings(local_start);
+            const local_start: u64 = if (start > global_base) start - global_base else 0;
             const available: usize = @intCast(part_rows - local_start);
             const want = @min(n - dst, available);
+
+            var op = try part_mod.OpenedPartAny.open(self.io, self.alloc, dir, self.table);
+            defer op.deinit();
+            var cr = try op.columnReaderRange(ci, local_start, want);
+            defer cr.deinit();
+
             const Ctx = struct {
                 out: [][][]const u8,
                 idx: usize,
@@ -392,7 +426,6 @@ const ScanState = struct {
         const chunk_alloc = out.arena.allocator();
         out.columns = try chunk_alloc.alloc(chunk.Column, self.table.columns.len);
         const null_words = chunk.nullMaskWords(n);
-        const end: usize = @intCast(start + n);
         const base: usize = @intCast(start);
 
         for (self.table.columns, 0..) |col, ci| {
@@ -407,21 +440,7 @@ const ScanState = struct {
                     if (is_pruned) {
                         @memset(buf, 0);
                     } else {
-                        try self.ensureRawFixed(ci);
-                        switch (self.raw_cols[ci]) {
-                            .i16s => |s| {
-                                for (s[base..end], 0..) |v, i| buf[i] = v;
-                            },
-                            .i32s => |s| {
-                                for (s[base..end], 0..) |v, i| buf[i] = v;
-                            },
-                            .i64s => |s| {
-                                @memcpy(buf, s[base..end]);
-                            },
-                            else => {
-                                @memset(buf, 0);
-                            },
-                        }
+                        try self.readFixedRange(ci, start, n, buf);
                     }
                     break :blk if (core_ty == .int64) .{ .int64 = buf } else .{ .datetime64_ms = buf };
                 },
@@ -430,20 +449,14 @@ const ScanState = struct {
                     if (is_pruned) {
                         @memset(fbuf, 0.0);
                     } else {
-                        try self.ensureRawFixed(ci);
-                        switch (self.raw_cols[ci]) {
-                            .i64s => |s| {
-                                if (col.ty == .float32) {
-                                    for (s[base..end], 0..) |iv, i| {
-                                        fbuf[i] = @floatCast(@as(f32, @bitCast(@as(u32, @truncate(@as(u64, @bitCast(iv)))))));
-                                    }
-                                } else {
-                                    for (s[base..end], 0..) |iv, i| fbuf[i] = @bitCast(iv);
-                                }
-                            },
-                            else => {
-                                @memset(fbuf, 0.0);
-                            },
+                        const ibuf = try chunk_alloc.alloc(i64, n);
+                        try self.readFixedRange(ci, start, n, ibuf);
+                        if (col.ty == .float32) {
+                            for (ibuf, 0..) |iv, i| {
+                                fbuf[i] = @floatCast(@as(f32, @bitCast(@as(u32, @truncate(@as(u64, @bitCast(iv)))))));
+                            }
+                        } else {
+                            for (ibuf, 0..) |iv, i| fbuf[i] = @bitCast(iv);
                         }
                     }
                     break :blk .{ .float64 = fbuf };
@@ -453,15 +466,9 @@ const ScanState = struct {
                     if (is_pruned) {
                         @memset(ubuf, 0);
                     } else {
-                        try self.ensureRawFixed(ci);
-                        switch (self.raw_cols[ci]) {
-                            .i32s => |s| {
-                                for (s[base..end], 0..) |v, i| ubuf[i] = @truncate(@as(u32, @bitCast(v)));
-                            },
-                            else => {
-                                @memset(ubuf, 0);
-                            },
-                        }
+                        const ibuf = try chunk_alloc.alloc(i64, n);
+                        try self.readFixedRange(ci, start, n, ibuf);
+                        for (ibuf, 0..) |v, i| ubuf[i] = @intCast(v);
                     }
                     break :blk .{ .date_u16 = ubuf };
                 },
@@ -470,15 +477,9 @@ const ScanState = struct {
                     if (is_pruned) {
                         @memset(bbuf, 0);
                     } else {
-                        try self.ensureRawFixed(ci);
-                        switch (self.raw_cols[ci]) {
-                            .i64s => |s| {
-                                for (s[base..end], 0..) |v, i| bbuf[i] = @intCast(@as(u8, @truncate(@as(u64, @bitCast(v)))));
-                            },
-                            else => {
-                                @memset(bbuf, 0);
-                            },
-                        }
+                        const ibuf = try chunk_alloc.alloc(i64, n);
+                        try self.readFixedRange(ci, start, n, ibuf);
+                        for (ibuf, 0..) |v, i| bbuf[i] = @intCast(@as(u8, @truncate(@as(u64, @bitCast(v)))));
                     }
                     break :blk .{ .bool_u8 = bbuf };
                 },
@@ -487,15 +488,9 @@ const ScanState = struct {
                     if (is_pruned) {
                         @memset(ubuf, 0);
                     } else {
-                        try self.ensureRawFixed(ci);
-                        switch (self.raw_cols[ci]) {
-                            .i64s => |s| {
-                                for (s[base..end], 0..) |v, i| ubuf[i] = @bitCast(v);
-                            },
-                            else => {
-                                @memset(ubuf, 0);
-                            },
-                        }
+                        const ibuf = try chunk_alloc.alloc(i64, n);
+                        try self.readFixedRange(ci, start, n, ibuf);
+                        for (ibuf, 0..) |v, i| ubuf[i] = @bitCast(v);
                     }
                     break :blk .{ .uint64 = ubuf };
                 },
@@ -567,6 +562,11 @@ const ScanState = struct {
         const dir = self.part_dirs[self.part_idx];
         self.part_idx += 1;
         self.opened = try part_mod.OpenedPartAny.open(self.io, self.alloc, dir, self.table);
+        const is_compact = switch (self.opened.?) {
+            .compact => true,
+            .wide => false,
+        };
+        if (is_compact) return true;
         for (self.table.columns, 0..) |_, i| {
             // Skip columns not in the needed set (column pruning).
             if (!self.isNeeded(i)) continue;
@@ -607,20 +607,24 @@ const ScanState = struct {
         };
         const chunk_alloc = out.arena.allocator();
         const null_words  = chunk.nullMaskWords(n);
+        const use_range_readers = switch (op.*) {
+            .compact => true,
+            .wide => false,
+        };
 
         for (self.table.columns, 0..) |col, ci| {
             const null_mask = try chunk_alloc.alloc(u64, null_words);
             @memset(null_mask, 0);
             const core_ty = toCoreColTypeFull(col);
             // Pruned column: produce zero/empty data without reading from disk.
-            const is_pruned = self.col_readers[ci] == null and !self.isNeeded(ci);
+            const is_pruned = !self.isNeeded(ci);
             const col_data: chunk.ColumnData = switch (core_ty) {
                 .int64, .datetime64_ms => blk: {
                     const buf = try chunk_alloc.alloc(i64, n);
                     if (is_pruned) {
                         @memset(buf, 0);
                     } else {
-                        const actual = try self.col_readers[ci].?.readFixed(buf);
+                        const actual = try self.readFixedFromCurrentPart(op, use_range_readers, ci, n, buf);
                         if (actual < n) @memset(buf[actual..], 0);
                     }
                     break :blk if (core_ty == .int64) .{ .int64 = buf } else .{ .datetime64_ms = buf };
@@ -631,7 +635,7 @@ const ScanState = struct {
                         @memset(fbuf, 0.0);
                     } else {
                         const ibuf = try chunk_alloc.alloc(i64, n);
-                        _ = try self.col_readers[ci].?.readFixed(ibuf);
+                        _ = try self.readFixedFromCurrentPart(op, use_range_readers, ci, n, ibuf);
                         for (ibuf, 0..) |iv, i| fbuf[i] = @bitCast(iv);
                     }
                     break :blk .{ .float64 = fbuf };
@@ -642,7 +646,7 @@ const ScanState = struct {
                         @memset(ubuf, 0);
                     } else {
                         const ibuf = try chunk_alloc.alloc(i64, n);
-                        _ = try self.col_readers[ci].?.readFixed(ibuf);
+                        _ = try self.readFixedFromCurrentPart(op, use_range_readers, ci, n, ibuf);
                         for (ibuf, 0..) |iv, i| ubuf[i] = @intCast(@as(u16, @truncate(@as(u64, @bitCast(iv)))));
                     }
                     break :blk .{ .date_u16 = ubuf };
@@ -653,7 +657,7 @@ const ScanState = struct {
                         @memset(bbuf, 0);
                     } else {
                         const ibuf = try chunk_alloc.alloc(i64, n);
-                        _ = try self.col_readers[ci].?.readFixed(ibuf);
+                        _ = try self.readFixedFromCurrentPart(op, use_range_readers, ci, n, ibuf);
                         for (ibuf, 0..) |iv, i| bbuf[i] = @intCast(@as(u8, @truncate(@as(u64, @bitCast(iv)))));
                     }
                     break :blk .{ .bool_u8 = bbuf };
@@ -664,7 +668,7 @@ const ScanState = struct {
                         @memset(ubuf, 0);
                     } else {
                         const ibuf = try chunk_alloc.alloc(i64, n);
-                        _ = try self.col_readers[ci].?.readFixed(ibuf);
+                        _ = try self.readFixedFromCurrentPart(op, use_range_readers, ci, n, ibuf);
                         for (ibuf, 0..) |iv, i| ubuf[i] = @bitCast(iv);
                     }
                     break :blk .{ .uint64 = ubuf };
@@ -680,7 +684,13 @@ const ScanState = struct {
                                 idx: usize,
                             };
                             var sctx = Ctx{ .buf = bbuf, .idx = 0 };
-                            const actual = try self.col_readers[ci].?.readStrings(n, &sctx,
+                            var tmp_cr: ?part_mod.ColumnReader = null;
+                            defer if (tmp_cr) |*cr| cr.deinit();
+                            const cr = if (use_range_readers) cr_blk: {
+                                tmp_cr = try op.columnReaderRange(ci, self.rows_read, n);
+                                break :cr_blk &tmp_cr.?;
+                            } else &self.col_readers[ci].?;
+                            const actual = try cr.readStrings(n, &sctx,
                                 struct {
                                     fn cb(c: *Ctx, str: []const u8) !void {
                                         c.buf[c.idx] = if (str.len != 0) 1 else 0;
@@ -702,7 +712,13 @@ const ScanState = struct {
                             alloc: std.mem.Allocator,
                         };
                         var sctx = Ctx{ .buf = sbuf, .idx = 0, .alloc = chunk_alloc };
-                        _ = try self.col_readers[ci].?.readStrings(n, &sctx,
+                        var tmp_cr: ?part_mod.ColumnReader = null;
+                        defer if (tmp_cr) |*cr| cr.deinit();
+                        const cr = if (use_range_readers) cr_blk: {
+                            tmp_cr = try op.columnReaderRange(ci, self.rows_read, n);
+                            break :cr_blk &tmp_cr.?;
+                        } else &self.col_readers[ci].?;
+                        _ = try cr.readStrings(n, &sctx,
                             struct {
                                 fn cb(c: *Ctx, str: []const u8) !void {
                                     c.buf[c.idx] = try c.alloc.dupe(u8, str);
@@ -719,7 +735,13 @@ const ScanState = struct {
                         @memset(sbuf, &.{});
                     } else {
                     // Use readArrayStrings to decode Array(String) columns from parts.
-                    if (self.col_readers[ci]) |*cr| {
+                    var tmp_cr: ?part_mod.ColumnReader = null;
+                    defer if (tmp_cr) |*cr| cr.deinit();
+                    const cr = if (use_range_readers) cr_blk: {
+                        tmp_cr = try op.columnReaderRange(ci, self.rows_read, n);
+                        break :cr_blk &tmp_cr.?;
+                    } else &self.col_readers[ci].?;
+                    {
                         const Ctx2 = struct {
                             buf:   [][][]const u8,
                             idx:   usize,
@@ -739,8 +761,6 @@ const ScanState = struct {
                         };
                         // Fill any unread rows with empty
                         while (ctx2.idx < n) : (ctx2.idx += 1) sbuf[ctx2.idx] = &.{};
-                    } else {
-                        @memset(sbuf, &.{});
                     }
                     } // end else (not pruned)
                     break :blk .{ .array_string = sbuf };

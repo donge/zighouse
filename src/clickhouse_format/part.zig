@@ -867,6 +867,22 @@ pub const ColumnReader = struct {
         if (self.size_data) |sd| self.allocator.free(sd);
     }
 
+    pub fn seekRows(self: *ColumnReader, n: usize) !void {
+        if (n == 0) return;
+        switch (self.col.ty) {
+            .text, .char, .low_card => _ = try self.skipStrings(n),
+            else => {
+                const width: usize = types.chFixedWidth(self.col.ty) orelse return error.NotAFixedColumn;
+                const remaining = self.row_count - self.rows_read;
+                const count = @min(n, remaining);
+                const needed = count * width;
+                if (self.cursor + needed > self.data.len) return error.UnexpectedEndOfData;
+                self.cursor += needed;
+                self.rows_read += count;
+            },
+        }
+    }
+
     /// Read up to `out.len` values from a fixed-width column, cast to i64.
     /// Returns the number of rows actually read.
     pub fn readFixed(self: *ColumnReader, out: []i64) !usize {
@@ -1106,11 +1122,11 @@ pub const CompactOpenedPart = struct {
     part_dir: []const u8,
     table: schema.Table,
     row_count: u64,
-    /// Per-substream: fully decompressed block bytes, one entry per block
-    /// (one block per substream per granule).
-    /// Index: substream_idx * n_granules + granule_idx
-    substream_data: [][]u8,
-    /// Number of substreams total.
+    /// Compact-part logical marks from data.cmrk4. String columns have two
+    /// logical substreams (sizes + bytes) sharing one physical compressed block.
+    mark_table: marks.CompactMarkTable,
+    data_file_size: u64,
+    /// Number of logical substreams total.
     n_substreams: usize,
     /// n_granules (derived from row_count and GRANULE_SIZE).
     n_granules: usize,
@@ -1130,54 +1146,37 @@ pub const CompactOpenedPart = struct {
 
         const n_gran: usize = if (row_count == 0) 0 else (row_count + GRANULE_SIZE - 1) / GRANULE_SIZE;
 
-        // In CH Compact format: data.bin has one physical block per column per granule.
-        // For String columns, the single block contains: sizes (n_rows*8 bytes) + raw bytes.
-        // So total physical blocks = n_gran * n_columns.
         const n_cols = table.columns.len;
 
-        // Compute actual physical block count per granule and per-column start.
-        // String/char: 1 physical block (combined sizes+data)
-        // LowCardinality: 2 physical blocks (dict + index)
-        // Fixed-width: 1 physical block
-        // This must match the write-side physical block emission in CompactWriter.finalize().
+        // Compute logical substream count and per-column mark start.
+        // String/char: two logical marks, but both point into one combined block.
+        // LowCardinality: two physical/logical blocks (dict + index).
+        // Fixed-width: one block.
         const col_ss = try allocator.alloc(usize, n_cols);
         errdefer allocator.free(col_ss);
         var total_substreams: usize = 0;
         for (0..n_cols) |ci| {
             col_ss[ci] = total_substreams;
             total_substreams += switch (table.columns[ci].ty) {
-                .low_card => 2,  // dict block + index block
-                else => 1,       // single physical block (fixed or combined string)
+                .text, .char, .low_card => 2,
+                else => 1,
             };
         }
 
-        // Read and decompress all blocks from data.bin.
-        const total_blocks = n_gran * total_substreams;
-        const substream_data = try allocator.alloc([]u8, total_blocks);
-        errdefer {
-            for (substream_data) |sd| allocator.free(sd);
-            allocator.free(substream_data);
-        }
-        for (substream_data) |*sd| sd.* = &.{};
+        const cmrk_path = try std.fmt.allocPrint(allocator, "{s}/data.cmrk4", .{part_dir});
+        defer allocator.free(cmrk_path);
+        const cmrk_bytes = try std.Io.Dir.cwd().readFileAlloc(io, cmrk_path, allocator, .limited(std.math.maxInt(usize)));
+        defer allocator.free(cmrk_bytes);
+        const mark_table = try marks.readCmrk4Adaptive(allocator, cmrk_bytes, total_substreams);
+        errdefer mark_table.deinit(allocator);
 
-        if (total_blocks > 0) {
-            const bin_path = try std.fmt.allocPrint(allocator, "{s}/data.bin", .{part_dir});
-            defer allocator.free(bin_path);
-            const bin_file = try std.Io.Dir.cwd().openFile(io, bin_path, .{});
-            defer bin_file.close(io);
-            const stat = try bin_file.stat(io);
-            const bin_raw = try std.posix.mmap(null, stat.size, .{ .READ = true }, .{ .TYPE = .PRIVATE }, bin_file.handle, 0);
-            defer std.posix.munmap(bin_raw);
+        const bin_path = try std.fmt.allocPrint(allocator, "{s}/data.bin", .{part_dir});
+        defer allocator.free(bin_path);
+        const bin_file = try std.Io.Dir.cwd().openFile(io, bin_path, .{});
+        defer bin_file.close(io);
+        const bin_stat = try bin_file.stat(io);
 
-            var bin_r = std.Io.Reader.fixed(bin_raw);
-            for (substream_data) |*sd| {
-                const chunk = block.readBlock(allocator, &bin_r) catch |e| switch (e) {
-                    error.TruncatedBlock => break,
-                    else => return e,
-                };
-                sd.* = chunk;
-            }
-        }
+        if (n_gran != mark_table.n_granules) return error.InvalidMarkCount;
 
         return .{
             .allocator = allocator,
@@ -1185,7 +1184,8 @@ pub const CompactOpenedPart = struct {
             .part_dir = part_dir,
             .table = table,
             .row_count = row_count,
-            .substream_data = substream_data,
+            .mark_table = mark_table,
+            .data_file_size = bin_stat.size,
             .n_substreams = total_substreams,
             .n_granules = n_gran,
             .col_substream_start = col_ss,
@@ -1193,29 +1193,79 @@ pub const CompactOpenedPart = struct {
     }
 
     pub fn deinit(self: *CompactOpenedPart) void {
-        for (self.substream_data) |sd| self.allocator.free(sd);
-        self.allocator.free(self.substream_data);
+        self.mark_table.deinit(self.allocator);
         self.allocator.free(self.col_substream_start);
+    }
+
+    fn blockRange(self: *CompactOpenedPart, mark_idx: usize) !struct { u64, u64 } {
+        if (mark_idx >= self.mark_table.marks.len) return error.InvalidMarkCount;
+        const start = self.mark_table.marks[mark_idx].offset_in_file;
+        var end = self.mark_table.eof_offset;
+        var i = mark_idx + 1;
+        while (i < self.mark_table.marks.len) : (i += 1) {
+            const off = self.mark_table.marks[i].offset_in_file;
+            if (off > start) {
+                end = off;
+                break;
+            }
+        }
+        if (end < start or end > self.data_file_size) return error.InvalidMarkCount;
+        return .{ start, end - start };
+    }
+
+    fn readBlockAt(self: *CompactOpenedPart, file: std.Io.File, mark_idx: usize) ![]u8 {
+        const range = try self.blockRange(mark_idx);
+        const len: usize = @intCast(range[1]);
+        const compressed = try self.allocator.alloc(u8, len);
+        defer self.allocator.free(compressed);
+        const read_n = try file.readPositionalAll(self.io, compressed, range[0]);
+        if (read_n != compressed.len) return error.UnexpectedEndOfData;
+        var reader = std.Io.Reader.fixed(compressed);
+        return block.readBlock(self.allocator, &reader);
     }
 
     /// Return a ColumnReader for column at `col_idx`.
     /// Collects and concatenates all granule blocks for this column's substreams.
     pub fn columnReader(self: *CompactOpenedPart, col_idx: usize) !ColumnReader {
+        return self.columnReaderGranules(col_idx, 0, self.n_granules);
+    }
+
+    /// Return a ColumnReader that only reads granules intersecting
+    /// `[start_row, start_row + row_count)`. The returned reader is positioned
+    /// at `start_row`, so callers can read exactly `row_count` rows.
+    pub fn columnReaderRange(self: *CompactOpenedPart, col_idx: usize, start_row: u64, row_count: usize) !ColumnReader {
+        if (row_count == 0 or start_row >= self.row_count) {
+            return self.emptyColumnReader(col_idx);
+        }
+        const end_row = @min(start_row + row_count, self.row_count);
+        const first_gran: usize = @intCast(start_row / GRANULE_SIZE);
+        const last_gran: usize = @intCast((end_row - 1) / GRANULE_SIZE);
+        var cr = try self.columnReaderGranules(col_idx, first_gran, last_gran - first_gran + 1);
+        const skip_rows: usize = @intCast(start_row - @as(u64, @intCast(first_gran)) * GRANULE_SIZE);
+        try cr.seekRows(skip_rows);
+        cr.row_count = cr.rows_read + (end_row - start_row);
+        return cr;
+    }
+
+    fn emptyColumnReader(self: *CompactOpenedPart, col_idx: usize) !ColumnReader {
+        return ColumnReader{
+            .allocator = self.allocator,
+            .col = self.table.columns[col_idx],
+            .row_count = 0,
+            .data = try self.allocator.alloc(u8, 0),
+            .size_data = null,
+            .cursor = 0,
+            .size_cursor = 0,
+            .rows_read = 0,
+        };
+    }
+
+    fn columnReaderGranules(self: *CompactOpenedPart, col_idx: usize, first_granule: usize, granule_count: usize) !ColumnReader {
         const col = self.table.columns[col_idx];
         const ss_start = self.col_substream_start[col_idx];
 
-        if (self.row_count == 0) {
-            return ColumnReader{
-                .allocator = self.allocator,
-                .col = col,
-                .row_count = 0,
-                .data = try self.allocator.alloc(u8, 0),
-                .size_data = null,
-                .cursor = 0,
-                .size_cursor = 0,
-                .rows_read = 0,
-            };
-        }
+        if (self.row_count == 0 or granule_count == 0 or first_granule >= self.n_granules)
+            return self.emptyColumnReader(col_idx);
 
         // Concatenate all granule blocks for this column's data (and size if String)
         var data_buf: std.ArrayListUnmanaged(u8) = .empty;
@@ -1223,17 +1273,29 @@ pub const CompactOpenedPart = struct {
         var size_buf: std.ArrayListUnmanaged(u8) = .empty;
         errdefer size_buf.deinit(self.allocator);
 
-        for (0..self.n_granules) |g| {
+        const bin_path = try std.fmt.allocPrint(self.allocator, "{s}/data.bin", .{self.part_dir});
+        defer self.allocator.free(bin_path);
+        const bin_file = try std.Io.Dir.cwd().openFile(self.io, bin_path, .{});
+        defer bin_file.close(self.io);
+
+        const granule_end = @min(first_granule + granule_count, self.n_granules);
+        var rows_loaded: u64 = 0;
+        if (col.ty == .low_card and first_granule > 0) {
+            const dict_idx = ss_start;
+            const dict = try self.readBlockAt(bin_file, dict_idx);
+            defer self.allocator.free(dict);
+            try data_buf.appendSlice(self.allocator, dict);
+        }
+        for (first_granule..granule_end) |g| {
+            const n_rows_in_gran = self.mark_table.granularities[g];
+            rows_loaded += n_rows_in_gran;
             // In CH Compact format: one physical block per column per granule.
             // For String columns: block = sizes_bytes(n_rows*8) + raw_bytes.
             const block_idx = g * self.n_substreams + ss_start;
             switch (col.ty) {
                 .text, .char => {
-                    const combined = self.substream_data[block_idx];
-                    // Compute rows in this granule
-                    const gs = g * GRANULE_SIZE;
-                    const ge = @min(gs + GRANULE_SIZE, self.row_count);
-                    const n_rows_in_gran = ge - gs;
+                    const combined = try self.readBlockAt(bin_file, block_idx);
+                    defer self.allocator.free(combined);
                     const sizes_bytes = n_rows_in_gran * 8;
                     if (sizes_bytes > combined.len) return error.UnexpectedEndOfData;
                     try size_buf.appendSlice(self.allocator, combined[0..sizes_bytes]);
@@ -1245,12 +1307,18 @@ pub const CompactOpenedPart = struct {
                     // block at ss_start+1 = index for this granule
                     // Accumulate dict from granule 0, and all index payloads.
                     if (g == 0) {
-                        try data_buf.appendSlice(self.allocator, self.substream_data[block_idx]);
+                        const dict = try self.readBlockAt(bin_file, block_idx);
+                        defer self.allocator.free(dict);
+                        try data_buf.appendSlice(self.allocator, dict);
                     }
-                    try size_buf.appendSlice(self.allocator, self.substream_data[block_idx + 1]);
+                    const index = try self.readBlockAt(bin_file, block_idx + 1);
+                    defer self.allocator.free(index);
+                    try size_buf.appendSlice(self.allocator, index);
                 },
                 else => {
-                    try data_buf.appendSlice(self.allocator, self.substream_data[block_idx]);
+                    const data = try self.readBlockAt(bin_file, block_idx);
+                    defer self.allocator.free(data);
+                    try data_buf.appendSlice(self.allocator, data);
                 },
             }
         }
@@ -1262,12 +1330,12 @@ pub const CompactOpenedPart = struct {
             const index_raw = try size_buf.toOwnedSlice(self.allocator);
             defer self.allocator.free(index_raw);
             const deserialized = try low_card.deserializeToStringBuf(
-                self.allocator, dict_raw, index_raw, self.row_count,
+                self.allocator, dict_raw, index_raw, rows_loaded,
             );
             return ColumnReader{
                 .allocator = self.allocator,
                 .col = col,
-                .row_count = self.row_count,
+                .row_count = rows_loaded,
                 .data = deserialized.data,
                 .size_data = deserialized.size_data,
                 .cursor = 0,
@@ -1287,7 +1355,7 @@ pub const CompactOpenedPart = struct {
         return ColumnReader{
             .allocator = self.allocator,
             .col = col,
-            .row_count = self.row_count,
+            .row_count = rows_loaded,
             .data = try data_buf.toOwnedSlice(self.allocator),
             .size_data = size_data,
             .cursor = 0,
@@ -1815,6 +1883,53 @@ test "CompactPart write + read round-trip" {
     }
 }
 
+test "CompactOpenedPart range reader keeps LowCardinality dictionary" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const part_dir = "/tmp/zig_test_compact_lc_range";
+
+    const cols = [_]schema.Column{
+        .{ .name = "id", .ty = .int32 },
+        .{ .name = "tag", .ty = .low_card, .ch_type = "LowCardinality(String)" },
+    };
+    const table = schema.Table{ .name = "test_compact_lc_range", .columns = &cols };
+    const rows: usize = GRANULE_SIZE + 4;
+
+    {
+        var cp = try CompactPart.open(io, allocator, part_dir, table, 0x82);
+        defer cp.deinit();
+
+        const ids = try allocator.alloc(i64, rows);
+        defer allocator.free(ids);
+        for (ids, 0..) |*v, i| v.* = @intCast(i);
+        try cp.appendFixedBatch(0, ids);
+        for (0..rows) |i| try cp.appendString(1, if (i % 2 == 0) "even" else "odd");
+        try cp.finish();
+    }
+
+    {
+        var cop = try CompactOpenedPart.open(io, allocator, part_dir, table);
+        defer cop.deinit();
+        var cr = try cop.columnReaderRange(1, GRANULE_SIZE + 1, 2);
+        defer cr.deinit();
+
+        const Ctx = struct {
+            allocator: std.mem.Allocator,
+            items: std.ArrayList([]const u8),
+        };
+        var got = Ctx{ .allocator = allocator, .items = .empty };
+        defer got.items.deinit(allocator);
+        _ = try cr.readStrings(2, &got, struct {
+            fn cb(out: *Ctx, s: []const u8) !void {
+                try out.items.append(out.allocator, s);
+            }
+        }.cb);
+        try std.testing.expectEqual(@as(usize, 2), got.items.items.len);
+        try std.testing.expectEqualStrings("odd", got.items.items[0]);
+        try std.testing.expectEqualStrings("even", got.items.items[1]);
+    }
+}
+
 test "CompactOpenedPart reads CH-written compact part" {
     // This test reads the part created by the CH server in the integration setup.
     // It is skipped if the part directory doesn't exist.
@@ -2294,6 +2409,18 @@ pub const OpenedPartAny = union(enum) {
         return switch (self.*) {
             .wide    => |*p| p.columnReader(col_idx),
             .compact => |*p| p.columnReader(col_idx),
+        };
+    }
+
+    pub fn columnReaderRange(self: *OpenedPartAny, col_idx: usize, start_row: u64, row_count: usize) !ColumnReader {
+        return switch (self.*) {
+            .compact => |*p| p.columnReaderRange(col_idx, start_row, row_count),
+            .wide => |*p| blk: {
+                var cr = try p.columnReader(col_idx);
+                errdefer cr.deinit();
+                try cr.seekRows(@intCast(start_row));
+                break :blk cr;
+            },
         };
     }
 };

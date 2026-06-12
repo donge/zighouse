@@ -122,6 +122,19 @@ pub const CompactMark = struct {
     offset_in_block: u64,
 };
 
+pub const CompactMarkTable = struct {
+    marks: []CompactMark,
+    granularities: []u64,
+    n_substreams: usize,
+    n_granules: usize,
+    eof_offset: u64,
+
+    pub fn deinit(self: CompactMarkTable, allocator: std.mem.Allocator) void {
+        allocator.free(self.marks);
+        allocator.free(self.granularities);
+    }
+};
+
 pub const COMPACT_MARK_SIZE: usize = 16; // 2 × u64
 
 /// Read all compact marks from a decompressed `.cmrk4` payload.
@@ -149,6 +162,60 @@ pub fn readCmrk4(allocator: std.mem.Allocator, file_bytes: []const u8) ![]Compac
     const decompressed = try block.readBlock(allocator, &reader);
     defer allocator.free(decompressed);
     return readCompactMarks(allocator, decompressed);
+}
+
+/// Read adaptive `.cmrk4` marks written by modern compact parts:
+/// each granule row has n_substreams CompactMark entries followed by a u64
+/// granularity, plus one EOF sentinel row. Returns only real granule marks;
+/// EOF is exposed separately as `eof_offset`.
+pub fn readCmrk4Adaptive(
+    allocator: std.mem.Allocator,
+    file_bytes: []const u8,
+    n_substreams: usize,
+) !CompactMarkTable {
+    if (n_substreams == 0) return error.InvalidMarkCount;
+
+    var reader = std.Io.Reader.fixed(file_bytes);
+    const decompressed = try block.readBlock(allocator, &reader);
+    defer allocator.free(decompressed);
+
+    const row_bytes = n_substreams * COMPACT_MARK_SIZE + 8;
+    if (decompressed.len < row_bytes or decompressed.len % row_bytes != 0) {
+        return error.TruncatedMark;
+    }
+    const rows = decompressed.len / row_bytes;
+    if (rows == 0) return error.InvalidMarkCount;
+    const n_granules = rows - 1;
+
+    const out_marks = try allocator.alloc(CompactMark, n_granules * n_substreams);
+    errdefer allocator.free(out_marks);
+    const granularities = try allocator.alloc(u64, n_granules);
+    errdefer allocator.free(granularities);
+
+    var pos: usize = 0;
+    for (0..n_granules) |g| {
+        for (0..n_substreams) |s| {
+            out_marks[g * n_substreams + s] = .{
+                .offset_in_file = std.mem.readInt(u64, decompressed[pos..][0..8], .little),
+                .offset_in_block = std.mem.readInt(u64, decompressed[pos + 8 ..][0..8], .little),
+            };
+            pos += COMPACT_MARK_SIZE;
+        }
+        granularities[g] = std.mem.readInt(u64, decompressed[pos..][0..8], .little);
+        pos += 8;
+    }
+
+    const eof_offset = std.mem.readInt(u64, decompressed[pos..][0..8], .little);
+    pos += n_substreams * COMPACT_MARK_SIZE + 8;
+    if (pos != decompressed.len) return error.TruncatedMark;
+
+    return .{
+        .marks = out_marks,
+        .granularities = granularities,
+        .n_substreams = n_substreams,
+        .n_granules = n_granules,
+        .eof_offset = eof_offset,
+    };
 }
 
 /// Encode compact marks and write as a single LZ4-compressed CH block.

@@ -256,6 +256,13 @@ pub fn parse(allocator: std.mem.Allocator, sql: []const u8) !ParseResult {
 
         const col_ty = parseColumnType(col_type_raw) orelse return error.UnsupportedColumnType;
 
+        const col_name_owned = try allocator.dupe(u8, col_name_raw);
+        // Full type name from source (captures multi-word types like "DOUBLE PRECISION").
+        // Capture before skipping DEFAULT/MATERIALIZED/etc so client-visible type strings
+        // stay parseable by ClickHouse drivers.
+        const ch_type_full = std.mem.trim(u8, tok.src[type_src_start..tok.pos], " \t\r\n");
+        const ch_type_owned = try allocator.dupe(u8, ch_type_full);
+
         // Skip optional column-level constraints: DEFAULT, NOT NULL, UNIQUE, PRIMARY KEY,
         // REFERENCES, CHECK, MATERIALIZED, ALIAS, COMMENT, CODEC, etc.
         if (tok.peekKeyword("DEFAULT") or tok.peekKeyword("MATERIALIZED") or tok.peekKeyword("ALIAS") or tok.peekKeyword("COMMENT") or tok.peekKeyword("CODEC") or
@@ -264,10 +271,6 @@ pub fn parse(allocator: std.mem.Allocator, sql: []const u8) !ParseResult {
             tok.skipToColumnDelimiter();
         }
 
-        const col_name_owned = try allocator.dupe(u8, col_name_raw);
-        // Full type name from source (captures multi-word types like "DOUBLE PRECISION")
-        const ch_type_full = std.mem.trim(u8, tok.src[type_src_start..tok.pos], " \t\r\n");
-        const ch_type_owned = try allocator.dupe(u8, ch_type_full);
         try cols.append(allocator, .{ .name = col_name_owned, .ty = col_ty, .ch_type = ch_type_owned });
     }
 
@@ -592,10 +595,12 @@ test "parse: ORDER BY tuple" {
     try std.testing.expectEqualStrings("id", result.entry.pk.?);
 }
 
-test "parse: unsupported type returns error" {
+test "parse: Decimal type maps to Float64 compatibility storage" {
     const allocator = std.testing.allocator;
     const sql = "CREATE TABLE t (x Decimal(10,2)) ENGINE = MergeTree";
-    try std.testing.expectError(error.UnsupportedColumnType, parse(allocator, sql));
+    var result = try parse(allocator, sql);
+    defer result.deinit();
+    try std.testing.expectEqual(schema.ColumnType.float64, result.entry.table.columns[0].ty);
 }
 
 test "parse: Float32 and Float64 are supported" {
@@ -725,6 +730,9 @@ test "parse: DEFAULT clause is skipped" {
     try std.testing.expectEqual(schema.ColumnType.text,      result.entry.table.columns[7].ty); // note
     try std.testing.expectEqual(schema.ColumnType.timestamp, result.entry.table.columns[8].ty); // updated_at
     try std.testing.expectEqual(schema.ColumnType.int64,     result.entry.table.columns[9].ty); // version
+    try std.testing.expectEqualStrings("Float64", result.entry.table.columns[4].ch_type.?);
+    try std.testing.expectEqualStrings("UInt8", result.entry.table.columns[6].ch_type.?);
+    try std.testing.expectEqualStrings("String", result.entry.table.columns[7].ch_type.?);
     try std.testing.expectEqualStrings("rule_id", result.entry.pk.?);
 }
 
