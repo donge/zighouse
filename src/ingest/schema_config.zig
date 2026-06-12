@@ -259,31 +259,45 @@ fn parseColumnType(s: []const u8) ?schema.ColumnType {
     if (asciiEql(s, "UInt32")) return .int32;
     if (asciiEql(s, "UInt64")) return .int64;
     if (asciiEql(s, "Date")) return .date;
+    if (asciiEql(s, "Date32")) return .date;
     if (asciiEql(s, "DateTime")) return .timestamp;
-    if (std.mem.startsWith(u8, s, "DateTime(")) return .timestamp;
-    if (std.mem.startsWith(u8, s, "datetime(")) return .timestamp;
+    if (std.ascii.startsWithIgnoreCase(s, "DateTime(")) return .timestamp;
     if (asciiEql(s, "String")) return .text;
+    if (asciiEql(s, "FixedString")) return .text;
     if (asciiEql(s, "Float32")) return .float32;
     if (asciiEql(s, "Float64")) return .float64;
+
+    if (asciiEql(s, "INT") or asciiEql(s, "INTEGER")) return .int32;
+    if (asciiEql(s, "SMALLINT")) return .int16;
+    if (asciiEql(s, "BIGINT")) return .int64;
+    if (asciiEql(s, "TINYINT") or asciiEql(s, "BOOL") or asciiEql(s, "BOOLEAN")) return .int8;
+    if (asciiEql(s, "FLOAT") or asciiEql(s, "REAL")) return .float32;
+    if (asciiEql(s, "DOUBLE") or asciiEql(s, "DECIMAL") or asciiEql(s, "NUMERIC") or asciiEql(s, "DEC")) return .float64;
+    if (asciiEql(s, "VARCHAR") or asciiEql(s, "CHAR") or asciiEql(s, "CHARACTER") or asciiEql(s, "TEXT")) return .text;
+    if (asciiEql(s, "TIME") or asciiEql(s, "TIMESTAMP")) return .timestamp;
+
     // Extended CH types: map to closest base type (ch_type preserved for wire encoding).
-    if (std.mem.startsWith(u8, s, "LowCardinality(")) return .low_card;
-    if (std.mem.startsWith(u8, s, "DateTime64(")) return .timestamp;
+    if (std.ascii.startsWithIgnoreCase(s, "LowCardinality(")) return .low_card;
+    if (std.ascii.startsWithIgnoreCase(s, "DateTime64(")) return .timestamp;
     if (asciiEql(s, "IPv4")) return .text;
     if (asciiEql(s, "IPv6")) return .text;
-    if (std.mem.startsWith(u8, s, "Array(")) return .text;
-    if (std.mem.startsWith(u8, s, "Map(")) return .text;
-    if (std.mem.startsWith(u8, s, "Nullable(")) return .text;
-    if (std.mem.startsWith(u8, s, "FixedString(")) return .text;
+    if (std.ascii.startsWithIgnoreCase(s, "Array(")) return .text;
+    if (std.ascii.startsWithIgnoreCase(s, "Map(")) return .text;
+    if (std.ascii.startsWithIgnoreCase(s, "Nullable(")) {
+        const inner = extractInnerType(s) orelse return null;
+        return parseColumnType(inner);
+    }
+    if (std.ascii.startsWithIgnoreCase(s, "FixedString(")) return .text;
     if (asciiEql(s, "UUID")) return .text;
     if (asciiEql(s, "Bool")) return .int8;
-    if (std.mem.startsWith(u8, s, "Enum8(")) return .text;
-    if (std.mem.startsWith(u8, s, "Enum16(")) return .text;
-    if (std.mem.startsWith(u8, s, "Decimal(")) return .float64;
-    if (std.mem.startsWith(u8, s, "Decimal32(")) return .float64;
-    if (std.mem.startsWith(u8, s, "Decimal64(")) return .float64;
-    if (std.mem.startsWith(u8, s, "Decimal128(")) return .float64;
-    if (std.mem.startsWith(u8, s, "Tuple(")) return .text;
-    if (std.mem.startsWith(u8, s, "SimpleAggregateFunction(")) {
+    if (std.ascii.startsWithIgnoreCase(s, "Enum8(")) return .text;
+    if (std.ascii.startsWithIgnoreCase(s, "Enum16(")) return .text;
+    if (std.ascii.startsWithIgnoreCase(s, "Decimal(")) return .float64;
+    if (std.ascii.startsWithIgnoreCase(s, "Decimal32(")) return .float64;
+    if (std.ascii.startsWithIgnoreCase(s, "Decimal64(")) return .float64;
+    if (std.ascii.startsWithIgnoreCase(s, "Decimal128(")) return .float64;
+    if (std.ascii.startsWithIgnoreCase(s, "Tuple(")) return .text;
+    if (std.ascii.startsWithIgnoreCase(s, "SimpleAggregateFunction(")) {
         // Unwrap to inner type (second argument after the first comma at top level)
         const body = s["SimpleAggregateFunction(".len .. s.len - 1];
         var depth: usize = 0;
@@ -304,8 +318,14 @@ fn parseColumnType(s: []const u8) ?schema.ColumnType {
         }
         return .text;
     }
-    if (std.mem.startsWith(u8, s, "AggregateFunction(")) return .text;
+    if (std.ascii.startsWithIgnoreCase(s, "AggregateFunction(")) return .text;
     return null;
+}
+
+fn extractInnerType(s: []const u8) ?[]const u8 {
+    const open = std.mem.indexOfScalar(u8, s, '(') orelse return null;
+    if (s.len <= open + 1 or s[s.len - 1] != ')') return null;
+    return std.mem.trim(u8, s[open + 1 .. s.len - 1], " \t\r\n");
 }
 
 fn asciiEql(a: []const u8, b: []const u8) bool {
@@ -368,6 +388,33 @@ test "find: returns null for unknown table" {
 
     try std.testing.expect(cfg.find("default", "missing") == null);
     try std.testing.expect(cfg.find("other", "t") == null);
+}
+
+test "loadFromSlice: SQL aliases and wrappers use DDL-compatible storage types" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"tables": [{
+        \\  "db": "default",
+        \\  "name": "typed",
+        \\  "columns": [
+        \\    {"name": "id", "type": "INTEGER"},
+        \\    {"name": "name", "type": "VARCHAR"},
+        \\    {"name": "ok", "type": "BOOLEAN"},
+        \\    {"name": "ts", "type": "Nullable(DateTime64(3))"},
+        \\    {"name": "cat", "type": "LowCardinality(VARCHAR)"}
+        \\  ]
+        \\}]}
+    ;
+    var cfg = try loadFromSlice(allocator, json);
+    defer cfg.deinit();
+
+    const found = cfg.find("default", "typed").?;
+    try std.testing.expectEqual(schema.ColumnType.int32, found.table.columns[0].ty);
+    try std.testing.expectEqual(schema.ColumnType.text, found.table.columns[1].ty);
+    try std.testing.expectEqual(schema.ColumnType.int8, found.table.columns[2].ty);
+    try std.testing.expectEqual(schema.ColumnType.timestamp, found.table.columns[3].ty);
+    try std.testing.expectEqual(schema.ColumnType.low_card, found.table.columns[4].ty);
+    try std.testing.expectEqual(schema.ColumnType.text, found.table.columns[4].low_card_inner);
 }
 
 test "addEntry: deep-copies strings, original can be freed" {
