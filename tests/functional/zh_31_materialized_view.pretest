@@ -5,20 +5,21 @@
 set -euo pipefail
 
 CURL="curl -s --noproxy localhost,127.0.0.1"
+HTTP_PORT=$((PORT + 1))
 
 # Create source and target tables.
-$CURL -X POST "http://localhost:$PORT/" \
+$CURL -X POST "http://localhost:$HTTP_PORT/" \
     --data-binary "CREATE TABLE zh_mv_src (id UInt32, val Int64) ENGINE = MergeTree ORDER BY id"
 
-$CURL -X POST "http://localhost:$PORT/" \
+$CURL -X POST "http://localhost:$HTTP_PORT/" \
     --data-binary "CREATE TABLE zh_mv_dst (id UInt32, val_doubled Int64) ENGINE = MergeTree ORDER BY id"
 
 # Create materialized view.
-$CURL -X POST "http://localhost:$PORT/" \
+$CURL -X POST "http://localhost:$HTTP_PORT/" \
     --data-binary "CREATE MATERIALIZED VIEW default.zh_mv TO default.zh_mv_dst AS SELECT id, val * 2 AS val_doubled FROM zh_mv_src"
 
 # Insert data into source.
-$CURL -X POST "http://localhost:$PORT/" \
+$CURL -X POST "http://localhost:$HTTP_PORT/" \
     --data-binary "INSERT INTO zh_mv_src VALUES (1, 10), (2, 20), (3, 30)"
 
 # Run compactor once to apply the materialized view.
