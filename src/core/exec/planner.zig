@@ -1542,6 +1542,10 @@ const scalar_fns = [_]ScalarFn{
     .{ .name = "hour", .out = .int64 },
     .{ .name = "toMinute", .out = .int64 },
     .{ .name = "toSecond", .out = .int64 },
+    .{ .name = "toYear", .out = .int64 },
+    .{ .name = "toMonth", .out = .int64 },
+    .{ .name = "toDayOfMonth", .out = .int64 },
+    .{ .name = "toDayOfWeek", .out = .int64 },
     // Math
     .{ .name = "sqrt", .out = .float64 },
     // Array scalar aggregates

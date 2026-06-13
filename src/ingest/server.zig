@@ -1841,7 +1841,7 @@ fn parseDateTimeLiteral(s: []const u8) ?i64 {
         const ss = std.fmt.parseInt(i64, str[17..19], 10) catch 0;
         secs += hh * 3600 + mm * 60 + ss;
     }
-    return secs;
+    return secs * 1000; // datetime64_ms expects milliseconds
 }
 
 /// Gregorian calendar: year/month/day → days since 1970-01-01.

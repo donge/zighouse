@@ -461,7 +461,10 @@ pub fn toCsvOffset(alloc: std.mem.Allocator, rs: ResultSet, row_start: usize) ![
                         try buf.print(alloc, "{d}", .{v});
                     }
                 },
-                .date_u16 => try buf.print(alloc, "{d}", .{col.data.date_u16[r]}),
+                .date_u16 => {
+                    const ymd = core.exec.kernels.daysToYMD(col.data.date_u16[r]);
+                    try buf.print(alloc, "{d:0>4}-{d:0>2}-{d:0>2}", .{ ymd[0], ymd[1], ymd[2] });
+                },
                 .datetime64_ms => try buf.print(alloc, "{d}", .{col.data.datetime64_ms[r]}),
                 .string => {
                     const s = col.data.string[r];

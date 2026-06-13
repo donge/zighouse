@@ -1731,7 +1731,14 @@ fn executeNode(node: *const plan.PhysicalNode, ctx: *QueryContext) !RowList {
     const alloc = ctx.allocator();
     switch (node.*) {
         // ── Sources ───────────────────────────────────────────────────────────
-        .part_scan, .mem_scan, .chunk_source => {
+        .chunk_source => |cs| {
+            // Execute the inner sub-plan (may contain filter, project, agg, etc.)
+            return executeNode(cs.input, ctx);
+        },
+        .part_scan, .mem_scan => {
+            // Fall through to the ctx.source scan path below only for
+            // part_scan and mem_scan (not chunk_source — that must execute
+            // its inner plan to apply filter/project/agg operators).
             const schema_metas = ctx.source.schema();
             const metas = try alloc.dupe(result.ColMeta, schema_metas);
             var rl = RowList.init(metas);
@@ -2081,7 +2088,7 @@ fn projectItemsContainArrayJoin(items: []const plan.ProjectItem) bool {
 /// filter/project/limit over a direct source — i.e. no pipeline breakers.
 fn isScannable(node: *const plan.PhysicalNode) bool {
     return switch (node.*) {
-        .part_scan, .mem_scan, .chunk_source => true,
+        .part_scan, .mem_scan => true,
         .filter => |f| isScannable(f.input),
         .project => |p| !projectItemsContainArrayJoin(p.items) and isScannable(p.input),
         .limit => |l| isScannable(l.input),
@@ -3222,7 +3229,7 @@ fn executeHashAggChunked(
                     if (arg != .col_ref) break :blk null;
                     break :blk2 .count_distinct_u64;
                 },
-                .sum => .i64_sum, // type refined at runtime (int64/uint64/f64)
+                .sum => if (item.out_type == .float64) .f64_sum else .i64_sum,
                 .avg => blk2: {
                     const avg_arg = item.expr.agg_call.arg orelse break :blk null;
                     if (avg_arg == .col_ref) break :blk2 .f64_sum;
@@ -6204,7 +6211,7 @@ fn initAccumForAgg(item: plan.ProjectItem) AggAccum {
         .agg_call => |ac| switch (ac.kind) {
             .count_star => .{ .count = 0 },
             .count => if (ac.distinct) .{ .distinct_u64 = .{} } else .{ .count = 0 },
-            .sum => .{ .i64_sum = 0 },
+            .sum => if (item.out_type == .float64) .{ .f64_sum = 0.0 } else .{ .i64_sum = 0 },
             .avg => .{ .f64_avg = .{ .sum = 0.0, .count = 0 } },
             .min => if (item.out_type == .string) .{ .str_min = null } else .{ .i64_min = std.math.maxInt(i64) },
             .max => if (item.out_type == .string) .{ .str_max = null } else .{ .i64_max = std.math.minInt(i64) },
@@ -7454,7 +7461,7 @@ fn executeHashAggParallelStrKey(
                 if (arg != .col_ref) return null;
                 break :blk .count_distinct_u64;
             } else .count,
-            .sum => .i64_sum,
+            .sum => if (item.out_type == .float64) .f64_sum else .i64_sum,
             .avg => blk_avg: {
                 const avg_arg = item.expr.agg_call.arg orelse return null;
                 if (avg_arg == .col_ref) break :blk_avg .f64_sum;
@@ -8919,7 +8926,7 @@ fn executeHashAggParallelCompactTopK(
                 if (arg != .col_ref) return null;
                 break :blk .count_distinct_u64;
             } else .count,
-            .sum => .i64_sum,
+            .sum => if (item.out_type == .float64) .f64_sum else .i64_sum,
             .avg => blk_avg: {
                 const avg_arg = item.expr.agg_call.arg orelse return null;
                 if (avg_arg == .col_ref) break :blk_avg .f64_sum;

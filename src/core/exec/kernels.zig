@@ -566,8 +566,7 @@ fn evalFnCallFull(fc: *const plan.FnCall, row: []const ?Value, lambda_val: ?Valu
             return Value{ .string = try ipv6BytesToStr(v.string, arena) };
         }
         if (v.toStr()) |s| return Value{ .string = s };
-        const out = try std.fmt.allocPrint(arena, "{}", .{v});
-        return Value{ .string = out };
+        return Value{ .string = try valueToArrayString(v, arena) };
     }
     if (std.mem.eql(u8, name, "CAST_array_string")) {
         const v = args[0] orelse return Value{ .array_string = &.{} };
@@ -581,7 +580,7 @@ fn evalFnCallFull(fc: *const plan.FnCall, row: []const ?Value, lambda_val: ?Valu
             },
             else => {
                 const out = try arena.alloc([]const u8, 1);
-                out[0] = try std.fmt.allocPrint(arena, "{}", .{v});
+                out[0] = try valueToArrayString(v, arena);
                 return Value{ .array_string = out };
             },
         }
@@ -1536,8 +1535,7 @@ fn evalFnCallFull(fc: *const plan.FnCall, row: []const ?Value, lambda_val: ?Valu
     if (std.mem.eql(u8, name, "toString")) {
         const v = args[0] orelse return null;
         if (v.toStr()) |s| return Value{ .string = s };
-        const s = try std.fmt.allocPrint(arena, "{}", .{v});
-        return Value{ .string = s };
+        return Value{ .string = try valueToArrayString(v, arena) };
     }
 
     if (std.mem.eql(u8, name, "hasAny")) {
@@ -1782,12 +1780,12 @@ fn castValue(v: Value, to: ColumnType, arena: std.mem.Allocator) !?Value {
             break :blk Value{ .date_u16 = @intCast(i) };
         } else null,
         .datetime64_ms => if (v.toI64()) |i| Value{ .datetime64_ms = i } else null,
-        .string => Value{ .string = try std.fmt.allocPrint(arena, "{}", .{v}) },
+        .string => Value{ .string = try valueToArrayString(v, arena) },
         .array_string => null, // no scalar cast to array
     };
 }
 
-fn valueToArrayString(v: Value, arena: std.mem.Allocator) ![]const u8 {
+pub fn valueToArrayString(v: Value, arena: std.mem.Allocator) ![]const u8 {
     if (v.toStr()) |s| return s;
     return switch (v) {
         .bool_u8 => |b| if (b != 0) "1" else "0",
