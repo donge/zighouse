@@ -3,6 +3,7 @@
 /// Supported syntax (case-insensitive keywords):
 ///
 ///   CREATE TABLE [IF NOT EXISTS] [db.]table (
+///   ATTACH TABLE [db.]table [UUID '...'] (
 ///     col_name TypeName [, ...]
 ///   ) ENGINE = MergeTree [ORDER BY col] [PRIMARY KEY col]
 ///
@@ -44,17 +45,17 @@ pub const ParseResult = struct {
     }
 };
 
-/// Parse a CREATE TABLE statement.
+/// Parse a CREATE/ATTACH TABLE statement.
 /// Caller must call result.deinit(allocator) when done.
 pub fn parse(allocator: std.mem.Allocator, sql: []const u8) !ParseResult {
     var tok = Tokenizer.init(sql);
 
-    // CREATE
-    try expectKeyword(&tok, "CREATE");
-    // TABLE
+    const first_kw = tok.next() orelse return error.UnexpectedEndOfInput;
+    if (!std.ascii.eqlIgnoreCase(first_kw, "CREATE") and !std.ascii.eqlIgnoreCase(first_kw, "ATTACH"))
+        return error.UnexpectedToken;
+
     try expectKeyword(&tok, "TABLE");
-    // IF NOT EXISTS (optional)
-    if (tok.peekKeyword("IF")) {
+    if (std.ascii.eqlIgnoreCase(first_kw, "CREATE") and tok.peekKeyword("IF")) {
         tok.skip();
         try expectKeyword(&tok, "NOT");
         try expectKeyword(&tok, "EXISTS");
@@ -68,6 +69,11 @@ pub fn parse(allocator: std.mem.Allocator, sql: []const u8) !ParseResult {
         tok.skip(); // consume '.'
         db = first_name;
         table_name = tok.next() orelse return error.MissingTableName;
+    }
+
+    if (std.ascii.eqlIgnoreCase(first_kw, "ATTACH") and tok.peekKeyword("UUID")) {
+        tok.skip();
+        _ = tok.next() orelse return error.UnexpectedEndOfInput;
     }
     const db_owned = try allocator.dupe(u8, db);
     errdefer allocator.free(db_owned);
@@ -750,6 +756,31 @@ test "parse: ClickHouse metadata DDL with partition ttl settings and sort keys" 
     try std.testing.expectEqual(@as(usize, 2), result.entry.table.sort_keys.len);
     try std.testing.expectEqualStrings("event_type", result.entry.table.sort_keys[0]);
     try std.testing.expectEqualStrings("ts", result.entry.table.sort_keys[1]);
+}
+
+test "parse: Atomic ATTACH TABLE metadata with UUID and sort keys" {
+    const allocator = std.testing.allocator;
+    const sql =
+        \\ATTACH TABLE _ UUID 'f0805669-b200-4cf8-8cb4-565fad8eb655'
+        \\(
+        \\    `date` Date,
+        \\    `code` String,
+        \\    `close` Float64,
+        \\    `ver` UInt64
+        \\)
+        \\ENGINE = ReplacingMergeTree(ver)
+        \\ORDER BY (code, date)
+        \\SETTINGS index_granularity = 8192
+    ;
+    var result = try parse(allocator, sql);
+    defer result.deinit();
+
+    try std.testing.expectEqualStrings("_", result.entry.name);
+    try std.testing.expectEqual(@as(usize, 4), result.entry.table.columns.len);
+    try std.testing.expectEqualStrings("code", result.entry.pk.?);
+    try std.testing.expectEqual(@as(usize, 2), result.entry.table.sort_keys.len);
+    try std.testing.expectEqualStrings("code", result.entry.table.sort_keys[0]);
+    try std.testing.expectEqualStrings("date", result.entry.table.sort_keys[1]);
 }
 
 test "parse: full scoring_rules with upper column" {

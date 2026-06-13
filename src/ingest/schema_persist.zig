@@ -271,7 +271,12 @@ fn loadClickHouseMetadataSql(
 
             var buf: std.ArrayList(u8) = .empty;
             defer buf.deinit(allocator);
-            try appendTableJson(&buf, allocator, db, &parsed.entry);
+            var entry_for_json = parsed.entry;
+            if (std.mem.eql(u8, entry_for_json.name, "_")) {
+                entry_for_json.name = table_name;
+                entry_for_json.table.name = table_name;
+            }
+            try appendTableJson(&buf, allocator, db, &entry_for_json);
             try fragments.append(allocator, try allocator.dupe(u8, std.mem.trim(u8, buf.items, " \t\r\n")));
             try loaded.append(allocator, .{
                 .db = try allocator.dupe(u8, db),
@@ -410,6 +415,18 @@ test "loadAll: loads ClickHouse metadata sql after schema json" {
             \\SETTINGS index_granularity = 8192
         ,
     });
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = meta_dir ++ "/atomic_name.sql",
+        .data =
+            \\ATTACH TABLE _ UUID 'f0805669-b200-4cf8-8cb4-565fad8eb655'
+            \\(
+            \\  `code` String,
+            \\  `date` Date
+            \\)
+            \\ENGINE = ReplacingMergeTree
+            \\ORDER BY (code, date)
+        ,
+    });
 
     var cfg = try loadAll(allocator, io, root);
     defer cfg.deinit();
@@ -426,4 +443,9 @@ test "loadAll: loads ClickHouse metadata sql after schema json" {
     try std.testing.expectEqual(@as(usize, 2), meta.table.sort_keys.len);
     try std.testing.expectEqualStrings("event_type", meta.table.sort_keys[0]);
     try std.testing.expectEqualStrings("ts", meta.table.sort_keys[1]);
+
+    const atomic = cfg.find("vprobe", "atomic_name").?;
+    try std.testing.expectEqualStrings("atomic_name", atomic.table.name);
+    try std.testing.expectEqual(@as(usize, 2), atomic.table.sort_keys.len);
+    try std.testing.expectEqualStrings("code", atomic.table.sort_keys[0]);
 }

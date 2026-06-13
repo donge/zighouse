@@ -797,6 +797,80 @@ pub const OpenedPart = struct {
 
     pub fn deinit(_: *OpenedPart) void {}
 
+    fn fileExists(self: *OpenedPart, path: []const u8) bool {
+        const f = std.Io.Dir.cwd().openFile(self.io, path, .{}) catch return false;
+        f.close(self.io);
+        return true;
+    }
+
+    fn readMarksForStem(self: *OpenedPart, stem: []const u8) ![]marks.Mark {
+        const cmrk_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}.cmrk2", .{ self.part_dir, stem });
+        defer self.allocator.free(cmrk_path);
+        var compressed_marks = true;
+        const cmrk_bytes = std.Io.Dir.cwd().readFileAlloc(self.io, cmrk_path, self.allocator, .limited(std.math.maxInt(usize))) catch |err| switch (err) {
+            error.FileNotFound => blk: {
+                const mrk_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}.mrk2", .{ self.part_dir, stem });
+                defer self.allocator.free(mrk_path);
+                compressed_marks = false;
+                break :blk try std.Io.Dir.cwd().readFileAlloc(self.io, mrk_path, self.allocator, .limited(std.math.maxInt(usize)));
+            },
+            else => return err,
+        };
+        defer self.allocator.free(cmrk_bytes);
+
+        const raw = if (compressed_marks) raw_blk: {
+            var r = std.Io.Reader.fixed(cmrk_bytes);
+            break :raw_blk try block.readBlock(self.allocator, &r);
+        } else try self.allocator.dupe(u8, cmrk_bytes);
+        defer self.allocator.free(raw);
+
+        var r = std.Io.Reader.fixed(raw);
+        return marks.readAllMarks(self.allocator, &r);
+    }
+
+    fn compressedRange(mark_list: []const marks.Mark, idx: usize, file_size: u64) !struct { u64, u64 } {
+        if (idx >= mark_list.len) return error.InvalidMarkCount;
+        const start = mark_list[idx].offset_in_compressed_file;
+        var end = file_size;
+        var i = idx + 1;
+        while (i < mark_list.len) : (i += 1) {
+            const off = mark_list[i].offset_in_compressed_file;
+            if (off > start) {
+                end = off;
+                break;
+            }
+        }
+        if (end < start or end > file_size) return error.InvalidMarkCount;
+        return .{ start, end - start };
+    }
+
+    fn readCompressedBlockAt(self: *OpenedPart, file: std.Io.File, mark_list: []const marks.Mark, idx: usize, file_size: u64) ![]u8 {
+        const range = try compressedRange(mark_list, idx, file_size);
+        const len: usize = @intCast(range[1]);
+        const compressed = try self.allocator.alloc(u8, len);
+        defer self.allocator.free(compressed);
+        const read_n = try file.readPositionalAll(self.io, compressed, range[0]);
+        if (read_n != compressed.len) return error.UnexpectedEndOfData;
+        var reader = std.Io.Reader.fixed(compressed);
+        return block.readBlock(self.allocator, &reader);
+    }
+
+    fn blockSliceForMark(mark_list: []const marks.Mark, idx: usize, decompressed: []const u8, max_len: ?usize) ![]const u8 {
+        const decompressed_len = decompressed.len;
+        const start: usize = @intCast(mark_list[idx].offset_in_decompressed_block);
+        if (start > decompressed_len) return error.UnexpectedEndOfData;
+        var end = decompressed_len;
+        if (idx + 1 < mark_list.len and mark_list[idx + 1].offset_in_compressed_file == mark_list[idx].offset_in_compressed_file) {
+            end = @intCast(mark_list[idx + 1].offset_in_decompressed_block);
+        }
+        if (max_len) |len| {
+            if (start + len > decompressed_len) return error.UnexpectedEndOfData;
+            end = @min(end, start + len);
+        }
+        if (end < start) return error.UnexpectedEndOfData;
+        return decompressed[start..end];
+    }
+
     /// Return a ColumnReader for column at `col_idx`.
     /// The caller owns the returned ColumnReader and must call deinit() on it.
     pub fn columnReader(self: *OpenedPart, col_idx: usize) !ColumnReader {
@@ -873,6 +947,98 @@ pub const OpenedPart = struct {
             .rows_read = 0,
         };
     }
+
+    pub fn columnReaderRange(self: *OpenedPart, col_idx: usize, start_row: u64, row_count: usize) !ColumnReader {
+        if (row_count == 0 or start_row >= self.row_count) {
+            return ColumnReader{
+                .allocator = self.allocator,
+                .col = self.table.columns[col_idx],
+                .row_count = 0,
+                .data = try self.allocator.alloc(u8, 0),
+                .size_data = null,
+                .cursor = 0,
+                .size_cursor = 0,
+                .rows_read = 0,
+            };
+        }
+
+        const col = self.table.columns[col_idx];
+        const end_row = @min(start_row + row_count, self.row_count);
+        const marks_for_col = try self.readMarksForStem(col.name);
+        defer self.allocator.free(marks_for_col);
+        if (marks_for_col.len == 0) return error.InvalidMarkCount;
+
+        const first_gran: usize = @intCast(start_row / GRANULE_SIZE);
+        const last_gran: usize = @intCast((end_row - 1) / GRANULE_SIZE);
+        if (first_gran >= marks_for_col.len) return error.InvalidMarkCount;
+
+        const bin_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}.bin", .{ self.part_dir, col.name });
+        defer self.allocator.free(bin_path);
+        const bin_file = try std.Io.Dir.cwd().openFile(self.io, bin_path, .{});
+        defer bin_file.close(self.io);
+        const bin_size = (try bin_file.stat(self.io)).size;
+
+        var data_buf: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer data_buf.deinit(self.allocator);
+        var rows_loaded: u64 = 0;
+
+        const width = types.chFixedWidth(col.ty);
+        for (first_gran..@min(last_gran + 1, marks_for_col.len)) |g| {
+            const block_data = try self.readCompressedBlockAt(bin_file, marks_for_col, g, bin_size);
+            defer self.allocator.free(block_data);
+            const rows_in_gran = marks_for_col[g].granularity;
+            rows_loaded += rows_in_gran;
+            const byte_len = if (width) |w| @as(?usize, @intCast(rows_in_gran * w)) else null;
+            const slice = try blockSliceForMark(marks_for_col, g, block_data, byte_len);
+            try data_buf.appendSlice(self.allocator, slice);
+        }
+
+        const size_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}.size.bin", .{ self.part_dir, col.name });
+        defer self.allocator.free(size_path);
+        var size_data: ?[]u8 = null;
+        var varuint_strings = false;
+        if (col.ty == .text or col.ty == .char or col.ty == .low_card) {
+            const has_size_stream = self.fileExists(size_path);
+            if (has_size_stream) {
+                const size_stem = try std.fmt.allocPrint(self.allocator, "{s}.size", .{col.name});
+                defer self.allocator.free(size_stem);
+                const size_marks = try self.readMarksForStem(size_stem);
+                defer {
+                    self.allocator.free(size_marks);
+                }
+                const size_file = try std.Io.Dir.cwd().openFile(self.io, size_path, .{});
+                defer size_file.close(self.io);
+                const size_file_size = (try size_file.stat(self.io)).size;
+                var size_buf: std.ArrayListUnmanaged(u8) = .empty;
+                errdefer size_buf.deinit(self.allocator);
+                for (first_gran..@min(last_gran + 1, size_marks.len)) |g| {
+                    const block_data = try self.readCompressedBlockAt(size_file, size_marks, g, size_file_size);
+                    defer self.allocator.free(block_data);
+                    const slice = try blockSliceForMark(size_marks, g, block_data, @intCast(size_marks[g].granularity * 8));
+                    try size_buf.appendSlice(self.allocator, slice);
+                }
+                size_data = try size_buf.toOwnedSlice(self.allocator);
+            } else {
+                varuint_strings = true;
+            }
+        }
+
+        var cr = ColumnReader{
+            .allocator = self.allocator,
+            .col = col,
+            .row_count = rows_loaded,
+            .data = try data_buf.toOwnedSlice(self.allocator),
+            .size_data = size_data,
+            .cursor = 0,
+            .size_cursor = 0,
+            .rows_read = 0,
+            .varuint_strings = varuint_strings,
+        };
+        const skip_rows: usize = @intCast(start_row - @as(u64, @intCast(first_gran)) * GRANULE_SIZE);
+        try cr.seekRows(skip_rows);
+        cr.row_count = cr.rows_read + (end_row - start_row);
+        return cr;
+    }
 };
 
 /// A cursor for reading decoded column values from a MergeTree part.
@@ -895,6 +1061,7 @@ pub const ColumnReader = struct {
     /// Byte cursor into `size_data`.
     size_cursor: usize,
     rows_read: u64,
+    varuint_strings: bool = false,
 
     pub fn deinit(self: *ColumnReader) void {
         self.allocator.free(self.data);
@@ -961,16 +1128,22 @@ pub const ColumnReader = struct {
             .text, .char, .low_card => {},
             else => return error.NotAStringColumn,
         }
-        const sd = self.size_data orelse return error.MissingSizeStream;
         const remaining_rows = self.row_count - self.rows_read;
         const count = @min(n, remaining_rows);
         var read: usize = 0;
 
         while (read < count) : (read += 1) {
-            // Read u64 LE length from size sub-stream
-            if (self.size_cursor + 8 > sd.len) return error.UnexpectedEndOfData;
-            const len: usize = @intCast(std.mem.readInt(u64, sd[self.size_cursor..][0..8], .little));
-            self.size_cursor += 8;
+            const len: usize = if (self.varuint_strings) blk: {
+                const r = readVarUIntLocal(self.data[self.cursor..]) orelse return error.UnexpectedEndOfData;
+                self.cursor += r[1];
+                break :blk r[0];
+            } else blk: {
+                const sd = self.size_data orelse return error.MissingSizeStream;
+                if (self.size_cursor + 8 > sd.len) return error.UnexpectedEndOfData;
+                const l: usize = @intCast(std.mem.readInt(u64, sd[self.size_cursor..][0..8], .little));
+                self.size_cursor += 8;
+                break :blk l;
+            };
             if (len > string_codec.MAX_STRING_LEN) return error.StringTooLarge;
             if (self.cursor + len > self.data.len) return error.UnexpectedEndOfData;
             const s = self.data[self.cursor .. self.cursor + len];
@@ -988,14 +1161,21 @@ pub const ColumnReader = struct {
             .text, .char, .low_card => {},
             else => return error.NotAStringColumn,
         }
-        const sd = self.size_data orelse return error.MissingSizeStream;
         const remaining_rows = self.row_count - self.rows_read;
         const count = @min(n, remaining_rows);
         var skipped: usize = 0;
         while (skipped < count) : (skipped += 1) {
-            if (self.size_cursor + 8 > sd.len) return error.UnexpectedEndOfData;
-            const len: usize = @intCast(std.mem.readInt(u64, sd[self.size_cursor..][0..8], .little));
-            self.size_cursor += 8;
+            const len: usize = if (self.varuint_strings) blk: {
+                const r = readVarUIntLocal(self.data[self.cursor..]) orelse return error.UnexpectedEndOfData;
+                self.cursor += r[1];
+                break :blk r[0];
+            } else blk: {
+                const sd = self.size_data orelse return error.MissingSizeStream;
+                if (self.size_cursor + 8 > sd.len) return error.UnexpectedEndOfData;
+                const l: usize = @intCast(std.mem.readInt(u64, sd[self.size_cursor..][0..8], .little));
+                self.size_cursor += 8;
+                break :blk l;
+            };
             if (self.cursor + len > self.data.len) return error.UnexpectedEndOfData;
             self.cursor += len;
         }
@@ -2405,6 +2585,80 @@ test "Part write + OpenedPart read round-trips fixed and string columns" {
     }
 }
 
+test "OpenedPart range reader reads ClickHouse wide String varUInt stream" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const part_dir = "/tmp/zig_test_ch_wide_string";
+    {
+        var cwd = std.Io.Dir.cwd();
+        cwd.deleteTree(io, part_dir) catch {};
+        try cwd.createDirPath(io, part_dir);
+    }
+    defer {
+        var cwd = std.Io.Dir.cwd();
+        cwd.deleteTree(io, part_dir) catch {};
+    }
+
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = part_dir ++ "/count.txt", .data = "3\n" });
+
+    var raw = std.ArrayList(u8).empty;
+    defer raw.deinit(allocator);
+    const strings = [_][]const u8{ "alpha", "beta", "gamma" };
+    for (strings) |s| {
+        try raw.append(allocator, @intCast(s.len));
+        try raw.appendSlice(allocator, s);
+    }
+
+    {
+        var aw = std.Io.Writer.Allocating.init(allocator);
+        defer aw.deinit();
+        try block.writeBlock(&aw.writer, raw.items, block.METHOD_LZ4);
+        var al = aw.toArrayList();
+        defer al.deinit(allocator);
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = part_dir ++ "/Name.bin", .data = al.items });
+    }
+
+    {
+        var mark_raw: [marks.MARK_SIZE]u8 = undefined;
+        var mw = std.Io.Writer.fixed(&mark_raw);
+        try marks.writeMark(&mw, .{
+            .offset_in_compressed_file = 0,
+            .offset_in_decompressed_block = 0,
+            .granularity = 3,
+        });
+        const mark_bytes = std.Io.Writer.buffered(&mw);
+
+        var aw = std.Io.Writer.Allocating.init(allocator);
+        defer aw.deinit();
+        try block.writeBlock(&aw.writer, mark_bytes, block.METHOD_LZ4);
+        var al = aw.toArrayList();
+        defer al.deinit(allocator);
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = part_dir ++ "/Name.cmrk2", .data = al.items });
+    }
+
+    const cols = [_]schema.Column{.{ .name = "Name", .ty = .text }};
+    const table = schema.Table{ .name = "wide_strings", .columns = &cols };
+    var op = try OpenedPart.open(io, allocator, part_dir, table);
+    defer op.deinit();
+
+    var cr = try op.columnReaderRange(0, 1, 2);
+    defer cr.deinit();
+    const expected = [_][]const u8{ "beta", "gamma" };
+    const Ctx = struct {
+        idx: usize = 0,
+        expected: *const [2][]const u8,
+
+        fn cb(self: *@This(), s: []const u8) !void {
+            try std.testing.expectEqualStrings(self.expected[self.idx], s);
+            self.idx += 1;
+        }
+    };
+    var ctx = Ctx{ .expected = &expected };
+    const n = try cr.readStrings(2, &ctx, Ctx.cb);
+    try std.testing.expectEqual(@as(usize, 2), n);
+    try std.testing.expectEqual(@as(usize, 2), ctx.idx);
+}
+
 test "pk_col_name: primary.idx stores correct PK column values" {
     // Regression test for the bug where pk_col_idx was hardcoded to 0.
     // When pk_col_name is "CounterID" (col index 1), primary.idx must store
@@ -2532,9 +2786,16 @@ pub const OpenedPartAny = union(enum) {
         };
         if (is_compact) {
             return .{ .compact = try CompactOpenedPart.open(io, alloc, dir, table) };
-        } else {
-            return .{ .wide = try OpenedPart.open(io, alloc, dir, table) };
         }
+        const cmrk3_path = try std.fmt.allocPrint(alloc, "{s}/data.cmrk3", .{dir});
+        defer alloc.free(cmrk3_path);
+        const has_cmrk3 = blk: {
+            const f = std.Io.Dir.cwd().openFile(io, cmrk3_path, .{}) catch break :blk false;
+            f.close(io);
+            break :blk true;
+        };
+        if (has_cmrk3) return error.UnsupportedCompactMarkVersion;
+        return .{ .wide = try OpenedPart.open(io, alloc, dir, table) };
     }
 
     pub fn deinit(self: *OpenedPartAny) void {
@@ -2561,12 +2822,7 @@ pub const OpenedPartAny = union(enum) {
     pub fn columnReaderRange(self: *OpenedPartAny, col_idx: usize, start_row: u64, row_count: usize) !ColumnReader {
         return switch (self.*) {
             .compact => |*p| p.columnReaderRange(col_idx, start_row, row_count),
-            .wide => |*p| blk: {
-                var cr = try p.columnReader(col_idx);
-                errdefer cr.deinit();
-                try cr.seekRows(@intCast(start_row));
-                break :blk cr;
-            },
+            .wide => |*p| p.columnReaderRange(col_idx, start_row, row_count),
         };
     }
 };

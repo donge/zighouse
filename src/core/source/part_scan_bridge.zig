@@ -140,7 +140,7 @@ const ScanState = struct {
         for (part_dirs) |dir| {
             const part_rows = try readPartCount(alloc, io, dir);
             total_rows += part_rows;
-            if (try isLargeCompactPart(alloc, io, dir, part_rows)) {
+            if (part_rows > RAW_MATERIALIZE_MAX_COMPACT_ROWS or try isLargeCompactPart(alloc, io, dir, part_rows)) {
                 raw_materialize_allowed = false;
             }
         }
@@ -695,7 +695,7 @@ const ScanState = struct {
         self.opened = try part_mod.OpenedPartAny.open(self.io, self.alloc, dir, self.table);
         const is_compact = switch (self.opened.?) {
             .compact => true,
-            .wide => false,
+            .wide => true,
         };
         if (is_compact) return true;
         for (self.table.columns, 0..) |_, i| {
@@ -740,7 +740,7 @@ const ScanState = struct {
         const null_words  = chunk.nullMaskWords(n);
         const use_range_readers = switch (op.*) {
             .compact => true,
-            .wide => false,
+            .wide => true,
         };
 
         for (self.table.columns, 0..) |col, ci| {
@@ -866,12 +866,12 @@ const ScanState = struct {
                         @memset(sbuf, &.{});
                     } else {
                     // Use readArrayStrings to decode Array(String) columns from parts.
-                    var tmp_cr: ?part_mod.ColumnReader = null;
-                    defer if (tmp_cr) |*cr| cr.deinit();
-                    const cr = if (use_range_readers) cr_blk: {
-                        tmp_cr = try op.columnReaderRange(ci, self.rows_read, n);
-                        break :cr_blk &tmp_cr.?;
-                    } else &self.col_readers[ci].?;
+                        var tmp_cr: ?part_mod.ColumnReader = null;
+                        defer if (tmp_cr) |*cr| cr.deinit();
+                        const cr = if (use_range_readers) cr_blk: {
+                            tmp_cr = try op.columnReaderRange(ci, self.rows_read, n);
+                            break :cr_blk &tmp_cr.?;
+                        } else &self.col_readers[ci].?;
                     {
                         const Ctx2 = struct {
                             buf:   [][][]const u8,
@@ -1007,6 +1007,7 @@ pub const PartScanBridge = struct {
                 if (ci >= 256) break;
                 if (std.mem.eql(u8, col.name, name)) {
                     s.override_needed[ci] = true;
+                    s.nonempty_bool[ci] = false;
                     break;
                 }
             }
