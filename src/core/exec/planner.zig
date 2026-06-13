@@ -481,6 +481,14 @@ pub fn plan_query(
                         try post_agg_projs_list.append(ctx.alloc, pp);
                         continue;
                     }
+                    // case_when with embedded aggregate calls (e.g. avg(confidence))
+                    // or forward references to agg output aliases → push to post-agg.
+                    if (p.func == .case_when) {
+                        if (try rewriteCaseWhenPostAgg(ctx, p, &agg_items_list)) |pp| {
+                            try post_agg_projs_list.append(ctx.alloc, pp);
+                            continue;
+                        }
+                    }
                     const has_ha = std.mem.indexOf(u8, col_text, "__ha__") != null;
                     if (has_ha) {
                         try post_agg_projs_list.append(ctx.alloc, p);
@@ -993,6 +1001,22 @@ fn ensureHiddenMaxAgg(
     return alias;
 }
 
+fn ensureHiddenAvgAgg(
+    ctx: *PlannerCtx,
+    arg_text: []const u8,
+    agg_items: *std.ArrayListUnmanaged(ProjectItem),
+) !?[]const u8 {
+    if (findAggAliasForCall(agg_items.items, .avg, arg_text)) |alias| return alias;
+    const alias = try std.fmt.allocPrint(ctx.alloc, "__ha__avg_{d}", .{agg_items.items.len});
+    const item = try aggExprToProjectItem(ctx, .{
+        .func = .avg,
+        .column = arg_text,
+        .alias = alias,
+    }) orelse return null;
+    try agg_items.append(ctx.alloc, item);
+    return alias;
+}
+
 fn findMatchingParen(text: []const u8, open_idx: usize) ?usize {
     var depth: usize = 0;
     var in_str = false;
@@ -1062,7 +1086,7 @@ fn rewriteAggregatePostAgg(
     var changed = false;
     var i: usize = 0;
     while (i < col_text.len) {
-        if (i + 4 <= col_text.len and std.ascii.eqlIgnoreCase(col_text[i .. i + 4], "max(")) {
+            if (i + 4 <= col_text.len and std.ascii.eqlIgnoreCase(col_text[i .. i + 4], "max(")) {
             const before_ok = i == 0 or !std.ascii.isAlphanumeric(col_text[i - 1]) and col_text[i - 1] != '_';
             if (before_ok) {
                 const close_idx = findMatchingParen(col_text, i + 3) orelse {
@@ -1072,6 +1096,22 @@ fn rewriteAggregatePostAgg(
                 };
                 const arg_text = col_text[i + 4 .. close_idx];
                 const alias = try ensureHiddenMaxAgg(ctx, arg_text, agg_items) orelse return null;
+                try result.appendSlice(ctx.alloc, alias);
+                changed = true;
+                i = close_idx + 1;
+                continue;
+            }
+        }
+        if (i + 4 <= col_text.len and std.ascii.eqlIgnoreCase(col_text[i .. i + 4], "avg(")) {
+            const before_ok = i == 0 or !std.ascii.isAlphanumeric(col_text[i - 1]) and col_text[i - 1] != '_';
+            if (before_ok) {
+                const close_idx = findMatchingParen(col_text, i + 3) orelse {
+                    try result.append(ctx.alloc, col_text[i]);
+                    i += 1;
+                    continue;
+                };
+                const arg_text = col_text[i + 4 .. close_idx];
+                const alias = try ensureHiddenAvgAgg(ctx, arg_text, agg_items) orelse return null;
                 try result.appendSlice(ctx.alloc, alias);
                 changed = true;
                 i = close_idx + 1;
@@ -1090,7 +1130,48 @@ fn rewriteAggregatePostAgg(
     };
 }
 
-/// Parse "YYYY-MM-DD" string to days-since-epoch (i64), or null if not a date string.
+/// Scan case_when then_texts for simple "avg(col_name)" patterns, extract as hidden
+/// aggregate items, and rewrite to use `__ha__*` aliases so the case_when can be
+/// resolved in the post-agg phase (where virtual_cols includes agg outputs).
+fn rewriteCaseWhenPostAgg(
+    ctx: *PlannerCtx,
+    p: generic_sql.Expr,
+    agg_items: *std.ArrayListUnmanaged(ProjectItem),
+) !?generic_sql.Expr {
+    const cwd = p.case_when_data orelse return null;
+    var had_agg = false;
+    const n = cwd.then_texts.len;
+    var new_then = try ctx.alloc.alloc([]const u8, n);
+    for (cwd.then_texts, 0..) |tt, i| {
+        const trimmed = std.mem.trim(u8, tt, " \t\r\n");
+        if (trimmed.len > 5 and std.ascii.startsWithIgnoreCase(trimmed, "avg(") and trimmed[trimmed.len - 1] == ')') {
+            const arg = trimmed[4 .. trimmed.len - 1];
+            if (std.mem.indexOfAny(u8, arg, "(), \t") == null) {
+                const alias = try ensureHiddenAvgAgg(ctx, arg, agg_items) orelse {
+                    new_then[i] = tt;
+                    continue;
+                };
+                new_then[i] = alias;
+                had_agg = true;
+                continue;
+            }
+        }
+        new_then[i] = tt;
+    }
+    if (!had_agg) return null;
+    const new_cwd = try ctx.alloc.create(generic_sql.CaseWhenData);
+    new_cwd.* = .{
+        .when_texts = cwd.when_texts,
+        .then_texts = new_then,
+        .else_text = cwd.else_text,
+    };
+    return generic_sql.Expr{
+        .func = .case_when,
+        .case_when_data = new_cwd,
+        .alias = p.alias,
+    };
+}
+
 fn parseDateStrToI64(s: []const u8) ?i64 {
     if (s.len < 10 or s[4] != '-' or s[7] != '-') return null;
     const y = std.fmt.parseInt(i32, s[0..4], 10) catch return null;
@@ -1526,6 +1607,7 @@ const scalar_fns = [_]ScalarFn{
     .{ .name = "toUInt8OrZero", .out = .uint64 },
     .{ .name = "toDate", .out = .date_u16 },
     .{ .name = "toDateOrZero", .out = .date_u16 },
+    .{ .name = "toDateTime", .out = .datetime64_ms },
     .{ .name = "toYYYYMMDD", .out = .int64 },
     .{ .name = "toyyyymmdd", .out = .int64 }, // duckdb_parse lowercases it
     .{ .name = "toStartOfHour", .out = .datetime64_ms },
@@ -1620,6 +1702,7 @@ const TokKind = enum {
     kw_null, // NULL
     kw_between, // BETWEEN
     kw_in, // IN
+    kw_interval, // INTERVAL
     lbracket, // [
     rbracket, // ]
     arrow, // ->
@@ -1784,6 +1867,7 @@ const Lexer = struct {
             if (std.ascii.eqlIgnoreCase(word, "NULL")) return .{ .kind = .kw_null, .text = word };
             if (std.ascii.eqlIgnoreCase(word, "BETWEEN")) return .{ .kind = .kw_between, .text = word };
             if (std.ascii.eqlIgnoreCase(word, "IN")) return .{ .kind = .kw_in, .text = word };
+            if (std.ascii.eqlIgnoreCase(word, "INTERVAL")) return .{ .kind = .kw_interval, .text = word };
             return .{ .kind = .ident, .text = word };
         }
 
@@ -2135,6 +2219,35 @@ fn prattExpr(pctx: *ParseCtx, min_bp: u8) anyerror!?Expr {
             const fc = try pctx.arena.create(plan.FnCall);
             fc.* = .{ .name = fn_name, .args = args_slice };
             break :blk_case Expr{ .fn_call = fc };
+        },
+
+        // INTERVAL n UNIT → literal seconds (i64)
+        .kw_interval => blk_interval: {
+            const val_expr = try prattExpr(pctx, 0) orelse return null;
+            const val: i64 = switch (val_expr) {
+                .lit_i64 => |v| v,
+                .lit_u64 => |v| @intCast(v),
+                .lit_f64 => |v| @intCast(@as(i64, @intFromFloat(v))),
+                else => return null,
+            };
+            const unit_tok = pctx.lex.next();
+            if (unit_tok.kind != .ident) return null;
+            const unit = unit_tok.text;
+            const multiplier: i64 = if (std.ascii.eqlIgnoreCase(unit, "second") or
+                std.ascii.eqlIgnoreCase(unit, "seconds"))
+                @as(i64, 1)
+            else if (std.ascii.eqlIgnoreCase(unit, "minute") or
+                std.ascii.eqlIgnoreCase(unit, "minutes"))
+                @as(i64, 60)
+            else if (std.ascii.eqlIgnoreCase(unit, "hour") or
+                std.ascii.eqlIgnoreCase(unit, "hours"))
+                @as(i64, 3600)
+            else if (std.ascii.eqlIgnoreCase(unit, "day") or
+                std.ascii.eqlIgnoreCase(unit, "days"))
+                @as(i64, 86400)
+            else
+                return null;
+            break :blk_interval Expr{ .lit_i64 = val * multiplier };
         },
 
         // Integer literal
