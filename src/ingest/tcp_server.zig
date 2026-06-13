@@ -383,6 +383,16 @@ fn wireKind(ch_type: []const u8) WireKind {
     return .string;
 }
 
+test "wireKind classifies common ClickHouse fixed-width text types" {
+    try std.testing.expectEqual(WireKind.fixed_blob4, wireKind("IPv4"));
+    try std.testing.expectEqual(WireKind.fixed_blob16, wireKind("IPv6"));
+    try std.testing.expectEqual(WireKind.fixed_blob16, wireKind("UUID"));
+    try std.testing.expectEqual(WireKind.fixed1, wireKind("Bool"));
+    try std.testing.expectEqual(WireKind.fixed4, wireKind("Date32"));
+    try std.testing.expectEqual(WireKind.fixed_blob16, wireKind("Nullable(UUID)"));
+    try std.testing.expectEqual(WireKind.fixed8, wireKind("SimpleAggregateFunction(sum, UInt64)"));
+}
+
 // ── Read one ClientData block ───────────────────────────────────────────────
 
 fn readClientDataBlock(

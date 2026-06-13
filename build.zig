@@ -763,6 +763,8 @@ pub fn build(b: *std.Build) void {
     tcp_server_mod.addImport("ir_planner", ir_planner_mod);
     tcp_server_mod.addImport("core", core_mod);
     tcp_server_mod.addImport("part_scan_bridge", part_scan_bridge_mod);
+    const tcp_server_tests = b.addTest(.{ .root_module = tcp_server_mod });
+    const tcp_server_test_cmd = b.addRunArtifact(tcp_server_tests);
 
     // Wire serializer into ingest_server
     ingest_server_mod.addImport("core", core_mod);
@@ -810,6 +812,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&schema_persist_test_cmd.step);
     test_step.dependOn(&part_scanner_test_cmd.step);
     test_step.dependOn(&part_writer_session_test_cmd.step);
+    test_step.dependOn(&tcp_server_test_cmd.step);
     test_step.dependOn(&ddl_parser_test_cmd.step);
     test_step.dependOn(&mv_parse_test_cmd.step);
     test_step.dependOn(&native_block_test_cmd.step);
