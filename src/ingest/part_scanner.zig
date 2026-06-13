@@ -102,7 +102,7 @@ pub fn scan(
     // ── Collect valid entries ─────────────────────────────────────────────────
     var iter = parts_dir.iterate();
     while (try iter.next(io)) |entry| {
-        if (entry.kind != .directory) continue;
+        if (entry.kind != .directory and entry.kind != .sym_link) continue;
         if (std.mem.startsWith(u8, entry.name, "tmp_")) continue; // in-progress write
 
         const parsed = parseName(entry.name) orelse continue;
