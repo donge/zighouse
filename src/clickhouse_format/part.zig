@@ -1113,6 +1113,60 @@ pub const OpenedPart = struct {
     /// Return a ColumnReader for column at `col_idx`.
     /// The caller owns the returned ColumnReader and must call deinit() on it.
     pub fn columnReader(self: *OpenedPart, col_idx: usize) !ColumnReader {
+        return self.columnReaderImpl(col_idx) catch |err| switch (err) {
+            error.FileNotFound => self.defaultColumnReader(col_idx),
+            else => return err,
+        };
+    }
+
+    fn defaultColumnReader(self: *OpenedPart, col_idx: usize) ColumnReader {
+        const col = self.table.columns[col_idx];
+        const n = self.row_count;
+        const data: []u8 = switch (col.ty) {
+            .text, .char, .low_card => self.allocator.alloc(u8, 0) catch @panic("OOM"),
+            .int8, .float32, .float64 => blk: {
+                const buf = self.allocator.alloc(u8, n * @sizeOf(i64)) catch @panic("OOM");
+                @memset(buf, 0);
+                break :blk buf;
+            },
+            .int16 => blk: {
+                const buf = self.allocator.alloc(u8, n * @sizeOf(i16)) catch @panic("OOM");
+                @memset(buf, 0);
+                break :blk buf;
+            },
+            .int32, .date => blk: {
+                const buf = self.allocator.alloc(u8, n * @sizeOf(i32)) catch @panic("OOM");
+                @memset(buf, 0);
+                break :blk buf;
+            },
+            .int64, .timestamp => blk: {
+                const buf = self.allocator.alloc(u8, n * @sizeOf(i64)) catch @panic("OOM");
+                @memset(buf, 0);
+                break :blk buf;
+            },
+        };
+        const size_data: ?[]u8 = switch (col.ty) {
+            .text, .char, .low_card => blk: {
+                if (n == 0) break :blk null;
+                const buf = self.allocator.alloc(u8, n * @sizeOf(u64)) catch @panic("OOM");
+                @memset(buf, 0);
+                break :blk buf;
+            },
+            else => null,
+        };
+        return ColumnReader{
+            .allocator = self.allocator,
+            .col = col,
+            .row_count = n,
+            .data = data,
+            .size_data = size_data,
+            .cursor = 0,
+            .size_cursor = 0,
+            .rows_read = 0,
+        };
+    }
+
+    fn columnReaderImpl(self: *OpenedPart, col_idx: usize) !ColumnReader {
         const col = self.table.columns[col_idx];
         if (isArrayString(col)) {
             return self.readWideArrayStringRange(col, 0, std.math.maxInt(usize));
@@ -1197,6 +1251,13 @@ pub const OpenedPart = struct {
     }
 
     pub fn columnReaderRange(self: *OpenedPart, col_idx: usize, start_row: u64, row_count: usize) !ColumnReader {
+        return self.columnReaderRangeImpl(col_idx, start_row, row_count) catch |err| switch (err) {
+            error.FileNotFound => return self.defaultColumnReader(col_idx),
+            else => return err,
+        };
+    }
+
+    fn columnReaderRangeImpl(self: *OpenedPart, col_idx: usize, start_row: u64, row_count: usize) !ColumnReader {
         if (row_count == 0 or start_row >= self.row_count) {
             return ColumnReader{
                 .allocator = self.allocator,
@@ -1363,8 +1424,13 @@ pub const ColumnReader = struct {
         const n = @min(out.len, remaining);
         if (n == 0) return 0;
         const needed = n * width;
-        if (self.cursor + needed > self.data.len) return error.UnexpectedEndOfData;
-        for (0..n) |i| {
+        const actual_n: usize = if (self.cursor + needed > self.data.len)
+            @min(n, (self.data.len - self.cursor) / width)
+        else
+            n;
+        if (actual_n == 0) return 0;
+        const actual_needed = actual_n * width;
+        for (0..actual_n) |i| {
             const slice = self.data[self.cursor + i * width ..][0..width];
             out[i] = switch (self.col.ty) {
                 .int8 => @as(i64, @as(i8, @bitCast(slice[0]))),
@@ -1372,18 +1438,14 @@ pub const ColumnReader = struct {
                 .date => @as(i64, std.mem.readInt(u16, slice[0..2], .little)),
                 .int32 => @as(i64, std.mem.readInt(i32, slice[0..4], .little)),
                 .int64, .timestamp => std.mem.readInt(i64, slice[0..8], .little),
-                // float32: raw 4-byte bits stored as i64 (upper 32 bits zero)
                 .float32 => @as(i64, std.mem.readInt(u32, slice[0..4], .little)),
-                // float64: raw 8-byte bits reinterpreted as i64
                 .float64 => @bitCast(std.mem.readInt(u64, slice[0..8], .little)),
-                else => {
-                    return error.NotAFixedColumn;
-                },
+                else => return error.NotAFixedColumn,
             };
         }
-        self.cursor += needed;
-        self.rows_read += n;
-        return n;
+        self.cursor += actual_needed;
+        self.rows_read += actual_n;
+        return actual_n;
     }
 
     /// Read up to `n` strings from a string column, invoking `callback(ctx, []const u8)`
@@ -2288,9 +2350,18 @@ pub const CompactOpenedPart = struct {
                     }
                 },
                 else => {
-                    const data = try self.readBlockAt(bin_file, block_idx);
-                    defer self.allocator.free(data);
-                    try data_buf.appendSlice(self.allocator, data);
+                    // Check for sparse serialization (CH 26.x .sparse.idx substream)
+                    // For now: read only the data substream (rel=1) and skip the sparse.idx.
+                    // The compactBlock function correctly handles shared compressed blocks.
+                    if (self.col_substream_count[col_idx] > 1 and self.substreamRel(col_idx, ".sparse.idx") != null) {
+                        const data = try self.compactBlock(bin_file, col_idx, g, 1);
+                        defer self.allocator.free(data);
+                        try data_buf.appendSlice(self.allocator, data);
+                    } else {
+                        const data = try self.readBlockAt(bin_file, block_idx);
+                        defer self.allocator.free(data);
+                        try data_buf.appendSlice(self.allocator, data);
+                    }
                 },
             }
         }
@@ -2339,6 +2410,7 @@ pub const CompactOpenedPart = struct {
             .fixed_string_width = fixedStringWidth(col),
         };
     }
+
 };
 
 // ── Compact part writer ────────────────────────────────────────────────────────
