@@ -33,6 +33,61 @@ const low_card = @import("low_card.zig");
 
 pub const GRANULE_SIZE: u64 = 8192;
 
+fn chType(col: schema.Column) []const u8 {
+    return col.ch_type orelse types.chTypeName(col.ty);
+}
+
+fn startsType(s: []const u8, prefix: []const u8) bool {
+    return std.ascii.startsWithIgnoreCase(s, prefix);
+}
+
+fn isArrayString(col: schema.Column) bool {
+    const ct = chType(col);
+    return startsType(ct, "Array(String)") or startsType(ct, "Array(LowCardinality(String))");
+}
+
+fn isMapStringFloat64(col: schema.Column) bool {
+    return startsType(chType(col), "Map(String, Float64)");
+}
+
+fn isMapStringString(col: schema.Column) bool {
+    return startsType(chType(col), "Map(String, String)");
+}
+
+fn fixedStringWidth(col: schema.Column) usize {
+    const ct = chType(col);
+    if (std.ascii.eqlIgnoreCase(ct, "IPv6") or std.ascii.eqlIgnoreCase(ct, "UUID")) return 16;
+    if (std.ascii.eqlIgnoreCase(ct, "IPv4")) return 4;
+    if (startsType(ct, "FixedString(")) {
+        const open = std.mem.indexOfScalar(u8, ct, '(') orelse return 0;
+        if (ct.len <= open + 1 or ct[ct.len - 1] != ')') return 0;
+        return std.fmt.parseInt(usize, std.mem.trim(u8, ct[open + 1 .. ct.len - 1], " \t\r\n"), 10) catch 0;
+    }
+    return 0;
+}
+
+fn writeVarUIntTo(list: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, value: u64) !void {
+    var x = value;
+    while (x >= 0x80) {
+        try list.append(allocator, @intCast((x & 0x7f) | 0x80));
+        x >>= 7;
+    }
+    try list.append(allocator, @intCast(x));
+}
+
+fn findTableColumn(table: schema.Table, name: []const u8) ?usize {
+    for (table.columns, 0..) |col, i| {
+        if (std.mem.eql(u8, col.name, name)) return i;
+    }
+    return null;
+}
+
+fn columnNameFromSubstreamHeader(line: []const u8) ?[]const u8 {
+    const a = std.mem.indexOfScalar(u8, line, '`') orelse return null;
+    const b_rel = std.mem.indexOfScalar(u8, line[a + 1 ..], '`') orelse return null;
+    return line[a + 1 .. a + 1 + b_rel];
+}
+
 pub fn readCompactPrimaryFixedValues(
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -855,6 +910,41 @@ pub const OpenedPart = struct {
         return block.readBlock(self.allocator, &reader);
     }
 
+    fn readCompressedRangeAt(self: *OpenedPart, file: std.Io.File, mark_list: []const marks.Mark, idx: usize, file_size: u64, max_len: ?usize) ![]u8 {
+        const range = try compressedRange(mark_list, idx, file_size);
+        const len: usize = @intCast(range[1]);
+        const compressed = try self.allocator.alloc(u8, len);
+        defer self.allocator.free(compressed);
+        const read_n = try file.readPositionalAll(self.io, compressed, range[0]);
+        if (read_n != compressed.len) return error.UnexpectedEndOfData;
+        var reader = std.Io.Reader.fixed(compressed);
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer out.deinit(self.allocator);
+        var first = true;
+        while (true) {
+            const raw = block.readBlock(self.allocator, &reader) catch |e| switch (e) {
+                error.TruncatedBlock => break,
+                else => return e,
+            };
+            defer self.allocator.free(raw);
+            var start: usize = 0;
+            if (first) {
+                start = @intCast(mark_list[idx].offset_in_decompressed_block);
+                if (start > raw.len) return error.UnexpectedEndOfData;
+            }
+            var slice = raw[start..];
+            if (max_len) |ml| {
+                const remaining = if (out.items.len >= ml) 0 else ml - out.items.len;
+                if (remaining == 0) break;
+                if (slice.len > remaining) slice = slice[0..remaining];
+            }
+            try out.appendSlice(self.allocator, slice);
+            if (max_len != null and out.items.len >= max_len.?) break;
+            first = false;
+        }
+        return out.toOwnedSlice(self.allocator);
+    }
+
     fn blockSliceForMark(mark_list: []const marks.Mark, idx: usize, decompressed: []const u8, max_len: ?usize) ![]const u8 {
         const decompressed_len = decompressed.len;
         const start: usize = @intCast(mark_list[idx].offset_in_decompressed_block);
@@ -871,10 +961,168 @@ pub const OpenedPart = struct {
         return decompressed[start..end];
     }
 
+    fn readStemRange(self: *OpenedPart, stem: []const u8, first_gran: usize, last_gran: usize, max_bytes_per_row: ?usize) !struct { data: []u8, marks: []marks.Mark, rows: u64 } {
+        const mark_list = try self.readMarksForStem(stem);
+        errdefer self.allocator.free(mark_list);
+        if (mark_list.len == 0 or first_gran >= mark_list.len) return error.InvalidMarkCount;
+
+        const path = try std.fmt.allocPrint(self.allocator, "{s}/{s}.bin", .{ self.part_dir, stem });
+        defer self.allocator.free(path);
+        const file = try std.Io.Dir.cwd().openFile(self.io, path, .{});
+        defer file.close(self.io);
+        const file_size = (try file.stat(self.io)).size;
+
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer buf.deinit(self.allocator);
+        var rows: u64 = 0;
+        for (first_gran..@min(last_gran + 1, mark_list.len)) |g| {
+            const byte_len = if (max_bytes_per_row) |w| @as(?usize, @intCast(mark_list[g].granularity * w)) else null;
+            const block_data = try self.readCompressedRangeAt(file, mark_list, g, file_size, byte_len);
+            defer self.allocator.free(block_data);
+            try buf.appendSlice(self.allocator, block_data);
+            rows += mark_list[g].granularity;
+        }
+        return .{ .data = try buf.toOwnedSlice(self.allocator), .marks = mark_list, .rows = rows };
+    }
+
+    fn readWideArrayStringRange(self: *OpenedPart, col: schema.Column, first_gran: usize, last_gran: usize) !ColumnReader {
+        const offsets_stem = try std.fmt.allocPrint(self.allocator, "{s}.size0", .{col.name});
+        defer self.allocator.free(offsets_stem);
+        const sizes_stem = try std.fmt.allocPrint(self.allocator, "{s}.size", .{col.name});
+        defer self.allocator.free(sizes_stem);
+        const offsets = try self.readStemRange(offsets_stem, first_gran, last_gran, 8);
+        defer self.allocator.free(offsets.data);
+        defer self.allocator.free(offsets.marks);
+        const sizes = try self.readStemRange(sizes_stem, first_gran, last_gran, null);
+        defer self.allocator.free(sizes.data);
+        defer self.allocator.free(sizes.marks);
+        const elems = try self.readStemRange(col.name, first_gran, last_gran, null);
+        defer self.allocator.free(elems.data);
+        defer self.allocator.free(elems.marks);
+
+        var out_data: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer out_data.deinit(self.allocator);
+        var out_sizes: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer out_sizes.deinit(self.allocator);
+        var elem_size_pos: usize = 0;
+        var elem_data_pos: usize = 0;
+        const n_rows = offsets.data.len / 8;
+        for (0..n_rows) |i| {
+            const elem_count: usize = @intCast(std.mem.readInt(u64, offsets.data[i * 8 ..][0..8], .little));
+            const row_start = out_data.items.len;
+            for (0..elem_count) |_| {
+                if (elem_size_pos + 8 > sizes.data.len) return error.UnexpectedEndOfData;
+                const len: usize = @intCast(std.mem.readInt(u64, sizes.data[elem_size_pos..][0..8], .little));
+                elem_size_pos += 8;
+                if (elem_data_pos + len > elems.data.len) return error.UnexpectedEndOfData;
+                try writeVarUIntTo(&out_data, self.allocator, len);
+                try out_data.appendSlice(self.allocator, elems.data[elem_data_pos .. elem_data_pos + len]);
+                elem_data_pos += len;
+            }
+            var row_len: [8]u8 = undefined;
+            std.mem.writeInt(u64, &row_len, out_data.items.len - row_start, .little);
+            try out_sizes.appendSlice(self.allocator, &row_len);
+        }
+
+        return .{
+            .allocator = self.allocator,
+            .col = col,
+            .row_count = n_rows,
+            .data = try out_data.toOwnedSlice(self.allocator),
+            .size_data = try out_sizes.toOwnedSlice(self.allocator),
+            .cursor = 0,
+            .size_cursor = 0,
+            .rows_read = 0,
+        };
+    }
+
+    fn readWideMapRange(self: *OpenedPart, col: schema.Column, first_gran: usize, last_gran: usize) !ColumnReader {
+        const key_size_stem = try std.fmt.allocPrint(self.allocator, "{s}%2Ekeys.size", .{col.name});
+        defer self.allocator.free(key_size_stem);
+        const key_stem = try std.fmt.allocPrint(self.allocator, "{s}%2Ekeys", .{col.name});
+        defer self.allocator.free(key_stem);
+        const val_size_stem = try std.fmt.allocPrint(self.allocator, "{s}%2Evalues.size", .{col.name});
+        defer self.allocator.free(val_size_stem);
+        const val_stem = try std.fmt.allocPrint(self.allocator, "{s}%2Evalues", .{col.name});
+        defer self.allocator.free(val_stem);
+        const offsets_stem = try std.fmt.allocPrint(self.allocator, "{s}.size0", .{col.name});
+        defer self.allocator.free(offsets_stem);
+
+        const offsets = try self.readStemRange(offsets_stem, first_gran, last_gran, 8);
+        defer self.allocator.free(offsets.data);
+        defer self.allocator.free(offsets.marks);
+        const key_sizes = try self.readStemRange(key_size_stem, first_gran, last_gran, null);
+        defer self.allocator.free(key_sizes.data);
+        defer self.allocator.free(key_sizes.marks);
+        const keys = try self.readStemRange(key_stem, first_gran, last_gran, null);
+        defer self.allocator.free(keys.data);
+        defer self.allocator.free(keys.marks);
+        const values = try self.readStemRange(val_stem, first_gran, last_gran, if (isMapStringFloat64(col)) 8 else null);
+        defer self.allocator.free(values.data);
+        defer self.allocator.free(values.marks);
+        var value_sizes_data: ?[]u8 = null;
+        var value_sizes_marks: ?[]marks.Mark = null;
+        if (isMapStringString(col)) {
+            const vs = try self.readStemRange(val_size_stem, first_gran, last_gran, null);
+            value_sizes_data = vs.data;
+            value_sizes_marks = vs.marks;
+        }
+        defer if (value_sizes_data) |d| self.allocator.free(d);
+        defer if (value_sizes_marks) |m| self.allocator.free(m);
+
+        return buildMapReader(self.allocator, col, offsets.data, key_sizes.data, keys.data, value_sizes_data, values.data);
+    }
+
+    fn readWideLowCardinalityRange(self: *OpenedPart, col: schema.Column, first_gran: usize, last_gran: usize) !ColumnReader {
+        const dict_stem = try std.fmt.allocPrint(self.allocator, "{s}.dict", .{col.name});
+        defer self.allocator.free(dict_stem);
+
+        const dict_marks = try self.readMarksForStem(dict_stem);
+        defer self.allocator.free(dict_marks);
+        if (dict_marks.len == 0) return error.InvalidMarkCount;
+        const dict_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}.bin", .{ self.part_dir, dict_stem });
+        defer self.allocator.free(dict_path);
+        const dict_file = try std.Io.Dir.cwd().openFile(self.io, dict_path, .{});
+        defer dict_file.close(self.io);
+        const dict_size = (try dict_file.stat(self.io)).size;
+        const dict_data = try self.readCompressedBlockAt(dict_file, dict_marks, 0, dict_size);
+        defer self.allocator.free(dict_data);
+
+        const index = try self.readStemRange(col.name, first_gran, last_gran, null);
+        defer self.allocator.free(index.data);
+        defer self.allocator.free(index.marks);
+
+        const normalized_index = try normalizeLowCardIndexStream(self.allocator, index.data, index.rows);
+        defer self.allocator.free(normalized_index);
+
+        const deserialized = try low_card.deserializeToStringBuf(
+            self.allocator, dict_data, normalized_index, index.rows,
+        );
+        return ColumnReader{
+            .allocator = self.allocator,
+            .col = col,
+            .row_count = index.rows,
+            .data = deserialized.data,
+            .size_data = deserialized.size_data,
+            .cursor = 0,
+            .size_cursor = 0,
+            .rows_read = 0,
+        };
+    }
+
     /// Return a ColumnReader for column at `col_idx`.
     /// The caller owns the returned ColumnReader and must call deinit() on it.
     pub fn columnReader(self: *OpenedPart, col_idx: usize) !ColumnReader {
         const col = self.table.columns[col_idx];
+        if (isArrayString(col)) {
+            return self.readWideArrayStringRange(col, 0, std.math.maxInt(usize));
+        }
+        if (isMapStringFloat64(col) or isMapStringString(col)) {
+            return self.readWideMapRange(col, 0, std.math.maxInt(usize));
+        }
+        if (col.ty == .low_card) {
+            return self.readWideLowCardinalityRange(col, 0, std.math.maxInt(usize));
+        }
         const bin_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}.bin", .{ self.part_dir, col.name });
         defer self.allocator.free(bin_path);
         const mrk_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}.cmrk2", .{ self.part_dir, col.name });
@@ -964,6 +1212,27 @@ pub const OpenedPart = struct {
 
         const col = self.table.columns[col_idx];
         const end_row = @min(start_row + row_count, self.row_count);
+        if (isArrayString(col) or isMapStringFloat64(col) or isMapStringString(col)) {
+            const first_gran: usize = @intCast(start_row / GRANULE_SIZE);
+            const last_gran: usize = @intCast((end_row - 1) / GRANULE_SIZE);
+            var cr = if (isArrayString(col))
+                try self.readWideArrayStringRange(col, first_gran, last_gran)
+            else
+                try self.readWideMapRange(col, first_gran, last_gran);
+            const skip_rows: usize = @intCast(start_row - @as(u64, @intCast(first_gran)) * GRANULE_SIZE);
+            try cr.seekRows(skip_rows);
+            cr.row_count = cr.rows_read + (end_row - start_row);
+            return cr;
+        }
+        if (col.ty == .low_card) {
+            const first_gran: usize = @intCast(start_row / GRANULE_SIZE);
+            const last_gran: usize = @intCast((end_row - 1) / GRANULE_SIZE);
+            var cr = try self.readWideLowCardinalityRange(col, first_gran, last_gran);
+            const skip_rows: usize = @intCast(start_row - @as(u64, @intCast(first_gran)) * GRANULE_SIZE);
+            try cr.seekRows(skip_rows);
+            cr.row_count = cr.rows_read + (end_row - start_row);
+            return cr;
+        }
         const marks_for_col = try self.readMarksForStem(col.name);
         defer self.allocator.free(marks_for_col);
         if (marks_for_col.len == 0) return error.InvalidMarkCount;
@@ -982,7 +1251,8 @@ pub const OpenedPart = struct {
         errdefer data_buf.deinit(self.allocator);
         var rows_loaded: u64 = 0;
 
-        const width = types.chFixedWidth(col.ty);
+        const fixed_str_width = fixedStringWidth(col);
+        const width = types.chFixedWidth(col.ty) orelse if (fixed_str_width != 0) fixed_str_width else null;
         for (first_gran..@min(last_gran + 1, marks_for_col.len)) |g| {
             const block_data = try self.readCompressedBlockAt(bin_file, marks_for_col, g, bin_size);
             defer self.allocator.free(block_data);
@@ -997,7 +1267,7 @@ pub const OpenedPart = struct {
         defer self.allocator.free(size_path);
         var size_data: ?[]u8 = null;
         var varuint_strings = false;
-        if (col.ty == .text or col.ty == .char or col.ty == .low_card) {
+        if ((col.ty == .text or col.ty == .char or col.ty == .low_card) and fixed_str_width == 0) {
             const has_size_stream = self.fileExists(size_path);
             if (has_size_stream) {
                 const size_stem = try std.fmt.allocPrint(self.allocator, "{s}.size", .{col.name});
@@ -1033,6 +1303,7 @@ pub const OpenedPart = struct {
             .size_cursor = 0,
             .rows_read = 0,
             .varuint_strings = varuint_strings,
+            .fixed_string_width = fixed_str_width,
         };
         const skip_rows: usize = @intCast(start_row - @as(u64, @intCast(first_gran)) * GRANULE_SIZE);
         try cr.seekRows(skip_rows);
@@ -1062,6 +1333,7 @@ pub const ColumnReader = struct {
     size_cursor: usize,
     rows_read: u64,
     varuint_strings: bool = false,
+    fixed_string_width: usize = 0,
 
     pub fn deinit(self: *ColumnReader) void {
         self.allocator.free(self.data);
@@ -1070,17 +1342,16 @@ pub const ColumnReader = struct {
 
     pub fn seekRows(self: *ColumnReader, n: usize) !void {
         if (n == 0) return;
-        switch (self.col.ty) {
-            .text, .char, .low_card => _ = try self.skipStrings(n),
-            else => {
-                const width: usize = types.chFixedWidth(self.col.ty) orelse return error.NotAFixedColumn;
-                const remaining = self.row_count - self.rows_read;
-                const count = @min(n, remaining);
-                const needed = count * width;
-                if (self.cursor + needed > self.data.len) return error.UnexpectedEndOfData;
-                self.cursor += needed;
-                self.rows_read += count;
-            },
+        if (self.col.ty == .text or self.col.ty == .char or self.col.ty == .low_card or self.fixed_string_width != 0 or isArrayString(self.col) or isMapStringFloat64(self.col) or isMapStringString(self.col)) {
+            _ = try self.skipStrings(n);
+        } else {
+            const width: usize = types.chFixedWidth(self.col.ty) orelse return error.NotAFixedColumn;
+            const remaining = self.row_count - self.rows_read;
+            const count = @min(n, remaining);
+            const needed = count * width;
+            if (self.cursor + needed > self.data.len) return error.UnexpectedEndOfData;
+            self.cursor += needed;
+            self.rows_read += count;
         }
     }
 
@@ -1124,16 +1395,15 @@ pub const ColumnReader = struct {
         ctx: anytype,
         callback: anytype,
     ) !usize {
-        switch (self.col.ty) {
-            .text, .char, .low_card => {},
-            else => return error.NotAStringColumn,
+        if (!(self.col.ty == .text or self.col.ty == .char or self.col.ty == .low_card or self.fixed_string_width != 0 or isMapStringFloat64(self.col) or isMapStringString(self.col))) {
+            return error.NotAStringColumn;
         }
         const remaining_rows = self.row_count - self.rows_read;
         const count = @min(n, remaining_rows);
         var read: usize = 0;
 
         while (read < count) : (read += 1) {
-            const len: usize = if (self.varuint_strings) blk: {
+            const len: usize = if (self.fixed_string_width != 0) self.fixed_string_width else if (self.varuint_strings) blk: {
                 const r = readVarUIntLocal(self.data[self.cursor..]) orelse return error.UnexpectedEndOfData;
                 self.cursor += r[1];
                 break :blk r[0];
@@ -1157,15 +1427,14 @@ pub const ColumnReader = struct {
     /// Skip `n` rows of a string column without invoking any callback.
     /// Advances internal cursors identically to readStrings but discards the data.
     pub fn skipStrings(self: *ColumnReader, n: usize) !usize {
-        switch (self.col.ty) {
-            .text, .char, .low_card => {},
-            else => return error.NotAStringColumn,
+        if (!(self.col.ty == .text or self.col.ty == .char or self.col.ty == .low_card or self.fixed_string_width != 0 or isMapStringFloat64(self.col) or isMapStringString(self.col) or isArrayString(self.col))) {
+            return error.NotAStringColumn;
         }
         const remaining_rows = self.row_count - self.rows_read;
         const count = @min(n, remaining_rows);
         var skipped: usize = 0;
         while (skipped < count) : (skipped += 1) {
-            const len: usize = if (self.varuint_strings) blk: {
+            const len: usize = if (self.fixed_string_width != 0) self.fixed_string_width else if (self.varuint_strings) blk: {
                 const r = readVarUIntLocal(self.data[self.cursor..]) orelse return error.UnexpectedEndOfData;
                 self.cursor += r[1];
                 break :blk r[0];
@@ -1199,10 +1468,7 @@ pub const ColumnReader = struct {
         ctx: anytype,
         callback: anytype,
     ) !usize {
-        switch (self.col.ty) {
-            .text, .char => {},
-            else => return error.NotAStringColumn,
-        }
+        if (!(self.col.ty == .text or self.col.ty == .char or isArrayString(self.col))) return error.NotAStringColumn;
         const sd = self.size_data orelse return error.MissingSizeStream;
         const remaining_rows = self.row_count - self.rows_read;
         const count = @min(n, remaining_rows);
@@ -1243,6 +1509,7 @@ pub const ColumnReader = struct {
                         const r = readVarUIntLocal(blob[off..]) orelse return error.UnexpectedEndOfData;
                         const slen = r[0];
                         const lb = r[1];
+                        if (off + lb + slen > blob.len) return error.UnexpectedEndOfData;
                         off += lb + slen;
                         elem_count += 1;
                     }
@@ -1256,6 +1523,7 @@ pub const ColumnReader = struct {
                         const slen = r[0];
                         const lb = r[1];
                         off += lb;
+                        if (off + slen > blob.len) return error.UnexpectedEndOfData;
                         elems[ei] = try arena.dupe(u8, blob[off .. off + slen]);
                         off += slen;
                         ei += 1;
@@ -1308,6 +1576,223 @@ fn readVarUIntLocal(buf: []const u8) ?struct { usize, usize } {
     return null;
 }
 
+fn normalizeLowCardIndexStream(allocator: std.mem.Allocator, raw: []const u8, row_count: u64) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    var pos: usize = 0;
+    var rows_done: u64 = 0;
+    while (rows_done < row_count) {
+        if (pos + 16 > raw.len) return error.InvalidIndexStream;
+        const flags = std.mem.readInt(u64, raw[pos..][0..8], .little);
+        const second = std.mem.readInt(u64, raw[pos + 8 ..][0..8], .little);
+        const key_type = flags & 0x3;
+        const key_width: usize = switch (key_type) {
+            low_card.KEY_TYPE_U8 => 1,
+            low_card.KEY_TYPE_U16 => 2,
+            low_card.KEY_TYPE_U32 => 4,
+            else => 8,
+        };
+
+        var n_rows: u64 = undefined;
+        var keys_pos: usize = undefined;
+        if (second == 0 and pos + 24 <= raw.len) {
+            n_rows = std.mem.readInt(u64, raw[pos + 16 ..][0..8], .little);
+            keys_pos = pos + 24;
+        } else {
+            n_rows = second;
+            keys_pos = pos + 16;
+        }
+        if (n_rows > row_count - rows_done) return error.InvalidIndexStream;
+        const key_bytes = std.math.mul(usize, @intCast(n_rows), key_width) catch return error.InvalidIndexStream;
+        if (keys_pos + key_bytes > raw.len) return error.InvalidIndexStream;
+
+        var header: [24]u8 = undefined;
+        std.mem.writeInt(u64, header[0..8], key_type, .little);
+        std.mem.writeInt(u64, header[8..16], 0, .little);
+        std.mem.writeInt(u64, header[16..24], n_rows, .little);
+        try out.appendSlice(allocator, &header);
+        try out.appendSlice(allocator, raw[keys_pos .. keys_pos + key_bytes]);
+
+        pos = keys_pos + key_bytes;
+        rows_done += n_rows;
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+fn buildArrayStringReader(
+    allocator: std.mem.Allocator,
+    col: schema.Column,
+    offsets: []const u8,
+    elem_sizes: []const u8,
+    elems: []const u8,
+) !ColumnReader {
+    var out_data: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out_data.deinit(allocator);
+    var out_sizes: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out_sizes.deinit(allocator);
+    var elem_size_pos: usize = 0;
+    var elem_data_pos: usize = 0;
+    const n_rows = offsets.len / 8;
+    for (0..n_rows) |i| {
+        const elem_count: usize = @intCast(std.mem.readInt(u64, offsets[i * 8 ..][0..8], .little));
+        const row_start = out_data.items.len;
+        for (0..elem_count) |_| {
+            if (elem_size_pos + 8 > elem_sizes.len) return error.UnexpectedEndOfData;
+            const len: usize = @intCast(std.mem.readInt(u64, elem_sizes[elem_size_pos..][0..8], .little));
+            elem_size_pos += 8;
+            if (elem_data_pos + len > elems.len) return error.UnexpectedEndOfData;
+            try writeVarUIntTo(&out_data, allocator, len);
+            try out_data.appendSlice(allocator, elems[elem_data_pos .. elem_data_pos + len]);
+            elem_data_pos += len;
+        }
+        var row_len: [8]u8 = undefined;
+        std.mem.writeInt(u64, &row_len, out_data.items.len - row_start, .little);
+        try out_sizes.appendSlice(allocator, &row_len);
+    }
+    return .{
+        .allocator = allocator,
+        .col = col,
+        .row_count = n_rows,
+        .data = try out_data.toOwnedSlice(allocator),
+        .size_data = try out_sizes.toOwnedSlice(allocator),
+        .cursor = 0,
+        .size_cursor = 0,
+        .rows_read = 0,
+    };
+}
+
+fn buildMapReader(
+    allocator: std.mem.Allocator,
+    col: schema.Column,
+    offsets: []const u8,
+    key_sizes: []const u8,
+    keys: []const u8,
+    value_sizes: ?[]const u8,
+    values: []const u8,
+) !ColumnReader {
+    var out_data: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out_data.deinit(allocator);
+    var out_sizes: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out_sizes.deinit(allocator);
+    var key_size_pos: usize = 0;
+    var key_data_pos: usize = 0;
+    var val_size_pos: usize = 0;
+    var val_data_pos: usize = 0;
+    var truncated_tail = false;
+    const n_rows = offsets.len / 8;
+    for (0..n_rows) |i| {
+        const count: usize = @intCast(std.mem.readInt(u64, offsets[i * 8 ..][0..8], .little));
+        const row_start = out_data.items.len;
+        if (truncated_tail) {
+            try writeVarUIntTo(&out_data, allocator, 0);
+            var empty_len: [8]u8 = undefined;
+            std.mem.writeInt(u64, &empty_len, out_data.items.len - row_start, .little);
+            try out_sizes.appendSlice(allocator, &empty_len);
+            continue;
+        }
+        try writeVarUIntTo(&out_data, allocator, count);
+        for (0..count) |_| {
+            if (key_size_pos + 8 > key_sizes.len) {
+                out_data.shrinkRetainingCapacity(row_start);
+                try writeVarUIntTo(&out_data, allocator, 0);
+                truncated_tail = true;
+                break;
+            }
+            const len: usize = @intCast(std.mem.readInt(u64, key_sizes[key_size_pos..][0..8], .little));
+            key_size_pos += 8;
+            if (key_data_pos + len > keys.len) {
+                out_data.shrinkRetainingCapacity(row_start);
+                try writeVarUIntTo(&out_data, allocator, 0);
+                truncated_tail = true;
+                break;
+            }
+            try writeVarUIntTo(&out_data, allocator, len);
+            try out_data.appendSlice(allocator, keys[key_data_pos .. key_data_pos + len]);
+            key_data_pos += len;
+        }
+        if (truncated_tail) {
+            // Current row was rewritten as an empty map.
+        } else if (isMapStringFloat64(col)) {
+            const bytes = count * 8;
+            if (val_data_pos + bytes > values.len) {
+                out_data.shrinkRetainingCapacity(row_start);
+                try writeVarUIntTo(&out_data, allocator, 0);
+                truncated_tail = true;
+            } else {
+                try out_data.appendSlice(allocator, values[val_data_pos .. val_data_pos + bytes]);
+                val_data_pos += bytes;
+            }
+        } else {
+            const sizes = value_sizes orelse return error.MissingSizeStream;
+            for (0..count) |_| {
+                if (val_size_pos + 8 > sizes.len) {
+                    out_data.shrinkRetainingCapacity(row_start);
+                    try writeVarUIntTo(&out_data, allocator, 0);
+                    truncated_tail = true;
+                    break;
+                }
+                const len: usize = @intCast(std.mem.readInt(u64, sizes[val_size_pos..][0..8], .little));
+                val_size_pos += 8;
+                if (val_data_pos + len > values.len) {
+                    out_data.shrinkRetainingCapacity(row_start);
+                    try writeVarUIntTo(&out_data, allocator, 0);
+                    truncated_tail = true;
+                    break;
+                }
+                try writeVarUIntTo(&out_data, allocator, len);
+                try out_data.appendSlice(allocator, values[val_data_pos .. val_data_pos + len]);
+                val_data_pos += len;
+            }
+        }
+        var row_len: [8]u8 = undefined;
+        std.mem.writeInt(u64, &row_len, out_data.items.len - row_start, .little);
+        try out_sizes.appendSlice(allocator, &row_len);
+    }
+    return .{
+        .allocator = allocator,
+        .col = col,
+        .row_count = n_rows,
+        .data = try out_data.toOwnedSlice(allocator),
+        .size_data = try out_sizes.toOwnedSlice(allocator),
+        .cursor = 0,
+        .size_cursor = 0,
+        .rows_read = 0,
+    };
+}
+
+fn defaultColumnReader(allocator: std.mem.Allocator, col: schema.Column, row_count: u64) !ColumnReader {
+    const n: usize = @intCast(row_count);
+    if (col.ty == .text or col.ty == .char or col.ty == .low_card or isArrayString(col) or isMapStringFloat64(col) or isMapStringString(col) or fixedStringWidth(col) != 0) {
+        const size_data = try allocator.alloc(u8, n * 8);
+        @memset(size_data, 0);
+        return .{
+            .allocator = allocator,
+            .col = col,
+            .row_count = row_count,
+            .data = try allocator.alloc(u8, 0),
+            .size_data = size_data,
+            .cursor = 0,
+            .size_cursor = 0,
+            .rows_read = 0,
+            .fixed_string_width = 0,
+        };
+    }
+    const width = types.chFixedWidth(col.ty) orelse 0;
+    const data = try allocator.alloc(u8, n * width);
+    @memset(data, 0);
+    return .{
+        .allocator = allocator,
+        .col = col,
+        .row_count = row_count,
+        .data = data,
+        .size_data = null,
+        .cursor = 0,
+        .size_cursor = 0,
+        .rows_read = 0,
+    };
+}
+
 // ── Compact part read/write ────────────────────────────────────────────────────
 //
 // Compact part layout (CH 22+ default for small parts):
@@ -1348,6 +1833,7 @@ pub const CompactOpenedPart = struct {
     col_substream_start: []usize,
     /// Actual substream count per column (from columns_substreams.txt or schema).
     col_substream_count: []usize,
+    substream_names: []?[]u8,
 
     pub fn open(
         io: std.Io,
@@ -1383,6 +1869,9 @@ pub const CompactOpenedPart = struct {
             col_substream_count[ci] = n;
             total_substreams += n;
         }
+        var substream_names: []?[]u8 = try allocator.alloc(?[]u8, total_substreams);
+        errdefer allocator.free(substream_names);
+        @memset(substream_names, null);
 
         // Override with actual counts from columns_substreams.txt if present.
         {
@@ -1393,30 +1882,36 @@ pub const CompactOpenedPart = struct {
                 if (subs_text) |st| {
                     defer allocator.free(st);
                     total_substreams = 0;
+                    for (substream_names) |maybe| if (maybe) |name| allocator.free(name);
+                    allocator.free(substream_names);
+                    @memset(col_substream_count, 0);
+                    @memset(col_ss, 0);
                     var line_iter = std.mem.splitScalar(u8, st, '\n');
                     _ = line_iter.next(); // version line
                     _ = line_iter.next(); // N columns line
-                    for (0..n_cols) |ci| {
-                        const line = line_iter.next() orelse break;
-                        const N = std.fmt.parseInt(usize, std.mem.trim(u8, line[0..std.mem.indexOfScalar(u8, line, ' ') orelse line.len], " \t"), 10) catch 2;
-                        col_substream_count[ci] = N;
-                        col_ss[ci] = total_substreams;
-                        total_substreams += N;
-                        for (0..N) |_| _ = line_iter.next() orelse break;
+                    var names = std.ArrayListUnmanaged(?[]u8).empty;
+                    errdefer {
+                        for (names.items) |maybe| if (maybe) |name| allocator.free(name);
+                        names.deinit(allocator);
                     }
+                    while (line_iter.next()) |line| {
+                        const trimmed_line = std.mem.trim(u8, line, " \t\r\n");
+                        if (trimmed_line.len == 0) continue;
+                        const N = std.fmt.parseInt(usize, std.mem.trim(u8, line[0..std.mem.indexOfScalar(u8, line, ' ') orelse line.len], " \t"), 10) catch 2;
+                        const col_idx = if (columnNameFromSubstreamHeader(line)) |nm| findTableColumn(table, nm) else null;
+                        if (col_idx) |ci| {
+                            col_substream_count[ci] = N;
+                            col_ss[ci] = total_substreams;
+                        }
+                        total_substreams += N;
+                        for (0..N) |_| {
+                            const sub_line = line_iter.next() orelse break;
+                            const trimmed = std.mem.trim(u8, sub_line, " \t\r\n");
+                            try names.append(allocator, try allocator.dupe(u8, trimmed));
+                        }
+                    }
+                    substream_names = try names.toOwnedSlice(allocator);
                 }
-            }
-        }
-
-        // Adjust column starts to skip extra substreams (sparse.idx, etc.).
-        // Do NOT skip dict_prefix for LC — the reader handles 3-stream format.
-        for (0..n_cols) |ci| {
-            const expected: usize = switch (table.columns[ci].ty) {
-                .text, .char, .low_card => 2,
-                else => 1,
-            };
-            if (col_substream_count[ci] > expected and table.columns[ci].ty != .low_card) {
-                col_ss[ci] += col_substream_count[ci] - expected;
             }
         }
 
@@ -1447,6 +1942,7 @@ pub const CompactOpenedPart = struct {
             .n_granules = n_gran,
             .col_substream_start = col_ss,
             .col_substream_count = col_substream_count,
+            .substream_names = substream_names,
         };
     }
 
@@ -1454,6 +1950,8 @@ pub const CompactOpenedPart = struct {
         self.mark_table.deinit(self.allocator);
         self.allocator.free(self.col_substream_start);
         self.allocator.free(self.col_substream_count);
+        for (self.substream_names) |maybe| if (maybe) |name| self.allocator.free(name);
+        self.allocator.free(self.substream_names);
     }
 
     fn blockRange(self: *CompactOpenedPart, mark_idx: usize) !struct { u64, u64 } {
@@ -1481,6 +1979,137 @@ pub const CompactOpenedPart = struct {
         if (read_n != compressed.len) return error.UnexpectedEndOfData;
         var reader = std.Io.Reader.fixed(compressed);
         return block.readBlock(self.allocator, &reader);
+    }
+
+    fn substreamRel(self: *CompactOpenedPart, col_idx: usize, suffix: []const u8) ?usize {
+        const start = self.col_substream_start[col_idx];
+        const count = self.col_substream_count[col_idx];
+        for (0..count) |rel| {
+            const idx = start + rel;
+            if (idx >= self.substream_names.len) break;
+            const name = self.substream_names[idx] orelse continue;
+            if (std.mem.endsWith(u8, name, suffix)) return rel;
+        }
+        return null;
+    }
+
+    fn compactBlock(self: *CompactOpenedPart, file: std.Io.File, col_idx: usize, granule: usize, rel: usize) ![]u8 {
+        const idx = granule * self.n_substreams + self.col_substream_start[col_idx] + rel;
+        const mark = self.mark_table.marks[idx];
+        var compressed_end = self.mark_table.eof_offset;
+        var same_block_end: ?usize = null;
+        var i = idx + 1;
+        while (i < self.mark_table.marks.len) : (i += 1) {
+            const next = self.mark_table.marks[i];
+            if (next.offset_in_file == mark.offset_in_file) {
+                if (next.offset_in_block > mark.offset_in_block) {
+                    same_block_end = @intCast(next.offset_in_block);
+                    break;
+                }
+                continue;
+            }
+            if (next.offset_in_file > mark.offset_in_file) {
+                compressed_end = next.offset_in_file;
+                break;
+            }
+        }
+        if (compressed_end < mark.offset_in_file or compressed_end > self.data_file_size) return error.InvalidMarkCount;
+        const len: usize = @intCast(if (compressed_end == mark.offset_in_file) self.data_file_size - mark.offset_in_file else compressed_end - mark.offset_in_file);
+        const compressed = try self.allocator.alloc(u8, len);
+        defer self.allocator.free(compressed);
+        const read_n = try file.readPositionalAll(self.io, compressed, mark.offset_in_file);
+        if (read_n != compressed.len) return error.UnexpectedEndOfData;
+
+        var reader = std.Io.Reader.fixed(compressed);
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer out.deinit(self.allocator);
+        var first = true;
+        while (true) {
+            const raw = block.readBlock(self.allocator, &reader) catch |e| switch (e) {
+                error.TruncatedBlock => break,
+                else => return e,
+            };
+            defer self.allocator.free(raw);
+            var start: usize = 0;
+            var end = raw.len;
+            if (first) {
+                start = @intCast(mark.offset_in_block);
+                if (start > raw.len) return error.UnexpectedEndOfData;
+                if (same_block_end) |sbe| {
+                    if (sbe > raw.len or sbe < start) return error.UnexpectedEndOfData;
+                    end = sbe;
+                }
+            }
+            try out.appendSlice(self.allocator, raw[start..end]);
+            if (same_block_end != null) break;
+            first = false;
+        }
+        return out.toOwnedSlice(self.allocator);
+    }
+
+    fn readCompactArrayStringGranules(self: *CompactOpenedPart, col_idx: usize, first_granule: usize, granule_count: usize, file: std.Io.File) !ColumnReader {
+        const size0_rel = self.substreamRel(col_idx, ".size0") orelse return error.UnsupportedSubstreamLayout;
+        const size_rel = self.substreamRel(col_idx, ".size") orelse return error.UnsupportedSubstreamLayout;
+        const data_rel = self.substreamRel(col_idx, self.table.columns[col_idx].name) orelse self.col_substream_count[col_idx] - 1;
+        var offsets_buf: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer offsets_buf.deinit(self.allocator);
+        var sizes_buf: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer sizes_buf.deinit(self.allocator);
+        var elems_buf: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer elems_buf.deinit(self.allocator);
+        const granule_end = @min(first_granule + granule_count, self.n_granules);
+        for (first_granule..granule_end) |g| {
+            const offsets = try self.compactBlock(file, col_idx, g, size0_rel);
+            defer self.allocator.free(offsets);
+            const sizes = try self.compactBlock(file, col_idx, g, size_rel);
+            defer self.allocator.free(sizes);
+            const elems = try self.compactBlock(file, col_idx, g, data_rel);
+            defer self.allocator.free(elems);
+            try offsets_buf.appendSlice(self.allocator, offsets);
+            try sizes_buf.appendSlice(self.allocator, sizes);
+            try elems_buf.appendSlice(self.allocator, elems);
+        }
+        return try buildArrayStringReader(self.allocator, self.table.columns[col_idx], offsets_buf.items, sizes_buf.items, elems_buf.items);
+    }
+
+    fn readCompactMapGranules(self: *CompactOpenedPart, col_idx: usize, first_granule: usize, granule_count: usize, file: std.Io.File) !ColumnReader {
+        const col = self.table.columns[col_idx];
+        const size0_rel = self.substreamRel(col_idx, ".size0") orelse return error.UnsupportedSubstreamLayout;
+        const key_size_rel = self.substreamRel(col_idx, "%2Ekeys.size") orelse return error.UnsupportedSubstreamLayout;
+        const key_rel = self.substreamRel(col_idx, "%2Ekeys") orelse return error.UnsupportedSubstreamLayout;
+        const val_rel = self.substreamRel(col_idx, "%2Evalues") orelse return error.UnsupportedSubstreamLayout;
+        const val_size_rel = self.substreamRel(col_idx, "%2Evalues.size");
+        var offsets_buf: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer offsets_buf.deinit(self.allocator);
+        var key_sizes_buf: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer key_sizes_buf.deinit(self.allocator);
+        var keys_buf: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer keys_buf.deinit(self.allocator);
+        var val_sizes_buf: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer val_sizes_buf.deinit(self.allocator);
+        var vals_buf: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer vals_buf.deinit(self.allocator);
+        const granule_end = @min(first_granule + granule_count, self.n_granules);
+        for (first_granule..granule_end) |g| {
+            const offsets = try self.compactBlock(file, col_idx, g, size0_rel);
+            defer self.allocator.free(offsets);
+            const key_sizes = try self.compactBlock(file, col_idx, g, key_size_rel);
+            defer self.allocator.free(key_sizes);
+            const keys = try self.compactBlock(file, col_idx, g, key_rel);
+            defer self.allocator.free(keys);
+            const vals = try self.compactBlock(file, col_idx, g, val_rel);
+            defer self.allocator.free(vals);
+            try offsets_buf.appendSlice(self.allocator, offsets);
+            try key_sizes_buf.appendSlice(self.allocator, key_sizes);
+            try keys_buf.appendSlice(self.allocator, keys);
+            try vals_buf.appendSlice(self.allocator, vals);
+            if (val_size_rel) |rel| {
+                const val_sizes = try self.compactBlock(file, col_idx, g, rel);
+                defer self.allocator.free(val_sizes);
+                try val_sizes_buf.appendSlice(self.allocator, val_sizes);
+            }
+        }
+        return try buildMapReader(self.allocator, col, offsets_buf.items, key_sizes_buf.items, keys_buf.items, if (val_sizes_buf.items.len == 0) null else val_sizes_buf.items, vals_buf.items);
     }
 
     /// Return a ColumnReader for column at `col_idx`.
@@ -1525,6 +2154,15 @@ pub const CompactOpenedPart = struct {
 
         if (self.row_count == 0 or granule_count == 0 or first_granule >= self.n_granules)
             return self.emptyColumnReader(col_idx);
+        if (self.col_substream_count[col_idx] == 0) {
+            const rows: u64 = blk: {
+                var total: u64 = 0;
+                const end = @min(first_granule + granule_count, self.n_granules);
+                for (first_granule..end) |g| total += self.mark_table.granularities[g];
+                break :blk total;
+            };
+            return defaultColumnReader(self.allocator, col, rows);
+        }
 
         // Concatenate all granule blocks for this column's data (and size if String)
         var data_buf: std.ArrayListUnmanaged(u8) = .empty;
@@ -1536,6 +2174,13 @@ pub const CompactOpenedPart = struct {
         defer self.allocator.free(bin_path);
         const bin_file = try std.Io.Dir.cwd().openFile(self.io, bin_path, .{});
         defer bin_file.close(self.io);
+
+        if (isArrayString(col) and self.substreamRel(col_idx, ".size0") != null) {
+            return self.readCompactArrayStringGranules(col_idx, first_granule, granule_count, bin_file);
+        }
+        if ((isMapStringFloat64(col) or isMapStringString(col)) and self.substreamRel(col_idx, ".size0") != null) {
+            return self.readCompactMapGranules(col_idx, first_granule, granule_count, bin_file);
+        }
 
         const granule_end = @min(first_granule + granule_count, self.n_granules);
         var rows_loaded: u64 = 0;
@@ -1553,12 +2198,39 @@ pub const CompactOpenedPart = struct {
             const block_idx = g * self.n_substreams + ss_start;
             switch (col.ty) {
                 .text, .char => {
-                    const combined = try self.readBlockAt(bin_file, block_idx);
-                    defer self.allocator.free(combined);
-                    const sizes_bytes = n_rows_in_gran * 8;
-                    if (sizes_bytes > combined.len) return error.UnexpectedEndOfData;
-                    try size_buf.appendSlice(self.allocator, combined[0..sizes_bytes]);
-                    try data_buf.appendSlice(self.allocator, combined[sizes_bytes..]);
+                    const fw = fixedStringWidth(col);
+                    if (fw != 0) {
+                        const data = try self.readBlockAt(bin_file, block_idx);
+                        defer self.allocator.free(data);
+                        try data_buf.appendSlice(self.allocator, data);
+                    } else if (self.col_substream_count[col_idx] >= 2) {
+                        const size_rel = self.substreamRel(col_idx, ".size") orelse 0;
+                        const data_rel = if (size_rel == 0) @as(usize, 1) else @as(usize, 0);
+                        const size_mark = self.mark_table.marks[g * self.n_substreams + ss_start + size_rel];
+                        const data_mark = self.mark_table.marks[g * self.n_substreams + ss_start + data_rel];
+                        if (size_mark.offset_in_file == data_mark.offset_in_file) {
+                            const combined = try self.readBlockAt(bin_file, g * self.n_substreams + ss_start + size_rel);
+                            defer self.allocator.free(combined);
+                            const sizes_bytes = n_rows_in_gran * 8;
+                            if (sizes_bytes > combined.len) return error.UnexpectedEndOfData;
+                            try size_buf.appendSlice(self.allocator, combined[0..sizes_bytes]);
+                            try data_buf.appendSlice(self.allocator, combined[sizes_bytes..]);
+                        } else {
+                            const sizes = try self.compactBlock(bin_file, col_idx, g, size_rel);
+                            defer self.allocator.free(sizes);
+                            const data = try self.compactBlock(bin_file, col_idx, g, data_rel);
+                            defer self.allocator.free(data);
+                            try size_buf.appendSlice(self.allocator, sizes);
+                            try data_buf.appendSlice(self.allocator, data);
+                        }
+                    } else {
+                        const combined = try self.readBlockAt(bin_file, block_idx);
+                        defer self.allocator.free(combined);
+                        const sizes_bytes = n_rows_in_gran * 8;
+                        if (sizes_bytes > combined.len) return error.UnexpectedEndOfData;
+                        try size_buf.appendSlice(self.allocator, combined[0..sizes_bytes]);
+                        try data_buf.appendSlice(self.allocator, combined[sizes_bytes..]);
+                    }
                 },
                 .low_card => {
                     // LC: 3 substreams per granule in CH 26.x (dict_prefix + dict + index),
@@ -1566,16 +2238,10 @@ pub const CompactOpenedPart = struct {
                     const ss_n = self.col_substream_count[col_idx];
                     if (ss_n == 3) {
                         // CH 26.x 3-substream LC: dict_prefix (granule 0), dict+index per granule.
-                        // dict_prefix is the base dictionary (version + num_keys + keys).
-                        if (g == 0) {
-                            // Read dict_prefix as the initial dictionary blob
-                            const dict_prefix = try self.readBlockAt(bin_file, block_idx);
-                            defer self.allocator.free(dict_prefix);
-                            try data_buf.appendSlice(self.allocator, dict_prefix);
-                        }
-                        // dict block: skip (dict updates are included in index_addl_keys)
+                        // dict_prefix/dict may share a compressed block with index; normalize
+                        // additional string keys from the index stream into the old dict format.
                         // index block: IndexesSerializationType + optional addl keys + num_rows + index data
-                        const index_raw = try self.readBlockAt(bin_file, block_idx + 2);
+                        const index_raw = try self.compactBlock(bin_file, col_idx, g, 2);
                         defer self.allocator.free(index_raw);
                         var ip: usize = 0;
                         if (ip + 8 > index_raw.len) return error.InvalidIndexStream;
@@ -1584,21 +2250,30 @@ pub const CompactOpenedPart = struct {
                             // HasAdditionalKeys → read into dict
                             if (ip + 8 > index_raw.len) return error.InvalidIndexStream;
                             const num_keys = std.mem.readInt(u64, index_raw[ip..][0..8], .little); ip += 8;
-                            if (ip + num_keys * 8 > index_raw.len) return error.InvalidIndexStream;
                             // Build old-format dict block: version(1) + num_keys + key data
-                            try data_buf.ensureUnusedCapacity(self.allocator, 16 + num_keys * 8);
-                            data_buf.appendSliceAssumeCapacity(&[_]u8{1,0,0,0,0,0,0,0}); // version=1
+                            try data_buf.ensureUnusedCapacity(self.allocator, 16);
+                            var version_bytes: [8]u8 = undefined;
+                            std.mem.writeInt(u64, &version_bytes, 1, .little);
+                            data_buf.appendSliceAssumeCapacity(&version_bytes);
                             var num_bytes: [8]u8 = undefined;
                             std.mem.writeInt(u64, &num_bytes, num_keys, .little);
                             data_buf.appendSliceAssumeCapacity(&num_bytes);
-                            // Copy key data
-                            try data_buf.appendSlice(self.allocator, index_raw[ip..ip + num_keys * 8]);
-                            ip += num_keys * 8;
+                            for (0..num_keys) |_| {
+                                const r = readVarUIntLocal(index_raw[ip..]) orelse return error.InvalidIndexStream;
+                                const slen = r[0];
+                                if (ip + r[1] + slen > index_raw.len) return error.InvalidIndexStream;
+                                try data_buf.appendSlice(self.allocator, index_raw[ip .. ip + r[1] + slen]);
+                                ip += r[1] + slen;
+                            }
                         }
                         // Read num_rows and skip it (index data follows)
                         if (ip + 8 > index_raw.len) return error.InvalidIndexStream;
-                        _ = std.mem.readInt(u64, index_raw[ip..][0..8], .little); ip += 8;
-                        // The rest is index data (appended to size_buf)
+                        const num_rows = std.mem.readInt(u64, index_raw[ip..][0..8], .little); ip += 8;
+                        var header: [24]u8 = undefined;
+                        std.mem.writeInt(u64, header[0..8], flags & 0x3, .little);
+                        std.mem.writeInt(u64, header[8..16], 0, .little);
+                        std.mem.writeInt(u64, header[16..24], num_rows, .little);
+                        try size_buf.appendSlice(self.allocator, &header);
                         try size_buf.appendSlice(self.allocator, index_raw[ip..]);
                     } else {
                         // Old 2-substream format
@@ -1642,7 +2317,10 @@ pub const CompactOpenedPart = struct {
         }
 
         const size_data: ?[]u8 = switch (col.ty) {
-            .text, .char => try size_buf.toOwnedSlice(self.allocator),
+            .text, .char => if (fixedStringWidth(col) == 0) try size_buf.toOwnedSlice(self.allocator) else blk: {
+                size_buf.deinit(self.allocator);
+                break :blk null;
+            },
             else => blk: {
                 size_buf.deinit(self.allocator);
                 break :blk null;
@@ -1658,6 +2336,7 @@ pub const CompactOpenedPart = struct {
             .cursor = 0,
             .size_cursor = 0,
             .rows_read = 0,
+            .fixed_string_width = fixedStringWidth(col),
         };
     }
 };

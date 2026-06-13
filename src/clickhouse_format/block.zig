@@ -164,17 +164,13 @@ pub fn readBlock(allocator: std.mem.Allocator, reader: *std.Io.Reader) ![]u8 {
         break :blk 256 * 1024;
     } else size_with_header - HEADER_SIZE;
 
-    // Read compressed data
-    var compressed_buf: [256 * 1024]u8 = undefined;
-    const compressed_len_actual = @min(compressed_len, compressed_buf.len);
-    const n_read = try reader.readSliceShort(compressed_buf[0..compressed_len_actual]);
-    if (n_read == 0) return error.TruncatedBlock;
-    const compressed = try allocator.alloc(u8, n_read);
+    // Read compressed data. ClickHouse Array/Map substreams can exceed 256 KiB.
+    const compressed = try allocator.alloc(u8, compressed_len);
     errdefer allocator.free(compressed);
-    @memcpy(compressed, compressed_buf[0..n_read]);
+    try reader.readSliceAll(compressed);
 
     // Verify checksum over [header ++ compressed]
-    const to_hash = try allocator.alloc(u8, HEADER_SIZE + n_read);
+    const to_hash = try allocator.alloc(u8, HEADER_SIZE + compressed.len);
     defer allocator.free(to_hash);
     @memcpy(to_hash[0..HEADER_SIZE], &header_bytes);
     @memcpy(to_hash[HEADER_SIZE..], compressed);
@@ -361,4 +357,3 @@ test "block multiple sequential" {
         try std.testing.expectEqualStrings(expected, dec);
     }
 }
-
