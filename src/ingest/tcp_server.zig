@@ -129,6 +129,18 @@ fn wstr(buf: *std.ArrayListUnmanaged(u8), a: std.mem.Allocator, s: []const u8) !
 }
 
 fn writeBlockInfo(buf: *std.ArrayListUnmanaged(u8), a: std.mem.Allocator) !void {
+    // Match clickhouse-go v2.45 encodeBlockInfo format:
+    //   PutUVarInt(1)   // field 1 = overflows marker
+    //   PutBool(false)  // is_overflows = false
+    //   PutUVarInt(2)   // field 2 = bucket number
+    //   PutInt32(-1)    // bucket_num = -1 (no bucket)
+    //   PutUVarInt(0)   // terminator
+    try wuv(buf, a, 1);
+    try buf.append(a, 0);
+    try wuv(buf, a, 2);
+    var tmp: [4]u8 = undefined;
+    std.mem.writeInt(i32, &tmp, -1, .little);
+    try buf.appendSlice(a, &tmp);
     try wuv(buf, a, 0);
 }
 

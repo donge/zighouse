@@ -38,6 +38,18 @@ fn putString(buf: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, s: []co
 }
 
 fn putBlockInfo(buf: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator) !void {
+    // Match clickhouse-go v2.45 encodeBlockInfo format:
+    //   PutUVarInt(1)   // field 1 = overflows marker
+    //   PutBool(false)  // is_overflows = false
+    //   PutUVarInt(2)   // field 2 = bucket number
+    //   PutInt32(-1)    // bucket_num = -1 (no bucket)
+    //   PutUVarInt(0)   // terminator
+    try putUVarInt(buf, alloc, 1);
+    try buf.append(alloc, 0);
+    try putUVarInt(buf, alloc, 2);
+    var tmp: [4]u8 = undefined;
+    std.mem.writeInt(i32, &tmp, -1, .little);
+    try buf.appendSlice(alloc, &tmp);
     try putUVarInt(buf, alloc, 0);
 }
 
