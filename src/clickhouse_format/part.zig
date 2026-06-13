@@ -1364,8 +1364,9 @@ pub const CompactOpenedPart = struct {
 
         // Compute logical substream count and per-column mark start.
         // String/char: two logical marks, but both point into one combined block.
-        // LowCardinality: two physical/logical blocks (dict + index).
-        // Fixed-width: one block.
+        // LowCardinality: two physical/logical blocks (dict + index) in ZH format,
+        // but ClickHouse 26.x uses three (dict_prefix + dict + index).
+        // Override with actual counts from columns_substreams.txt if present.
         const col_ss = try allocator.alloc(usize, n_cols);
         errdefer allocator.free(col_ss);
         var total_substreams: usize = 0;
@@ -1375,6 +1376,42 @@ pub const CompactOpenedPart = struct {
                 .text, .char, .low_card => 2,
                 else => 1,
             };
+        }
+        // Override with actual substream counts from columns_substreams.txt
+        {
+            const sub_path = std.fmt.allocPrint(allocator, "{s}/columns_substreams.txt", .{part_dir}) catch null;
+            if (sub_path) |sp| {
+                defer allocator.free(sp);
+                const subs_text = std.Io.Dir.cwd().readFileAlloc(io, sp, allocator, .limited(65536)) catch null;
+                if (subs_text) |st| {
+                    defer allocator.free(st);
+                    total_substreams = 0;
+                    var line_iter = std.mem.splitScalar(u8, st, '\n');
+                    // "columns substreams version: 1"
+                    _ = line_iter.next();
+                    // "<N> columns:"
+                    _ = line_iter.next();
+                    for (0..n_cols) |ci| {
+                        const line = line_iter.next() orelse break;
+                        const N = std.fmt.parseInt(usize, std.mem.trim(u8, line[0..std.mem.indexOfScalar(u8, line, ' ') orelse line.len], " \t"), 10) catch 2;
+                        col_ss[ci] = total_substreams;
+                        total_substreams += N;
+                        for (0..N) |_| _ = line_iter.next() orelse break;
+                    }
+                    // CH 26.x writes 3 substreams for LowCardinality (dict_prefix + dict + index).
+                    // Our reader expects 2 (dict + index). Advance past dict_prefix.
+                    var col_counts: [256]usize = undefined;
+                    for (0..n_cols) |ci| {
+                        const next = if (ci + 1 < n_cols) col_ss[ci + 1] else total_substreams;
+                        col_counts[ci] = next - col_ss[ci];
+                    }
+                    for (0..n_cols) |ci| {
+                        if (table.columns[ci].ty == .low_card and col_counts[ci] == 3) {
+                            col_ss[ci] += 1;
+                        }
+                    }
+                }
+            }
         }
 
         const cmrk_path = try std.fmt.allocPrint(allocator, "{s}/data.cmrk4", .{part_dir});
