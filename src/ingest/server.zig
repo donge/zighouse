@@ -1306,6 +1306,16 @@ pub const Server = struct {
         if (try self.tryIrExecute(plan, &entry.table, parts.dirs(), sql_clean)) |rs| {
             var owned_rs = rs;
             defer owned_rs.deinit();
+
+            // FINAL deduplication: for ReplacingMergeTree tables, keep only the
+            // first row per primary key (highest version, since ORDER BY version DESC
+            // was injected by the FINAL handler).
+            if (sql_needs_free and entry.pk != null) {
+                if (try dedupResultSetByPk(self.allocator, &owned_rs, entry.pk.?, entry.table)) |deduped| {
+                    owned_rs.deinit();
+                    owned_rs = deduped;
+                }
+            }
             try self.serializeResultSet(request, out, &owned_rs, want_json, want_tsv, skip_header);
             return;
         }
@@ -2368,6 +2378,113 @@ fn removeFinal(allocator: std.mem.Allocator, sql: []const u8) ![]u8 {
         i += 1;
     }
     return result.toOwnedSlice(allocator);
+}
+
+/// Deduplicate a ResultSet by primary key. For ReplacingMergeTree FINAL queries:
+/// ORDER BY version DESC was injected, so the first row per pk has the highest version.
+fn dedupResultSetByPk(
+    allocator: std.mem.Allocator,
+    rs: *const core.ResultSet,
+    pk_name: []const u8,
+    table: schema.Table,
+) !?core.ResultSet {
+    _ = table;
+    var pk_idx: ?usize = null;
+    for (rs.metas, 0..) |meta, i| {
+        if (std.mem.eql(u8, meta.name, pk_name)) { pk_idx = i; break; }
+    }
+    const pki = pk_idx orelse return null;
+
+    const num_rows = rs.num_rows;
+    const num_cols = rs.numCols();
+
+    var seen = std.AutoHashMap(u64, void).init(allocator);
+    defer seen.deinit();
+
+    var unique_count: usize = 0;
+    for (0..num_rows) |r| {
+        if (core.chunk.isNull(rs.columns[pki].null_mask, r)) continue;
+        const hash = switch (rs.columns[pki].data) {
+            .int64 => |vals| @as(u64, @bitCast(vals[r])),
+            .uint64 => |vals| vals[r],
+            .float64 => |vals| @as(u64, @bitCast(vals[r])),
+            .string => |vals| std.hash.Wyhash.hash(0, vals[r]),
+            .date_u16 => |vals| @as(u64, vals[r]),
+            .datetime64_ms => |vals| @as(u64, @bitCast(vals[r])),
+            .bool_u8 => |vals| @as(u64, vals[r]),
+            else => @as(u64, r),
+        };
+        if (seen.contains(hash)) continue;
+        try seen.put(hash, {});
+        unique_count += 1;
+    }
+
+    if (unique_count == num_rows) return null;
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    const ra = arena.allocator();
+
+    const out_metas = try ra.dupe(core.result.ColMeta, rs.metas);
+    const out_cols = try ra.alloc(core.chunk.Column, num_cols);
+    for (out_cols, out_metas) |*col, meta| {
+        col.* = .{
+            .name = meta.name,
+            .data = switch (meta.col_type) {
+                .bool_u8 => .{ .bool_u8 = try ra.alloc(u8, unique_count) },
+                .int64 => .{ .int64 = try ra.alloc(i64, unique_count) },
+                .uint64 => .{ .uint64 = try ra.alloc(u64, unique_count) },
+                .float64 => .{ .float64 = try ra.alloc(f64, unique_count) },
+                .date_u16 => .{ .date_u16 = try ra.alloc(u16, unique_count) },
+                .datetime64_ms => .{ .datetime64_ms = try ra.alloc(i64, unique_count) },
+                .string => .{ .string = try ra.alloc([]const u8, unique_count) },
+                .array_string => .{ .array_string = try ra.alloc([][]const u8, unique_count) },
+            },
+            .null_mask = try ra.alloc(u64, core.chunk.nullMaskWords(unique_count)),
+            .len = unique_count,
+        };
+        @memset(col.null_mask, 0);
+    }
+
+    var seen2 = std.AutoHashMap(u64, void).init(allocator);
+    defer seen2.deinit();
+    var out_row: usize = 0;
+    for (0..num_rows) |r| {
+        if (core.chunk.isNull(rs.columns[pki].null_mask, r)) continue;
+        const hash = switch (rs.columns[pki].data) {
+            .int64 => |vals| @as(u64, @bitCast(vals[r])),
+            .uint64 => |vals| vals[r],
+            .float64 => |vals| @as(u64, @bitCast(vals[r])),
+            .string => |vals| std.hash.Wyhash.hash(0, vals[r]),
+            .date_u16 => |vals| @as(u64, vals[r]),
+            .datetime64_ms => |vals| @as(u64, @bitCast(vals[r])),
+            .bool_u8 => |vals| @as(u64, vals[r]),
+            else => @as(u64, r),
+        };
+        if (seen2.contains(hash)) continue;
+        try seen2.put(hash, {});
+
+        for (out_cols, 0..) |*oc, ci| {
+            const cs = rs.columns[ci];
+            switch (oc.data) {
+                .bool_u8 => oc.data.bool_u8[out_row] = cs.data.bool_u8[r],
+                .int64 => oc.data.int64[out_row] = cs.data.int64[r],
+                .uint64 => oc.data.uint64[out_row] = cs.data.uint64[r],
+                .float64 => oc.data.float64[out_row] = cs.data.float64[r],
+                .date_u16 => oc.data.date_u16[out_row] = cs.data.date_u16[r],
+                .datetime64_ms => oc.data.datetime64_ms[out_row] = cs.data.datetime64_ms[r],
+                .string => oc.data.string[out_row] = cs.data.string[r],
+                .array_string => oc.data.array_string[out_row] = cs.data.array_string[r],
+            }
+        }
+        out_row += 1;
+    }
+
+    return core.ResultSet{
+        .metas = out_metas,
+        .columns = out_cols,
+        .num_rows = unique_count,
+        .arena = arena,
+    };
 }
 
 /// Extract a URL query parameter value from a path like `/?query=...&foo=bar`.
