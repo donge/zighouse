@@ -18,10 +18,10 @@ jobs:
             runner: macos-14
             suffix: macos-arm64
             zig-url: https://ziglang.org/download/0.16.0/zig-aarch64-macos-0.16.0.tar.xz
-          - target: x86_64-macos
-            runner: macos-13
-            suffix: macos-x86_64
-            zig-url: https://ziglang.org/download/0.16.0/zig-x86_64-macos-0.16.0.tar.xz
+          # - target: x86_64-macos
+          #   runner: macos-13
+          #   suffix: macos-x86_64
+          #   zig-url: https://ziglang.org/download/0.16.0/zig-x86_64-macos-0.16.0.tar.xz
           - target: x86_64-linux-gnu
             runner: ubuntu-latest
             suffix: linux-x86_64
