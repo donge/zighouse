@@ -607,6 +607,7 @@ pub fn build(b: *std.Build) void {
     ddl_parser_mod.addImport("schema_config", schema_config_mod);
     ddl_parser_mod.addImport("type_mapping", type_mapping_mod);
     tcp_server_mod.addImport("ddl_parser", ddl_parser_mod);
+    schema_persist_mod.addImport("ddl_parser", ddl_parser_mod);
     const ddl_parser_tests = b.addTest(.{ .root_module = ddl_parser_mod });
     const ddl_parser_test_cmd = b.addRunArtifact(ddl_parser_tests);
 

@@ -34,6 +34,8 @@ pub const ParseResult = struct {
             self.allocator.free(col.name);
             if (col.ch_type) |ct| self.allocator.free(ct);
         }
+        for (self.entry.table.sort_keys) |sk| self.allocator.free(sk);
+        if (self.entry.table.sort_keys.len > 0) self.allocator.free(self.entry.table.sort_keys);
         self.allocator.free(self.columns);
         self.allocator.free(self.entry.db);
         self.allocator.free(self.entry.name);
@@ -281,9 +283,14 @@ pub fn parse(allocator: std.mem.Allocator, sql: []const u8) !ParseResult {
     if (cols.items.len == 0) return error.NoColumnsFound;
 
     // ENGINE = ... (optional for us — we ignore the engine name)
-    // ORDER BY col — first column becomes pk
+    // ORDER BY col / tuple — full expression becomes sort_keys, first column becomes pk.
     var pk: ?[]const u8 = null;
     errdefer if (pk) |p| allocator.free(p);
+    var sort_keys: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer {
+        for (sort_keys.items) |sk| allocator.free(sk);
+        sort_keys.deinit(allocator);
+    }
 
     while (tok.next()) |kw| {
         if (std.ascii.eqlIgnoreCase(kw, "ORDER")) {
@@ -292,18 +299,28 @@ pub fn parse(allocator: std.mem.Allocator, sql: []const u8) !ParseResult {
             // ORDER BY can be (col1, col2) or just col1
             if (tok.peekChar('(')) {
                 tok.skip(); // consume '('
-                const first_col = tok.next() orelse break;
-                // ORDER BY tuple() means no meaningful pk — use default (col 0)
-                if (!std.ascii.eqlIgnoreCase(first_col, "tuple")) {
-                    pk = try allocator.dupe(u8, first_col);
-                }
-                // drain rest of tuple
+                var depth: usize = 1;
                 while (tok.next()) |t| {
-                    if (t.len == 1 and t[0] == ')') break;
+                    if (t.len == 1 and t[0] == '(') {
+                        depth += 1;
+                        continue;
+                    }
+                    if (t.len == 1 and t[0] == ')') {
+                        depth -= 1;
+                        if (depth == 0) break;
+                        continue;
+                    }
+                    if (depth != 1 or (t.len == 1 and t[0] == ',')) continue;
+                    if (std.ascii.eqlIgnoreCase(t, "tuple")) continue;
+                    const key = try allocator.dupe(u8, std.mem.trim(u8, t, "`\""));
+                    try sort_keys.append(allocator, key);
+                    if (pk == null) pk = try allocator.dupe(u8, key);
                 }
             } else {
                 const order_col = tok.next() orelse break;
-                pk = try allocator.dupe(u8, order_col);
+                const key = try allocator.dupe(u8, std.mem.trim(u8, order_col, "`\""));
+                try sort_keys.append(allocator, key);
+                pk = try allocator.dupe(u8, key);
             }
         } else if (std.ascii.eqlIgnoreCase(kw, "PRIMARY")) {
             const key_kw = tok.next() orelse break;
@@ -337,13 +354,14 @@ pub fn parse(allocator: std.mem.Allocator, sql: []const u8) !ParseResult {
     }
 
     const columns_slice = try cols.toOwnedSlice(allocator);
+    const sort_keys_slice = try sort_keys.toOwnedSlice(allocator);
 
     return .{
         .entry = .{
             .db = db_owned,
             .name = table_name_owned,
             .pk = pk,
-            .table = .{ .name = table_name_for_table, .columns = columns_slice },
+            .table = .{ .name = table_name_for_table, .columns = columns_slice, .sort_keys = sort_keys_slice },
         },
         .columns = columns_slice,
         .allocator = allocator,
@@ -553,6 +571,9 @@ test "parse: ORDER BY tuple" {
     var result = try parse(allocator, sql);
     defer result.deinit();
     try std.testing.expectEqualStrings("id", result.entry.pk.?);
+    try std.testing.expectEqual(@as(usize, 2), result.entry.table.sort_keys.len);
+    try std.testing.expectEqualStrings("id", result.entry.table.sort_keys[0]);
+    try std.testing.expectEqualStrings("ts", result.entry.table.sort_keys[1]);
 }
 
 test "parse: Decimal type maps to Float64 compatibility storage" {
@@ -694,6 +715,41 @@ test "parse: DEFAULT clause is skipped" {
     try std.testing.expectEqualStrings("UInt8", result.entry.table.columns[6].ch_type.?);
     try std.testing.expectEqualStrings("String", result.entry.table.columns[7].ch_type.?);
     try std.testing.expectEqualStrings("rule_id", result.entry.pk.?);
+    try std.testing.expectEqual(@as(usize, 1), result.entry.table.sort_keys.len);
+    try std.testing.expectEqualStrings("rule_id", result.entry.table.sort_keys[0]);
+}
+
+test "parse: ClickHouse metadata DDL with partition ttl settings and sort keys" {
+    const allocator = std.testing.allocator;
+    const sql =
+        \\CREATE TABLE vprobe.detect_events
+        \\(
+        \\    `event_type` LowCardinality(String),
+        \\    `ts` DateTime64(3),
+        \\    `src_ip` IPv6,
+        \\    `features` Map(String, Float64),
+        \\    `version` UInt64
+        \\)
+        \\ENGINE = ReplacingMergeTree(version)
+        \\PARTITION BY toYYYYMM(ts)
+        \\ORDER BY (event_type, ts)
+        \\TTL ts + INTERVAL 30 DAY
+        \\SETTINGS index_granularity = 8192
+    ;
+    var result = try parse(allocator, sql);
+    defer result.deinit();
+
+    try std.testing.expectEqualStrings("vprobe", result.entry.db);
+    try std.testing.expectEqualStrings("detect_events", result.entry.name);
+    try std.testing.expectEqual(@as(usize, 5), result.entry.table.columns.len);
+    try std.testing.expectEqualStrings("LowCardinality(String)", result.entry.table.columns[0].ch_type.?);
+    try std.testing.expectEqualStrings("DateTime64(3)", result.entry.table.columns[1].ch_type.?);
+    try std.testing.expectEqualStrings("IPv6", result.entry.table.columns[2].ch_type.?);
+    try std.testing.expectEqualStrings("Map(String, Float64)", result.entry.table.columns[3].ch_type.?);
+    try std.testing.expectEqualStrings("event_type", result.entry.pk.?);
+    try std.testing.expectEqual(@as(usize, 2), result.entry.table.sort_keys.len);
+    try std.testing.expectEqualStrings("event_type", result.entry.table.sort_keys[0]);
+    try std.testing.expectEqualStrings("ts", result.entry.table.sort_keys[1]);
 }
 
 test "parse: full scoring_rules with upper column" {

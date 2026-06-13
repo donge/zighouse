@@ -1,9 +1,10 @@
 /// Part scanner: enumerates ClickHouse MergeTree part directories under
 ///   <data_dir>/<db>/<table>/parts/
 ///
-/// Part naming convention: all_{min_seq}_{max_seq}_{level}
+/// Part naming convention: <partition>_{min_seq}_{max_seq}_{level}
 ///   - Fresh INSERT parts: all_N_N_0  (min==max, level==0)
 ///   - Merged parts:       all_3_7_1  (covers seq 3..7, merge level 1)
+///   - CH partitioned:     202406_3_7_1
 ///
 /// Sorting: by min_seq ascending (numeric, not lexicographic).
 /// Overlap filtering: if all_3_7_1 exists, constituent parts
@@ -27,20 +28,19 @@ pub const PartMeta = struct {
     full_path: []const u8,
 };
 
-/// Parse "all_{min}_{max}_{level}" → fields.  Returns null on mismatch.
+/// Parse "<partition>_{min}_{max}_{level}" → fields.  Returns null on mismatch.
 pub fn parseName(name: []const u8) ?struct { min_seq: u64, max_seq: u64, level: u32 } {
-    if (!std.mem.startsWith(u8, name, "all_")) return null;
-    var rest = name[4..]; // skip "all_"
+    const us3 = std.mem.lastIndexOfScalar(u8, name, '_') orelse return null;
+    const level = std.fmt.parseInt(u32, name[us3 + 1 ..], 10) catch return null;
+    const before_level = name[0..us3];
 
-    const us1 = std.mem.indexOfScalar(u8, rest, '_') orelse return null;
-    const min_seq = std.fmt.parseInt(u64, rest[0..us1], 10) catch return null;
-    rest = rest[us1 + 1 ..];
+    const us2 = std.mem.lastIndexOfScalar(u8, before_level, '_') orelse return null;
+    const max_seq = std.fmt.parseInt(u64, before_level[us2 + 1 ..], 10) catch return null;
+    const before_max = before_level[0..us2];
 
-    const us2 = std.mem.indexOfScalar(u8, rest, '_') orelse return null;
-    const max_seq = std.fmt.parseInt(u64, rest[0..us2], 10) catch return null;
-    rest = rest[us2 + 1 ..];
-
-    const level = std.fmt.parseInt(u32, rest, 10) catch return null;
+    const us1 = std.mem.lastIndexOfScalar(u8, before_max, '_') orelse return null;
+    if (us1 == 0) return null;
+    const min_seq = std.fmt.parseInt(u64, before_max[us1 + 1 ..], 10) catch return null;
     return .{ .min_seq = min_seq, .max_seq = max_seq, .level = level };
 }
 
@@ -72,7 +72,7 @@ pub const PartList = struct {
 };
 
 /// Scan <data_dir>/<db>/<table>/parts/ and return all valid part directories.
-/// - Ignores entries not matching "all_{min}_{max}_{level}" or starting with "tmp_".
+/// - Ignores entries not matching "<partition>_{min}_{max}_{level}" or starting with "tmp_".
 /// - Sorts by min_seq ascending (numeric); ties broken by level descending.
 /// - Filters out parts whose [min,max] range is fully covered by a
 ///   higher-level merged part.
@@ -184,10 +184,21 @@ test "parseName: basic cases" {
     try t.expectEqual(@as(u64, 7), r2.max_seq);
     try t.expectEqual(@as(u32, 1), r2.level);
 
+    const r3 = parseName("202406_3_7_1").?;
+    try t.expectEqual(@as(u64, 3), r3.min_seq);
+    try t.expectEqual(@as(u64, 7), r3.max_seq);
+    try t.expectEqual(@as(u32, 1), r3.level);
+
+    const r4 = parseName("tuple_hash_10_20_3").?;
+    try t.expectEqual(@as(u64, 10), r4.min_seq);
+    try t.expectEqual(@as(u64, 20), r4.max_seq);
+    try t.expectEqual(@as(u32, 3), r4.level);
+
     try t.expect(parseName("tmp_abc")  == null);
     try t.expect(parseName("all_")     == null);
     try t.expect(parseName("other")    == null);
     try t.expect(parseName("all_1_1")  == null); // missing level
+    try t.expect(parseName("_1_1_0")   == null); // missing partition prefix
 }
 
 test "scan: empty when parts dir missing" {

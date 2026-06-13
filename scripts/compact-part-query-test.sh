@@ -183,6 +183,33 @@ if [[ "$union_json" != *'"rows":2'* || "$union_json" != *'"id":1'* || "$union_js
 fi
 echo "PASS union all json"
 
+mkdir -p "$DATA_DIR/metadata/default" "$DATA_DIR/default/meta_events/parts"
+cat > "$DATA_DIR/metadata/default/meta_events.sql" <<'SQL'
+CREATE TABLE default.meta_events
+(
+    `id` Int32,
+    `user_id` Int64,
+    `category` String,
+    `score` Int32
+)
+ENGINE = MergeTree
+ORDER BY (id, user_id)
+SETTINGS index_granularity = 8192
+SQL
+first_part="$(find "$DATA_DIR/default/compact_events/parts" -mindepth 1 -maxdepth 1 -type d | sort | head -n 1)"
+cp -R "$first_part" "$DATA_DIR/default/meta_events/parts/"
+if [[ -f "$DATA_DIR/default/meta_events/schema.json" ]]; then
+    echo "FAIL metadata-only table unexpectedly has schema.json"
+    exit 1
+fi
+kill "$SERVER_PID" 2>/dev/null || true
+wait "$SERVER_PID" 2>/dev/null || true
+"$BINARY" serve "--data-dir=$DATA_DIR" "--port=$PORT" &>/tmp/zh-compact-query-server.log &
+SERVER_PID=$!
+wait_for_server
+expect_eq "metadata sql schema count" "3" "$(select_tsv "SELECT count(*) FROM default.meta_events")"
+expect_eq "metadata sql schema sort key filter" "2" "$(select_tsv "SELECT id FROM default.meta_events WHERE id = 2")"
+
 python3 - <<'PY' > /tmp/zh_compact_wnat.bin
 import struct, sys
 

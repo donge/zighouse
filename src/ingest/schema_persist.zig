@@ -22,6 +22,19 @@
 const std = @import("std");
 const schema = @import("schema");
 const schema_config = @import("schema_config");
+const ddl_parser = @import("ddl_parser");
+
+const LoadedKey = struct {
+    db: []const u8,
+    table: []const u8,
+};
+
+fn hasLoaded(keys: []const LoadedKey, db: []const u8, table: []const u8) bool {
+    for (keys) |k| {
+        if (std.mem.eql(u8, k.db, db) and std.mem.eql(u8, k.table, table)) return true;
+    }
+    return false;
+}
 
 // ── Shared serialiser ─────────────────────────────────────────────────────────
 
@@ -144,9 +157,15 @@ pub fn loadAll(
 ) !schema_config.SchemaConfig {
     // Collect all JSON fragments.
     var fragments: std.ArrayList([]const u8) = .empty;
+    var loaded: std.ArrayList(LoadedKey) = .empty;
     defer {
         for (fragments.items) |f| allocator.free(f);
         fragments.deinit(allocator);
+        for (loaded.items) |k| {
+            allocator.free(k.db);
+            allocator.free(k.table);
+        }
+        loaded.deinit(allocator);
     }
 
     var data_dir_handle = std.Io.Dir.cwd().openDir(io, data_dir, .{ .iterate = true }) catch |err| switch (err) {
@@ -183,8 +202,14 @@ pub fn loadAll(
             const fragment = try allocator.dupe(u8, trimmed);
             allocator.free(json_bytes);
             try fragments.append(allocator, fragment);
+            try loaded.append(allocator, .{
+                .db = try allocator.dupe(u8, db),
+                .table = try allocator.dupe(u8, table_name),
+            });
         }
     }
+
+    try loadClickHouseMetadataSql(allocator, io, data_dir, &fragments, &loaded);
 
     if (fragments.items.len == 0) {
         return schema_config.loadFromSlice(allocator, "{\"tables\":[]}");
@@ -201,6 +226,59 @@ pub fn loadAll(
     try combined.appendSlice(allocator, "]}");
 
     return schema_config.loadFromSlice(allocator, combined.items);
+}
+
+fn loadClickHouseMetadataSql(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    data_dir: []const u8,
+    fragments: *std.ArrayList([]const u8),
+    loaded: *std.ArrayList(LoadedKey),
+) !void {
+    const meta_root = try std.fmt.allocPrint(allocator, "{s}/metadata", .{data_dir});
+    defer allocator.free(meta_root);
+
+    var meta_dir = std.Io.Dir.cwd().openDir(io, meta_root, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir => return,
+        else => return err,
+    };
+    defer meta_dir.close(io);
+
+    var db_iter = meta_dir.iterate();
+    while (try db_iter.next(io)) |db_entry| {
+        if (db_entry.kind != .directory) continue;
+        const db = db_entry.name;
+        const db_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ meta_root, db });
+        defer allocator.free(db_path);
+
+        var db_dir = std.Io.Dir.cwd().openDir(io, db_path, .{ .iterate = true }) catch continue;
+        defer db_dir.close(io);
+
+        var table_iter = db_dir.iterate();
+        while (try table_iter.next(io)) |sql_entry| {
+            if (sql_entry.kind != .file) continue;
+            if (!std.mem.endsWith(u8, sql_entry.name, ".sql")) continue;
+            const table_name = sql_entry.name[0 .. sql_entry.name.len - ".sql".len];
+            if (hasLoaded(loaded.items, db, table_name)) continue;
+
+            const sql_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ db_path, sql_entry.name });
+            defer allocator.free(sql_path);
+            const sql = std.Io.Dir.cwd().readFileAlloc(io, sql_path, allocator, .limited(1024 * 1024)) catch continue;
+            defer allocator.free(sql);
+
+            var parsed = ddl_parser.parse(allocator, sql) catch continue;
+            defer parsed.deinit();
+
+            var buf: std.ArrayList(u8) = .empty;
+            defer buf.deinit(allocator);
+            try appendTableJson(&buf, allocator, db, &parsed.entry);
+            try fragments.append(allocator, try allocator.dupe(u8, std.mem.trim(u8, buf.items, " \t\r\n")));
+            try loaded.append(allocator, .{
+                .db = try allocator.dupe(u8, db),
+                .table = try allocator.dupe(u8, table_name),
+            });
+        }
+    }
 }
 
 fn columnTypeName(ty: schema.ColumnType) []const u8 {
@@ -279,4 +357,73 @@ test "columnTypeName round-trips through schema_config" {
     try std.testing.expectEqual(schema.ColumnType.text, found.table.columns[5].ty);
 
     _ = entry; // suppress unused warning
+}
+
+test "loadAll: loads ClickHouse metadata sql after schema json" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const root = "/tmp/zig_test_schema_metadata_sql";
+    {
+        var cwd = std.Io.Dir.cwd();
+        cwd.deleteTree(io, root) catch {};
+    }
+    defer {
+        var cwd = std.Io.Dir.cwd();
+        cwd.deleteTree(io, root) catch {};
+    }
+
+    const json_dir = root ++ "/vprobe/json_first";
+    try std.Io.Dir.cwd().createDirPath(io, json_dir);
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = json_dir ++ "/schema.json",
+        .data =
+            \\{"db":"vprobe","name":"json_first","columns":[{"name":"id","type":"Int32"}],"sort_keys":["id"]}
+        ,
+    });
+
+    const meta_dir = root ++ "/metadata/vprobe";
+    try std.Io.Dir.cwd().createDirPath(io, meta_dir);
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = meta_dir ++ "/json_first.sql",
+        .data =
+            \\CREATE TABLE vprobe.json_first
+            \\(
+            \\  `id` UInt64,
+            \\  `ignored` String
+            \\)
+            \\ENGINE = MergeTree
+            \\ORDER BY (id)
+        ,
+    });
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = meta_dir ++ "/from_metadata.sql",
+        .data =
+            \\CREATE TABLE vprobe.from_metadata
+            \\(
+            \\  `event_type` LowCardinality(String),
+            \\  `ts` DateTime64(3),
+            \\  `features` Map(String, Float64)
+            \\)
+            \\ENGINE = ReplacingMergeTree(ts)
+            \\PARTITION BY toYYYYMM(ts)
+            \\ORDER BY (event_type, ts)
+            \\SETTINGS index_granularity = 8192
+        ,
+    });
+
+    var cfg = try loadAll(allocator, io, root);
+    defer cfg.deinit();
+
+    const json_first = cfg.find("vprobe", "json_first").?;
+    try std.testing.expectEqual(@as(usize, 1), json_first.table.columns.len);
+    try std.testing.expectEqual(schema.ColumnType.int32, json_first.table.columns[0].ty);
+
+    const meta = cfg.find("vprobe", "from_metadata").?;
+    try std.testing.expectEqual(@as(usize, 3), meta.table.columns.len);
+    try std.testing.expectEqualStrings("LowCardinality(String)", meta.table.columns[0].ch_type.?);
+    try std.testing.expectEqualStrings("DateTime64(3)", meta.table.columns[1].ch_type.?);
+    try std.testing.expectEqualStrings("Map(String, Float64)", meta.table.columns[2].ch_type.?);
+    try std.testing.expectEqual(@as(usize, 2), meta.table.sort_keys.len);
+    try std.testing.expectEqualStrings("event_type", meta.table.sort_keys[0]);
+    try std.testing.expectEqualStrings("ts", meta.table.sort_keys[1]);
 }
