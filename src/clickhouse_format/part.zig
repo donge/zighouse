@@ -1346,6 +1346,8 @@ pub const CompactOpenedPart = struct {
     n_granules: usize,
     /// Substream index for each column's first substream.
     col_substream_start: []usize,
+    /// Actual substream count per column (from columns_substreams.txt or schema).
+    col_substream_count: []usize,
 
     pub fn open(
         io: std.Io,
@@ -1369,15 +1371,20 @@ pub const CompactOpenedPart = struct {
         // Override with actual counts from columns_substreams.txt if present.
         const col_ss = try allocator.alloc(usize, n_cols);
         errdefer allocator.free(col_ss);
+        var col_substream_count = try allocator.alloc(usize, n_cols);
+        errdefer allocator.free(col_substream_count);
         var total_substreams: usize = 0;
         for (0..n_cols) |ci| {
             col_ss[ci] = total_substreams;
-            total_substreams += switch (table.columns[ci].ty) {
+            const n: usize = switch (table.columns[ci].ty) {
                 .text, .char, .low_card => 2,
                 else => 1,
             };
+            col_substream_count[ci] = n;
+            total_substreams += n;
         }
-        // Override with actual substream counts from columns_substreams.txt
+
+        // Override with actual counts from columns_substreams.txt if present.
         {
             const sub_path = std.fmt.allocPrint(allocator, "{s}/columns_substreams.txt", .{part_dir}) catch null;
             if (sub_path) |sp| {
@@ -1387,13 +1394,12 @@ pub const CompactOpenedPart = struct {
                     defer allocator.free(st);
                     total_substreams = 0;
                     var line_iter = std.mem.splitScalar(u8, st, '\n');
-                    // "columns substreams version: 1"
-                    _ = line_iter.next();
-                    // "<N> columns:"
-                    _ = line_iter.next();
+                    _ = line_iter.next(); // version line
+                    _ = line_iter.next(); // N columns line
                     for (0..n_cols) |ci| {
                         const line = line_iter.next() orelse break;
                         const N = std.fmt.parseInt(usize, std.mem.trim(u8, line[0..std.mem.indexOfScalar(u8, line, ' ') orelse line.len], " \t"), 10) catch 2;
+                        col_substream_count[ci] = N;
                         col_ss[ci] = total_substreams;
                         total_substreams += N;
                         for (0..N) |_| _ = line_iter.next() orelse break;
@@ -1401,28 +1407,16 @@ pub const CompactOpenedPart = struct {
                 }
             }
         }
-        // Adjust column starts to skip substreams we don't handle:
-        // LowCardinality: Skip dict_prefix if 3 substreams.
-        // Sparse columns: Skip sparse.idx if > expected.
-        {
-            var col_counts: [256]usize = undefined;
-            for (0..n_cols) |ci| {
-                const next = if (ci + 1 < n_cols) col_ss[ci + 1] else total_substreams;
-                col_counts[ci] = next - col_ss[ci];
-            }
-            // Expected substreams per type
-            var expected: [256]usize = undefined;
-            for (0..n_cols) |ci| {
-                expected[ci] = switch (table.columns[ci].ty) {
-                    .text, .char, .low_card => 2,
-                    else => 1,
-                };
-            }
-            // For CH 26.x: actual > expected → skip first (dict_prefix or sparse.idx)
-            for (0..n_cols) |ci| {
-                if (col_counts[ci] > expected[ci]) {
-                    col_ss[ci] += col_counts[ci] - expected[ci];
-                }
+
+        // Adjust column starts to skip extra substreams (sparse.idx, etc.).
+        // Do NOT skip dict_prefix for LC — the reader handles 3-stream format.
+        for (0..n_cols) |ci| {
+            const expected: usize = switch (table.columns[ci].ty) {
+                .text, .char, .low_card => 2,
+                else => 1,
+            };
+            if (col_substream_count[ci] > expected and table.columns[ci].ty != .low_card) {
+                col_ss[ci] += col_substream_count[ci] - expected;
             }
         }
 
@@ -1452,12 +1446,14 @@ pub const CompactOpenedPart = struct {
             .n_substreams = total_substreams,
             .n_granules = n_gran,
             .col_substream_start = col_ss,
+            .col_substream_count = col_substream_count,
         };
     }
 
     pub fn deinit(self: *CompactOpenedPart) void {
         self.mark_table.deinit(self.allocator);
         self.allocator.free(self.col_substream_start);
+        self.allocator.free(self.col_substream_count);
     }
 
     fn blockRange(self: *CompactOpenedPart, mark_idx: usize) !struct { u64, u64 } {
@@ -1565,18 +1561,56 @@ pub const CompactOpenedPart = struct {
                     try data_buf.appendSlice(self.allocator, combined[sizes_bytes..]);
                 },
                 .low_card => {
-                    // LC: 2 substream blocks per granule.
-                    // block at ss_start   = dict (full dict only in granule 0)
-                    // block at ss_start+1 = index for this granule
-                    // Accumulate dict from granule 0, and all index payloads.
-                    if (g == 0) {
-                        const dict = try self.readBlockAt(bin_file, block_idx);
-                        defer self.allocator.free(dict);
-                        try data_buf.appendSlice(self.allocator, dict);
+                    // LC: 3 substreams per granule in CH 26.x (dict_prefix + dict + index),
+                    // or 2 substreams in old format (dict + index).
+                    const ss_n = self.col_substream_count[col_idx];
+                    if (ss_n == 3) {
+                        // CH 26.x 3-substream LC: dict_prefix (granule 0), dict+index per granule.
+                        // dict_prefix is the base dictionary (version + num_keys + keys).
+                        if (g == 0) {
+                            // Read dict_prefix as the initial dictionary blob
+                            const dict_prefix = try self.readBlockAt(bin_file, block_idx);
+                            defer self.allocator.free(dict_prefix);
+                            try data_buf.appendSlice(self.allocator, dict_prefix);
+                        }
+                        // dict block: skip (dict updates are included in index_addl_keys)
+                        // index block: IndexesSerializationType + optional addl keys + num_rows + index data
+                        const index_raw = try self.readBlockAt(bin_file, block_idx + 2);
+                        defer self.allocator.free(index_raw);
+                        var ip: usize = 0;
+                        if (ip + 8 > index_raw.len) return error.InvalidIndexStream;
+                        const flags = std.mem.readInt(u64, index_raw[ip..][0..8], .little); ip += 8;
+                        if ((flags & 0x200) != 0) {
+                            // HasAdditionalKeys → read into dict
+                            if (ip + 8 > index_raw.len) return error.InvalidIndexStream;
+                            const num_keys = std.mem.readInt(u64, index_raw[ip..][0..8], .little); ip += 8;
+                            if (ip + num_keys * 8 > index_raw.len) return error.InvalidIndexStream;
+                            // Build old-format dict block: version(1) + num_keys + key data
+                            try data_buf.ensureUnusedCapacity(self.allocator, 16 + num_keys * 8);
+                            data_buf.appendSliceAssumeCapacity(&[_]u8{1,0,0,0,0,0,0,0}); // version=1
+                            var num_bytes: [8]u8 = undefined;
+                            std.mem.writeInt(u64, &num_bytes, num_keys, .little);
+                            data_buf.appendSliceAssumeCapacity(&num_bytes);
+                            // Copy key data
+                            try data_buf.appendSlice(self.allocator, index_raw[ip..ip + num_keys * 8]);
+                            ip += num_keys * 8;
+                        }
+                        // Read num_rows and skip it (index data follows)
+                        if (ip + 8 > index_raw.len) return error.InvalidIndexStream;
+                        _ = std.mem.readInt(u64, index_raw[ip..][0..8], .little); ip += 8;
+                        // The rest is index data (appended to size_buf)
+                        try size_buf.appendSlice(self.allocator, index_raw[ip..]);
+                    } else {
+                        // Old 2-substream format
+                        if (g == 0) {
+                            const dict = try self.readBlockAt(bin_file, block_idx);
+                            defer self.allocator.free(dict);
+                            try data_buf.appendSlice(self.allocator, dict);
+                        }
+                        const index = try self.readBlockAt(bin_file, block_idx + 1);
+                        defer self.allocator.free(index);
+                        try size_buf.appendSlice(self.allocator, index);
                     }
-                    const index = try self.readBlockAt(bin_file, block_idx + 1);
-                    defer self.allocator.free(index);
-                    try size_buf.appendSlice(self.allocator, index);
                 },
                 else => {
                     const data = try self.readBlockAt(bin_file, block_idx);
