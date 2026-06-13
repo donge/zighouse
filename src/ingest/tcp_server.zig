@@ -315,7 +315,21 @@ fn skipBlockInfo(rd: TcpReader) !void {
 
 // ── Wire type classification ─────────────────────────────────────────────────
 
-const WireKind = enum { string, fixed1, fixed2, fixed4, fixed8, low_card, array_str, array_lc_str, array_fixed1, array_fixed4, array_fixed8 };
+const WireKind = enum {
+    string,
+    fixed1,
+    fixed2,
+    fixed4,
+    fixed8,
+    fixed_blob4,
+    fixed_blob16,
+    low_card,
+    array_str,
+    array_lc_str,
+    array_fixed1,
+    array_fixed4,
+    array_fixed8,
+};
 
 fn wireKind(ch_type: []const u8) WireKind {
     // SimpleAggregateFunction(func, InnerType) → unwrap to InnerType
@@ -340,10 +354,14 @@ fn wireKind(ch_type: []const u8) WireKind {
         return wireKind(inner_type);
     }
     if (std.ascii.eqlIgnoreCase(ch_type, "Int8") or std.ascii.eqlIgnoreCase(ch_type, "UInt8")) return .fixed1;
+    if (std.ascii.eqlIgnoreCase(ch_type, "Bool") or std.ascii.eqlIgnoreCase(ch_type, "Boolean")) return .fixed1;
     if (std.ascii.eqlIgnoreCase(ch_type, "Int16") or std.ascii.eqlIgnoreCase(ch_type, "UInt16")) return .fixed2;
     if (std.ascii.eqlIgnoreCase(ch_type, "Int32") or std.ascii.eqlIgnoreCase(ch_type, "UInt32") or
         std.ascii.eqlIgnoreCase(ch_type, "Float32")) return .fixed4;
     if (std.ascii.eqlIgnoreCase(ch_type, "Date")) return .fixed2;
+    if (std.ascii.eqlIgnoreCase(ch_type, "Date32")) return .fixed4;
+    if (std.ascii.eqlIgnoreCase(ch_type, "IPv4")) return .fixed_blob4;
+    if (std.ascii.eqlIgnoreCase(ch_type, "IPv6") or std.ascii.eqlIgnoreCase(ch_type, "UUID")) return .fixed_blob16;
     if (std.ascii.eqlIgnoreCase(ch_type, "Int64") or std.ascii.eqlIgnoreCase(ch_type, "UInt64") or
         std.ascii.eqlIgnoreCase(ch_type, "Float64")) return .fixed8;
     if (std.ascii.startsWithIgnoreCase(ch_type, "DateTime64")) return .fixed8;
@@ -620,6 +638,16 @@ fn readClientDataBlock(
                 .fixed8 => {
                     const v = try rd.readInt(i64, .little);
                     if (col_bufs) |bs| if (buf_idx) |idx| try bs[idx].fixed_vals.append(a, v);
+                },
+                .fixed_blob4, .fixed_blob16 => {
+                    const width: usize = if (kind == .fixed_blob4) 4 else 16;
+                    var tmp: [16]u8 = undefined;
+                    try rd.readNoEof(tmp[0..width]);
+                    if (col_bufs) |bs| if (buf_idx) |idx| {
+                        const offset = bs[idx].str_bytes.items.len;
+                        try bs[idx].str_bytes.appendSlice(a, tmp[0..width]);
+                        try bs[idx].str_vals.append(a, bs[idx].str_bytes.items[offset .. offset + width]);
+                    };
                 },
                 .string => {
                     const s = try rd.readString(a);
