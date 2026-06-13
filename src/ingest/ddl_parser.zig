@@ -21,6 +21,7 @@
 const std = @import("std");
 const schema = @import("schema");
 const schema_config = @import("schema_config");
+const type_mapping = @import("type_mapping");
 
 pub const ParseResult = struct {
     entry: schema_config.TableEntry,
@@ -352,52 +353,11 @@ pub fn parse(allocator: std.mem.Allocator, sql: []const u8) !ParseResult {
 // ── Type mapping ──────────────────────────────────────────────────────────────
 
 pub fn parseColumnTypePublic(s: []const u8) ?schema.ColumnType {
-    return parseColumnType(s);
+    return type_mapping.parseType(s, .ddl);
 }
 
 fn parseColumnType(s: []const u8) ?schema.ColumnType {
-    if (std.ascii.eqlIgnoreCase(s, "Int8"))  return .int8;
-    if (std.ascii.eqlIgnoreCase(s, "Int16")) return .int16;
-    if (std.ascii.eqlIgnoreCase(s, "Int32")) return .int32;
-    if (std.ascii.eqlIgnoreCase(s, "Int64")) return .int64;
-    if (std.ascii.eqlIgnoreCase(s, "UInt16")) return .int16;
-    if (std.ascii.eqlIgnoreCase(s, "UInt32")) return .int32;
-    if (std.ascii.eqlIgnoreCase(s, "UInt8"))  return .int8;
-    if (std.ascii.eqlIgnoreCase(s, "UInt64")) return .int64;
-    if (std.ascii.eqlIgnoreCase(s, "Date")) return .date;
-    if (std.ascii.eqlIgnoreCase(s, "Date32")) return .date;
-    if (std.ascii.eqlIgnoreCase(s, "DateTime")) return .timestamp;
-    if (std.ascii.eqlIgnoreCase(s, "DateTime64")) return .timestamp;
-    if (std.ascii.eqlIgnoreCase(s, "String")) return .text;
-    if (std.ascii.eqlIgnoreCase(s, "FixedString")) return .text;
-    if (std.ascii.eqlIgnoreCase(s, "IPv4")) return .text;
-    if (std.ascii.eqlIgnoreCase(s, "IPv6")) return .text;
-    if (std.ascii.eqlIgnoreCase(s, "Float32")) return .float32;
-    if (std.ascii.eqlIgnoreCase(s, "Float64")) return .float64;
-    // SQL standard type aliases
-    if (std.ascii.eqlIgnoreCase(s, "INT")) return .int32;
-    if (std.ascii.eqlIgnoreCase(s, "INTEGER")) return .int32;
-    if (std.ascii.eqlIgnoreCase(s, "SMALLINT")) return .int16;
-    if (std.ascii.eqlIgnoreCase(s, "BIGINT")) return .int64;
-    if (std.ascii.eqlIgnoreCase(s, "TINYINT")) return .int8;
-    if (std.ascii.eqlIgnoreCase(s, "BOOLEAN")) return .int8;
-    if (std.ascii.eqlIgnoreCase(s, "FLOAT")) return .float32;
-    if (std.ascii.eqlIgnoreCase(s, "REAL")) return .float32;
-    if (std.ascii.eqlIgnoreCase(s, "DOUBLE")) return .float64;
-    if (std.ascii.eqlIgnoreCase(s, "DECIMAL")) return .float64;
-    if (std.ascii.eqlIgnoreCase(s, "NUMERIC")) return .float64;
-    if (std.ascii.eqlIgnoreCase(s, "DEC")) return .float64;
-    if (std.ascii.eqlIgnoreCase(s, "VARCHAR")) return .text;
-    if (std.ascii.eqlIgnoreCase(s, "CHAR")) return .text;
-    if (std.ascii.eqlIgnoreCase(s, "CHARACTER")) return .text;
-    if (std.ascii.eqlIgnoreCase(s, "TEXT")) return .text;
-    if (std.ascii.eqlIgnoreCase(s, "BLOB")) return .text;
-    if (std.ascii.eqlIgnoreCase(s, "CLOB")) return .text;
-    if (std.ascii.eqlIgnoreCase(s, "NAME")) return .text;
-    if (std.ascii.eqlIgnoreCase(s, "TIME")) return .timestamp;
-    if (std.ascii.eqlIgnoreCase(s, "TIMESTAMP")) return .timestamp;
-    if (std.ascii.eqlIgnoreCase(s, "NCHAR")) return .text;
-    return null;
+    return type_mapping.parseType(s, .ddl);
 }
 
 // ── Tokenizer ─────────────────────────────────────────────────────────────────

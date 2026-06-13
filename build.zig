@@ -517,12 +517,22 @@ pub fn build(b: *std.Build) void {
     unit_tests.root_module.addImport("generic_store", generic_store_mod);
 
     // ── ingest module tests ─────────────────────────────────────────────────
+    const type_mapping_mod = b.createModule(.{
+        .root_source_file = b.path("src/ingest/type_mapping.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    type_mapping_mod.addImport("schema", schema_mod);
+    const type_mapping_tests = b.addTest(.{ .root_module = type_mapping_mod });
+    const type_mapping_test_cmd = b.addRunArtifact(type_mapping_tests);
+
     const row_binary_decoder_mod = b.createModule(.{
         .root_source_file = b.path("src/ingest/row_binary_decoder.zig"),
         .target = target,
         .optimize = optimize,
     });
     row_binary_decoder_mod.addImport("schema", schema_mod);
+    row_binary_decoder_mod.addImport("type_mapping", type_mapping_mod);
     const row_binary_decoder_tests = b.addTest(.{ .root_module = row_binary_decoder_mod });
     const row_binary_decoder_test_cmd = b.addRunArtifact(row_binary_decoder_tests);
 
@@ -532,6 +542,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     schema_config_mod.addImport("schema", schema_mod);
+    schema_config_mod.addImport("type_mapping", type_mapping_mod);
     const schema_config_tests = b.addTest(.{ .root_module = schema_config_mod });
     const schema_config_test_cmd = b.addRunArtifact(schema_config_tests);
 
@@ -594,6 +605,7 @@ pub fn build(b: *std.Build) void {
     });
     ddl_parser_mod.addImport("schema", schema_mod);
     ddl_parser_mod.addImport("schema_config", schema_config_mod);
+    ddl_parser_mod.addImport("type_mapping", type_mapping_mod);
     tcp_server_mod.addImport("ddl_parser", ddl_parser_mod);
     const ddl_parser_tests = b.addTest(.{ .root_module = ddl_parser_mod });
     const ddl_parser_test_cmd = b.addRunArtifact(ddl_parser_tests);
@@ -790,6 +802,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&ch_checksums_test_cmd.step);
     test_step.dependOn(&ch_string_codec_test_cmd.step);
     test_step.dependOn(&ch_part_test_cmd.step);
+    test_step.dependOn(&type_mapping_test_cmd.step);
     test_step.dependOn(&generic_store_bridge_test_cmd.step);
     test_step.dependOn(&part_scan_bridge_test_cmd.step);
     test_step.dependOn(&row_binary_decoder_test_cmd.step);

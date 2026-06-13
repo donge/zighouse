@@ -31,6 +31,7 @@
 ///   String   -> .text
 const std = @import("std");
 const schema = @import("schema");
+const type_mapping = @import("type_mapping");
 
 pub const TableEntry = struct {
     db: []const u8,
@@ -224,11 +225,10 @@ pub fn loadFromSlice(allocator: std.mem.Allocator, json_bytes: []const u8) !Sche
                 else => return error.ColumnTypeNotString,
             };
 
-            const ty = parseColumnType(col_type_str) orelse return error.UnknownColumnType;
+            const ty = type_mapping.parseType(col_type_str, .schema_config) orelse return error.UnknownColumnType;
             const lc_inner: schema.ColumnType = if (ty == .low_card) blk: {
-                // Extract inner type from "LowCardinality(<inner>)"
-                const inner_str = col_type_str["LowCardinality(".len .. col_type_str.len - 1];
-                break :blk parseColumnType(inner_str) orelse .text;
+                const inner_str = type_mapping.innerType(col_type_str) orelse break :blk .text;
+                break :blk type_mapping.parseType(inner_str, .schema_config) orelse .text;
             } else .text;
             col.* = .{ .name = col_name, .ty = ty, .low_card_inner = lc_inner, .ch_type = col_type_str };
         }
@@ -247,95 +247,6 @@ pub fn loadFromSlice(allocator: std.mem.Allocator, json_bytes: []const u8) !Sche
         .arena = arena,
         .dynamic_tables = .empty,
     };
-}
-
-fn parseColumnType(s: []const u8) ?schema.ColumnType {
-    if (asciiEql(s, "Int8")) return .int8;
-    if (asciiEql(s, "Int16")) return .int16;
-    if (asciiEql(s, "Int32")) return .int32;
-    if (asciiEql(s, "Int64")) return .int64;
-    if (asciiEql(s, "UInt8")) return .int8;
-    if (asciiEql(s, "UInt16")) return .int16;
-    if (asciiEql(s, "UInt32")) return .int32;
-    if (asciiEql(s, "UInt64")) return .int64;
-    if (asciiEql(s, "Date")) return .date;
-    if (asciiEql(s, "Date32")) return .date;
-    if (asciiEql(s, "DateTime")) return .timestamp;
-    if (std.ascii.startsWithIgnoreCase(s, "DateTime(")) return .timestamp;
-    if (asciiEql(s, "String")) return .text;
-    if (asciiEql(s, "FixedString")) return .text;
-    if (asciiEql(s, "Float32")) return .float32;
-    if (asciiEql(s, "Float64")) return .float64;
-
-    if (asciiEql(s, "INT") or asciiEql(s, "INTEGER")) return .int32;
-    if (asciiEql(s, "SMALLINT")) return .int16;
-    if (asciiEql(s, "BIGINT")) return .int64;
-    if (asciiEql(s, "TINYINT") or asciiEql(s, "BOOL") or asciiEql(s, "BOOLEAN")) return .int8;
-    if (asciiEql(s, "FLOAT") or asciiEql(s, "REAL")) return .float32;
-    if (asciiEql(s, "DOUBLE") or asciiEql(s, "DECIMAL") or asciiEql(s, "NUMERIC") or asciiEql(s, "DEC")) return .float64;
-    if (asciiEql(s, "VARCHAR") or asciiEql(s, "CHAR") or asciiEql(s, "CHARACTER") or asciiEql(s, "TEXT")) return .text;
-    if (asciiEql(s, "TIME") or asciiEql(s, "TIMESTAMP")) return .timestamp;
-
-    // Extended CH types: map to closest base type (ch_type preserved for wire encoding).
-    if (std.ascii.startsWithIgnoreCase(s, "LowCardinality(")) return .low_card;
-    if (std.ascii.startsWithIgnoreCase(s, "DateTime64(")) return .timestamp;
-    if (asciiEql(s, "IPv4")) return .text;
-    if (asciiEql(s, "IPv6")) return .text;
-    if (std.ascii.startsWithIgnoreCase(s, "Array(")) return .text;
-    if (std.ascii.startsWithIgnoreCase(s, "Map(")) return .text;
-    if (std.ascii.startsWithIgnoreCase(s, "Nullable(")) {
-        const inner = extractInnerType(s) orelse return null;
-        return parseColumnType(inner);
-    }
-    if (std.ascii.startsWithIgnoreCase(s, "FixedString(")) return .text;
-    if (asciiEql(s, "UUID")) return .text;
-    if (asciiEql(s, "Bool")) return .int8;
-    if (std.ascii.startsWithIgnoreCase(s, "Enum8(")) return .text;
-    if (std.ascii.startsWithIgnoreCase(s, "Enum16(")) return .text;
-    if (std.ascii.startsWithIgnoreCase(s, "Decimal(")) return .float64;
-    if (std.ascii.startsWithIgnoreCase(s, "Decimal32(")) return .float64;
-    if (std.ascii.startsWithIgnoreCase(s, "Decimal64(")) return .float64;
-    if (std.ascii.startsWithIgnoreCase(s, "Decimal128(")) return .float64;
-    if (std.ascii.startsWithIgnoreCase(s, "Tuple(")) return .text;
-    if (std.ascii.startsWithIgnoreCase(s, "SimpleAggregateFunction(")) {
-        // Unwrap to inner type (second argument after the first comma at top level)
-        const body = s["SimpleAggregateFunction(".len .. s.len - 1];
-        var depth: usize = 0;
-        var i: usize = 0;
-        while (i < body.len) : (i += 1) {
-            if (body[i] == '(') {
-                depth += 1;
-                continue;
-            }
-            if (body[i] == ')') {
-                if (depth > 0) depth -= 1;
-                continue;
-            }
-            if (body[i] == ',' and depth == 0) {
-                const inner = std.mem.trim(u8, body[i + 1 ..], " \t");
-                return parseColumnType(inner);
-            }
-        }
-        return .text;
-    }
-    if (std.ascii.startsWithIgnoreCase(s, "AggregateFunction(")) return .text;
-    return null;
-}
-
-fn extractInnerType(s: []const u8) ?[]const u8 {
-    const open = std.mem.indexOfScalar(u8, s, '(') orelse return null;
-    if (s.len <= open + 1 or s[s.len - 1] != ')') return null;
-    return std.mem.trim(u8, s[open + 1 .. s.len - 1], " \t\r\n");
-}
-
-fn asciiEql(a: []const u8, b: []const u8) bool {
-    if (a.len != b.len) return false;
-    for (a, b) |ca, cb| {
-        const la = if (ca >= 'A' and ca <= 'Z') ca + 32 else ca;
-        const lb = if (cb >= 'A' and cb <= 'Z') cb + 32 else cb;
-        if (la != lb) return false;
-    }
-    return true;
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

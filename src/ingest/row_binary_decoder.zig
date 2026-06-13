@@ -26,6 +26,7 @@
 
 const std = @import("std");
 const schema = @import("schema");
+const type_mapping = @import("type_mapping");
 
 pub const MAX_STRING_LEN: usize = 128 * 1024 * 1024;
 
@@ -665,80 +666,7 @@ pub fn decodeNativeBlock(allocator: std.mem.Allocator, data: []const u8) !WithHe
 /// Map a ClickHouse type string to our schema.ColumnType.
 /// Handles Nullable(T) and LowCardinality(T) wrappers.
 fn parseChType(s: []const u8) ?schema.ColumnType {
-    if (chTypeStartsWith(s, "SimpleAggregateFunction(")) {
-        const inner = simpleAggregateInnerType(s) orelse return .text;
-        return parseChType(inner);
-    }
-    if (chTypeStartsWith(s, "AggregateFunction(")) return .text;
-    if (chTypeEql(s, "Int8")) return .int8;
-    if (chTypeEql(s, "Int16")) return .int16;
-    if (chTypeEql(s, "Int32")) return .int32;
-    if (chTypeEql(s, "Int64")) return .int64;
-    if (chTypeEql(s, "UInt8"))  return .int8;
-    if (chTypeEql(s, "UInt16")) return .int16;
-    if (chTypeEql(s, "UInt32")) return .int32;
-    if (chTypeEql(s, "UInt64")) return .int64;
-    if (chTypeEql(s, "Date")) return .date;
-    if (chTypeEql(s, "Date32")) return .date;
-    // DateTime is 4-byte UInt32 (seconds since epoch) on the wire — map to int32.
-    // DateTime64(*) is 8-byte Int64 — map to timestamp (handled below via startsWith).
-    if (chTypeEql(s, "DateTime")) return .int32;
-    if (chTypeEql(s, "String")) return .text;
-    if (chTypeEql(s, "FixedString")) return .text;
-    if (chTypeEql(s, "IPv4")) return .text;
-    if (chTypeEql(s, "IPv6")) return .text;
-    if (chTypeEql(s, "UUID")) return .text;
-    if (chTypeEql(s, "Float32")) return .float32;
-    if (chTypeEql(s, "Float64")) return .float64;
-    if (chTypeEql(s, "Bool") or chTypeEql(s, "Boolean")) return .int8;
-    // Nullable(T) / LowCardinality(T)
-    if (chTypeStartsWith(s, "Nullable(") or chTypeStartsWith(s, "LowCardinality(")) {
-        const inner = extractInner(s);
-        return parseChType(inner);
-    }
-    // Array(...) / Map(...) → text blob
-    if (chTypeStartsWith(s, "Array(") or chTypeStartsWith(s, "Map(")) return .text;
-    // DateTime64(precision) / DateTime64(precision, tz)
-    if (chTypeStartsWith(s, "DateTime64")) return .timestamp;
-    // FixedString(N)
-    if (chTypeStartsWith(s, "FixedString(")) return .text;
-    // Decimal(P, S) — map based on precision to match CH wire size.
-    // Decimal32 (P≤9): 4 bytes → float32; Decimal64 (P≤18): 8 bytes → float64;
-    // Decimal128/256: 16/32 bytes — fall through to text (raw bytes).
-    if (chTypeStartsWith(s, "Decimal")) {
-        // Explicit aliases
-        if (chTypeStartsWith(s, "Decimal32")) return .float32;
-        if (chTypeStartsWith(s, "Decimal64")) return .float64;
-        if (chTypeStartsWith(s, "Decimal128") or chTypeStartsWith(s, "Decimal256")) return .text;
-        // Decimal(P, S) — extract precision
-        const inner = extractInner(s);
-        const comma = std.mem.indexOfScalar(u8, inner, ',') orelse inner.len;
-        const p_str = std.mem.trim(u8, inner[0..comma], " ");
-        const p = std.fmt.parseInt(u32, p_str, 10) catch 19;
-        if (p <= 9) return .float32;
-        if (p <= 18) return .float64;
-        return .text; // Decimal128/256: store raw bytes as text
-    }
-    // Enum8 / Enum16 — store as the underlying integer type.
-    if (chTypeStartsWith(s, "Enum8(") or chTypeEql(s, "Enum8")) return .int8;
-    if (chTypeStartsWith(s, "Enum16(") or chTypeEql(s, "Enum16")) return .int16;
-    return null;
-}
-
-fn simpleAggregateInnerType(s: []const u8) ?[]const u8 {
-    const body = extractInner(s);
-    if (body.ptr == s.ptr) return null;
-    var depth: usize = 0;
-    for (body, 0..) |c, i| {
-        if (c == '(') {
-            depth += 1;
-        } else if (c == ')') {
-            if (depth > 0) depth -= 1;
-        } else if (c == ',' and depth == 0) {
-            return std.mem.trim(u8, body[i + 1 ..], " \t\r\n");
-        }
-    }
-    return null;
+    return type_mapping.parseType(s, .wire);
 }
 
 fn chTypeEql(a: []const u8, b: []const u8) bool {
