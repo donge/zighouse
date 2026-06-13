@@ -508,7 +508,7 @@ fn runCommand(init: std.process.Init, allocator: std.mem.Allocator, args: *std.p
         cfg.mat_views = mat_views;
         try compactor.run(allocator, init.io, cfg);
     } else if (std.mem.eql(u8, command, "--version") or std.mem.eql(u8, command, "-v")) {
-        try writeOut(init.io, "zighouse v1.0.0\n");
+        try writeOut(init.io, "zighouse v1.0.1\n");
     } else if (std.mem.eql(u8, command, "help") or std.mem.eql(u8, command, "--help") or std.mem.eql(u8, command, "-h")) {
         try printUsage(init.io);
     } else {
