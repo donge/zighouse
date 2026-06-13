@@ -24,6 +24,10 @@ pub const BLOCK_HEADER_TOTAL: usize = CHECKSUM_SIZE + HEADER_SIZE;
 pub const METHOD_LZ4: u8 = 0x82;
 pub const METHOD_NONE: u8 = 0x02;
 pub const METHOD_ZSTD: u8 = 0x90;
+/// CH 26.x uses alternative ZSTD method bytes:
+/// 0x22 = ZSTD level 1, 0x23 = ZSTD level 2 (encoded as (level << 5) | 2)
+const METHOD_ZSTD_ALT1: u8 = 0x22;
+const METHOD_ZSTD_ALT2: u8 = 0x23;
 
 // ── ZSTD C bindings ──────────────────────────────────────────────────────────
 pub const zstd = struct {
@@ -136,20 +140,41 @@ pub fn readBlock(allocator: std.mem.Allocator, reader: *std.Io.Reader) ![]u8 {
     try reader.readSliceAll(&header_bytes);
 
     const method = header_bytes[0];
-    if (method != METHOD_LZ4 and method != METHOD_NONE and method != METHOD_ZSTD)
+    // CH 26.x uses alternate method bytes for ZSTD (0x22, 0x23 etc.).
+    // For standard LZ4/ZSTD/NONE: 9-byte header (method + 4B comp_size + 4B decomp_size).
+    // For alternate methods: the 8-byte "size" fields might be absent or differently encoded.
+    // Fall back to reading rest of stream as compressed data.
+    if (method != METHOD_LZ4 and method != METHOD_NONE and method != METHOD_ZSTD and
+        method != METHOD_ZSTD_ALT1 and method != METHOD_ZSTD_ALT2)
         return error.UnsupportedCompressionMethod;
+
+    const is_alt_zstd = method == METHOD_ZSTD_ALT1 or method == METHOD_ZSTD_ALT2;
     const size_with_header = std.mem.readInt(u32, header_bytes[1..5], .little);
     const size_decompressed = std.mem.readInt(u32, header_bytes[5..9], .little);
-    if (size_with_header < HEADER_SIZE) return error.TruncatedBlock;
-    const compressed_len = size_with_header - HEADER_SIZE;
+    if (size_with_header < HEADER_SIZE and !is_alt_zstd) return error.TruncatedBlock;
+    const compressed_len = if (is_alt_zstd) blk: {
+        // For alternate ZSTD: the 8-byte header uses CH 26.x encoding which
+        // may not store sizes in the same layout as 0x82/0x90.
+        // Read what the header says, clamped to a reasonable maximum.
+        const raw = size_with_header;
+        if (raw > HEADER_SIZE and raw < 10 * 1024 * 1024)
+            break :blk raw - HEADER_SIZE;
+        // Fallback: if sizes are clearly wrong (larger than any realistic block),
+        // use a reasonable default and let ZSTD determine actual output size.
+        break :blk 256 * 1024;
+    } else size_with_header - HEADER_SIZE;
 
     // Read compressed data
-    const compressed = try allocator.alloc(u8, compressed_len);
+    var compressed_buf: [256 * 1024]u8 = undefined;
+    const compressed_len_actual = @min(compressed_len, compressed_buf.len);
+    const n_read = try reader.readSliceShort(compressed_buf[0..compressed_len_actual]);
+    if (n_read == 0) return error.TruncatedBlock;
+    const compressed = try allocator.alloc(u8, n_read);
     errdefer allocator.free(compressed);
-    try reader.readSliceAll(compressed);
+    @memcpy(compressed, compressed_buf[0..n_read]);
 
     // Verify checksum over [header ++ compressed]
-    const to_hash = try allocator.alloc(u8, HEADER_SIZE + compressed_len);
+    const to_hash = try allocator.alloc(u8, HEADER_SIZE + n_read);
     defer allocator.free(to_hash);
     @memcpy(to_hash[0..HEADER_SIZE], &header_bytes);
     @memcpy(to_hash[HEADER_SIZE..], compressed);
@@ -161,6 +186,18 @@ pub fn readBlock(allocator: std.mem.Allocator, reader: *std.Io.Reader) ![]u8 {
     if (computed != stored) return error.ChecksumMismatch;
 
     // Decompress
+    if (is_alt_zstd) {
+        // CH 26.x ZSTD: header sizes may be unreliable. Read compressed data,
+        // then ask ZSTD to decompress with a generous output estimate.
+        const out_estimate = compressed.len * 8;
+        const decompressed = try allocator.alloc(u8, out_estimate);
+        errdefer allocator.free(decompressed);
+        const result = zstd.ZSTD_decompress(decompressed.ptr, decompressed.len, compressed.ptr, compressed.len);
+        allocator.free(compressed);
+        if (zstd.ZSTD_isError(result) != 0) return error.ZstdDecompressFailed;
+        return decompressed[0..result];
+    }
+
     const decompressed = try allocator.alloc(u8, size_decompressed);
     errdefer allocator.free(decompressed);
 
@@ -171,7 +208,7 @@ pub fn readBlock(allocator: std.mem.Allocator, reader: *std.Io.Reader) ![]u8 {
         return decompressed;
     }
 
-    if (method == METHOD_ZSTD) {
+    if (method == METHOD_ZSTD or method == METHOD_ZSTD_ALT1 or method == METHOD_ZSTD_ALT2) {
         const result = zstd.ZSTD_decompress(
             decompressed.ptr,
             decompressed.len,

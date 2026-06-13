@@ -1398,18 +1398,30 @@ pub const CompactOpenedPart = struct {
                         total_substreams += N;
                         for (0..N) |_| _ = line_iter.next() orelse break;
                     }
-                    // CH 26.x writes 3 substreams for LowCardinality (dict_prefix + dict + index).
-                    // Our reader expects 2 (dict + index). Advance past dict_prefix.
-                    var col_counts: [256]usize = undefined;
-                    for (0..n_cols) |ci| {
-                        const next = if (ci + 1 < n_cols) col_ss[ci + 1] else total_substreams;
-                        col_counts[ci] = next - col_ss[ci];
-                    }
-                    for (0..n_cols) |ci| {
-                        if (table.columns[ci].ty == .low_card and col_counts[ci] == 3) {
-                            col_ss[ci] += 1;
-                        }
-                    }
+                }
+            }
+        }
+        // Adjust column starts to skip substreams we don't handle:
+        // LowCardinality: Skip dict_prefix if 3 substreams.
+        // Sparse columns: Skip sparse.idx if > expected.
+        {
+            var col_counts: [256]usize = undefined;
+            for (0..n_cols) |ci| {
+                const next = if (ci + 1 < n_cols) col_ss[ci + 1] else total_substreams;
+                col_counts[ci] = next - col_ss[ci];
+            }
+            // Expected substreams per type
+            var expected: [256]usize = undefined;
+            for (0..n_cols) |ci| {
+                expected[ci] = switch (table.columns[ci].ty) {
+                    .text, .char, .low_card => 2,
+                    else => 1,
+                };
+            }
+            // For CH 26.x: actual > expected → skip first (dict_prefix or sparse.idx)
+            for (0..n_cols) |ci| {
+                if (col_counts[ci] > expected[ci]) {
+                    col_ss[ci] += col_counts[ci] - expected[ci];
                 }
             }
         }
