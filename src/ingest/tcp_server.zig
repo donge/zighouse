@@ -129,8 +129,6 @@ fn wstr(buf: *std.ArrayListUnmanaged(u8), a: std.mem.Allocator, s: []const u8) !
 }
 
 fn writeBlockInfo(buf: *std.ArrayListUnmanaged(u8), a: std.mem.Allocator) !void {
-    try wuv(buf, a, 1); try buf.append(a, 0);
-    try wuv(buf, a, 2); try buf.appendSlice(a, &[4]u8{ 0xFF, 0xFF, 0xFF, 0xFF });
     try wuv(buf, a, 0);
 }
 
@@ -731,16 +729,10 @@ fn handleConn(ctx: *ServerCtx, stream: net.Stream) !void {
             CLIENT_QUERY => {
                 const sql = try readClientQuery(a, rd, used_revision);
                 defer a.free(sql);
-                // Consume trailing empty ClientData
-                const trailing = rd.readByte() catch 0xFF;
-                if (trailing == CLIENT_DATA) {
-                    _ = try readClientDataBlock(a, rd, null, null);
-                } else if (trailing != 0xFF) {
-                    // Unexpected byte — put it back by re-reading won't work,
-                    // log and continue (may cause stream desync)
-                    std.debug.print("tcp: WARNING unexpected trailing byte 0x{x:02}, stream may desync\n", .{trailing});
-                }
                 try dispatchQuery(ctx, a, w, sql, rd);
+            },
+            CLIENT_DATA => {
+                _ = try readClientDataBlock(a, rd, null, null);
             },
             CLIENT_CANCEL => break,
             else => {

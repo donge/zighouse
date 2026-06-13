@@ -38,10 +38,6 @@ fn putString(buf: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, s: []co
 }
 
 fn putBlockInfo(buf: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator) !void {
-    try putUVarInt(buf, alloc, 1);
-    try buf.append(alloc, 0);
-    try putUVarInt(buf, alloc, 2);
-    try buf.appendSlice(alloc, &[4]u8{ 0xFF, 0xFF, 0xFF, 0xFF });
     try putUVarInt(buf, alloc, 0);
 }
 
