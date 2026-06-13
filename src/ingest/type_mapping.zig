@@ -78,6 +78,27 @@ pub fn innerType(s: []const u8) ?[]const u8 {
     return std.mem.trim(u8, s[open + 1 .. s.len - 1], " \t\r\n");
 }
 
+pub fn wireFixedWidth(s: []const u8) ?usize {
+    if (starts(s, "SimpleAggregateFunction(")) {
+        return wireFixedWidth(simpleAggregateInnerType(s) orelse return null);
+    }
+    if (eq(s, "IPv4")) return 4;
+    if (eq(s, "IPv6") or eq(s, "UUID")) return 16;
+    if (eq(s, "UInt8") or eq(s, "Int8") or eq(s, "Bool") or eq(s, "Boolean")) return 1;
+    if (eq(s, "UInt16") or eq(s, "Int16") or eq(s, "Date")) return 2;
+    if (eq(s, "UInt32") or eq(s, "Int32") or eq(s, "Float32") or eq(s, "Date32") or
+        eq(s, "DateTime")) return 4;
+    if (eq(s, "UInt64") or eq(s, "Int64") or eq(s, "Float64") or starts(s, "DateTime64")) return 8;
+    if (starts(s, "Decimal32")) return 4;
+    if (starts(s, "Decimal64")) return 8;
+    if (starts(s, "Decimal128")) return 16;
+    if (starts(s, "Decimal256")) return 32;
+    if (starts(s, "FixedString(")) {
+        return std.fmt.parseInt(usize, innerType(s) orelse return null, 10) catch null;
+    }
+    return null;
+}
+
 fn simpleAggregateInnerType(s: []const u8) ?[]const u8 {
     const body = innerType(s) orelse return null;
     var depth: usize = 0;
@@ -115,4 +136,16 @@ test "type mapping handles wrappers and common aliases" {
     try std.testing.expectEqual(schema.ColumnType.int64, parseType("SimpleAggregateFunction(sum, UInt64)", .wire).?);
     try std.testing.expectEqual(schema.ColumnType.float32, parseType("Decimal32(9)", .wire).?);
     try std.testing.expectEqual(schema.ColumnType.float64, parseType("Decimal32(9)", .schema_config).?);
+}
+
+test "type mapping reports ClickHouse wire fixed widths" {
+    try std.testing.expectEqual(@as(?usize, 16), wireFixedWidth("UUID"));
+    try std.testing.expectEqual(@as(?usize, 4), wireFixedWidth("IPv4"));
+    try std.testing.expectEqual(@as(?usize, 16), wireFixedWidth("IPv6"));
+    try std.testing.expectEqual(@as(?usize, 1), wireFixedWidth("Bool"));
+    try std.testing.expectEqual(@as(?usize, 4), wireFixedWidth("DateTime"));
+    try std.testing.expectEqual(@as(?usize, 8), wireFixedWidth("DateTime64(3)"));
+    try std.testing.expectEqual(@as(?usize, 12), wireFixedWidth("FixedString(12)"));
+    try std.testing.expectEqual(@as(?usize, 8), wireFixedWidth("SimpleAggregateFunction(sum, UInt64)"));
+    try std.testing.expectEqual(@as(?usize, null), wireFixedWidth("String"));
 }

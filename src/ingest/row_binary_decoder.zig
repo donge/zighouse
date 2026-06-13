@@ -688,29 +688,7 @@ fn extractInner(s: []const u8) []const u8 {
 /// Used by consumeNativeTextRows to decide how to consume each row.
 /// Public alias used by server.zig for VALUES INSERT array encoding.
 pub fn chTypeFixedWidth(type_str: []const u8) ?usize {
-    return nativeTextFixedWidth(type_str);
-}
-
-fn nativeTextFixedWidth(type_str: []const u8) ?usize {
-    if (chTypeEql(type_str, "IPv4")) return 4;
-    if (chTypeEql(type_str, "IPv6")) return 16;
-    if (chTypeEql(type_str, "UUID")) return 16;
-    // Numeric fixed-width types (used as Map values, etc.)
-    if (chTypeEql(type_str, "UInt8")  or chTypeEql(type_str, "Int8") or
-        chTypeEql(type_str, "Bool") or chTypeEql(type_str, "Boolean")) return 1;
-    if (chTypeEql(type_str, "UInt16") or chTypeEql(type_str, "Int16")) return 2;
-    if (chTypeEql(type_str, "UInt32") or chTypeEql(type_str, "Int32")  or
-        chTypeEql(type_str, "Float32") or chTypeEql(type_str, "Date") or
-        chTypeEql(type_str, "Date32")) return 4;
-    if (chTypeEql(type_str, "UInt64") or chTypeEql(type_str, "Int64")  or
-        chTypeEql(type_str, "Float64") or chTypeEql(type_str, "DateTime") or
-        chTypeStartsWith(type_str, "DateTime64")) return 8;
-    if (chTypeStartsWith(type_str, "FixedString(")) {
-        // e.g. "FixedString(36)"
-        const inner = extractInner(type_str);
-        return std.fmt.parseInt(usize, inner, 10) catch null;
-    }
-    return null; // variable-length: String, Array(...), Map(...)
+    return type_mapping.wireFixedWidth(type_str);
 }
 
 /// Skip one Native-block value for a .text column, returning the raw bytes as a blob.
@@ -720,7 +698,7 @@ fn nativeTextFixedWidth(type_str: []const u8) ?usize {
 /// For Map(K,V): read varUInt(count) key+value pairs recursively.
 /// The raw bytes (including any length prefixes) are returned as a slice into `data`.
 fn measureNativeValue(type_str: []const u8, data: []const u8, pos: usize) !usize {
-    if (nativeTextFixedWidth(type_str)) |w| {
+    if (type_mapping.wireFixedWidth(type_str)) |w| {
         if (pos + w > data.len) return error.UnexpectedEndOfData;
         return w;
     }
