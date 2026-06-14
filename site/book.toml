@@ -8,6 +8,7 @@ language = "en"
 default-theme = "ayu"
 preferred-dark-theme = "coal"
 no-section-label = true
+site-url = "/zighouse/docs/"
 git-repository-url = "https://github.com/donge/zighouse"
 edit-url-template = "https://github.com/donge/zighouse/edit/main/site/src/{path}"
 additional-css = ["theme/custom.css"]

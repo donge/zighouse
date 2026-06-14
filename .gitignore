@@ -31,3 +31,7 @@ data/*.ddb
 # SQL conformance testing suite
 sqltest/
 clickhouse-test-results/
+
+# Site build artifacts
+site/book/
+donge.org/
