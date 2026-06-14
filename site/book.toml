@@ -1,0 +1,19 @@
+[book]
+title = "ZigHouse"
+authors = ["donge"]
+description = "A ClickHouse-compatible columnar OLAP engine in Zig"
+language = "en"
+
+[output.html]
+default-theme = "ayu"
+preferred-dark-theme = "coal"
+no-section-label = true
+git-repository-url = "https://github.com/donge/zighouse"
+edit-url-template = "https://github.com/donge/zighouse/edit/main/site/src/{path}"
+additional-css = ["theme/custom.css"]
+
+[output.html.playground]
+runnable = false
+
+[output.html.code]
+hidelines = { "=" = "hidden" }
