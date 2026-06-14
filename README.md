@@ -37,10 +37,13 @@ Zig SQL parser.
 
 ```sh
 # Import a Parquet file
-./zighouse import-parquet --format=generic hits.parquet ./store hits
+./zighouse import hits.parquet --table=hits
+
+# Start the HTTP server
+./zighouse serve /var/lib/zighouse
 
 # Run all 43 ClickBench queries
-./zighouse bench ./store hits clickbench-submit/zighouse/queries.sql
+./zighouse bench --store=./store --query=9
 ```
 
 ## ClickBench
