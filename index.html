@@ -18,6 +18,41 @@
       --code-ink: #eef8ef;
     }
     * { box-sizing: border-box; }
+    nav {
+      display: flex;
+      gap: 20px;
+      align-items: center;
+      margin-bottom: 28px;
+      padding: 0 8px;
+      max-width: 1080px;
+      margin-left: auto;
+      margin-right: auto;
+      margin-top: 20px;
+    }
+    nav .logo {
+      font-weight: 800;
+      color: var(--accent);
+      font-size: 1.05rem;
+      letter-spacing: -0.03em;
+    }
+    nav a {
+      color: var(--muted);
+      text-decoration: none;
+      font-size: 0.92rem;
+    }
+    nav a:hover { color: var(--accent); }
+    .doc-link {
+      display: inline-block;
+      margin-top: 4px;
+      padding: 10px 24px;
+      background: var(--accent);
+      color: #fff;
+      border-radius: 40px;
+      text-decoration: none;
+      font-weight: 600;
+      font-size: 0.95rem;
+    }
+    .doc-link:hover { background: #92400e; }
     body {
       margin: 0;
       background:
@@ -147,6 +182,12 @@
   </style>
 </head>
 <body>
+<nav>
+    <span class="logo">ZigHouse</span>
+    <a href="/zighouse/">Home</a>
+    <a href="/zighouse/docs/">Docs</a>
+    <a href="https://github.com/donge/zighouse">GitHub</a>
+  </nav>
 <main>
   <header>
     <div class="tag">ZigHouse principles</div>
@@ -155,6 +196,9 @@
       ZigHouse is an experiment in building a small, native analytical engine in Zig.
       The idea is simple: store data by column, turn SQL into a compact execution plan,
       and use memory mapping, vectorized scans, and compile-time specialization to keep the CPU busy.
+    </p>
+    <p>
+      <a class="doc-link" href="/zighouse/docs/">Read the docs →</a>
     </p>
   </header>
 
@@ -310,8 +354,13 @@ const b = loadVector(i64, big_values, 0);   // 8 lanes</code></pre>
   </section>
 
   <footer>
-    This page uses ZigHouse as context to explain the principles of columnar analytical execution:
-    column layout, vectorized scans, compile-time specialization, and continuous performance validation.
+    <p>
+      <a href="/zighouse/docs/">Full documentation →</a>
+    </p>
+    <p>
+      This page uses ZigHouse as context to explain the principles of columnar analytical execution:
+      column layout, vectorized scans, compile-time specialization, and continuous performance validation.
+    </p>
   </footer>
 </main>
 </body>

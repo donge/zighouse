@@ -32,6 +32,5 @@ data/*.ddb
 sqltest/
 clickhouse-test-results/
 
-# Site build artifacts
+# Site source artifacts
 site/book/
-donge.org/
