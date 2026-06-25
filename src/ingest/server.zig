@@ -274,9 +274,12 @@ pub const Server = struct {
             // Substitute $N parameters from URL query string params.
             const after_params = try substituteParams(self.allocator, target, trimmed_raw);
             defer self.allocator.free(after_params);
-            // Strip trailing FORMAT <name> clause (added by clickhouse-go).
-            // Keep FINAL keyword intact — handleSelectNoDrainEx will handle it.
-            const trimmed = stripFormatClause(after_params);
+            // Strip trailing FORMAT <name> clause (added by clickhouse-go) — only for non-INSERT.
+            // INSERT handlers use parseInsertTarget which needs the FORMAT keyword.
+            const trimmed = if (asciiStartsWith(after_params, "INSERT"))
+                after_params
+            else
+                stripFormatClause(after_params);
             try self.dispatchSqlWithData(request, out, trimmed, data_part);
         }
     }
@@ -409,12 +412,18 @@ pub const Server = struct {
             errdefer self.allocator.free(key_short);
             const val = try self.allocator.dupe(u8, select_sql);
             errdefer self.allocator.free(val);
+            if (self.views.getEntry(key_short)) |existing| {
+                self.allocator.free(existing.value_ptr.*);
+            }
             try self.views.put(key_short, val);
             if (std.mem.indexOfScalar(u8, view_full_name, '.') != null) {
                 const key_full = try self.allocator.dupe(u8, view_full_name);
                 errdefer self.allocator.free(key_full);
                 const val2 = try self.allocator.dupe(u8, select_sql);
                 errdefer self.allocator.free(val2);
+                if (self.views.getEntry(key_full)) |existing2| {
+                    self.allocator.free(existing2.value_ptr.*);
+                }
                 try self.views.put(key_full, val2);
             }
             try respondOk(self, request, out, native_path);
@@ -443,6 +452,9 @@ pub const Server = struct {
             errdefer self.allocator.free(fn_key);
             const fn_val = try self.allocator.dupe(u8, lambda_body);
             errdefer self.allocator.free(fn_val);
+            if (self.functions.getEntry(fn_key)) |existing| {
+                self.allocator.free(existing.value_ptr.*);
+            }
             try self.functions.put(fn_key, fn_val);
             try respondOk(self, request, out, native_path);
             return;
@@ -1185,19 +1197,20 @@ pub const Server = struct {
             return;
         }
 
-        // Strip FINAL modifier.
-        const sql_needs_free = std.ascii.indexOfIgnoreCase(sql_clean_input, "FINAL") != null;
+        // Strip FINAL modifier. removeFinal returns the original slice when no FINAL
+        // is present (no allocation), and a heap-allocated copy when FINAL was stripped.
         const sql_after_final = try removeFinal(self.allocator, sql_clean_input);
-        errdefer if (sql_needs_free) self.allocator.free(sql_after_final);
+        const final_was_stripped = sql_after_final.ptr != sql_clean_input.ptr;
+        errdefer if (final_was_stripped) self.allocator.free(sql_after_final);
         const sql_clean: []const u8 = blk_sc: {
-            if (sql_needs_free and std.ascii.indexOfIgnoreCase(sql_after_final, "ORDER BY") == null) {
+            if (final_was_stripped and std.ascii.indexOfIgnoreCase(sql_after_final, "ORDER BY") == null) {
                 const s = try std.fmt.allocPrint(self.allocator, "{s} ORDER BY version DESC", .{sql_after_final});
                 self.allocator.free(sql_after_final);
                 break :blk_sc s;
             }
             break :blk_sc sql_after_final;
         };
-        defer if (!std.mem.eql(u8, sql_clean, sql)) self.allocator.free(sql_clean);
+        defer if (final_was_stripped) self.allocator.free(sql_clean);
 
         // Parse SQL into a Plan.
         const plan = (try generic_sql.parse(self.allocator, sql_clean)) orelse {
@@ -1310,7 +1323,7 @@ pub const Server = struct {
             // FINAL deduplication: for ReplacingMergeTree tables, keep only the
             // first row per primary key (highest version, since ORDER BY version DESC
             // was injected by the FINAL handler).
-            if (sql_needs_free and entry.pk != null) {
+            if (final_was_stripped and entry.pk != null) {
                 if (try dedupResultSetByPk(self.allocator, &owned_rs, entry.pk.?, entry.table)) |deduped| {
                     owned_rs.deinit();
                     owned_rs = deduped;
@@ -1335,6 +1348,7 @@ pub const Server = struct {
             try sendResponse(request, out, .bad_request, "Expected: INSERT INTO <db>.<table> FORMAT RowBinary[WithNamesAndTypes]\n");
             return;
         };
+
 
         // VALUES INSERT is entirely in the SQL string — data part is empty; handle first.
         if (insert_info.values_fmt) {
@@ -2351,12 +2365,13 @@ fn stripFormatClause(sql: []const u8) []const u8 {
 /// Returns a heap-allocated copy with FINAL removed (caller owns it), or a dupe
 /// of the original if FINAL was not present.
 fn removeFinal(allocator: std.mem.Allocator, sql: []const u8) ![]u8 {
-    // Case-insensitive search for word-boundary FINAL
+    // Case-insensitive search for word-boundary FINAL.
+    // When no FINAL is found, returns the original slice to avoid an allocation.
     var result: std.ArrayList(u8) = .empty;
     errdefer result.deinit(allocator);
     var i: usize = 0;
+    var stripped: bool = false;
     while (i < sql.len) {
-        // Check for FINAL at word boundary
         const final_kw = "FINAL";
         if (i + final_kw.len <= sql.len and
             std.ascii.eqlIgnoreCase(sql[i .. i + final_kw.len], final_kw))
@@ -2365,9 +2380,8 @@ fn removeFinal(allocator: std.mem.Allocator, sql: []const u8) ![]u8 {
             const after_pos = i + final_kw.len;
             const after_ok = after_pos >= sql.len or (!std.ascii.isAlphanumeric(sql[after_pos]) and sql[after_pos] != '_');
             if (before_ok and after_ok) {
-                // Skip FINAL + any trailing space
+                stripped = true;
                 i = after_pos;
-                // Remove one preceding space if present
                 if (result.items.len > 0 and result.items[result.items.len - 1] == ' ') {
                     result.items.len -= 1;
                 }
@@ -2376,6 +2390,10 @@ fn removeFinal(allocator: std.mem.Allocator, sql: []const u8) ![]u8 {
         }
         try result.append(allocator, sql[i]);
         i += 1;
+    }
+    if (!stripped) {
+        result.deinit(allocator);
+        return @constCast(sql);
     }
     return result.toOwnedSlice(allocator);
 }

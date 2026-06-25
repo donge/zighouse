@@ -317,6 +317,8 @@ pub const HashJoinNode = struct {
 
     left: *PhysicalNode,
     right: *PhysicalNode,
+    left_alias: ?[]const u8 = null,
+    right_alias: ?[]const u8 = null,
     join_type: JoinType,
     /// Equi-join conditions: left_col_idx == right_col_idx pairs.
     /// Non-equi conditions are handled as a post-join filter.

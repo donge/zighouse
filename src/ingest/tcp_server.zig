@@ -34,7 +34,7 @@ pub const ServerCtx = struct {
 
 // ── Protocol constants ──────────────────────────────────────────────────────
 
-const REVISION: u64 = 54455; // below 54456 (PROFILE_EVENTS_IN_INSERT) to skip profile-events-after-insert
+const REVISION: u64 = 54455; // keep clickhouse-go on the older handshake shape
 const DBMS_MIN_REVISION_WITH_CUSTOM_SERIALIZATION: u64 = 54454;
 const DBMS_MIN_PROTOCOL_VERSION_WITH_ADDENDUM: u64 = 54458;
 const DBMS_MIN_PROTOCOL_VERSION_WITH_PARAMETERS: u64 = 54459;
@@ -297,16 +297,93 @@ fn readClientQuery(a: std.mem.Allocator, rd: TcpReader, used_revision: u64) ![]u
     _ = try rd.readByte(); // compression
     const sql = try rd.readString(a);
 
-    if (used_revision >= DBMS_MIN_PROTOCOL_VERSION_WITH_PARAMETERS) {
+    if (used_revision >= DBMS_MIN_PROTOCOL_VERSION_WITH_PARAMETERS or hasDollarParameter(sql)) {
+        var params: std.ArrayListUnmanaged(QueryParam) = .empty;
+        defer {
+            for (params.items) |p| {
+                a.free(p.key);
+                a.free(p.ty);
+                a.free(p.value);
+            }
+            params.deinit(a);
+        }
         while (true) {
             const pk = try rd.readString(a);
-            defer a.free(pk);
             if (pk.len == 0) break;
-            try rd.skipString();
+            const pty = try rd.readString(a);
+            const pv = try rd.readString(a);
+            try params.append(a, .{ .key = pk, .ty = pty, .value = pv });
+        }
+        if (params.items.len > 0 and hasDollarParameter(sql)) {
+            return substituteQueryParams(a, sql, params.items);
         }
     }
 
     return sql;
+}
+
+const QueryParam = struct {
+    key: []const u8,
+    ty: []const u8,
+    value: []const u8,
+};
+
+fn substituteQueryParams(a: std.mem.Allocator, sql: []const u8, params: []const QueryParam) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(a);
+    var i: usize = 0;
+    while (i < sql.len) {
+        if (sql[i] == '$' and i + 1 < sql.len and std.ascii.isDigit(sql[i + 1])) {
+            var j = i + 1;
+            while (j < sql.len and std.ascii.isDigit(sql[j])) : (j += 1) {}
+            const key = sql[i + 1 .. j];
+            if (findQueryParam(params, key)) |p| {
+                try appendParamLiteral(a, &out, p);
+                i = j;
+                continue;
+            }
+        }
+        try out.append(a, sql[i]);
+        i += 1;
+    }
+    a.free(sql);
+    return out.toOwnedSlice(a);
+}
+
+fn findQueryParam(params: []const QueryParam, key: []const u8) ?QueryParam {
+    for (params) |p| {
+        if (std.mem.eql(u8, p.key, key)) return p;
+    }
+    return null;
+}
+
+fn appendParamLiteral(a: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), p: QueryParam) !void {
+    const ty = p.ty;
+    const v = p.value;
+    const quote =
+        std.ascii.indexOfIgnoreCase(ty, "String") != null or
+        std.ascii.indexOfIgnoreCase(ty, "Date") != null or
+        std.ascii.indexOfIgnoreCase(ty, "Time") != null or
+        std.ascii.indexOfIgnoreCase(ty, "UUID") != null or
+        std.ascii.indexOfIgnoreCase(ty, "IPv") != null;
+    if (!quote) {
+        try out.appendSlice(a, v);
+        return;
+    }
+    try out.append(a, '\'');
+    for (v) |ch| {
+        if (ch == '\'') try out.append(a, '\'');
+        try out.append(a, ch);
+    }
+    try out.append(a, '\'');
+}
+
+fn hasDollarParameter(sql: []const u8) bool {
+    var i: usize = 0;
+    while (i + 1 < sql.len) : (i += 1) {
+        if (sql[i] == '$' and std.ascii.isDigit(sql[i + 1])) return true;
+    }
+    return false;
 }
 
 // ── Skip block info ─────────────────────────────────────────────────────────
@@ -768,6 +845,7 @@ fn dispatchQuery(
     if (std.ascii.startsWithIgnoreCase(s, "INSERT")) {
         try handleInsert(ctx, a, w, s, rd);
     } else if (std.ascii.startsWithIgnoreCase(s, "SELECT") or
+               std.ascii.startsWithIgnoreCase(s, "WITH") or
                std.ascii.startsWithIgnoreCase(s, "SHOW") or
                std.ascii.startsWithIgnoreCase(s, "DESC")) {
         // Normalize: strip FINAL keyword and SETTINGS clause
@@ -837,6 +915,7 @@ fn removeFinalKeyword(a: std.mem.Allocator, sql: []const u8) ![]u8 {
     var result: std.ArrayListUnmanaged(u8) = .empty;
     errdefer result.deinit(a);
     var i: usize = 0;
+    var stripped: bool = false;
     while (i < sql.len) {
         const kw = "FINAL";
         if (i + kw.len <= sql.len and std.ascii.eqlIgnoreCase(sql[i..i + kw.len], kw)) {
@@ -844,8 +923,8 @@ fn removeFinalKeyword(a: std.mem.Allocator, sql: []const u8) ![]u8 {
             const after_pos = i + kw.len;
             const after_ok = after_pos >= sql.len or (!std.ascii.isAlphanumeric(sql[after_pos]) and sql[after_pos] != '_');
             if (before_ok and after_ok) {
+                stripped = true;
                 i = after_pos;
-                // Remove one preceding space if present
                 if (result.items.len > 0 and result.items[result.items.len - 1] == ' ') {
                     result.items.len -= 1;
                 }
@@ -854,6 +933,10 @@ fn removeFinalKeyword(a: std.mem.Allocator, sql: []const u8) ![]u8 {
         }
         try result.append(a, sql[i]);
         i += 1;
+    }
+    if (!stripped) {
+        result.deinit(a);
+        return @constCast(sql);
     }
     return result.toOwnedSlice(a);
 }
@@ -1052,32 +1135,26 @@ fn handleSelect(ctx: *ServerCtx, a: std.mem.Allocator, w: *Io.Writer, sql: []con
     // ── Default: execute against real table data via IR pipeline ─────────────
     const plan_opt = try generic_sql.parse(a, sql);
     if (plan_opt == null) {
-        // Unknown SQL — return empty result
-        var block_buf: std.ArrayListUnmanaged(u8) = .empty;
-        defer block_buf.deinit(a);
-        try writeBlockInfo(&block_buf, a);
-        try wuv(&block_buf, a, 0); try wuv(&block_buf, a, 0);
-        try sendData(a, w, block_buf.items);
-        try sendProfileInfo(a, w);
-        try sendEos(w);
+        // Unknown SQL — return a typed empty result when the SELECT list is
+        // recoverable, otherwise the legacy 0-column empty block.
+        if (sendEmptySqlBlock(a, w, sql)) |_| return else |_| {}
+        try sendEmptyBlock(a, w);
         return;
     }
     const plan = plan_opt.?;
     defer generic_sql.deinit(a, plan);
 
-    // ── Subquery / UNION ALL: not yet supported — return empty result ─────────
-    if (plan.subquery_source != null or plan.union_other != null) {
-        var block_buf: std.ArrayListUnmanaged(u8) = .empty;
-        defer block_buf.deinit(a);
-        try writeBlockInfo(&block_buf, a); try wuv(&block_buf, a, 0); try wuv(&block_buf, a, 0);
-        try sendData(a, w, block_buf.items); try sendProfileInfo(a, w); try sendEos(w);
+    // ── UNION ALL: not yet supported — return typed empty result ──────────────
+    if (plan.union_other != null) {
+        try sendEmptyPlanBlock(a, w, plan);
         return;
     }
 
-    const db_table = splitDbTable(plan.table);
+    const scan_table = planScanTable(plan) orelse plan.table;
+    const db_table = splitDbTable(scan_table);
     const entry_opt = ctx.schemas.find(db_table.db, db_table.table);
     const table: *const schema.Table = if (entry_opt) |e| &e.table else
-        return sendEmptyBlock(a, w);
+        return sendEmptyPlanBlock(a, w, plan);
 
     var parts = try part_scanner.scan(a, ctx.io, ctx.data_dir, db_table.db, db_table.table);
     defer parts.deinit();
@@ -1130,7 +1207,7 @@ fn handleSelect(ctx: *ServerCtx, a: std.mem.Allocator, w: *Io.Writer, sql: []con
 
     // IR returned null — unsupported shape, return empty result.
     std.log.warn("tcp returning empty block for unsupported SELECT: {s}", .{sql});
-    try sendEmptyBlock(a, w);
+    try sendEmptyPlanBlock(a, w, plan);
 }
 
 fn sendEmptyBlock(a: std.mem.Allocator, w: *Io.Writer) !void {
@@ -1141,6 +1218,204 @@ fn sendEmptyBlock(a: std.mem.Allocator, w: *Io.Writer) !void {
     try sendData(a, w, block_buf.items);
     try sendProfileInfo(a, w);
     try sendEos(w);
+}
+
+fn sendEmptyPlanBlock(a: std.mem.Allocator, w: *Io.Writer, plan: generic_sql.Plan) !void {
+    var rs = try emptyResultForPlan(a, plan);
+    defer rs.deinit();
+    const nb = try serializer.toNativeBlock(a, rs);
+    defer a.free(nb);
+    try sendData(a, w, nb);
+    try sendProfileInfo(a, w);
+    try sendEos(w);
+}
+
+fn sendEmptySqlBlock(a: std.mem.Allocator, w: *Io.Writer, sql: []const u8) !void {
+    var rs = try emptyResultForSql(a, sql);
+    defer rs.deinit();
+    const nb = try serializer.toNativeBlock(a, rs);
+    defer a.free(nb);
+    try sendData(a, w, nb);
+    try sendProfileInfo(a, w);
+    try sendEos(w);
+}
+
+fn emptyResultForSql(parent_alloc: std.mem.Allocator, sql: []const u8) !core.ResultSet {
+    const sel = lastKeyword(sql, "SELECT") orelse return error.UnsupportedFeature;
+    const from_rel = indexKeyword(sql[sel + "SELECT".len ..], "FROM") orelse return error.UnsupportedFeature;
+    const list = std.mem.trim(u8, sql[sel + "SELECT".len .. sel + "SELECT".len + from_rel], " \t\r\n");
+    if (list.len == 0 or std.mem.eql(u8, list, "*")) return error.UnsupportedFeature;
+
+    var arena = std.heap.ArenaAllocator.init(parent_alloc);
+    errdefer arena.deinit();
+    const a = arena.allocator();
+    var metas_list: std.ArrayListUnmanaged(core.result.ColMeta) = .empty;
+    var cols_list: std.ArrayListUnmanaged(core.Column) = .empty;
+
+    var start: usize = 0;
+    var depth: i32 = 0;
+    for (list, 0..) |ch, i| {
+        switch (ch) {
+            '(' => depth += 1,
+            ')' => {
+                if (depth > 0) depth -= 1;
+            },
+            ',' => if (depth == 0) {
+                try appendEmptySqlColumn(a, list[start..i], &metas_list, &cols_list);
+                start = i + 1;
+            },
+            else => {},
+        }
+    }
+    try appendEmptySqlColumn(a, list[start..], &metas_list, &cols_list);
+    if (metas_list.items.len == 0) return error.UnsupportedFeature;
+    return .{
+        .metas = try metas_list.toOwnedSlice(a),
+        .columns = try cols_list.toOwnedSlice(a),
+        .num_rows = 0,
+        .arena = arena,
+    };
+}
+
+fn appendEmptySqlColumn(
+    a: std.mem.Allocator,
+    raw_item: []const u8,
+    metas: *std.ArrayListUnmanaged(core.result.ColMeta),
+    cols: *std.ArrayListUnmanaged(core.Column),
+) !void {
+    const item = std.mem.trim(u8, raw_item, " \t\r\n");
+    if (item.len == 0) return;
+    const alias = selectItemName(item);
+    const ty = inferEmptyNameType(alias);
+    const name = try a.dupe(u8, alias);
+    try metas.append(a, .{ .name = name, .col_type = ty });
+    try cols.append(a, .{
+        .name = name,
+        .data = try allocEmptyColumnData(a, ty),
+        .null_mask = &.{},
+        .len = 0,
+    });
+}
+
+fn selectItemName(item: []const u8) []const u8 {
+    if (lastKeyword(item, "AS")) |as_pos| return std.mem.trim(u8, item[as_pos + 2 ..], " \t\r\n`\"");
+    var end = std.mem.trim(u8, item, " \t\r\n");
+    if (std.mem.lastIndexOfScalar(u8, end, '.')) |dot| end = end[dot + 1 ..];
+    return std.mem.trim(u8, end, " \t\r\n`\"");
+}
+
+fn inferEmptyNameType(name: []const u8) core.ColumnType {
+    if (std.ascii.eqlIgnoreCase(name, "as_dst") or
+        std.ascii.eqlIgnoreCase(name, "as_src") or
+        std.ascii.eqlIgnoreCase(name, "cnt") or
+        std.ascii.indexOfIgnoreCase(name, "count") != null)
+        return .uint64;
+    if (std.ascii.eqlIgnoreCase(name, "ls") or
+        std.ascii.indexOfIgnoreCase(name, "timestamp") != null or
+        std.ascii.indexOfIgnoreCase(name, "time") != null)
+        return .datetime64_ms;
+    return .string;
+}
+
+fn emptyResultForPlan(parent_alloc: std.mem.Allocator, plan: generic_sql.Plan) !core.ResultSet {
+    var arena = std.heap.ArenaAllocator.init(parent_alloc);
+    errdefer arena.deinit();
+    const a = arena.allocator();
+    const metas = try a.alloc(core.result.ColMeta, plan.projections.len);
+    const cols = try a.alloc(core.Column, plan.projections.len);
+    for (plan.projections, 0..) |p, i| {
+        const name = p.alias orelse p.column orelse "?";
+        const ty = inferEmptyColType(p);
+        metas[i] = .{ .name = try a.dupe(u8, name), .col_type = ty };
+        cols[i] = .{
+            .name = metas[i].name,
+            .data = try allocEmptyColumnData(a, ty),
+            .null_mask = &.{},
+            .len = 0,
+        };
+    }
+    return .{ .metas = metas, .columns = cols, .num_rows = 0, .arena = arena };
+}
+
+fn inferEmptyColType(p: generic_sql.Expr) core.ColumnType {
+    return switch (p.func) {
+        .count_star, .count_distinct, .count_if, .uniq_exact, .uniq_exact_if => .uint64,
+        .sum, .avg, .min_if, .max_if, .sum_array, .sum_array_if => .float64,
+        .min, .max => blk: {
+            const c = p.column orelse "";
+            if (std.ascii.indexOfIgnoreCase(c, "timestamp") != null or
+                std.ascii.indexOfIgnoreCase(c, "time") != null)
+                break :blk .datetime64_ms;
+            if (std.ascii.indexOfIgnoreCase(c, "date") != null)
+                break :blk .date_u16;
+            break :blk .string;
+        },
+        .int_literal => .int64,
+        .float_literal => .float64,
+        .group_uniq_array, .group_array => .array_string,
+        .column_ref, .case_when, .cmp_expr, .any_val => blk: {
+            const c = p.column orelse p.alias orelse "";
+            if (std.ascii.indexOfIgnoreCase(c, "count") != null or
+                std.ascii.indexOfIgnoreCase(c, "as_dst") != null or
+                std.ascii.indexOfIgnoreCase(c, "as_src") != null)
+                break :blk .uint64;
+            if (std.ascii.indexOfIgnoreCase(c, "timestamp") != null or
+                std.ascii.indexOfIgnoreCase(c, "last_seen") != null or
+                std.ascii.eqlIgnoreCase(c, "ls"))
+                break :blk .datetime64_ms;
+            break :blk .string;
+        },
+    };
+}
+
+fn indexKeyword(haystack: []const u8, needle: []const u8) ?usize {
+    var i: usize = 0;
+    while (i + needle.len <= haystack.len) : (i += 1) {
+        if (!std.ascii.eqlIgnoreCase(haystack[i .. i + needle.len], needle)) continue;
+        const before_ok = i == 0 or !std.ascii.isAlphanumeric(haystack[i - 1]);
+        const after = i + needle.len;
+        const after_ok = after >= haystack.len or !std.ascii.isAlphanumeric(haystack[after]);
+        if (before_ok and after_ok) return i;
+    }
+    return null;
+}
+
+fn lastKeyword(haystack: []const u8, needle: []const u8) ?usize {
+    var last: ?usize = null;
+    var off: usize = 0;
+    while (off < haystack.len) {
+        const idx = indexKeyword(haystack[off..], needle) orelse break;
+        last = off + idx;
+        off += idx + needle.len;
+    }
+    return last;
+}
+
+fn allocEmptyColumnData(a: std.mem.Allocator, ty: core.ColumnType) !core.chunk.ColumnData {
+    return switch (ty) {
+        .bool_u8 => .{ .bool_u8 = try a.alloc(u8, 0) },
+        .int64 => .{ .int64 = try a.alloc(i64, 0) },
+        .uint64 => .{ .uint64 = try a.alloc(u64, 0) },
+        .float64 => .{ .float64 = try a.alloc(f64, 0) },
+        .date_u16 => .{ .date_u16 = try a.alloc(u16, 0) },
+        .datetime64_ms => .{ .datetime64_ms = try a.alloc(i64, 0) },
+        .string => .{ .string = try a.alloc([]const u8, 0) },
+        .array_string => .{ .array_string = try a.alloc([][]const u8, 0) },
+    };
+}
+
+fn planScanTable(plan: generic_sql.Plan) ?[]const u8 {
+    if (plan.subquery_source) |sq| {
+        return planScanTable(sq.*);
+    }
+    if (plan.join) |j| {
+        return planScanTable(j.left.*) orelse planScanTable(j.right.*);
+    }
+    if (std.mem.eql(u8, plan.table, "__compute__") or
+        std.mem.eql(u8, plan.table, "numbers") or
+        std.mem.eql(u8, plan.table, "__subquery__"))
+        return null;
+    return plan.table;
 }
 
 // Helper: split "db.table" or just "table" into {db, table}.
@@ -1327,11 +1602,20 @@ fn handleInsert(
     var col_bufs = try row_binary_decoder.ColumnBuffer.initAll(a, entry.table);
     defer row_binary_decoder.ColumnBuffer.deinitAll(a, col_bufs);
 
+    // clickhouse-go v2 sends an empty CLIENT_DATA block after the query
+    // (external table end marker), then batch data blocks, then another
+    // empty block (end-of-insert marker). Skip the first empty block and
+    // only break when we see an empty block after processing real data.
+    var has_data = false;
     while (true) {
         const pkt = rd.readByte() catch break;
         if (pkt != CLIENT_DATA) break;
         const had_rows = try readClientDataBlock(a, rd, entry, col_bufs);
-        if (!had_rows) break;
+        if (had_rows) {
+            has_data = true;
+        } else if (has_data) {
+            break;
+        }
     }
 
     const total_rows = if (col_bufs.len > 0) col_bufs[0].rowCount() else 0;

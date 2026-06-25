@@ -243,14 +243,14 @@ pub fn plan_query(
             // JOIN: recursively plan each side and create a hash_join node.
             const left_node = try plan_query(ctx, js.left.*) orelse return null;
             const right_node = try plan_query(ctx, js.right.*) orelse return null;
-            // Resolve key column names to indices in the respective sub-plan outputs.
-            // For now, use the table schema (ctx.tbl) for name→index lookup on both sides.
-            // This is a best-effort: if the schema is unavailable or the column is not
-            // found, we fall back to index 0 (which may be wrong, but won't crash).
             var equi_list: std.ArrayListUnmanaged(plan.EquiKey) = .empty;
             for (js.on_left, js.on_right) |lname, rname| {
-                const lidx: usize = if (ctx.tbl) |t| (t.findColumn(lname) orelse 0) else 0;
-                const ridx: usize = if (ctx.tbl) |t| (t.findColumn(rname) orelse 0) else 0;
+                const lidx = findOutputColIdx(left_node, shortColName(lname)) orelse
+                    findOutputColIdx(left_node, lname) orelse
+                    if (ctx.tbl) |t| (t.findColumn(shortColName(lname)) orelse 0) else 0;
+                const ridx = findOutputColIdx(right_node, shortColName(rname)) orelse
+                    findOutputColIdx(right_node, rname) orelse
+                    if (ctx.tbl) |t| (t.findColumn(shortColName(rname)) orelse 0) else 0;
                 try equi_list.append(ctx.alloc, .{ .left_col_idx = lidx, .right_col_idx = ridx });
             }
             const equi_keys = try equi_list.toOwnedSlice(ctx.alloc);
@@ -264,10 +264,13 @@ pub fn plan_query(
             n.* = .{ .hash_join = .{
                 .left = left_node,
                 .right = right_node,
+                .left_alias = js.left_alias,
+                .right_alias = js.right_alias,
                 .join_type = join_type,
                 .equi_keys = equi_keys,
                 .filter = null,
             } };
+            ctx.virtual_cols = try outputVirtualCols(ctx, n);
             break :blk n;
         } else if (gplan.subquery_source) |sq| {
             // Subquery in FROM.
@@ -469,8 +472,10 @@ pub fn plan_query(
             // ── Normal aggregation (no ARRAY JOIN helpers) ────────────────
             // Non-agg projections whose column text references "__ha__*" aliases
             // are "post-agg scalars" — they must be evaluated after the agg node.
-            var post_agg_projs_list: std.ArrayListUnmanaged(generic_sql.Expr) = .empty;
-            for (projs) |p| {
+            const post_agg_by_proj = try ctx.alloc.alloc(?generic_sql.Expr, projs.len);
+            @memset(post_agg_by_proj, null);
+            var post_agg_count: usize = 0;
+            for (projs, 0..) |p, proj_idx| {
                 if (isAggregate(p.func)) {
                     const item = try aggExprToProjectItem(ctx, p) orelse return null;
                     try agg_items_list.append(ctx.alloc, item);
@@ -478,20 +483,23 @@ pub fn plan_query(
                     // Check if column text contains "__ha__" (post-agg scalar reference).
                     const col_text = p.column orelse "";
                     if (try rewriteAggregatePostAgg(ctx, p, &agg_items_list)) |pp| {
-                        try post_agg_projs_list.append(ctx.alloc, pp);
+                        post_agg_by_proj[proj_idx] = pp;
+                        post_agg_count += 1;
                         continue;
                     }
                     // case_when with embedded aggregate calls (e.g. avg(confidence))
                     // or forward references to agg output aliases → push to post-agg.
                     if (p.func == .case_when) {
                         if (try rewriteCaseWhenPostAgg(ctx, p, &agg_items_list)) |pp| {
-                            try post_agg_projs_list.append(ctx.alloc, pp);
+                            post_agg_by_proj[proj_idx] = pp;
+                            post_agg_count += 1;
                             continue;
                         }
                     }
                     const has_ha = std.mem.indexOf(u8, col_text, "__ha__") != null;
                     if (has_ha) {
-                        try post_agg_projs_list.append(ctx.alloc, p);
+                        post_agg_by_proj[proj_idx] = p;
+                        post_agg_count += 1;
                     } else {
                         const item = try scalarExprToProjectItem(ctx, p) orelse return null;
                         try key_items_list.append(ctx.alloc, item);
@@ -510,7 +518,6 @@ pub fn plan_query(
 
             const key_items = try key_items_list.toOwnedSlice(ctx.alloc);
             const agg_items = try agg_items_list.toOwnedSlice(ctx.alloc);
-            const post_agg_projs = try post_agg_projs_list.toOwnedSlice(ctx.alloc);
 
             const agg_node = try ctx.alloc.create(PhysicalNode);
             if (key_items.len == 0) {
@@ -529,7 +536,7 @@ pub fn plan_query(
             // build a post-project node after the agg_node.
             // The agg output columns are: [key_items..., agg_items...].
             // We populate virtual_cols so resolveColExpr can find them by name.
-            if (post_agg_projs.len > 0 or hidden_key_count > 0) {
+            if (post_agg_count > 0 or hidden_key_count > 0) {
                 // Build virtual column list from agg output.
                 var vcols_list: std.ArrayListUnmanaged(VirtualCol) = .empty;
                 for (key_items, 0..) |ki, i| {
@@ -551,35 +558,40 @@ pub fn plan_query(
                     ctx.virtual_cols = &.{};
                 } // reset after this block
 
-                // Build post-project items: all key_items (as pass-through col refs)
-                // plus the post-agg scalar expressions (which reference __ha__* cols).
+                // Build post-project items in the original SELECT order.
                 var post_items_list: std.ArrayListUnmanaged(ProjectItem) = .empty;
-                // Pass through key_items (GROUP BY cols) first.
-                for (key_items, 0..) |ki, i| {
-                    if (isHiddenGroupAlias(ki.alias)) continue;
-                    const ref = try ctx.alloc.create(plan.ColRef);
-                    ref.* = .{ .index = i, .name = ki.alias };
-                    try post_items_list.append(ctx.alloc, .{
-                        .expr = Expr{ .col_ref = ref.* },
-                        .alias = ki.alias,
-                        .out_type = ki.out_type,
-                    });
-                }
-                // Pass through agg_items as col refs (skip __ha__* hidden ones from final output).
-                for (agg_items, 0..) |ai, i| {
-                    if (std.mem.startsWith(u8, ai.alias, "__ha__")) continue;
-                    const ref = try ctx.alloc.create(plan.ColRef);
-                    ref.* = .{ .index = key_items.len + i, .name = ai.alias };
-                    try post_items_list.append(ctx.alloc, .{
-                        .expr = Expr{ .col_ref = ref.* },
-                        .alias = ai.alias,
-                        .out_type = ai.out_type,
-                    });
-                }
-                // Add post-agg scalar projections (using virtual_cols for __ha__* resolution).
-                for (post_agg_projs) |pp| {
-                    const item = try scalarExprToProjectItem(ctx, pp) orelse return null;
-                    try post_items_list.append(ctx.alloc, item);
+                for (projs, 0..) |p, proj_idx| {
+                    if (post_agg_by_proj[proj_idx]) |pp| {
+                        const item = try scalarExprToProjectItem(ctx, pp) orelse return null;
+                        try post_items_list.append(ctx.alloc, item);
+                        continue;
+                    }
+                    const alias = p.alias orelse p.column orelse "";
+                    if (isAggregate(p.func)) {
+                        for (agg_items, 0..) |ai, i| {
+                            if (!std.mem.eql(u8, ai.alias, alias)) continue;
+                            if (std.mem.startsWith(u8, ai.alias, "__ha__")) break;
+                            const ref = plan.ColRef{ .index = key_items.len + i, .name = ai.alias };
+                            try post_items_list.append(ctx.alloc, .{
+                                .expr = Expr{ .col_ref = ref },
+                                .alias = ai.alias,
+                                .out_type = ai.out_type,
+                            });
+                            break;
+                        }
+                    } else {
+                        for (key_items, 0..) |ki, i| {
+                            if (!std.mem.eql(u8, ki.alias, alias)) continue;
+                            if (isHiddenGroupAlias(ki.alias)) break;
+                            const ref = plan.ColRef{ .index = i, .name = ki.alias };
+                            try post_items_list.append(ctx.alloc, .{
+                                .expr = Expr{ .col_ref = ref },
+                                .alias = ki.alias,
+                                .out_type = ki.out_type,
+                            });
+                            break;
+                        }
+                    }
                 }
                 const post_items = try post_items_list.toOwnedSlice(ctx.alloc);
                 const post_proj_node = try ctx.alloc.create(PhysicalNode);
@@ -781,16 +793,16 @@ pub fn plan_query(
 fn findOutputColIdx(node: *const PhysicalNode, name: []const u8) ?usize {
     switch (node.*) {
         .project => |p| {
-            for (p.items, 0..) |item, i| if (std.mem.eql(u8, item.alias, name)) return i;
+            for (p.items, 0..) |item, i| if (colNameMatches(item.alias, name)) return i;
             return null;
         },
         .hash_agg => |ha| {
-            for (ha.keys, 0..) |item, i| if (std.mem.eql(u8, item.alias, name)) return i;
-            for (ha.aggs, 0..) |item, i| if (std.mem.eql(u8, item.alias, name)) return ha.keys.len + i;
+            for (ha.keys, 0..) |item, i| if (colNameMatches(item.alias, name)) return i;
+            for (ha.aggs, 0..) |item, i| if (colNameMatches(item.alias, name)) return ha.keys.len + i;
             return null;
         },
         .scalar_agg => |sa| {
-            for (sa.aggs, 0..) |item, i| if (std.mem.eql(u8, item.alias, name)) return i;
+            for (sa.aggs, 0..) |item, i| if (colNameMatches(item.alias, name)) return i;
             return null;
         },
         .top_k => |tk| return findOutputColIdx(tk.input, name),
@@ -798,8 +810,22 @@ fn findOutputColIdx(node: *const PhysicalNode, name: []const u8) ?usize {
         .limit => |lm| return findOutputColIdx(lm.input, name),
         .filter => |f| return findOutputColIdx(f.input, name),
         .chunk_source => |cs| return findOutputColIdx(cs.input, name),
+        .hash_join => |hj| {
+            if (findOutputColIdx(hj.left, name)) |idx| return idx;
+            if (findOutputColIdx(hj.right, name)) |idx| return outputLen(hj.left) + idx;
+            return null;
+        },
         else => return null,
     }
+}
+
+fn shortColName(name: []const u8) []const u8 {
+    if (std.mem.lastIndexOfScalar(u8, name, '.')) |dot| return name[dot + 1 ..];
+    return name;
+}
+
+fn colNameMatches(alias: []const u8, name: []const u8) bool {
+    return std.mem.eql(u8, alias, name) or std.mem.eql(u8, alias, shortColName(name));
 }
 
 fn outputVirtualCols(ctx: *PlannerCtx, node: *const PhysicalNode) ![]const VirtualCol {
@@ -831,6 +857,31 @@ fn outputVirtualCols(ctx: *PlannerCtx, node: *const PhysicalNode) ![]const Virtu
                 .col_type = item.out_type,
             });
         },
+        .hash_join => |hj| {
+            const left_cols = try outputVirtualCols(ctx, hj.left);
+            for (left_cols) |vc| {
+                try out.append(ctx.alloc, vc);
+                if (hj.left_alias) |alias| try out.append(ctx.alloc, .{
+                    .name = try std.fmt.allocPrint(ctx.alloc, "{s}.{s}", .{ alias, vc.name }),
+                    .idx = vc.idx,
+                    .col_type = vc.col_type,
+                });
+            }
+            const right_cols = try outputVirtualCols(ctx, hj.right);
+            const off = outputLen(hj.left);
+            for (right_cols) |vc| {
+                try out.append(ctx.alloc, .{
+                    .name = vc.name,
+                    .idx = off + vc.idx,
+                    .col_type = vc.col_type,
+                });
+                if (hj.right_alias) |alias| try out.append(ctx.alloc, .{
+                    .name = try std.fmt.allocPrint(ctx.alloc, "{s}.{s}", .{ alias, vc.name }),
+                    .idx = off + vc.idx,
+                    .col_type = vc.col_type,
+                });
+            }
+        },
         .chunk_source => |cs| return outputVirtualCols(ctx, cs.input),
         .top_k => |tk| return outputVirtualCols(ctx, tk.input),
         .order_by => |ob| return outputVirtualCols(ctx, ob.input),
@@ -850,6 +901,7 @@ fn outputLen(node: *const PhysicalNode) usize {
         .top_k => |tk| return outputLen(tk.input),
         .order_by => |ob| return outputLen(ob.input),
         .limit => |lm| return outputLen(lm.input),
+        .hash_join => |hj| return outputLen(hj.left) + outputLen(hj.right),
         .filter => |f| return outputLen(f.input),
         else => return 0,
     }
@@ -1095,8 +1147,14 @@ fn rewriteAggregatePostAgg(
                     continue;
                 };
                 const arg_text = col_text[i + 4 .. close_idx];
-                const alias = try ensureHiddenMaxAgg(ctx, arg_text, agg_items) orelse return null;
-                try result.appendSlice(ctx.alloc, alias);
+                if (isLegacyIntelDictHas(arg_text)) {
+                    try result.append(ctx.alloc, '0');
+                } else if (isTrieDictExpr(arg_text)) {
+                    try result.appendSlice(ctx.alloc, "0.0");
+                } else {
+                    const alias = try ensureHiddenMaxAgg(ctx, arg_text, agg_items) orelse return null;
+                    try result.appendSlice(ctx.alloc, alias);
+                }
                 changed = true;
                 i = close_idx + 1;
                 continue;
@@ -1128,6 +1186,21 @@ fn rewriteAggregatePostAgg(
         .column = try result.toOwnedSlice(ctx.alloc),
         .alias = p.alias orelse col_text,
     };
+}
+
+fn isLegacyIntelDictHas(text: []const u8) bool {
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    return std.ascii.startsWithIgnoreCase(trimmed, "dictHas(") and
+        std.mem.indexOf(u8, trimmed, "'vprobe.dict_intel'") != null;
+}
+
+fn isTrieDictExpr(text: []const u8) bool {
+    return std.mem.indexOf(u8, text, "vprobe.dict_ip_reputation_trie") != null;
+}
+
+fn defaultTrieAnyExpr(alias: []const u8) Expr {
+    if (std.mem.indexOf(u8, alias, "tags") != null) return Expr{ .lit_array = &.{} };
+    return Expr{ .lit_str = "" };
 }
 
 /// Scan case_when then_texts for simple "avg(col_name)" patterns, extract as hidden
@@ -1301,6 +1374,24 @@ fn whereNodeToExpr(ctx: *PlannerCtx, wn: *const generic_sql.WhereNode) ?Expr {
     }
 }
 
+fn condExprToExpr(ctx: *PlannerCtx, cond: *const generic_sql.CondExpr) !?Expr {
+    if (cond.cond_text) |text| return parseArithExpr(ctx, text);
+    if (cond.cond_col.len == 0) return null;
+    const left = resolveColExpr(ctx, cond.cond_col) orelse
+        (try parseArithExpr(ctx, cond.cond_col)) orelse return null;
+    const right: Expr = if (cond.cond_str) |s| .{ .lit_str = s } else .{ .lit_f64 = cond.cond_num };
+    const binop = try ctx.alloc.create(plan.BinOp);
+    binop.* = .{ .left = left, .right = right };
+    return switch (cond.cond_op) {
+        .eq => Expr{ .eq = binop },
+        .ne => Expr{ .neq = binop },
+        .lt => Expr{ .lt = binop },
+        .le => Expr{ .lte = binop },
+        .gt => Expr{ .gt = binop },
+        .ge => Expr{ .gte = binop },
+    };
+}
+
 // ── Column resolution ─────────────────────────────────────────────────────────
 
 /// Resolve a column name to a col_ref Expr (index from schema) or a
@@ -1317,6 +1408,11 @@ fn resolveColExpr(ctx: *PlannerCtx, col: []const u8) ?Expr {
     // Float literal
     if (std.fmt.parseFloat(f64, col) catch null) |fv| {
         return Expr{ .lit_f64 = fv };
+    }
+    // Virtual columns (subquery/project/aggregate outputs) shadow the base
+    // table schema for the current planning scope.
+    if (findVirtualCol(ctx.virtual_cols, col)) |vc| {
+        return Expr{ .col_ref = .{ .index = vc.idx, .name = col } };
     }
     // Column reference
     if (ctx.tbl) |tbl| {
@@ -1337,16 +1433,15 @@ fn resolveColExpr(ctx: *PlannerCtx, col: []const u8) ?Expr {
             return Expr{ .col_ref = .{ .index = idx, .name = col } };
         }
     }
-    // Unknown column — check virtual columns (agg output) before giving up.
-    if (findVirtualCol(ctx.virtual_cols, col)) |vc| {
-        return Expr{ .col_ref = .{ .index = vc.idx, .name = col } };
-    }
     return null;
 }
 
 fn findVirtualCol(vcols: []const VirtualCol, name: []const u8) ?VirtualCol {
     for (vcols) |vc| {
         if (std.mem.eql(u8, vc.name, name)) return vc;
+    }
+    for (vcols) |vc| {
+        if (colNameMatches(vc.name, name)) return vc;
     }
     return null;
 }
@@ -1904,7 +1999,7 @@ fn canonFnName(name: []const u8) []const u8 {
         "tuple",             "regexp_replace",           "replaceRegexpOne", "now",              "today",             "toHour",
         "hour",              "toMinute",                 "toSecond",         "sqrt",             "arrayElement",      "arraySum",
         "arrayAvg",          "array",                    "arrayIntersect",   "toIntervalSecond", "toIntervalMinute",  "toIntervalHour",
-        "toIntervalDay",     "toIntervalWeek",           "toIntervalMonth",  "toIntervalYear",   "CAST_array_string",
+        "toIntervalDay",     "toIntervalWeek",           "toIntervalMonth",  "toIntervalYear",   "CAST_array_string", "toDateTime64",
     };
     for (canon_names) |cn| {
         if (std.ascii.eqlIgnoreCase(cn, name)) return cn;
@@ -2356,6 +2451,26 @@ fn prattExpr(pctx: *ParseCtx, min_bp: u8) anyerror!?Expr {
                         .lit_str => |s| s,
                         else => return null,
                     };
+                    if (std.ascii.eqlIgnoreCase(name, "dictHas") and
+                        std.mem.eql(u8, dict_name, "vprobe.dict_intel"))
+                    {
+                        break :blk Expr{ .lit_bool = false };
+                    }
+                    if (std.mem.eql(u8, dict_name, "vprobe.dict_ip_reputation_trie")) {
+                        if (std.ascii.eqlIgnoreCase(name, "dictHas")) {
+                            break :blk Expr{ .lit_bool = false };
+                        }
+                        if (std.ascii.eqlIgnoreCase(name, "dictGetOrDefault") and args_slice.len >= 4) {
+                            const attr: []const u8 = switch (args_slice[1]) {
+                                .lit_str => |s| s,
+                                else => "",
+                            };
+                            if (std.ascii.eqlIgnoreCase(attr, "score")) break :blk Expr{ .lit_f64 = 0.0 };
+                            if (std.ascii.eqlIgnoreCase(attr, "tags")) break :blk Expr{ .lit_array = &.{} };
+                            break :blk Expr{ .lit_str = "" };
+                        }
+                        break :blk Expr{ .lit_null = {} };
+                    }
 
                     // Helper: unwrap tuple(a,b,...) → []Expr, else single-element slice
                     const unwrapKeys = struct {
@@ -2455,7 +2570,8 @@ fn prattExpr(pctx: *ParseCtx, min_bp: u8) anyerror!?Expr {
                         if (std.ascii.eqlIgnoreCase(sf.name, name) and args_slice.len == 1) break :blk2 true;
                     }
                     if (args_slice.len == 2) {
-                        if (std.ascii.eqlIgnoreCase(name, "greatest") or
+                        if (std.ascii.eqlIgnoreCase(name, "toDateTime64") or
+                            std.ascii.eqlIgnoreCase(name, "greatest") or
                             std.ascii.eqlIgnoreCase(name, "least") or
                             std.ascii.eqlIgnoreCase(name, "intDiv") or
                             std.ascii.eqlIgnoreCase(name, "modulo") or
@@ -2741,8 +2857,8 @@ fn inferExprType(ctx: *PlannerCtx, expr: Expr) ColumnType {
             if (std.mem.eql(u8, fc.name, "arrayMax") or std.mem.eql(u8, fc.name, "arrayMin")) return .string;
             if (std.mem.eql(u8, fc.name, "arrayJoin")) return .string;
             if (std.mem.eql(u8, fc.name, "arrayMap") or std.mem.eql(u8, fc.name, "arrayFilter")) return .array_string;
-            if (std.mem.eql(u8, fc.name, "and") or std.mem.eql(u8, fc.name, "or")) return .uint64;
-            if (std.mem.eql(u8, fc.name, "now")) return .datetime64_ms;
+            if (std.mem.eql(u8, fc.name, "and") or std.mem.eql(u8, fc.name, "or")) return .bool_u8;
+            if (std.mem.eql(u8, fc.name, "now") or std.mem.eql(u8, fc.name, "toDateTime64")) return .datetime64_ms;
             if (std.mem.eql(u8, fc.name, "today")) return .date_u16;
             if (std.mem.eql(u8, fc.name, "arrayElement")) return .string;
             if (std.mem.eql(u8, fc.name, "arrayIntersect") or
@@ -3054,9 +3170,20 @@ fn aggExprToProjectItem(ctx: *PlannerCtx, p: generic_sql.Expr) !?ProjectItem {
             agg_call.* = .{ .kind = .count_star, .arg = null, .distinct = false };
             return ProjectItem{ .expr = .{ .agg_call = agg_call }, .alias = alias, .out_type = .uint64 };
         },
-        .count_distinct, .uniq_exact => {
-            const arg_expr = resolveColExpr(ctx, col_name) orelse
+        .count_distinct, .uniq_exact, .uniq_exact_if => {
+            var arg_expr = resolveColExpr(ctx, col_name) orelse
                 (try parseArithExpr(ctx, col_name)) orelse return null;
+            if (p.func == .uniq_exact_if) {
+                const cond = p.cond orelse return null;
+                const cond_expr = try condExprToExpr(ctx, cond) orelse return null;
+                const fc = try ctx.alloc.create(plan.FnCall);
+                const args = try ctx.alloc.alloc(Expr, 3);
+                args[0] = cond_expr;
+                args[1] = arg_expr;
+                args[2] = .lit_null;
+                fc.* = .{ .name = "if", .args = args };
+                arg_expr = .{ .fn_call = fc };
+            }
             agg_call.* = .{ .kind = .count, .arg = arg_expr, .distinct = true };
             return ProjectItem{ .expr = .{ .agg_call = agg_call }, .alias = alias, .out_type = .uint64 };
         },
@@ -3098,13 +3225,13 @@ fn aggExprToProjectItem(ctx: *PlannerCtx, p: generic_sql.Expr) !?ProjectItem {
             return ProjectItem{ .expr = .{ .agg_call = agg_call }, .alias = alias, .out_type = col_type };
         },
         .max => {
-            const arg_expr = resolveColExpr(ctx, col_name) orelse
+            const arg_expr = if (isTrieDictExpr(col_name)) Expr{ .lit_f64 = 0.0 } else resolveColExpr(ctx, col_name) orelse
                 (try parseArithExpr(ctx, col_name)) orelse return null;
             const col_type = inferExprType(ctx, arg_expr);
             agg_call.* = .{ .kind = .max, .arg = arg_expr, .distinct = false };
             return ProjectItem{ .expr = .{ .agg_call = agg_call }, .alias = alias, .out_type = col_type };
         },
-        .group_uniq_array, .group_array, .uniq_exact_if => {
+        .group_uniq_array, .group_array => {
             const arg_expr = resolveColExpr(ctx, col_name) orelse
                 (try parseArithExpr(ctx, col_name)) orelse return null;
             const post_expr = try buildPostAggExpr(ctx, p.post_fn);
@@ -3119,7 +3246,7 @@ fn aggExprToProjectItem(ctx: *PlannerCtx, p: generic_sql.Expr) !?ProjectItem {
             return ProjectItem{ .expr = .{ .agg_call = agg_call }, .alias = alias, .out_type = out };
         },
         .any_val => {
-            const arg_expr = resolveColExpr(ctx, col_name) orelse
+            const arg_expr = if (isTrieDictExpr(col_name)) defaultTrieAnyExpr(alias) else resolveColExpr(ctx, col_name) orelse
                 (try parseArithExpr(ctx, col_name)) orelse return null;
             agg_call.* = .{ .kind = .any, .arg = arg_expr, .distinct = false };
             const col_type = inferExprType(ctx, arg_expr);

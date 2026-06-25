@@ -37,6 +37,15 @@ if $needs_import && [[ ! -f "$PARQUET_PATH" ]]; then
   exit 1
 fi
 
+if $needs_import; then
+  MIN_FREE_KB=${ZIGHOUSE_PERF_MIN_FREE_KB:-12582912} # 12 GiB
+  FREE_KB=$(df -Pk "$TMP_ROOT" | awk 'NR==2 {print $4}')
+  if [[ -n "$FREE_KB" && "$FREE_KB" -lt "$MIN_FREE_KB" ]]; then
+    echo "pre-commit perf: insufficient free space under $TMP_ROOT (${FREE_KB}KB < ${MIN_FREE_KB}KB)" >&2
+    exit 1
+  fi
+fi
+
 zig build -Doptimize=ReleaseFast
 
 if $needs_import; then
@@ -67,7 +76,7 @@ fi
 
 for i in $(seq 1 "$BENCH_REPEATS"); do
   "${TIME_CMD[@]}" sh -c "env ZIGHOUSE_CLICKBENCH_SUBMIT=1 \
-    '$ZIGHOUSE' bench '$STORE_DIR' hits clickbench-submit/zighouse/queries.sql 2>/dev/null" \
+    '$ZIGHOUSE' bench '--store=$STORE_DIR' hits clickbench-submit/zighouse/queries.sql 2>/dev/null" \
     > "$TMP_BENCH/bench-${i}.log" 2>&1
 done
 

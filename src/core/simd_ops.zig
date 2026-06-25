@@ -1,7 +1,6 @@
 /// SIMD reduction primitives for the core execution engine.
 /// These are inlined into pipeline.zig via @import("simd_ops.zig").
 /// Separate from src/simd.zig to avoid cross-module file ownership conflicts.
-
 const std = @import("std");
 
 /// SIMD sum of i16 slice, sign-extended and returned as i64 (wrapping).
@@ -18,6 +17,40 @@ pub fn sumI16(values: []const i16) i64 {
     var total: i32 = @reduce(.Add, acc);
     while (i < values.len) : (i += 1) total +%= values[i];
     return @as(i64, total);
+}
+
+/// Correct SIMD sum of i16 slice with widened i32 lanes.
+pub fn sumI16ToI64(values: []const i16) i64 {
+    const LANES = 16;
+    const V16 = @Vector(LANES, i16);
+    const V32 = @Vector(LANES, i32);
+    var acc: V32 = @splat(0);
+    var i: usize = 0;
+    while (i + LANES <= values.len) : (i += LANES) {
+        const v16: V16 = values[i..][0..LANES].*;
+        const v32: V32 = @intCast(v16);
+        acc +%= v32;
+    }
+    var total: i64 = @reduce(.Add, acc);
+    while (i < values.len) : (i += 1) total +%= values[i];
+    return total;
+}
+
+/// Correct SIMD sum of i32 slice with widened i64 lanes.
+pub fn sumI32ToI64(values: []const i32) i64 {
+    const LANES = 8;
+    const V32 = @Vector(LANES, i32);
+    const V64 = @Vector(LANES, i64);
+    var acc: V64 = @splat(0);
+    var i: usize = 0;
+    while (i + LANES <= values.len) : (i += LANES) {
+        const v32: V32 = values[i..][0..LANES].*;
+        const v64: V64 = @intCast(v32);
+        acc +%= v64;
+    }
+    var total: i64 = @reduce(.Add, acc);
+    while (i < values.len) : (i += 1) total +%= values[i];
+    return total;
 }
 
 /// SIMD sum of i64 slice using 8-wide vectors.
@@ -260,22 +293,56 @@ pub fn countIn2I64(values: []const i64, val1: i64, val2: i64) usize {
 /// `out_indices`. Returns the number of passing rows.
 /// Used for late-materialisation: build a pass-set before decoding other columns.
 pub fn filterI64(
-    values:      []const i64,
-    op:          enum(u8) { eq, neq, lt, lte, gt, gte, in2 },
-    val:         i64,
-    val2:        i64,
-    out_indices: []u32,   // must have capacity >= values.len
+    values: []const i64,
+    op: enum(u8) { eq, neq, lt, lte, gt, gte, in2 },
+    val: i64,
+    val2: i64,
+    out_indices: []u32, // must have capacity >= values.len
 ) usize {
     var n: usize = 0;
     switch (op) {
-        .neq => for (values, 0..) |v, i| { if (v != val) { out_indices[n] = @intCast(i); n += 1; } },
-        .eq  => for (values, 0..) |v, i| { if (v == val) { out_indices[n] = @intCast(i); n += 1; } },
-        .gt  => for (values, 0..) |v, i| { if (v >  val) { out_indices[n] = @intCast(i); n += 1; } },
-        .gte => for (values, 0..) |v, i| { if (v >= val) { out_indices[n] = @intCast(i); n += 1; } },
-        .lt  => for (values, 0..) |v, i| { if (v <  val) { out_indices[n] = @intCast(i); n += 1; } },
-        .lte => for (values, 0..) |v, i| { if (v <= val) { out_indices[n] = @intCast(i); n += 1; } },
-        .in2 => for (values, 0..) |v, i| { if (v == val or v == val2) { out_indices[n] = @intCast(i); n += 1; } },
+        .neq => for (values, 0..) |v, i| {
+            if (v != val) {
+                out_indices[n] = @intCast(i);
+                n += 1;
+            }
+        },
+        .eq => for (values, 0..) |v, i| {
+            if (v == val) {
+                out_indices[n] = @intCast(i);
+                n += 1;
+            }
+        },
+        .gt => for (values, 0..) |v, i| {
+            if (v > val) {
+                out_indices[n] = @intCast(i);
+                n += 1;
+            }
+        },
+        .gte => for (values, 0..) |v, i| {
+            if (v >= val) {
+                out_indices[n] = @intCast(i);
+                n += 1;
+            }
+        },
+        .lt => for (values, 0..) |v, i| {
+            if (v < val) {
+                out_indices[n] = @intCast(i);
+                n += 1;
+            }
+        },
+        .lte => for (values, 0..) |v, i| {
+            if (v <= val) {
+                out_indices[n] = @intCast(i);
+                n += 1;
+            }
+        },
+        .in2 => for (values, 0..) |v, i| {
+            if (v == val or v == val2) {
+                out_indices[n] = @intCast(i);
+                n += 1;
+            }
+        },
     }
     return n;
 }
-

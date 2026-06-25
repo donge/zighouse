@@ -1006,9 +1006,10 @@ pub const OpenedPart = struct {
         errdefer out_sizes.deinit(self.allocator);
         var elem_size_pos: usize = 0;
         var elem_data_pos: usize = 0;
+        var prev_offset: u64 = 0;
         const n_rows = offsets.data.len / 8;
         for (0..n_rows) |i| {
-            const elem_count: usize = @intCast(std.mem.readInt(u64, offsets.data[i * 8 ..][0..8], .little));
+            const elem_count = arrayElemCountFromOffsets(offsets.data, i, &prev_offset);
             const row_start = out_data.items.len;
             for (0..elem_count) |_| {
                 if (elem_size_pos + 8 > sizes.data.len) return error.UnexpectedEndOfData;
@@ -1466,24 +1467,24 @@ pub const ColumnReader = struct {
 
         while (read < count) : (read += 1) {
             const len: usize = if (self.fixed_string_width != 0) self.fixed_string_width else if (self.varuint_strings) blk: {
-                const r = readVarUIntLocal(self.data[self.cursor..]) orelse return error.UnexpectedEndOfData;
+                const r = readVarUIntLocal(self.data[self.cursor..]) orelse break;
                 self.cursor += r[1];
                 break :blk r[0];
             } else blk: {
                 const sd = self.size_data orelse return error.MissingSizeStream;
-                if (self.size_cursor + 8 > sd.len) return error.UnexpectedEndOfData;
+                if (self.size_cursor + 8 > sd.len) break;
                 const l: usize = @intCast(std.mem.readInt(u64, sd[self.size_cursor..][0..8], .little));
                 self.size_cursor += 8;
                 break :blk l;
             };
             if (len > string_codec.MAX_STRING_LEN) return error.StringTooLarge;
-            if (self.cursor + len > self.data.len) return error.UnexpectedEndOfData;
+            if (self.cursor + len > self.data.len) break;
             const s = self.data[self.cursor .. self.cursor + len];
             self.cursor += len;
             try callback(ctx, s);
         }
-        self.rows_read += count;
-        return count;
+        self.rows_read += read;
+        return read;
     }
 
     /// Skip `n` rows of a string column without invoking any callback.
@@ -1497,21 +1498,21 @@ pub const ColumnReader = struct {
         var skipped: usize = 0;
         while (skipped < count) : (skipped += 1) {
             const len: usize = if (self.fixed_string_width != 0) self.fixed_string_width else if (self.varuint_strings) blk: {
-                const r = readVarUIntLocal(self.data[self.cursor..]) orelse return error.UnexpectedEndOfData;
+                const r = readVarUIntLocal(self.data[self.cursor..]) orelse break;
                 self.cursor += r[1];
                 break :blk r[0];
             } else blk: {
                 const sd = self.size_data orelse return error.MissingSizeStream;
-                if (self.size_cursor + 8 > sd.len) return error.UnexpectedEndOfData;
+                if (self.size_cursor + 8 > sd.len) break;
                 const l: usize = @intCast(std.mem.readInt(u64, sd[self.size_cursor..][0..8], .little));
                 self.size_cursor += 8;
                 break :blk l;
             };
-            if (self.cursor + len > self.data.len) return error.UnexpectedEndOfData;
+            if (self.cursor + len > self.data.len) break;
             self.cursor += len;
         }
-        self.rows_read += count;
-        return count;
+        self.rows_read += skipped;
+        return skipped;
     }
 
     /// Read `n` rows of an Array(String) column.
@@ -1624,6 +1625,13 @@ pub const ColumnReader = struct {
 
 /// Read a variable-length unsigned integer (LEB128) from buf.
 /// Returns {value, bytes_consumed} or null if buf is empty or malformed.
+fn arrayElemCountFromOffsets(offsets: []const u8, row_idx: usize, prev_offset: *u64) usize {
+    const current = std.mem.readInt(u64, offsets[row_idx * 8 ..][0..8], .little);
+    const count = if (current >= prev_offset.*) current - prev_offset.* else current;
+    prev_offset.* = current;
+    return @intCast(count);
+}
+
 fn readVarUIntLocal(buf: []const u8) ?struct { usize, usize } {
     if (buf.len == 0) return null;
     var val: usize = 0;
@@ -1695,9 +1703,10 @@ fn buildArrayStringReader(
     errdefer out_sizes.deinit(allocator);
     var elem_size_pos: usize = 0;
     var elem_data_pos: usize = 0;
+    var prev_offset: u64 = 0;
     const n_rows = offsets.len / 8;
     for (0..n_rows) |i| {
-        const elem_count: usize = @intCast(std.mem.readInt(u64, offsets[i * 8 ..][0..8], .little));
+        const elem_count = arrayElemCountFromOffsets(offsets, i, &prev_offset);
         const row_start = out_data.items.len;
         for (0..elem_count) |_| {
             if (elem_size_pos + 8 > elem_sizes.len) return error.UnexpectedEndOfData;
@@ -1742,9 +1751,10 @@ fn buildMapReader(
     var val_size_pos: usize = 0;
     var val_data_pos: usize = 0;
     var truncated_tail = false;
+    var prev_offset: u64 = 0;
     const n_rows = offsets.len / 8;
     for (0..n_rows) |i| {
-        const count: usize = @intCast(std.mem.readInt(u64, offsets[i * 8 ..][0..8], .little));
+        const count = arrayElemCountFromOffsets(offsets, i, &prev_offset);
         const row_start = out_data.items.len;
         if (truncated_tail) {
             try writeVarUIntTo(&out_data, allocator, 0);
@@ -2262,7 +2272,11 @@ pub const CompactOpenedPart = struct {
                 .text, .char => {
                     const fw = fixedStringWidth(col);
                     if (fw != 0) {
-                        const data = try self.readBlockAt(bin_file, block_idx);
+                        const data_rel = if (self.col_substream_count[col_idx] >= 2) blk: {
+                            const size_rel = self.substreamRel(col_idx, ".size") orelse 0;
+                            break :blk if (size_rel == 0) @as(usize, 1) else @as(usize, 0);
+                        } else @as(usize, 0);
+                        const data = try self.compactBlock(bin_file, col_idx, g, data_rel);
                         defer self.allocator.free(data);
                         try data_buf.appendSlice(self.allocator, data);
                     } else if (self.col_substream_count[col_idx] >= 2) {

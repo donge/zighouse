@@ -18,6 +18,7 @@ const usage =
     \\Usage:
     \\  zighouse serve [<data_dir>] [--port=<port>]
     \\  zighouse import <parquet> [--db=<db>] [--table=<t>] [--pk=<col>]
+    \\  zighouse import-parquet [--format=generic|ch|ch-compact] [--pk=<col>] <parquet> <store> <table>
     \\  zighouse bench [--query=<N>] [--from=<N>] [--limit=<N>]
     \\  zighouse compact [--once] [--interval=<secs>]
     \\  zighouse query <sql>
@@ -62,21 +63,21 @@ fn traceMainWall(name: []const u8, started: i128) void {
 }
 
 fn runCommand(init: std.process.Init, allocator: std.mem.Allocator, args: *std.process.Args.Iterator, command: []const u8) !void {
-    if (std.mem.eql(u8, command, "import")) {
+    if (std.mem.eql(u8, command, "import") or std.mem.eql(u8, command, "import-parquet")) {
+        const legacy_import_parquet = std.mem.eql(u8, command, "import-parquet");
         // Generic Parquet import: infer schema, write generic_part store, write catalog manifest.
         // Usage: zighouse import <parquet> [--db=<db>] [--table=<t>] [--pk=<col>]
         var format: enum { generic, ch, ch_compact, ch_http } = .generic;
         var pk_col_name: ?[]const u8 = null;
         var db_name: []const u8 = "default";
         var bare_table: []const u8 = "hits";
+        var store_dir: ?[]const u8 = null;
         const parquet_path = blk: {
             var first = args.next() orelse return error.MissingParquetPath;
             while (true) {
                 if (std.mem.startsWith(u8, first, "--format=")) {
                     const fmt = first["--format=".len..];
-                    if (std.mem.eql(u8, fmt, "ch")) format = .ch
-                    else if (std.mem.eql(u8, fmt, "ch-compact")) format = .ch_compact
-                    else if (std.mem.eql(u8, fmt, "ch-http")) format = .ch_http;
+                    if (std.mem.eql(u8, fmt, "ch")) format = .ch else if (std.mem.eql(u8, fmt, "ch-compact")) format = .ch_compact else if (std.mem.eql(u8, fmt, "ch-http")) format = .ch_http;
                     first = args.next() orelse return error.MissingParquetPath;
                 } else if (std.mem.startsWith(u8, first, "--pk=")) {
                     pk_col_name = first["--pk=".len..];
@@ -93,13 +94,18 @@ fn runCommand(init: std.process.Init, allocator: std.mem.Allocator, args: *std.p
             }
             break :blk first;
         };
+        if (legacy_import_parquet) {
+            store_dir = args.next() orelse return error.MissingStoreDir;
+            bare_table = args.next() orelse return error.MissingTableName;
+        }
+        const store_path = store_dir orelse parquet_path;
         const table_name = bare_table;
         var inferred = try schema_infer.inferSchema(allocator, init.io, parquet_path, table_name);
         defer inferred.deinit();
         const row_count = switch (format) {
-            .generic    => try loader.importParquet(allocator, init.io, parquet_path, parquet_path, inferred.table),
-            .ch         => try loader.importParquetCH(allocator, init.io, parquet_path, parquet_path, inferred.table, pk_col_name),
-            .ch_compact => try loader.importParquetCompact(allocator, init.io, parquet_path, parquet_path, inferred.table),
+            .generic => try loader.importParquet(allocator, init.io, parquet_path, store_path, inferred.table),
+            .ch => try loader.importParquetCH(allocator, init.io, parquet_path, store_path, inferred.table, pk_col_name),
+            .ch_compact => try loader.importParquetCompact(allocator, init.io, parquet_path, store_path, inferred.table),
             .ch_http => blk: {
                 const ch_host = std.c.getenv("ZIGHOUSE_CH_HOST") orelse "127.0.0.1";
                 const ch_port_str = std.c.getenv("ZIGHOUSE_CH_PORT") orelse "8123";
@@ -118,28 +124,28 @@ fn runCommand(init: std.process.Init, allocator: std.mem.Allocator, args: *std.p
             },
         };
         const part_fmt: catalog.PartFormat = switch (format) {
-            .generic    => .generic,
-            .ch         => .ch_mergetree,
+            .generic => .generic,
+            .ch => .ch_mergetree,
             .ch_compact => .ch_mergetree,
-            .ch_http    => .ch_mergetree,
+            .ch_http => .ch_mergetree,
         };
         if (format != .ch_http) {
-            try catalog.Catalog.writeManifest(init.io, allocator, parquet_path, table_name, parquet_path, part_fmt);
+            try catalog.Catalog.writeManifest(init.io, allocator, store_path, table_name, parquet_path, part_fmt);
         }
         const sort_keys: []const []const u8 = &.{};
         var table_with_keys = inferred.table;
         table_with_keys.sort_keys = sort_keys;
 
         const entry = schema_config.TableEntry{
-            .db    = db_name,
-            .name  = bare_table,
-            .pk    = pk_col_name,
+            .db = db_name,
+            .name = bare_table,
+            .pk = pk_col_name,
             .table = table_with_keys,
         };
-        const table_dir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ parquet_path, bare_table });
+        const table_dir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ store_path, bare_table });
         defer allocator.free(table_dir);
         try schema_persist.saveToDir(init.io, allocator, table_dir, db_name, &entry);
-        try printOut(init.io, "imported {d} rows {s} -> {s}/{s}\n", .{ row_count, parquet_path, parquet_path, table_name });
+        try printOut(init.io, "imported {d} rows {s} -> {s}/{s}\n", .{ row_count, parquet_path, store_path, table_name });
     } else if (std.mem.eql(u8, command, "inspect")) {
         const parquet_path = args.next() orelse return error.MissingParquetPath;
         const output = try parquet.inspectPath(allocator, init.io, parquet_path);
@@ -172,12 +178,16 @@ fn runCommand(init: std.process.Init, allocator: std.mem.Allocator, args: *std.p
             inferred.table.columns.len,
             blk: {
                 var n: usize = 0;
-                for (inferred.table.columns) |c| if (c.ty != .text and c.ty != .char) { n += 1; };
+                for (inferred.table.columns) |c| if (c.ty != .text and c.ty != .char) {
+                    n += 1;
+                };
                 break :blk n;
             },
             blk: {
                 var n: usize = 0;
-                for (inferred.table.columns) |c| if (c.ty == .text or c.ty == .char) { n += 1; };
+                for (inferred.table.columns) |c| if (c.ty == .text or c.ty == .char) {
+                    n += 1;
+                };
                 break :blk n;
             },
         });
@@ -270,15 +280,15 @@ fn runCommand(init: std.process.Init, allocator: std.mem.Allocator, args: *std.p
         defer allocator.free(part_dir);
 
         const IrRunner = struct {
-            alloc:     std.mem.Allocator,
-            io:        std.Io,
-            part_dir:  []const u8,
-            table:     schema.Table,
-            bridge:    *gsb.GenericStoreBridge,
+            alloc: std.mem.Allocator,
+            io: std.Io,
+            part_dir: []const u8,
+            table: schema.Table,
+            bridge: *gsb.GenericStoreBridge,
 
             pub fn runQuery(self: *const @This(), query_text: []const u8) !?[]u8 {
                 const maybe_gplan = generic_sql.parse(self.alloc, query_text) catch |err| {
-                    std.log.err("bench parse error: {}: {s}", .{err, query_text});
+                    std.log.err("bench parse error: {}: {s}", .{ err, query_text });
                     return null;
                 };
                 const gplan = maybe_gplan orelse {
@@ -291,7 +301,7 @@ fn runCommand(init: std.process.Init, allocator: std.mem.Allocator, args: *std.p
                 errdefer arena.deinit();
                 var pctx = ir_planner.PlannerCtx.init(arena.allocator(), self.table);
                 const node = ir_planner.plan_query(&pctx, gplan) catch |err| {
-                    std.log.err("bench plan error: {}: {s}", .{err, query_text});
+                    std.log.err("bench plan error: {}: {s}", .{ err, query_text });
                     arena.deinit();
                     return null;
                 };
@@ -308,7 +318,7 @@ fn runCommand(init: std.process.Init, allocator: std.mem.Allocator, args: *std.p
                 defer qctx.deinit();
                 const t_exec_start = std.Io.Clock.Timestamp.now(self.io, .awake);
                 var rs = core.exec.pipeline.executePlan(node.?, &qctx) catch |err| {
-                    std.log.err("bench exec error: {}: {s}", .{err, query_text});
+                    std.log.err("bench exec error: {}: {s}", .{ err, query_text });
                     arena.deinit();
                     return null;
                 };
@@ -316,24 +326,28 @@ fn runCommand(init: std.process.Init, allocator: std.mem.Allocator, args: *std.p
                 defer rs.deinit();
                 arena.deinit();
 
-                std.log.info("exec_ms={d} rows={d} sql={s}", .{t_exec_ns / std.time.ns_per_ms, rs.num_rows, query_text[0..@min(80, query_text.len)]});
+                std.log.info("exec_ms={d} rows={d} sql={s}", .{ t_exec_ns / std.time.ns_per_ms, rs.num_rows, query_text[0..@min(80, query_text.len)] });
 
-                const out = try std.fmt.allocPrint(self.alloc, "rows={d} exec_ms={d}\n", .{rs.num_rows, t_exec_ns / std.time.ns_per_ms});
+                const out = try std.fmt.allocPrint(self.alloc, "rows={d} exec_ms={d}\n", .{ rs.num_rows, t_exec_ns / std.time.ns_per_ms });
                 return out;
             }
         };
 
         var shared_bridge = try gsb.GenericStoreBridge.init(
-            allocator, init.io, part_dir, table, &.{},
+            allocator,
+            init.io,
+            part_dir,
+            table,
+            &.{},
         );
         defer shared_bridge.deinit();
 
         const runner = IrRunner{
-            .alloc    = allocator,
-            .io       = init.io,
+            .alloc = allocator,
+            .io = init.io,
             .part_dir = part_dir,
-            .table    = table,
-            .bridge   = &shared_bridge,
+            .table = table,
+            .bridge = &shared_bridge,
         };
         try duckdb.benchWithRunner(allocator, init.io, qp, bench_range, &runner);
     } else if (std.mem.eql(u8, command, "query")) {
@@ -342,9 +356,9 @@ fn runCommand(init: std.process.Init, allocator: std.mem.Allocator, args: *std.p
         const gsb2 = @import("generic_store_bridge");
         const serializer = @import("serializer");
 
-        const store_dir2   = args.next() orelse return error.MissingStoreDir;
-        const table_name2  = args.next() orelse return error.MissingTableName;
-        const query_text2  = args.next() orelse return error.MissingQuery;
+        const store_dir2 = args.next() orelse return error.MissingStoreDir;
+        const table_name2 = args.next() orelse return error.MissingTableName;
+        const query_text2 = args.next() orelse return error.MissingQuery;
 
         const columns_txt2 = try std.fmt.allocPrint(allocator, "{s}/{s}/parts/all_1_1_0/columns.txt", .{ store_dir2, table_name2 });
         defer allocator.free(columns_txt2);

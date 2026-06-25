@@ -66,7 +66,10 @@ pub const ChunkSource = struct {
         return self.rs.metas;
     }
 
-    fn rowCountFn(_: *anyopaque) u64 { return 0; }
+    fn rowCountFn(ptr: *anyopaque) u64 {
+        const self: *ChunkSource = @ptrCast(@alignCast(ptr));
+        return @intCast(self.rs.num_rows);
+    }
 
     const vtable = SourceIface.VTable{
         .nextChunk = nextChunkFn,

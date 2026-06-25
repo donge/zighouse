@@ -130,6 +130,9 @@ pub fn scan(
     // O(n²) — expected n < a few hundred.
     // A part A is covered if there exists part B with:
     //   B.level > A.level  AND  B.min_seq <= A.min_seq  AND  B.max_seq >= A.max_seq
+    //   AND B has the same partition prefix (same part naming scheme — "all_*"
+    //   vs "20260426_*" etc.) because seq numbers are only comparable within
+    //   the same partition.
     const n = result._metas.items.len;
     var keep = try allocator.alloc(bool, n);
     defer allocator.free(keep);
@@ -142,6 +145,7 @@ pub fn scan(
             if (i == j or !keep[j]) continue;
             const b = result._metas.items[j];
             if (b.level > a.level and b.min_seq <= a.min_seq and b.max_seq >= a.max_seq) {
+                if (!partitionsEq(a.full_path, b.full_path)) continue;
                 keep[i] = false;
                 break;
             }
@@ -167,6 +171,32 @@ pub fn scan(
     }
 
     return result;
+}
+
+/// Returns true if two part directory paths have the same partition prefix
+/// (the prefix before the last three `_`-separated numeric fields).
+fn partitionsEq(a_path: []const u8, b_path: []const u8) bool {
+    // Extract part names: everything after the last '/'
+    const a_name = if (std.mem.lastIndexOfScalar(u8, a_path, '/')) |pos| a_path[pos + 1 ..] else a_path;
+    const b_name = if (std.mem.lastIndexOfScalar(u8, b_path, '/')) |pos| b_path[pos + 1 ..] else b_path;
+
+    // Find us1: position of the first `_` from the right, before the seq numbers.
+    // name = "<partition>_<min>_<max>_<level>"
+    const us3_a = std.mem.lastIndexOfScalar(u8, a_name, '_') orelse return false;
+    const before_level_a = a_name[0..us3_a];
+    const us2_a = std.mem.lastIndexOfScalar(u8, before_level_a, '_') orelse return false;
+    const before_max_a = before_level_a[0..us2_a];
+    const us1_a = std.mem.lastIndexOfScalar(u8, before_max_a, '_') orelse return false;
+
+    const us3_b = std.mem.lastIndexOfScalar(u8, b_name, '_') orelse return false;
+    const before_level_b = b_name[0..us3_b];
+    const us2_b = std.mem.lastIndexOfScalar(u8, before_level_b, '_') orelse return false;
+    const before_max_b = before_level_b[0..us2_b];
+    const us1_b = std.mem.lastIndexOfScalar(u8, before_max_b, '_') orelse return false;
+
+    const prefix_a = a_name[0..us1_a];
+    const prefix_b = b_name[0..us1_b];
+    return std.mem.eql(u8, prefix_a, prefix_b);
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

@@ -487,12 +487,19 @@ const ScanState = struct {
             defer cr.deinit();
 
             var ctx = Ctx{ .out = out, .idx = dst, .alloc = alloc };
-            _ = try cr.readStrings(want, &ctx, struct {
+            _ = cr.readStrings(want, &ctx, struct {
                 fn cb(c: *Ctx, str: []const u8) !void {
                     c.out[c.idx] = try c.alloc.dupe(u8, str);
                     c.idx += 1;
                 }
-            }.cb);
+            }.cb) catch |err| {
+                const col = self.table.columns[ci];
+                const ty_name = col.ch_type orelse @tagName(col.ty);
+                std.log.warn("part_scan string range failed: col={s} type={s} start={} n={} part={s} err={}", .{
+                    col.name, ty_name, start, n, dir, err,
+                });
+                return err;
+            };
             dst = ctx.idx;
             if (dst >= n) break;
         }
@@ -522,12 +529,19 @@ const ScanState = struct {
             defer cr.deinit();
 
             var ctx = Ctx{ .out = out, .idx = dst };
-            _ = try cr.readStrings(want, &ctx, struct {
+            _ = cr.readStrings(want, &ctx, struct {
                 fn cb(c: *Ctx, str: []const u8) !void {
                     c.out[c.idx] = if (str.len != 0) 1 else 0;
                     c.idx += 1;
                 }
-            }.cb);
+            }.cb) catch |err| {
+                const col = self.table.columns[ci];
+                const ty_name = col.ch_type orelse @tagName(col.ty);
+                std.log.warn("part_scan string nonempty range failed: col={s} type={s} start={} n={} part={s} err={}", .{
+                    col.name, ty_name, start, n, dir, err,
+                });
+                return err;
+            };
             dst = ctx.idx;
             if (dst >= n) break;
         }
@@ -557,14 +571,21 @@ const ScanState = struct {
                 idx: usize,
             };
             var ctx = Ctx{ .out = out, .idx = dst };
-            _ = try cr.readArrayStrings(want, alloc, &ctx,
+            _ = cr.readArrayStrings(want, alloc, &ctx,
                 struct {
                     fn cb(c: *Ctx, arr: [][]const u8) !void {
                         c.out[c.idx] = arr;
                         c.idx += 1;
                     }
                 }.cb,
-            );
+            ) catch |err| {
+                const col = self.table.columns[ci];
+                const ty_name = col.ch_type orelse @tagName(col.ty);
+                std.log.warn("part_scan array range failed: col={s} type={s} start={} n={} part={s} err={}", .{
+                    col.name, ty_name, start, n, dir, err,
+                });
+                return err;
+            };
             dst = ctx.idx;
             if (dst >= n) break;
         }
@@ -821,14 +842,20 @@ const ScanState = struct {
                                 tmp_cr = try op.columnReaderRange(ci, self.rows_read, n);
                                 break :cr_blk &tmp_cr.?;
                             } else &self.col_readers[ci].?;
-                            const actual = try cr.readStrings(n, &sctx,
+                            const actual = cr.readStrings(n, &sctx,
                                 struct {
                                     fn cb(c: *Ctx, str: []const u8) !void {
                                         c.buf[c.idx] = if (str.len != 0) 1 else 0;
                                         c.idx += 1;
                                     }
                                 }.cb,
-                            );
+                            ) catch |err| {
+                                const ty_name = col.ch_type orelse @tagName(col.ty);
+                                std.log.warn("part_scan string nonempty chunk failed: col={s} type={s} rows_read={} n={} err={}", .{
+                                    col.name, ty_name, self.rows_read, n, err,
+                                });
+                                return err;
+                            };
                             if (actual < n) @memset(bbuf[actual..], 0);
                         }
                         break :blk .{ .bool_u8 = bbuf };
@@ -849,14 +876,21 @@ const ScanState = struct {
                             tmp_cr = try op.columnReaderRange(ci, self.rows_read, n);
                             break :cr_blk &tmp_cr.?;
                         } else &self.col_readers[ci].?;
-                        _ = try cr.readStrings(n, &sctx,
+                        const actual2 = cr.readStrings(n, &sctx,
                             struct {
                                 fn cb(c: *Ctx, str: []const u8) !void {
                                     c.buf[c.idx] = try c.alloc.dupe(u8, str);
                                     c.idx += 1;
                                 }
                             }.cb,
-                        );
+                        ) catch |err| {
+                            const ty_name = col.ch_type orelse @tagName(col.ty);
+                            std.log.warn("part_scan string chunk failed: col={s} type={s} rows_read={} n={} err={}", .{
+                                col.name, ty_name, self.rows_read, n, err,
+                            });
+                            return err;
+                        };
+                        if (actual2 < n) @memset(sbuf[actual2..], "");
                     }
                     break :blk .{ .string = sbuf };
                 },

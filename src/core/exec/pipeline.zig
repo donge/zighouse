@@ -310,12 +310,8 @@ pub const RawColSlice = union(enum) {
     pub fn sumI64Range(self: RawColSlice, start: usize, end: usize) i64 {
         var total: i64 = 0;
         switch (self) {
-            .i16s => |a| {
-                for (a[start..end]) |v| total +%= v;
-            },
-            .i32s => |a| {
-                for (a[start..end]) |v| total +%= v;
-            },
+            .i16s => |a| total = simd.sumI16ToI64(a[start..end]),
+            .i32s => |a| total = simd.sumI32ToI64(a[start..end]),
             .i64s => |a| total = simd.sumI64(a[start..end]),
         }
         return total;
@@ -324,12 +320,8 @@ pub const RawColSlice = union(enum) {
     pub fn sumF64Range(self: RawColSlice, start: usize, end: usize) f64 {
         var total: f64 = 0;
         switch (self) {
-            .i16s => |a| {
-                for (a[start..end]) |v| total += @floatFromInt(v);
-            },
-            .i32s => |a| {
-                for (a[start..end]) |v| total += @floatFromInt(v);
-            },
+            .i16s => |a| total = @floatFromInt(simd.sumI16ToI64(a[start..end])),
+            .i32s => |a| total = @floatFromInt(simd.sumI32ToI64(a[start..end])),
             .i64s => |a| {
                 for (a[start..end]) |v| total += @floatFromInt(v);
             },
@@ -1220,6 +1212,59 @@ fn collectColRefs(expr: plan.Expr, mask: []bool) void {
     }
 }
 
+const ScanPrunePolicy = enum { any_reduction, half };
+
+/// Declarative column request shared by scan-based physical implementations.
+/// SourceIface currently caps runtime column overrides at 256 columns, so wide
+/// schemas outside that contract conservatively skip pruning.
+const ScanRequest = struct {
+    needed: [256]bool = [_]bool{false} ** 256,
+
+    fn addExpr(self: *ScanRequest, expr: plan.Expr) void {
+        collectColRefs(expr, &self.needed);
+    }
+
+    fn addItems(self: *ScanRequest, items: []const plan.ProjectItem) void {
+        for (items) |item| self.addExpr(item.expr);
+    }
+
+    fn addIndex(self: *ScanRequest, index: usize) void {
+        if (index < self.needed.len) self.needed[index] = true;
+    }
+
+    fn apply(self: *const ScanRequest, source: SourceIface, policy: ScanPrunePolicy) ScanScope {
+        const sm = source.schema();
+        if (sm.len == 0 or sm.len > self.needed.len) return .{ .source = source };
+
+        var count: usize = 0;
+        for (self.needed[0..sm.len]) |is_needed| count += @intFromBool(is_needed);
+        const worthwhile = count > 0 and count < sm.len and switch (policy) {
+            .any_reduction => true,
+            .half => count * 2 < sm.len,
+        };
+        if (!worthwhile) return .{ .source = source };
+
+        var names: [256][]const u8 = undefined;
+        var names_len: usize = 0;
+        for (self.needed[0..sm.len], 0..) |is_needed, i| {
+            if (is_needed) {
+                names[names_len] = sm[i].name;
+                names_len += 1;
+            }
+        }
+        source.setNeededCols(names[0..names_len]);
+        return .{ .source = source };
+    }
+};
+
+const ScanScope = struct {
+    source: SourceIface,
+
+    fn deinit(self: ScanScope) void {
+        self.source.setNeededCols(null);
+    }
+};
+
 fn copyRow(c: *DataChunk, from: usize, to: usize) void {
     for (c.columns) |*col| {
         if (col.pruned) continue; // shared read-only zero buffer; skip
@@ -1474,6 +1519,41 @@ pub const RowList = struct {
     }
 };
 
+fn cloneValueForRowList(v: Value, alloc: std.mem.Allocator) !Value {
+    return switch (v) {
+        .string => |s| Value{ .string = try alloc.dupe(u8, s) },
+        .array_string => |arr| blk: {
+            const out = try alloc.alloc([]const u8, arr.len);
+            for (arr, 0..) |s, i| out[i] = try alloc.dupe(u8, s);
+            break :blk Value{ .array_string = out };
+        },
+        else => v,
+    };
+}
+
+fn cloneMetas(metas: []const result.ColMeta, alloc: std.mem.Allocator) ![]result.ColMeta {
+    const out = try alloc.alloc(result.ColMeta, metas.len);
+    for (metas, 0..) |m, i| {
+        out[i] = m;
+        out[i].name = try alloc.dupe(u8, m.name);
+        if (m.ch_type) |ct| out[i].ch_type = try alloc.dupe(u8, ct);
+        if (m.hash_col_name) |hn| out[i].hash_col_name = try alloc.dupe(u8, hn);
+    }
+    return out;
+}
+
+fn cloneRowList(src: RowList, alloc: std.mem.Allocator) !RowList {
+    var rl = RowList.init(try cloneMetas(src.metas, alloc));
+    for (src.rows.items) |src_row| {
+        const row = try alloc.alloc(?Value, src_row.len);
+        for (src_row, 0..) |v_opt, i| {
+            row[i] = if (v_opt) |v| try cloneValueForRowList(v, alloc) else null;
+        }
+        try rl.append(alloc, row);
+    }
+    return rl;
+}
+
 fn allocColumnDataRA(col_type: ColumnType, n: usize, ra: std.mem.Allocator) !chunk.ColumnData {
     return switch (col_type) {
         .bool_u8 => .{ .bool_u8 = try ra.alloc(u8, n) },
@@ -1638,12 +1718,30 @@ pub fn executePlan(
         }
         var sink = ResultSink.init(result_alloc);
         try executeScannableToSink(node, ctx, &sink);
-        return sink.finish();
+        var rs = try sink.finish();
+        if (findProjectItems(node)) |items| {
+            for (items, 0..) |item, i| {
+                if (i >= rs.metas.len) break;
+                rs.metas[i].ch_type = item.ch_type;
+            }
+        }
+        return rs;
     }
 
     // ── Breaker path: existing RowList → ResultSet (single copy) ───────────
     var rl = try executeNode(node, ctx);
     return rl.toResultSet(result_alloc);
+}
+
+fn findProjectItems(node: *const plan.PhysicalNode) ?[]const plan.ProjectItem {
+    return switch (node.*) {
+        .project => |p| p.items,
+        .filter => |f| findProjectItems(f.input),
+        .limit => |l| findProjectItems(l.input),
+        .top_k => |tk| findProjectItems(tk.input),
+        .order_by => |ob| findProjectItems(ob.input),
+        else => null,
+    };
 }
 
 /// Stream a scannable node (scan/filter/project/limit) directly to a ResultSink.
@@ -1732,8 +1830,10 @@ fn executeNode(node: *const plan.PhysicalNode, ctx: *QueryContext) !RowList {
     switch (node.*) {
         // ── Sources ───────────────────────────────────────────────────────────
         .chunk_source => |cs| {
-            // Execute the inner sub-plan (may contain filter, project, agg, etc.)
-            return executeNode(cs.input, ctx);
+            // Expose the inner sub-plan as a stable intermediate row source for
+            // outer filter/project/aggregate operators.
+            const inner = try executeNode(cs.input, ctx);
+            return cloneRowList(inner, alloc);
         },
         .part_scan, .mem_scan => {
             // Fall through to the ctx.source scan path below only for
@@ -1948,6 +2048,53 @@ fn executeHashAggStrategy(
     };
 }
 
+fn buildAggResultMetas(
+    keys: []const plan.ProjectItem,
+    aggs: []const plan.ProjectItem,
+    alloc: std.mem.Allocator,
+) ![]result.ColMeta {
+    const metas = try alloc.alloc(result.ColMeta, keys.len + aggs.len);
+    for (keys, 0..) |item, i| {
+        metas[i] = .{ .name = item.alias, .col_type = item.out_type, .ch_type = item.ch_type };
+    }
+    for (aggs, 0..) |item, i| {
+        metas[keys.len + i] = .{ .name = item.alias, .col_type = item.out_type, .ch_type = item.ch_type };
+    }
+    return metas;
+}
+
+fn finalizeAggRows(
+    rows: RowList,
+    sort_keys: []const plan.SortKey,
+    top_k: usize,
+    alloc: std.mem.Allocator,
+) !RowList {
+    if (sort_keys.len == 0) return rows;
+    if (top_k > 0 and rows.rows.items.len > top_k) return executeTopK(rows, sort_keys, top_k, alloc);
+    return executeOrderBy(rows, sort_keys, alloc);
+}
+
+fn initAggAccums(aggs: []const plan.ProjectItem, alloc: std.mem.Allocator) ![]AggAccum {
+    const accums = try alloc.alloc(AggAccum, aggs.len);
+    for (aggs, 0..) |item, i| accums[i] = initAccumForAgg(item);
+    return accums;
+}
+
+fn finalizeScalarAgg(
+    accums: []AggAccum,
+    aggs: []const plan.ProjectItem,
+    alloc: std.mem.Allocator,
+) !RowList {
+    const row = try alloc.alloc(?Value, aggs.len);
+    for (aggs, 0..) |item, i| {
+        row[i] = try finalizeAccum(accums[i], item, alloc);
+        deinitAccum(&accums[i]);
+    }
+    var result_rows = RowList.init(try buildAggResultMetas(&.{}, aggs, alloc));
+    try result_rows.append(alloc, row);
+    return result_rows;
+}
+
 fn valueToBool(v: ?Value) bool {
     return if (v) |val| switch (val) {
         .bool_u8 => |b| b != 0,
@@ -2104,8 +2251,7 @@ fn executeScalarAggChunked(
     ctx: *QueryContext,
 ) !RowList {
     const alloc = ctx.allocator();
-    const accums = try alloc.alloc(AggAccum, aggs.len);
-    for (aggs, 0..) |item, ci| accums[ci] = initAccumForAgg(item);
+    const accums = try initAggAccums(aggs, alloc);
 
     var filter_state: ?FilterState = extractFilter(input);
     var lim_state: ?LimitState = extractLimit(input);
@@ -2146,16 +2292,7 @@ fn executeScalarAggChunked(
         if (lim_state) |ls| if (ls.done()) break;
     }
 
-    const metas = try alloc.alloc(result.ColMeta, aggs.len);
-    const out_row = try alloc.alloc(?Value, aggs.len);
-    for (aggs, 0..) |item, ci| {
-        metas[ci] = .{ .name = item.alias, .col_type = item.out_type };
-        out_row[ci] = try finalizeAccum(accums[ci], item, alloc);
-        deinitAccum(&accums[ci]);
-    }
-    var rl = RowList.init(metas);
-    try rl.append(alloc, out_row);
-    return rl;
+    return finalizeScalarAgg(accums, aggs, alloc);
 }
 
 /// Parallel scalar aggregation: split rows into T morsels, merge partial accumulators.
@@ -2199,12 +2336,11 @@ fn executeScalarAggParallel(
     const thread_accums = try alloc.alloc([]AggAccum, n_threads);
     const rows_per_thread: u32 = @intCast(@min(total_rows / n_threads + 1, 2_000_000));
     for (thread_accums) |*ta| {
-        ta.* = try alloc.alloc(AggAccum, aggs.len);
-        for (aggs, 0..) |item, ci| {
-            ta.*[ci] = initAccumForAgg(item);
+        ta.* = try initAggAccums(aggs, alloc);
+        for (ta.*) |*accum| {
             // Pre-allocate distinct_u64 hashmap to avoid repeated resizes.
-            if (ta.*[ci] == .distinct_u64)
-                try ta.*[ci].distinct_u64.ensureTotalCapacity(std.heap.c_allocator, rows_per_thread);
+            if (accum.* == .distinct_u64)
+                try accum.distinct_u64.ensureTotalCapacity(std.heap.c_allocator, rows_per_thread);
         }
     }
 
@@ -2475,6 +2611,7 @@ fn executeScalarAggParallel(
             switch (ac.kind) {
                 .count_star => infos_buf[ai] = .{ .kind = .count },
                 .sum, .avg => {
+                    if (ac.kind == .sum and item.out_type == .float64) break :blk_raw_scalar;
                     const arg = ac.arg orelse break :blk_raw_scalar;
                     if (arg != .col_ref) break :blk_raw_scalar;
                     const raw = RawColSlice.resolve(ctx.source, sm, arg.col_ref.index) orelse break :blk_raw_scalar;
@@ -2814,16 +2951,7 @@ fn executeScalarAggParallel(
         }
     }
 
-    const metas = try alloc.alloc(result.ColMeta, aggs.len);
-    const out_row = try alloc.alloc(?Value, aggs.len);
-    for (aggs, 0..) |item, ci| {
-        metas[ci] = .{ .name = item.alias, .col_type = item.out_type };
-        out_row[ci] = try finalizeAccum(merged[ci], item, alloc);
-        deinitAccum(&merged[ci]);
-    }
-    var rl = RowList.init(metas);
-    try rl.append(alloc, out_row);
-    return rl;
+    return try finalizeScalarAgg(merged, aggs, alloc);
 }
 
 /// Merge accumulator `src` into `dst` in-place.
@@ -3494,8 +3622,7 @@ fn executeHashAggChunked(
         .key_order = .{ 0, 1, 2 },
     };
 
-    const init_accums = try alloc.alloc(AggAccum, aggs.len);
-    for (aggs, 0..) |item, ci| init_accums[ci] = initAccumForAgg(item);
+    const init_accums = try initAggAccums(aggs, alloc);
     const key_buf = try alloc.alloc(Value, keys.len);
     const int_key_buf = try alloc.alloc(i64, keys.len);
 
@@ -3509,32 +3636,12 @@ fn executeHashAggChunked(
     const IntKeyDesc = struct { col_idx: usize, addend: i64 };
     const int_key_descs = try alloc.alloc(IntKeyDesc, keys.len);
 
-    // Compute which column indices are referenced by keys and aggs.
-    // Apply column restriction to avoid decoding unused columns.
-    {
-        var needed_mask = [_]bool{false} ** 256;
-        const ncols = @min(256, ctx.source.schema().len);
-        for (keys) |item| collectColRefs(item.expr, needed_mask[0..ncols]);
-        for (aggs) |item| collectColRefs(item.expr, needed_mask[0..ncols]);
-        if (filter_state) |*fs| collectColRefs(fs.predicate, needed_mask[0..ncols]);
-        var needed_count: usize = 0;
-        for (needed_mask[0..ncols]) |m| {
-            if (m) needed_count += 1;
-        }
-        if (needed_count * 2 < ctx.source.schema().len) {
-            var names_buf: [32][]const u8 = undefined;
-            var names_len: usize = 0;
-            const sm = ctx.source.schema();
-            for (needed_mask[0..ncols], 0..) |m, i| {
-                if (m and names_len < names_buf.len) {
-                    names_buf[names_len] = sm[i].name;
-                    names_len += 1;
-                }
-            }
-            ctx.source.setNeededCols(names_buf[0..names_len]);
-        }
-    }
-    defer ctx.source.setNeededCols(null);
+    var scan_request: ScanRequest = .{};
+    scan_request.addItems(keys);
+    scan_request.addItems(aggs);
+    if (filter_state) |*fs| scan_request.addExpr(fs.predicate);
+    const scan_scope = scan_request.apply(ctx.source, .any_reduction);
+    defer scan_scope.deinit();
 
     ctx.source.reset();
     var ref_indices: ?[]usize = null;
@@ -3961,10 +4068,7 @@ fn executeHashAggChunked(
         }
     }
 
-    const out_metas = try alloc.alloc(result.ColMeta, keys.len + aggs.len);
-    for (keys, 0..) |k, ki| out_metas[ki] = .{ .name = k.alias, .col_type = k.out_type };
-    for (aggs, 0..) |a, ai| out_metas[keys.len + ai] = .{ .name = a.alias, .col_type = a.out_type };
-
+    const out_metas = try buildAggResultMetas(keys, aggs, alloc);
     var rl = RowList.init(out_metas);
 
     if (use_pair_count_path) {
@@ -4604,27 +4708,11 @@ fn executeFilterProjectParallel(
     if (!extractAndIntConds(filter_pred, &ic_buf, &ic_n, false) or ic_n == 0) return null;
 
     // Column pruning: only load columns referenced by project and filter.
-    const sm = ctx.source.schema();
-    var needed_mask = [_]bool{false} ** 256;
-    const ncols = @min(256, sm.len);
-    for (proj_items) |item| collectColRefs(item.expr, needed_mask[0..ncols]);
-    collectColRefs(filter_pred, needed_mask[0..ncols]);
-    var n_needed: usize = 0;
-    for (needed_mask[0..ncols]) |m| {
-        if (m) n_needed += 1;
-    }
-    if (n_needed * 2 < sm.len) {
-        var names_buf: [32][]const u8 = undefined;
-        var names_len: usize = 0;
-        for (needed_mask[0..ncols], 0..) |m, i| {
-            if (m and names_len < names_buf.len) {
-                names_buf[names_len] = sm[i].name;
-                names_len += 1;
-            }
-        }
-        ctx.source.setNeededCols(names_buf[0..names_len]);
-    }
-    defer ctx.source.setNeededCols(null);
+    var scan_request: ScanRequest = .{};
+    scan_request.addItems(proj_items);
+    scan_request.addExpr(filter_pred);
+    const scan_scope = scan_request.apply(ctx.source, .any_reduction);
+    defer scan_scope.deinit();
 
     // Preload mapped columns before parallel phase.
     {
@@ -4833,8 +4921,7 @@ fn executeLimitChunked(node: *const plan.PhysicalNode, ctx: *QueryContext) !RowL
 // ── ScalarAgg helper ──────────────────────────────────────────────────────────
 
 fn executeScalarAgg(inner: RowList, aggs: []const plan.ProjectItem, alloc: std.mem.Allocator) !RowList {
-    const accums = try alloc.alloc(AggAccum, aggs.len);
-    for (aggs, 0..) |item, ci| accums[ci] = initAccumForAgg(item);
+    const accums = try initAggAccums(aggs, alloc);
 
     for (inner.rows.items) |row| {
         for (aggs, 0..) |item, ci| {
@@ -4843,15 +4930,7 @@ fn executeScalarAgg(inner: RowList, aggs: []const plan.ProjectItem, alloc: std.m
         }
     }
 
-    const metas = try alloc.alloc(result.ColMeta, aggs.len);
-    const out_row = try alloc.alloc(?Value, aggs.len);
-    for (aggs, 0..) |item, ci| {
-        metas[ci] = .{ .name = item.alias, .col_type = item.out_type };
-        out_row[ci] = try finalizeAccum(accums[ci], item, alloc);
-    }
-    var rl = RowList.init(metas);
-    try rl.append(alloc, out_row);
-    return rl;
+    return finalizeScalarAgg(accums, aggs, alloc);
 }
 
 // ── HashAgg helper ────────────────────────────────────────────────────────────
@@ -4864,8 +4943,7 @@ fn executeHashAgg(
 ) !RowList {
     var ht_agg = try ht.AggHashTable.init(alloc, keys.len, aggs.len);
 
-    const init_accums = try alloc.alloc(AggAccum, aggs.len);
-    for (aggs, 0..) |item, ci| init_accums[ci] = initAccumForAgg(item);
+    const init_accums = try initAggAccums(aggs, alloc);
 
     const key_buf = try alloc.alloc(Value, keys.len);
     for (inner.rows.items) |row| {
@@ -4880,10 +4958,7 @@ fn executeHashAgg(
         }
     }
 
-    const out_metas = try alloc.alloc(result.ColMeta, keys.len + aggs.len);
-    for (keys, 0..) |k, ki| out_metas[ki] = .{ .name = k.alias, .col_type = k.out_type };
-    for (aggs, 0..) |a, ai| out_metas[keys.len + ai] = .{ .name = a.alias, .col_type = a.out_type };
-
+    const out_metas = try buildAggResultMetas(keys, aggs, alloc);
     var rl = RowList.init(out_metas);
 
     const CtxT = struct {
@@ -5025,37 +5100,12 @@ fn executeTopKLateMat(
     const total_rows = ctx.source.rowCount();
     if (total_rows == 0) return RowList.init(@constCast(out_metas));
 
-    // Collect filter column names via col_ref traversal.
-    var col_mask = [_]bool{false} ** 256;
-    collectColRefs(filter_pred, col_mask[0..@min(256, schema_metas.len)]);
-
-    // Build scan column names: filter cols + sort key cols.
-    var scan_names_buf: [32][]const u8 = undefined;
-    var scan_names_len: usize = 0;
-    for (col_mask[0..@min(256, schema_metas.len)], 0..) |needed, idx| {
-        if (needed and scan_names_len < scan_names_buf.len) {
-            scan_names_buf[scan_names_len] = schema_metas[idx].name;
-            scan_names_len += 1;
-        }
-    }
-    for (keys) |key| {
-        if (key.col_idx >= schema_metas.len or scan_names_len >= scan_names_buf.len) continue;
-        var dup = false;
-        for (scan_names_buf[0..scan_names_len]) |n| {
-            if (std.mem.eql(u8, n, schema_metas[key.col_idx].name)) {
-                dup = true;
-                break;
-            }
-        }
-        if (!dup) {
-            scan_names_buf[scan_names_len] = schema_metas[key.col_idx].name;
-            scan_names_len += 1;
-        }
-    }
-
     // Phase 1: restrict source to scan cols, iterate fetchRange morsels.
-    ctx.source.setNeededCols(scan_names_buf[0..scan_names_len]);
-    defer ctx.source.setNeededCols(null);
+    var scan_request: ScanRequest = .{};
+    scan_request.addExpr(filter_pred);
+    for (keys) |key| scan_request.addIndex(key.col_idx);
+    const scan_scope = scan_request.apply(ctx.source, .any_reduction);
+    defer scan_scope.deinit();
 
     const HeapEntry = struct {
         global_row: u64,
@@ -5823,39 +5873,13 @@ fn executeTopKFromScannable(
     const narrow_scan_possible = !is_select_star and
         ctx.source.vtable.setNeededCols != null and
         filter_state != null;
+    var scan_request: ScanRequest = .{};
     if (narrow_scan_possible) {
-        // Collect all needed cols: project cols + filter cols + sort key cols.
-        var needed_mask = [_]bool{false} ** 256;
-        if (filter_state) |*fs| {
-            const pred = fs.predicate;
-            collectColRefs(pred, needed_mask[0..@min(256, schema_metas.len)]);
-        }
-        for (effective_keys) |key| {
-            if (key.col_idx < 256) needed_mask[key.col_idx] = true;
-        }
-        if (project_items) |items| {
-            for (items) |item| {
-                collectColRefs(item.expr, needed_mask[0..@min(256, schema_metas.len)]);
-            }
-        }
-        var needed_count: usize = 0;
-        for (needed_mask[0..@min(256, schema_metas.len)]) |m| {
-            if (m) needed_count += 1;
-        }
-        // Only worth restricting if we skip at least half the columns.
-        if (needed_count * 2 < schema_metas.len) {
-            var names_buf: [32][]const u8 = undefined;
-            var names_len: usize = 0;
-            for (needed_mask[0..@min(256, schema_metas.len)], 0..) |m, i| {
-                if (m and names_len < names_buf.len) {
-                    names_buf[names_len] = schema_metas[i].name;
-                    names_len += 1;
-                }
-            }
-            ctx.source.setNeededCols(names_buf[0..names_len]);
-            // Will be reset at the end of executeTopKFromScannable via defer below.
-        }
+        if (filter_state) |*fs| scan_request.addExpr(fs.predicate);
+        for (effective_keys) |key| scan_request.addIndex(key.col_idx);
+        if (project_items) |items| scan_request.addItems(items);
     }
+    const scan_scope = scan_request.apply(ctx.source, .any_reduction);
 
     if (use_late_mat) {
         const result_opt = try executeTopKLateMat(
@@ -5900,7 +5924,7 @@ fn executeTopKFromScannable(
     const sctx = SortCtx{ .keys = effective_keys };
 
     // If narrow_scan was applied, restore all cols after the scan is done.
-    defer if (narrow_scan_possible) ctx.source.setNeededCols(null);
+    defer scan_scope.deinit();
 
     // Strategy: accumulate up to K raw (pre-projection) schema rows in the heap.
     // Project only the final K winners — avoids projecting all 300K+ matching rows.
@@ -6303,6 +6327,51 @@ const MockSource = struct {
     }
 };
 
+test "ScanRequest keeps more than 32 referenced columns" {
+    const WideSource = struct {
+        metas: [64]result.ColMeta = undefined,
+        selected_count: ?usize = null,
+
+        fn nextChunk(_: *anyopaque, _: *DataChunk, _: *QueryContext) !bool {
+            return false;
+        }
+
+        fn reset(_: *anyopaque) void {}
+
+        fn schema(ptr: *anyopaque) []const result.ColMeta {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return &self.metas;
+        }
+
+        fn rowCount(_: *anyopaque) u64 {
+            return 0;
+        }
+
+        fn setNeededCols(ptr: *anyopaque, names: ?[]const []const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.selected_count = if (names) |cols| cols.len else null;
+        }
+
+        const vtable = SourceIface.VTable{
+            .nextChunk = nextChunk,
+            .reset = reset,
+            .schema = schema,
+            .rowCount = rowCount,
+            .setNeededCols = setNeededCols,
+        };
+    };
+
+    var source: WideSource = .{};
+    for (&source.metas) |*meta| meta.* = .{ .name = "c", .col_type = .int64 };
+
+    var request: ScanRequest = .{};
+    for (0..40) |i| request.addIndex(i);
+    const scope = request.apply(.{ .ptr = &source, .vtable = &WideSource.vtable }, .any_reduction);
+    try std.testing.expectEqual(@as(?usize, 40), source.selected_count);
+    scope.deinit();
+    try std.testing.expectEqual(@as(?usize, null), source.selected_count);
+}
+
 test "executePlan: scalar_agg count(*)" {
     const alloc = std.testing.allocator;
 
@@ -6419,10 +6488,11 @@ fn executeHashAggParallelPairCount(
     // Narrow-int check: skip for low-cardinality int columns.
     if (sm[i64_ci].is_narrow_int) return null;
 
-    // Restrict columns to only those needed.
-    const needed_names = [_][]const u8{ sm[i64_ci].name, sm[str_ci].name };
-    ctx.source.setNeededCols(&needed_names);
-    defer ctx.source.setNeededCols(null);
+    var scan_request: ScanRequest = .{};
+    scan_request.addIndex(i64_ci);
+    scan_request.addIndex(str_ci);
+    var scan_scope = scan_request.apply(ctx.source, .any_reduction);
+    defer scan_scope.deinit();
 
     // Preload columns.
     {
@@ -7059,14 +7129,12 @@ fn executeHashAggParallelTripleCount(
     const td = maybe_td orelse return null;
     const sm = ctx.source.schema();
 
-    // Restrict columns to only those needed.
-    const needed_names = [_][]const u8{
-        sm[td.n0_col].name,
-        sm[td.dp_col].name,
-        sm[td.str_col].name,
-    };
-    ctx.source.setNeededCols(&needed_names);
-    defer ctx.source.setNeededCols(null);
+    var scan_request: ScanRequest = .{};
+    scan_request.addIndex(td.n0_col);
+    scan_request.addIndex(td.dp_col);
+    scan_request.addIndex(td.str_col);
+    var scan_scope = scan_request.apply(ctx.source, .any_reduction);
+    defer scan_scope.deinit();
 
     // Preload columns.
     {
@@ -7280,10 +7348,7 @@ fn executeHashAggParallelTripleCount(
         if (aw.err) |e| return e;
     }
 
-    // Build output metas from keys + agg.
-    const out_metas = try alloc.alloc(result.ColMeta, keys.len + 1);
-    for (keys, 0..) |k, ki| out_metas[ki] = .{ .name = k.alias, .col_type = k.out_type };
-    out_metas[keys.len] = .{ .name = aggs[0].alias, .col_type = aggs[0].out_type };
+    const out_metas = try buildAggResultMetas(keys, aggs, alloc);
     var rl = RowList.init(out_metas);
 
     const EmitCtxTriple = struct {
@@ -7523,31 +7588,12 @@ fn executeHashAggParallelStrKey(
         else => null,
     };
 
-    // Apply column restriction.
-    {
-        const sm = ctx.source.schema();
-        var needed_mask = [_]bool{false} ** 256;
-        const ncols = @min(256, sm.len);
-        for (keys) |item| collectColRefs(item.expr, needed_mask[0..ncols]);
-        for (aggs) |item| collectColRefs(item.expr, needed_mask[0..ncols]);
-        if (filter_pred) |fp| collectColRefs(fp, needed_mask[0..ncols]);
-        var needed_count: usize = 0;
-        for (needed_mask[0..ncols]) |m| {
-            if (m) needed_count += 1;
-        }
-        if (needed_count * 2 < sm.len) {
-            var names_buf: [32][]const u8 = undefined;
-            var names_len: usize = 0;
-            for (needed_mask[0..ncols], 0..) |m, i| {
-                if (m and names_len < names_buf.len) {
-                    names_buf[names_len] = sm[i].name;
-                    names_len += 1;
-                }
-            }
-            ctx.source.setNeededCols(names_buf[0..names_len]);
-        }
-    }
-    defer ctx.source.setNeededCols(null);
+    var parallel_scan_request: ScanRequest = .{};
+    parallel_scan_request.addItems(keys);
+    parallel_scan_request.addItems(aggs);
+    if (filter_pred) |fp| parallel_scan_request.addExpr(fp);
+    const parallel_scan_scope = parallel_scan_request.apply(ctx.source, .any_reduction);
+    defer parallel_scan_scope.deinit();
 
     // Preload columns.
     {
@@ -8545,10 +8591,7 @@ fn executeHashAggParallelStrKey(
     }
 
     // Emit result.
-    const out_metas = try alloc.alloc(result.ColMeta, keys.len + aggs.len);
-    for (keys, 0..) |k, i| out_metas[i] = .{ .name = k.alias, .col_type = k.out_type };
-    for (aggs, 0..) |a, i| out_metas[keys.len + i] = .{ .name = a.alias, .col_type = a.out_type };
-
+    const out_metas = try buildAggResultMetas(keys, aggs, alloc);
     var rl = RowList.init(out_metas);
 
     // Build emit_int_key_n for emit decoding (same order as in runWork: col_ref non-str + lit_i64).
@@ -8679,15 +8722,7 @@ fn executeHashAggParallelStrKey(
         pht.iterateWithSlot(&emit_ctx, EmitCb.cb);
     }
 
-    // Apply top-K sort if requested.
-    if (top_k > 0 and sort_keys.len > 0 and rl.rows.items.len > top_k) {
-        const sorted = try executeTopK(rl, sort_keys, top_k, alloc);
-        return sorted;
-    }
-    if (sort_keys.len > 0) {
-        return try executeOrderBy(rl, sort_keys, alloc);
-    }
-    return rl;
+    return try finalizeAggRows(rl, sort_keys, top_k, alloc);
 }
 
 fn executeBoundedCountTopDistinct(
@@ -8823,9 +8858,7 @@ fn executeBoundedCountTopDistinct(
         acc_i64[distinct_ai * key_span + c.idx] = @intCast(distinct_sets[ci].len);
     }
 
-    const out_metas = try alloc.alloc(result.ColMeta, keys.len + aggs.len);
-    out_metas[0] = .{ .name = keys[0].alias, .col_type = keys[0].out_type };
-    for (aggs, 0..) |a, i| out_metas[1 + i] = .{ .name = a.alias, .col_type = a.out_type };
+    const out_metas = try buildAggResultMetas(keys, aggs, alloc);
     var rl = RowList.init(out_metas);
     for (candidates_buf[0..cand_len]) |c| {
         const row = try alloc.alloc(?Value, 1 + aggs.len);
@@ -8965,31 +8998,12 @@ fn executeHashAggParallelCompactTopK(
         }
     }
 
-    // Apply column restriction for scan.
-    {
-        const sm = ctx.source.schema();
-        var needed_mask = [_]bool{false} ** 256;
-        const ncols = @min(256, sm.len);
-        for (keys) |item| collectColRefs(item.expr, needed_mask[0..ncols]);
-        for (aggs) |item| collectColRefs(item.expr, needed_mask[0..ncols]);
-        if (filter_pred) |fp| collectColRefs(fp, needed_mask[0..ncols]);
-        var needed_count: usize = 0;
-        for (needed_mask[0..ncols]) |m| {
-            if (m) needed_count += 1;
-        }
-        if (needed_count * 2 < sm.len) {
-            var names_buf: [32][]const u8 = undefined;
-            var names_len: usize = 0;
-            for (needed_mask[0..ncols], 0..) |m, i| {
-                if (m and names_len < names_buf.len) {
-                    names_buf[names_len] = sm[i].name;
-                    names_len += 1;
-                }
-            }
-            ctx.source.setNeededCols(names_buf[0..names_len]);
-        }
-    }
-    defer ctx.source.setNeededCols(null);
+    var scan_request: ScanRequest = .{};
+    scan_request.addItems(keys);
+    scan_request.addItems(aggs);
+    if (filter_pred) |fp| scan_request.addExpr(fp);
+    const scan_scope = scan_request.apply(ctx.source, .any_reduction);
+    defer scan_scope.deinit();
 
     // If the filter is a simple `col_ref != ''` (string non-empty check), tell the
     // source to decode that column as bool_u8 instead of fat string pointers.
@@ -9250,9 +9264,7 @@ fn executeHashAggParallelCompactTopK(
             }
         }
         // Build RowList from non-zero histogram entries.
-        const hist_out_metas = try alloc.alloc(result.ColMeta, keys.len + aggs.len);
-        for (keys, 0..) |k, i| hist_out_metas[i] = .{ .name = k.alias, .col_type = k.out_type };
-        for (aggs, 0..) |a, i| hist_out_metas[keys.len + i] = .{ .name = a.alias, .col_type = a.out_type };
+        const hist_out_metas = try buildAggResultMetas(keys, aggs, alloc);
         var hist_rl = RowList.init(hist_out_metas);
         for (0..HIST_SIZE) |ui| {
             if (final_hist[ui] == 0) continue;
@@ -10099,34 +10111,13 @@ fn executeHashAggParallelCompactTopK(
         }
     };
 
-    // Column pruning: tell the source to only load the columns actually needed
-    // (filter + key + agg columns).  For the hits table (105 columns), Q41/Q42
-    // only touch 6-7 columns; pruning reduces fetchRange I/O from ~100MB/morsel
-    // to ~6MB/morsel, cutting scan time from ~12ms to ~1ms.
-    {
-        const ncols = @min(256, ctx.source.schema().len);
-        var needed_mask = [_]bool{false} ** 256;
-        for (keys) |item| collectColRefs(item.expr, needed_mask[0..ncols]);
-        for (aggs) |item| collectColRefs(item.expr, needed_mask[0..ncols]);
-        if (filter_pred) |fp| collectColRefs(fp, needed_mask[0..ncols]);
-        var needed_count: usize = 0;
-        for (needed_mask[0..ncols]) |m| {
-            if (m) needed_count += 1;
-        }
-        if (needed_count > 0 and needed_count * 2 < ctx.source.schema().len) {
-            const sm2 = ctx.source.schema();
-            var names_buf2: [32][]const u8 = undefined;
-            var names_len2: usize = 0;
-            for (needed_mask[0..ncols], 0..) |m, i| {
-                if (m and names_len2 < names_buf2.len) {
-                    names_buf2[names_len2] = sm2[i].name;
-                    names_len2 += 1;
-                }
-            }
-            ctx.source.setNeededCols(names_buf2[0..names_len2]);
-        }
-    }
-    defer ctx.source.setNeededCols(null);
+    // Q41/Q42 touch only 6-7 columns of the 105-column hits schema.
+    var parallel_scan_request: ScanRequest = .{};
+    parallel_scan_request.addItems(keys);
+    parallel_scan_request.addItems(aggs);
+    if (filter_pred) |fp| parallel_scan_request.addExpr(fp);
+    const parallel_scan_scope = parallel_scan_request.apply(ctx.source, .any_reduction);
+    defer parallel_scan_scope.deinit();
 
     // Allocate per-thread contexts.
     var morsel_src = parallel.MorselSource.init(total_rows, parallel.default_morsel_size);
@@ -10248,9 +10239,7 @@ fn executeHashAggParallelCompactTopK(
     // Precompute key output types so makeRow emits the correct Value union variant.
     const key_out_types_buf = try alloc.alloc(ColumnType, keys.len);
     for (keys, 0..) |k, i| key_out_types_buf[i] = k.out_type;
-    const out_metas = try alloc.alloc(result.ColMeta, keys.len + aggs.len);
-    for (keys, 0..) |k, i| out_metas[i] = .{ .name = k.alias, .col_type = k.out_type };
-    for (aggs, 0..) |a, i| out_metas[keys.len + i] = .{ .name = a.alias, .col_type = a.out_type };
+    const out_metas = try buildAggResultMetas(keys, aggs, alloc);
 
     if (top_offset > 0 and top_k > 0 and sort_keys.len > 0) {
         var merged_count: usize = 0;
@@ -11054,36 +11043,13 @@ fn executeTwoPhaseHashAgg(
 
     var morsel_src1 = parallel.MorselSource.init(total_rows, parallel.default_morsel_size);
 
-    // Column pruning for executeTwoPhaseHashAgg: only load columns touched by filter + keys + aggs.
-    {
-        const ncols2p = @min(256, ctx.source.schema().len);
-        var needed2p = [_]bool{false} ** 256;
-        for (keys) |item| collectColRefs(item.expr, needed2p[0..ncols2p]);
-        for (aggs) |item| collectColRefs(item.expr, needed2p[0..ncols2p]);
-        if (int_filter) |ics| for (ics) |ic| {
-            if (ic.col_idx < ncols2p) needed2p[ic.col_idx] = true;
-        };
-        if (str_filter) |sf| {
-            if (sf.col_idx < ncols2p) needed2p[sf.col_idx] = true;
-        }
-        var cnt2p: usize = 0;
-        for (needed2p[0..ncols2p]) |m| {
-            if (m) cnt2p += 1;
-        }
-        if (cnt2p > 0 and cnt2p * 2 < ctx.source.schema().len) {
-            const sm2p = ctx.source.schema();
-            var nbuf2p: [32][]const u8 = undefined;
-            var nlen2p: usize = 0;
-            for (needed2p[0..ncols2p], 0..) |m, i| {
-                if (m and nlen2p < nbuf2p.len) {
-                    nbuf2p[nlen2p] = sm2p[i].name;
-                    nlen2p += 1;
-                }
-            }
-            ctx.source.setNeededCols(nbuf2p[0..nlen2p]);
-        }
-    }
-    defer ctx.source.setNeededCols(null);
+    var scan_request: ScanRequest = .{};
+    scan_request.addItems(keys);
+    scan_request.addItems(aggs);
+    if (int_filter) |ics| for (ics) |ic| scan_request.addIndex(ic.col_idx);
+    if (str_filter) |sf| scan_request.addIndex(sf.col_idx);
+    const scan_scope = scan_request.apply(ctx.source, .half);
+    defer scan_scope.deinit();
 
     const scatter_ctxs = try alloc.alloc(ScatterCtx, n_threads);
     for (scatter_ctxs) |*sc| {
@@ -11223,9 +11189,7 @@ fn executeTwoPhaseHashAgg(
         }
         for (scatter_ctxs) |*sc| sc.buf_arena.deinit();
 
-        const out_metas = try alloc.alloc(result.ColMeta, n_keys + n_aggs);
-        for (keys, 0..) |k, i| out_metas[i] = .{ .name = k.alias, .col_type = k.out_type };
-        for (aggs, 0..) |a, i| out_metas[n_keys + i] = .{ .name = a.alias, .col_type = a.out_type };
+        const out_metas = try buildAggResultMetas(keys, aggs, alloc);
         var rl = RowList.init(out_metas);
         for (part_candidates) |c| {
             if (c.count == 0) continue;
@@ -11336,9 +11300,7 @@ fn executeTwoPhaseHashAgg(
         }
         for (scatter_ctxs) |*sc| sc.buf_arena.deinit();
 
-        const out_metas = try alloc.alloc(result.ColMeta, n_keys + n_aggs);
-        for (keys, 0..) |k, i| out_metas[i] = .{ .name = k.alias, .col_type = k.out_type };
-        for (aggs, 0..) |a, i| out_metas[n_keys + i] = .{ .name = a.alias, .col_type = a.out_type };
+        const out_metas = try buildAggResultMetas(keys, aggs, alloc);
         var rl = RowList.init(out_metas);
         for (counts, 0..) |count, idx| {
             if (count == 0) continue;
@@ -11527,9 +11489,7 @@ fn executeTwoPhaseHashAgg(
 
     const key_out_types_buf = try alloc.alloc(ColumnType, n_keys);
     for (keys, 0..) |k, i| key_out_types_buf[i] = k.out_type;
-    const out_metas = try alloc.alloc(result.ColMeta, n_keys + n_aggs);
-    for (keys, 0..) |k, i| out_metas[i] = .{ .name = k.alias, .col_type = k.out_type };
-    for (aggs, 0..) |a, i| out_metas[n_keys + i] = .{ .name = a.alias, .col_type = a.out_type };
+    const out_metas = try buildAggResultMetas(keys, aggs, alloc);
 
     var rl = RowList.init(out_metas);
     const EmitCtx = struct {
@@ -12405,46 +12365,18 @@ fn executeTwoPhaseHashAggStrKeySimple(
         (sidecar_col_idx == null or raw_sidecar_pre != null) and // sidecar ok if raw slice available
         str_filter_is_key_col; // str filter checked via key offsets
 
-    // ── Column pruning via setNeededCols ─────────────────────────────────────
-    // Collect the minimal set of column names needed, avoiding decoding the
-    // other 100+ unused schema columns in fetchRange.
-    // Skipped when skip_fetch is active (no fetchRange at all) or when needed > half schema.
+    var scatter_scan_request: ScanRequest = .{};
     if (!can_skip_fetch) {
-        var needed_names_buf: [32][]const u8 = undefined;
-        var needed_names_n: usize = 0;
-        // Helper: add name without duplicates.
-        const addName = struct {
-            fn add(buf: [][]const u8, n: *usize, name: []const u8) void {
-                for (buf[0..n.*]) |ex| {
-                    if (std.mem.eql(u8, ex, name)) return;
-                }
-                if (n.* < buf.len) {
-                    buf[n.*] = name;
-                    n.* += 1;
-                }
-            }
-        }.add;
-        if (key_col_idx < src_schema.len) addName(&needed_names_buf, &needed_names_n, src_schema[key_col_idx].name);
-        if (str_filter) |sf| {
-            if (sf.col_idx < src_schema.len) addName(&needed_names_buf, &needed_names_n, src_schema[sf.col_idx].name);
-        }
-        if (int_filter) |ics| {
-            for (ics) |cond| {
-                if (cond.col_idx < src_schema.len) addName(&needed_names_buf, &needed_names_n, src_schema[cond.col_idx].name);
-            }
-        }
+        scatter_scan_request.addIndex(key_col_idx);
+        if (str_filter) |sf| scatter_scan_request.addIndex(sf.col_idx);
+        if (int_filter) |ics| for (ics) |cond| scatter_scan_request.addIndex(cond.col_idx);
         for (agg_infos) |info| {
-            if (!count_only and info.col_idx < src_schema.len) addName(&needed_names_buf, &needed_names_n, src_schema[info.col_idx].name);
+            if (!count_only) scatter_scan_request.addIndex(info.col_idx);
         }
-        if (sidecar_col_idx) |sci| {
-            if (sci < src_schema.len) addName(&needed_names_buf, &needed_names_n, src_schema[sci].name);
-        }
-        // Only call setNeededCols when it actually reduces work (at least 2× reduction).
-        if (needed_names_n > 0 and needed_names_n * 2 < src_schema.len) {
-            ctx.source.setNeededCols(needed_names_buf[0..needed_names_n]);
-        }
+        if (sidecar_col_idx) |sci| scatter_scan_request.addIndex(sci);
     }
-    defer ctx.source.setNeededCols(null);
+    const scatter_scan_scope = scatter_scan_request.apply(ctx.source, .half);
+    defer scatter_scan_scope.deinit();
 
     var morsel_src1 = parallel.MorselSource.init(total_rows, parallel.default_morsel_size);
     const scatter_ctxs = try alloc.alloc(ScatterCtx, n_threads);
@@ -12772,9 +12704,7 @@ fn executeTwoPhaseHashAggStrKeySimple(
     for (scatter_ctxs) |*sc| sc.buf_arena.deinit();
 
     // ── Emit: iterate all partition HTs, build output RowList ────────────────
-    const out_metas = try alloc.alloc(result.ColMeta, keys.len + n_aggs);
-    for (keys, 0..) |k, i| out_metas[i] = .{ .name = k.alias, .col_type = k.out_type };
-    for (aggs, 0..) |a, i| out_metas[keys.len + i] = .{ .name = a.alias, .col_type = a.out_type };
+    const out_metas = try buildAggResultMetas(keys, aggs, alloc);
 
     const use_heap = top_k > 0 and sort_keys.len > 0;
 
@@ -13293,9 +13223,7 @@ fn executeTwoPhaseHashAggWithCW(
     defer for (scatter_ctxs) |*sc| sc.buf_arena.deinit();
 
     // ── Emit infrastructure ───────────────────────────────────────────────────
-    const out_metas2 = try alloc.alloc(result.ColMeta, keys.len + aggs.len);
-    for (keys, 0..) |k, i| out_metas2[i] = .{ .name = k.alias, .col_type = k.out_type };
-    for (aggs, 0..) |a, i| out_metas2[keys.len + i] = .{ .name = a.alias, .col_type = a.out_type };
+    const out_metas2 = try buildAggResultMetas(keys, aggs, alloc);
     var rl = RowList.init(out_metas2);
 
     // Compute emit_all_const (mirrors executeHashAggParallelStrKey logic).
@@ -13603,9 +13531,5 @@ fn executeTwoPhaseHashAggWithCW(
     }
 
     // ── Sort / TopK ───────────────────────────────────────────────────────────
-    if (top_k > 0 and sort_keys.len > 0 and rl.rows.items.len > top_k)
-        return try executeTopK(rl, sort_keys, top_k, alloc);
-    if (sort_keys.len > 0)
-        return try executeOrderBy(rl, sort_keys, alloc);
-    return rl;
+    return try finalizeAggRows(rl, sort_keys, top_k, alloc);
 }

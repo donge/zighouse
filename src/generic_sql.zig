@@ -120,6 +120,8 @@ pub const JoinSpec = struct {
     kind: JoinKind,
     left: *Plan,
     right: *Plan,
+    left_alias: ?[]const u8 = null,
+    right_alias: ?[]const u8 = null,
     /// Left-side column names for equi-join (parallel to on_right).
     on_left: []const []const u8,
     /// Right-side column names for equi-join (parallel to on_left).
@@ -357,6 +359,8 @@ pub fn deinit(allocator: std.mem.Allocator, plan: Plan) void {
         allocator.destroy(j.left);
         deinit(allocator, j.right.*);
         allocator.destroy(j.right);
+        if (j.left_alias) |s| allocator.free(s);
+        if (j.right_alias) |s| allocator.free(s);
         allocator.free(j.on_left);
         allocator.free(j.on_right);
         allocator.destroy(j);

@@ -48,8 +48,10 @@ pub fn buildPlan(allocator: Allocator, stmt: *ast.Stmt, ctes: ?[]ast.Cte) BuildE
 
 fn buildSelectPlan(allocator: Allocator, sel: ast.SelectStmt, ctes_from_parent: ?[]ast.Cte) BuildError!Plan {
     // Merge CTEs from the statement itself and from parent (for subqueries)
-    const all_ctes = sel.ctes;
-    _ = ctes_from_parent; // CTEs are inlined at lookup time
+    const parent_ctes = ctes_from_parent orelse &.{};
+    const merged_ctes_owned = parent_ctes.len > 0 and sel.ctes.len > 0;
+    const all_ctes = try mergeCtes(allocator, ctes_from_parent, sel.ctes);
+    defer if (merged_ctes_owned) allocator.free(all_ctes);
 
     // Build projections
     var projs = std.ArrayListUnmanaged(Expr).empty;
@@ -129,6 +131,8 @@ fn buildSelectPlan(allocator: Allocator, sel: ast.SelectStmt, ctes_from_parent: 
                     .kind = @enumFromInt(@intFromEnum(jc.kind)),
                     .left = left_ptr,
                     .right = right_ptr,
+                    .left_alias = try fromClauseAlias(allocator, jc.left.*),
+                    .right_alias = try fromClauseAlias(allocator, jc.right.*),
                     .on_left = try on_lefts.toOwnedSlice(allocator),
                     .on_right = try on_rights.toOwnedSlice(allocator),
                 };
@@ -290,6 +294,16 @@ fn findCte(ctes: []ast.Cte, name: []const u8) ?*ast.Stmt {
     return null;
 }
 
+fn mergeCtes(allocator: Allocator, parent: ?[]ast.Cte, local: []ast.Cte) BuildError![]ast.Cte {
+    const p = parent orelse &.{};
+    if (p.len == 0) return local;
+    if (local.len == 0) return @constCast(p);
+    const out = try allocator.alloc(ast.Cte, p.len + local.len);
+    @memcpy(out[0..p.len], p);
+    @memcpy(out[p.len..], local);
+    return out;
+}
+
 fn isAggregate(fn_: generic_sql.AggregateFn) bool {
     return switch (fn_) {
         .column_ref, .int_literal, .float_literal, .case_when, .cmp_expr => false,
@@ -307,30 +321,19 @@ fn tableRefName(allocator: Allocator, tr: ast.TableRef) BuildError![]const u8 {
 fn buildFromClause(allocator: Allocator, from: ast.FromClause, ctes: []ast.Cte) BuildError!Plan {
     switch (from) {
         .table => |tr| {
-            var p = Plan{ .table = undefined, .projections = &.{}, .owned = true };
             if (findCte(ctes, tr.name)) |cte_stmt| {
-                const sub = try allocator.create(Plan);
-                sub.* = try buildPlan(allocator, cte_stmt, ctes);
-                p.subquery_source = sub;
-                p.table = try allocator.dupe(u8, tr.name);
-            } else {
-                p.table = try tableRefName(allocator, tr);
+                return buildPlan(allocator, cte_stmt, ctes);
             }
-            return p;
+            return Plan{ .table = try tableRefName(allocator, tr), .projections = &.{}, .owned = true };
         },
         .subquery => |sq| {
-            const sub = try allocator.create(Plan);
-            sub.* = try buildPlan(allocator, sq.stmt, ctes);
-            return Plan{ .table = try allocator.dupe(u8, sq.alias orelse "__subquery__"), .projections = &.{}, .subquery_source = sub, .owned = true };
+            return buildPlan(allocator, sq.stmt, ctes);
         },
         .cte_ref => |name| {
-            var p = Plan{ .table = try allocator.dupe(u8, name), .projections = &.{}, .owned = true };
             if (findCte(ctes, name)) |cte_stmt| {
-                const sub = try allocator.create(Plan);
-                sub.* = try buildPlan(allocator, cte_stmt, ctes);
-                p.subquery_source = sub;
+                return buildPlan(allocator, cte_stmt, ctes);
             }
-            return p;
+            return Plan{ .table = try allocator.dupe(u8, name), .projections = &.{}, .owned = true };
         },
         .numbers => |n| {
             return Plan{ .table = try allocator.dupe(u8, "numbers"), .projections = &.{}, .numbers_count = if (n >= 0) @intCast(n) else null, .owned = true };
@@ -357,6 +360,8 @@ fn buildFromClause(allocator: Allocator, from: ast.FromClause, ctes: []ast.Cte) 
                 .kind = @enumFromInt(@intFromEnum(jc.kind)),
                 .left = left_ptr,
                 .right = right_ptr,
+                .left_alias = try fromClauseAlias(allocator, jc.left.*),
+                .right_alias = try fromClauseAlias(allocator, jc.right.*),
                 .on_left = try on_lefts.toOwnedSlice(allocator),
                 .on_right = try on_rights.toOwnedSlice(allocator),
             };
@@ -388,6 +393,17 @@ fn extractEquiKeys(
         },
         else => return error.UnsupportedFeature,
     }
+}
+
+fn fromClauseAlias(allocator: Allocator, from: ast.FromClause) BuildError!?[]const u8 {
+    return switch (from) {
+        .table => |tr| try allocator.dupe(u8, tr.alias orelse tr.name),
+        .subquery => |sq| if (sq.alias) |a| try allocator.dupe(u8, a) else null,
+        .cte_ref => |name| try allocator.dupe(u8, name),
+        .numbers => try allocator.dupe(u8, "numbers"),
+        .table_func => |tf| try allocator.dupe(u8, tf.name),
+        .join => null,
+    };
 }
 
 // ── Projection expression builder ─────────────────────────────────────────────

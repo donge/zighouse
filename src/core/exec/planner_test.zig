@@ -8,6 +8,18 @@ const planner_mod = @import("planner.zig");
 const PlannerCtx = planner_mod.PlannerCtx;
 const plan_query = planner_mod.plan_query;
 
+fn findHashAggNode(node: *const planner_mod.PhysicalNode) ?*const planner_mod.PhysicalNode {
+    return switch (node.*) {
+        .hash_agg => node,
+        .project => |p| findHashAggNode(p.input),
+        .filter => |f| findHashAggNode(f.input),
+        .order_by => |o| findHashAggNode(o.input),
+        .top_k => |t| findHashAggNode(t.input),
+        .limit => |l| findHashAggNode(l.input),
+        else => null,
+    };
+}
+
 // ── Existing tests (moved from planner.zig) ───────────────────────────────────
 
 test "planner: simple scan" {
@@ -180,6 +192,32 @@ test "planner: parsed dict score conditional infers Float64" {
     const node = try plan_query(&ctx, gplan) orelse return error.NullPlan;
     try std.testing.expect(node.* == .project);
     try std.testing.expectEqual(planner_mod.ColumnType.float64, node.project.items[0].out_type);
+}
+
+test "planner: trie tags any aggregate becomes empty Array(String)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const cols = [_]schema_mod.Column{
+        .{ .name = "dst_ip", .ty = .text, .ch_type = "IPv6" },
+    };
+    const tbl = schema_mod.Table{ .name = "detect_events", .columns = &cols };
+    var ctx = PlannerCtx.init(alloc, tbl);
+
+    const sql =
+        "SELECT any(if(isIPv4String(toString(dst_ip)), " ++
+        "dictGetOrDefault('vprobe.dict_ip_reputation_trie', 'tags', tuple(IPv4StringToNumOrDefault(toString(dst_ip))), CAST([], 'Array(String)')), " ++
+        "CAST([], 'Array(String)'))) AS intel_tags FROM detect_events GROUP BY toString(dst_ip)";
+    const gplan = (try generic_sql.parse(alloc, sql)) orelse return error.ParseFailed;
+    defer generic_sql.deinit(alloc, gplan);
+
+    const node = try plan_query(&ctx, gplan) orelse return error.NullPlan;
+    const ha = findHashAggNode(node) orelse return error.HashAggNotFound;
+    try std.testing.expectEqual(planner_mod.ColumnType.array_string, ha.hash_agg.aggs[0].out_type);
+    const ac = ha.hash_agg.aggs[0].expr.agg_call;
+    try std.testing.expect(ac.arg.? == .lit_array);
+    try std.testing.expectEqual(@as(usize, 0), ac.arg.?.lit_array.len);
 }
 
 test "planner: user function substitution respects identifier boundaries" {

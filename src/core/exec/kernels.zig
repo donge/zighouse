@@ -561,9 +561,8 @@ fn evalFnCallFull(fc: *const plan.FnCall, row: []const ?Value, lambda_val: ?Valu
     }
     if (std.mem.eql(u8, name, "toString") or std.mem.eql(u8, name, "CAST_str")) {
         const v = args[0] orelse return null;
-        // FixedString(16) IPv6: raw 16 bytes → format as IPv6 address string
-        if (v == .string and v.string.len == 16) {
-            return Value{ .string = try ipv6BytesToStr(v.string, arena) };
+        if (v == .string and (v.string.len == 4 or v.string.len == 16)) {
+            return Value{ .string = try ipBytesToStr(v.string, arena) };
         }
         if (v.toStr()) |s| return Value{ .string = s };
         return Value{ .string = try valueToArrayString(v, arena) };
@@ -1240,6 +1239,15 @@ fn evalFnCallFull(fc: *const plan.FnCall, row: []const ?Value, lambda_val: ?Valu
             else => null,
         };
     }
+    if (std.mem.eql(u8, name, "toDateTime64")) {
+        const v = args[0] orelse return null;
+        return switch (v) {
+            .datetime64_ms => v,
+            .int64 => |i| Value{ .datetime64_ms = i },
+            .uint64 => |u| Value{ .datetime64_ms = @intCast(u) },
+            else => null,
+        };
+    }
     if (std.mem.eql(u8, name, "toDate") or std.mem.eql(u8, name, "toDateOrZero")) {
         const v = args[0] orelse return Value{ .date_u16 = 0 };
         return switch (v) {
@@ -1534,6 +1542,9 @@ fn evalFnCallFull(fc: *const plan.FnCall, row: []const ?Value, lambda_val: ?Valu
     }
     if (std.mem.eql(u8, name, "toString")) {
         const v = args[0] orelse return null;
+        if (v == .string and (v.string.len == 4 or v.string.len == 16)) {
+            return Value{ .string = try ipBytesToStr(v.string, arena) };
+        }
         if (v.toStr()) |s| return Value{ .string = s };
         return Value{ .string = try valueToArrayString(v, arena) };
     }
@@ -1708,6 +1719,15 @@ fn parseIPv4(s: []const u8) ?u64 {
 fn isIPv6(s: []const u8) bool {
     return std.mem.indexOfScalar(u8, s, ':') != null and
         std.mem.indexOfScalar(u8, s, '.') == null;
+}
+
+fn ipBytesToStr(bytes: []const u8, arena: std.mem.Allocator) ![]const u8 {
+    if (bytes.len == 4) {
+        return std.fmt.allocPrint(arena, "{d}.{d}.{d}.{d}", .{
+            bytes[0], bytes[1], bytes[2], bytes[3],
+        });
+    }
+    return ipv6BytesToStr(bytes, arena);
 }
 
 /// Format 16 raw bytes as an IPv6 address string (RFC 5952 / ClickHouse format).
