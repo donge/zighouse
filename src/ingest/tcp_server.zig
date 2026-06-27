@@ -4,7 +4,6 @@
 /// so it shares all the same module imports (schema_config, row_binary_decoder, …).
 ///
 /// Protocol revision advertised: 54460 (clickhouse-go v2.45 DBMS_TCP_PROTOCOL_VERSION).
-
 const std = @import("std");
 const schema = @import("schema");
 const schema_config = @import("schema_config");
@@ -158,7 +157,9 @@ fn sendHello(a: std.mem.Allocator, w: *Io.Writer) !void {
     defer buf.deinit(a);
     try buf.append(a, SERVER_HELLO);
     try wstr(&buf, a, "ZigHouse");
-    try wuv(&buf, a, 24); try wuv(&buf, a, 3); try wuv(&buf, a, REVISION);
+    try wuv(&buf, a, 24);
+    try wuv(&buf, a, 3);
+    try wuv(&buf, a, REVISION);
     try wstr(&buf, a, "UTC");
     try wstr(&buf, a, "ZigHouse");
     try wuv(&buf, a, 0);
@@ -180,8 +181,12 @@ fn sendProfileInfo(a: std.mem.Allocator, w: *Io.Writer) !void {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(a);
     try buf.append(a, SERVER_PROFILE_INFO);
-    try wuv(&buf, a, 0); try wuv(&buf, a, 0); try wuv(&buf, a, 0);
-    try buf.append(a, 0); try wuv(&buf, a, 0); try buf.append(a, 0);
+    try wuv(&buf, a, 0);
+    try wuv(&buf, a, 0);
+    try wuv(&buf, a, 0);
+    try buf.append(a, 0);
+    try wuv(&buf, a, 0);
+    try buf.append(a, 0);
     try w.writeAll(buf.items);
     try w.flush();
 }
@@ -237,14 +242,14 @@ fn chTypeName(col: schema.Column) []const u8 {
         return ct;
     }
     return switch (col.ty) {
-        .int8    => "Int8",
-        .int16   => "Int16",
-        .int32   => "Int32",
-        .int64   => "Int64",
+        .int8 => "Int8",
+        .int16 => "Int16",
+        .int32 => "Int32",
+        .int64 => "Int64",
         .float32 => "Float32",
         .float64 => "Float64",
         .text, .char, .low_card => "String",
-        .date    => "Date",
+        .date => "Date",
         .timestamp => "DateTime",
     };
 }
@@ -279,7 +284,9 @@ fn readClientQuery(a: std.mem.Allocator, rd: TcpReader, used_revision: u64) ![]u
         }
     }
     if (used_revision >= 54453) {
-        _ = try rd.readUVarInt(); _ = try rd.readUVarInt(); _ = try rd.readUVarInt();
+        _ = try rd.readUVarInt();
+        _ = try rd.readUVarInt();
+        _ = try rd.readUVarInt();
     }
 
     // settings: key-value terminated by empty key
@@ -427,8 +434,14 @@ fn wireKind(ch_type: []const u8) WireKind {
         var depth: usize = 0;
         var i: usize = 0;
         while (i < body.len) : (i += 1) {
-            if (body[i] == '(') { depth += 1; continue; }
-            if (body[i] == ')') { if (depth > 0) depth -= 1; continue; }
+            if (body[i] == '(') {
+                depth += 1;
+                continue;
+            }
+            if (body[i] == ')') {
+                if (depth > 0) depth -= 1;
+                continue;
+            }
             if (body[i] == ',' and depth == 0) {
                 const inner_type = std.mem.trim(u8, body[i + 1 ..], " \t");
                 return wireKind(inner_type);
@@ -552,7 +565,10 @@ fn readClientDataBlock(
 
             // Read indices and expand to strings
             const key_width: usize = switch (key_type) {
-                0 => 1, 1 => 2, 2 => 4, 3 => 8,
+                0 => 1,
+                1 => 2,
+                2 => 4,
+                3 => 8,
             };
             for (0..@intCast(key_count)) |_| {
                 const key: u64 = switch (key_width) {
@@ -627,7 +643,12 @@ fn readClientDataBlock(
 
                 const key_count_lc = try rd.readInt(i64, .little);
                 if (key_count_lc < 0) return error.InvalidLCData;
-                const kw_lc: usize = switch (key_type_lc) { 0 => 1, 1 => 2, 2 => 4, 3 => 8 };
+                const kw_lc: usize = switch (key_type_lc) {
+                    0 => 1,
+                    1 => 2,
+                    2 => 4,
+                    3 => 8,
+                };
 
                 // Read all key indices and resolve to strings
                 const all_elems = try a.alloc([]const u8, @intCast(key_count_lc));
@@ -701,7 +722,12 @@ fn readClientDataBlock(
                 }
             } else {
                 // Array(fixed-width): skip element data
-                const elem_width: usize = switch (kind) { .array_fixed1 => 1, .array_fixed4 => 4, .array_fixed8 => 8, else => 1 };
+                const elem_width: usize = switch (kind) {
+                    .array_fixed1 => 1,
+                    .array_fixed4 => 4,
+                    .array_fixed8 => 8,
+                    else => 1,
+                };
                 for (0..@intCast(total_elems)) |_| {
                     var tmp: [8]u8 = undefined;
                     try rd.readNoEof(tmp[0..elem_width]);
@@ -845,15 +871,17 @@ fn dispatchQuery(
     if (std.ascii.startsWithIgnoreCase(s, "INSERT")) {
         try handleInsert(ctx, a, w, s, rd);
     } else if (std.ascii.startsWithIgnoreCase(s, "SELECT") or
-               std.ascii.startsWithIgnoreCase(s, "WITH") or
-               std.ascii.startsWithIgnoreCase(s, "SHOW") or
-               std.ascii.startsWithIgnoreCase(s, "DESC")) {
+        std.ascii.startsWithIgnoreCase(s, "WITH") or
+        std.ascii.startsWithIgnoreCase(s, "SHOW") or
+        std.ascii.startsWithIgnoreCase(s, "DESC"))
+    {
         // Normalize: strip FINAL keyword and SETTINGS clause
         const normalized = try normalizeSql(a, s);
         defer a.free(normalized);
         try handleSelect(ctx, a, w, normalized);
     } else if (std.ascii.startsWithIgnoreCase(s, "CREATE TABLE") or
-               std.ascii.startsWithIgnoreCase(s, "CREATE OR REPLACE TABLE")) {
+        std.ascii.startsWithIgnoreCase(s, "CREATE OR REPLACE TABLE"))
+    {
         try handleCreateTable(ctx, a, w, s);
     } else if (std.ascii.startsWithIgnoreCase(s, "DROP TABLE")) {
         try handleDropTable(ctx, a, w, s);
@@ -888,20 +916,31 @@ fn stripSettingsClause(sql: []const u8) []const u8 {
             continue;
         }
         if (c == '\'' or c == '"' or c == '`') {
-            in_quote = true; quote_char = c; i += 1; continue;
+            in_quote = true;
+            quote_char = c;
+            i += 1;
+            continue;
         }
-        if (c == '(') { depth += 1; i += 1; continue; }
-        if (c == ')') { if (depth > 0) depth -= 1; i += 1; continue; }
+        if (c == '(') {
+            depth += 1;
+            i += 1;
+            continue;
+        }
+        if (c == ')') {
+            if (depth > 0) depth -= 1;
+            i += 1;
+            continue;
+        }
         if (depth == 0) {
             const kw = "SETTINGS";
-            if (i + kw.len <= sql.len and std.ascii.eqlIgnoreCase(sql[i..i + kw.len], kw)) {
+            if (i + kw.len <= sql.len and std.ascii.eqlIgnoreCase(sql[i .. i + kw.len], kw)) {
                 const before = i == 0 or !std.ascii.isAlphanumeric(sql[i - 1]);
                 const after_pos = i + kw.len;
                 const after = after_pos >= sql.len or !std.ascii.isAlphanumeric(sql[after_pos]);
                 if (before and after) {
                     // Strip from here to end
                     var end = i;
-                    while (end > 0 and (sql[end-1] == ' ' or sql[end-1] == '\t' or sql[end-1] == '\r' or sql[end-1] == '\n')) end -= 1;
+                    while (end > 0 and (sql[end - 1] == ' ' or sql[end - 1] == '\t' or sql[end - 1] == '\r' or sql[end - 1] == '\n')) end -= 1;
                     return sql[0..end];
                 }
             }
@@ -918,8 +957,8 @@ fn removeFinalKeyword(a: std.mem.Allocator, sql: []const u8) ![]u8 {
     var stripped: bool = false;
     while (i < sql.len) {
         const kw = "FINAL";
-        if (i + kw.len <= sql.len and std.ascii.eqlIgnoreCase(sql[i..i + kw.len], kw)) {
-            const before_ok = i == 0 or (!std.ascii.isAlphanumeric(sql[i-1]) and sql[i-1] != '_');
+        if (i + kw.len <= sql.len and std.ascii.eqlIgnoreCase(sql[i .. i + kw.len], kw)) {
+            const before_ok = i == 0 or (!std.ascii.isAlphanumeric(sql[i - 1]) and sql[i - 1] != '_');
             const after_pos = i + kw.len;
             const after_ok = after_pos >= sql.len or (!std.ascii.isAlphanumeric(sql[after_pos]) and sql[after_pos] != '_');
             if (before_ok and after_ok) {
@@ -979,7 +1018,9 @@ fn sendScalarString(a: std.mem.Allocator, w: *Io.Writer, col_name: []const u8, v
     try writeBlockInfo(&buf, a);
     try wuv(&buf, a, 1); // 1 column
     try wuv(&buf, a, 1); // 1 row
-    try wstr(&buf, a, col_name); try wstr(&buf, a, "String"); try buf.append(a, 0);
+    try wstr(&buf, a, col_name);
+    try wstr(&buf, a, "String");
+    try buf.append(a, 0);
     try wstr(&buf, a, value);
     try sendData(a, w, buf.items);
     try sendProfileInfo(a, w);
@@ -993,7 +1034,9 @@ fn sendScalarUInt64(a: std.mem.Allocator, w: *Io.Writer, col_name: []const u8, v
     try writeBlockInfo(&buf, a);
     try wuv(&buf, a, 1); // 1 column
     try wuv(&buf, a, 1); // 1 row
-    try wstr(&buf, a, col_name); try wstr(&buf, a, "UInt64"); try buf.append(a, 0);
+    try wstr(&buf, a, col_name);
+    try wstr(&buf, a, "UInt64");
+    try buf.append(a, 0);
     var v_bytes: [8]u8 = undefined;
     std.mem.writeInt(u64, &v_bytes, value, .little);
     try buf.appendSlice(a, &v_bytes);
@@ -1005,15 +1048,20 @@ fn sendScalarUInt64(a: std.mem.Allocator, w: *Io.Writer, col_name: []const u8, v
 fn handleSelect(ctx: *ServerCtx, a: std.mem.Allocator, w: *Io.Writer, sql: []const u8) !void {
     // ── SHOW TABLES ───────────────────────────────────────────────────────
     if (std.ascii.startsWithIgnoreCase(sql, "SHOW TABLES") or
-        std.ascii.startsWithIgnoreCase(sql, "SHOW FULL TABLES")) {
+        std.ascii.startsWithIgnoreCase(sql, "SHOW FULL TABLES"))
+    {
         const list = if (ctx.schemas.dynamic_tables.items.len > 0)
-            ctx.schemas.dynamic_tables.items else ctx.schemas.tables;
+            ctx.schemas.dynamic_tables.items
+        else
+            ctx.schemas.tables;
         var buf: std.ArrayListUnmanaged(u8) = .empty;
         defer buf.deinit(a);
         try writeBlockInfo(&buf, a);
         try wuv(&buf, a, 1);
         try wuv(&buf, a, @intCast(list.len));
-        try wstr(&buf, a, "name"); try wstr(&buf, a, "String"); try buf.append(a, 0);
+        try wstr(&buf, a, "name");
+        try wstr(&buf, a, "String");
+        try buf.append(a, 0);
         for (list) |entry| try wstr(&buf, a, entry.name);
         try sendData(a, w, buf.items);
         try sendProfileInfo(a, w);
@@ -1029,14 +1077,16 @@ fn handleSelect(ctx: *ServerCtx, a: std.mem.Allocator, w: *Io.Writer, sql: []con
 
     // ── SELECT currentDatabase() ──────────────────────────────────────────
     if (std.ascii.indexOfIgnoreCase(sql, "currentDatabase()") != null or
-        std.ascii.indexOfIgnoreCase(sql, "current_database()") != null) {
+        std.ascii.indexOfIgnoreCase(sql, "current_database()") != null)
+    {
         try sendScalarString(a, w, "currentDatabase()", "default");
         return;
     }
 
     // ── SELECT count(*) FROM system.tables WHERE ... ─────────────────────
     if (std.ascii.indexOfIgnoreCase(sql, "system.tables") != null and
-        std.ascii.indexOfIgnoreCase(sql, "count(") != null) {
+        std.ascii.indexOfIgnoreCase(sql, "count(") != null)
+    {
         const table_filter = extractWhereNameField(sql, "name");
         var count: u64 = 0;
         if (table_filter) |tf| {
@@ -1048,7 +1098,8 @@ fn handleSelect(ctx: *ServerCtx, a: std.mem.Allocator, w: *Io.Writer, sql: []con
 
     // ── SELECT count(*) FROM system.columns WHERE ... ─────────────────────
     if (std.ascii.indexOfIgnoreCase(sql, "system.columns") != null and
-        std.ascii.indexOfIgnoreCase(sql, "count(") != null) {
+        std.ascii.indexOfIgnoreCase(sql, "count(") != null)
+    {
         const table_filter = extractWhereTableName(sql);
         const col_filter = extractWhereNameField(sql, "name");
         var count: u64 = 0;
@@ -1056,7 +1107,10 @@ fn handleSelect(ctx: *ServerCtx, a: std.mem.Allocator, w: *Io.Writer, sql: []con
             if (ctx.schemas.find("default", tf)) |entry| {
                 if (col_filter) |cf| {
                     for (entry.table.columns) |col| {
-                        if (std.ascii.eqlIgnoreCase(col.name, cf)) { count = 1; break; }
+                        if (std.ascii.eqlIgnoreCase(col.name, cf)) {
+                            count = 1;
+                            break;
+                        }
                     }
                 } else {
                     count = @intCast(entry.table.columns.len);
@@ -1082,7 +1136,9 @@ fn handleSelect(ctx: *ServerCtx, a: std.mem.Allocator, w: *Io.Writer, sql: []con
             if (ctx.schemas.find("default", tf) != null) matching = 1;
         } else {
             const list = if (ctx.schemas.dynamic_tables.items.len > 0)
-                ctx.schemas.dynamic_tables.items else ctx.schemas.tables;
+                ctx.schemas.dynamic_tables.items
+            else
+                ctx.schemas.tables;
             matching = @intCast(list.len);
         }
         try wuv(&block_buf, a, matching);
@@ -1117,12 +1173,16 @@ fn handleSelect(ctx: *ServerCtx, a: std.mem.Allocator, w: *Io.Writer, sql: []con
         try wuv(&block_buf, a, 2); // 2 columns: name, type
         try wuv(&block_buf, a, num_rows);
         // Column 1: name (meta + data)
-        try wstr(&block_buf, a, "name"); try wstr(&block_buf, a, "String"); try block_buf.append(a, 0);
+        try wstr(&block_buf, a, "name");
+        try wstr(&block_buf, a, "String");
+        try block_buf.append(a, 0);
         if (entry_opt) |e| {
             for (e.table.columns) |col| try wstr(&block_buf, a, col.name);
         }
         // Column 2: type (meta + data)
-        try wstr(&block_buf, a, "type"); try wstr(&block_buf, a, "String"); try block_buf.append(a, 0);
+        try wstr(&block_buf, a, "type");
+        try wstr(&block_buf, a, "String");
+        try block_buf.append(a, 0);
         if (entry_opt) |e| {
             for (e.table.columns) |col| try wstr(&block_buf, a, chTypeName(col));
         }
@@ -1153,8 +1213,7 @@ fn handleSelect(ctx: *ServerCtx, a: std.mem.Allocator, w: *Io.Writer, sql: []con
     const scan_table = planScanTable(plan) orelse plan.table;
     const db_table = splitDbTable(scan_table);
     const entry_opt = ctx.schemas.find(db_table.db, db_table.table);
-    const table: *const schema.Table = if (entry_opt) |e| &e.table else
-        return sendEmptyPlanBlock(a, w, plan);
+    const table: *const schema.Table = if (entry_opt) |e| &e.table else return sendEmptyPlanBlock(a, w, plan);
 
     var parts = try part_scanner.scan(a, ctx.io, ctx.data_dir, db_table.db, db_table.table);
     defer parts.deinit();
@@ -1176,7 +1235,11 @@ fn handleSelect(ctx: *ServerCtx, a: std.mem.Allocator, w: *Io.Writer, sql: []con
         }
         const pruned_cols = ir_planner.findPrunedCols(node.?);
         var bridge = part_scan_bridge.PartScanBridge.init(
-            a, ctx.io, table.*, parts.dirs(), pruned_cols,
+            a,
+            ctx.io,
+            table.*,
+            parts.dirs(),
+            pruned_cols,
         ) catch |err| {
             std.log.warn("tcp part_scan_bridge error: {}", .{err});
             arena.deinit();
@@ -1184,6 +1247,7 @@ fn handleSelect(ctx: *ServerCtx, a: std.mem.Allocator, w: *Io.Writer, sql: []con
         };
         defer bridge.deinit();
         var qctx = core.exec.pipeline.QueryContext.init(a, bridge.source());
+        qctx.setProfileLabel(sql);
         defer qctx.deinit();
         const rs = core.exec.pipeline.executePlan(node.?, &qctx) catch |err| {
             std.log.warn("tcp pipeline error: {}", .{err});
@@ -1207,14 +1271,28 @@ fn handleSelect(ctx: *ServerCtx, a: std.mem.Allocator, w: *Io.Writer, sql: []con
 
     // IR returned null — unsupported shape, return empty result.
     std.log.warn("tcp returning empty block for unsupported SELECT: {s}", .{sql});
+    if (strictUnsupportedSelect()) {
+        try sendException(a, w, 48, "unsupported SELECT");
+        return;
+    }
     try sendEmptyPlanBlock(a, w, plan);
+}
+
+fn strictUnsupportedSelect() bool {
+    const raw = std.c.getenv("ZIGHOUSE_STRICT_UNSUPPORTED") orelse return false;
+    const val = std.mem.span(raw);
+    return !(val.len == 0 or
+        std.mem.eql(u8, val, "0") or
+        std.ascii.eqlIgnoreCase(val, "false") or
+        std.ascii.eqlIgnoreCase(val, "off"));
 }
 
 fn sendEmptyBlock(a: std.mem.Allocator, w: *Io.Writer) !void {
     var block_buf: std.ArrayListUnmanaged(u8) = .empty;
     defer block_buf.deinit(a);
     try writeBlockInfo(&block_buf, a);
-    try wuv(&block_buf, a, 0); try wuv(&block_buf, a, 0);
+    try wuv(&block_buf, a, 0);
+    try wuv(&block_buf, a, 0);
     try sendData(a, w, block_buf.items);
     try sendProfileInfo(a, w);
     try sendEos(w);
@@ -1422,7 +1500,7 @@ fn planScanTable(plan: generic_sql.Plan) ?[]const u8 {
 const DbTable = struct { db: []const u8, table: []const u8 };
 fn splitDbTable(name: []const u8) DbTable {
     if (std.mem.indexOfScalar(u8, name, '.')) |dot| {
-        return .{ .db = name[0..dot], .table = name[dot+1..] };
+        return .{ .db = name[0..dot], .table = name[dot + 1 ..] };
     }
     return .{ .db = "default", .table = name };
 }
@@ -1496,7 +1574,10 @@ fn handleAlterTable(ctx: *ServerCtx, a: std.mem.Allocator, w: *Io.Writer, sql: [
     var it = std.mem.tokenizeAny(u8, sql, " \t\r\n");
     _ = it.next(); // ALTER
     _ = it.next(); // TABLE
-    const tbl_tok = it.next() orelse { try sendEos(w); return; };
+    const tbl_tok = it.next() orelse {
+        try sendEos(w);
+        return;
+    };
     const tbl = std.mem.trim(u8, tbl_tok, ";");
 
     var db: []const u8 = "default";
@@ -1511,14 +1592,24 @@ fn handleAlterTable(ctx: *ServerCtx, a: std.mem.Allocator, w: *Io.Writer, sql: [
         return;
     };
 
-    const action_tok = it.next() orelse { try sendEos(w); return; };
+    const action_tok = it.next() orelse {
+        try sendEos(w);
+        return;
+    };
 
     if (std.ascii.eqlIgnoreCase(action_tok, "ADD")) {
         // Consume optional COLUMN keyword
-        const maybe_col = it.next() orelse { try sendEos(w); return; };
+        const maybe_col = it.next() orelse {
+            try sendEos(w);
+            return;
+        };
         const col_name_raw = if (std.ascii.eqlIgnoreCase(maybe_col, "COLUMN"))
-            it.next() orelse { try sendEos(w); return; }
-        else maybe_col;
+            it.next() orelse {
+                try sendEos(w);
+                return;
+            }
+        else
+            maybe_col;
         const col_name = std.mem.trim(u8, col_name_raw, "`\"");
         const type_tok = it.next() orelse "String";
         const ch_type = std.mem.trim(u8, type_tok, " \t;");
@@ -1533,20 +1624,26 @@ fn handleAlterTable(ctx: *ServerCtx, a: std.mem.Allocator, w: *Io.Writer, sql: [
         @memcpy(new_cols[0..old_cols.len], old_cols);
         new_cols[old_cols.len] = .{
             .name = col_name,
-            .ty   = col_ty,
+            .ty = col_ty,
             .ch_type = ch_type,
         };
 
         var updated = existing.*;
         updated.table.columns = new_cols;
         try ctx.schemas.addEntry(a, updated);
-
     } else if (std.ascii.eqlIgnoreCase(action_tok, "DROP")) {
         // Consume optional COLUMN keyword
-        const maybe_col = it.next() orelse { try sendEos(w); return; };
+        const maybe_col = it.next() orelse {
+            try sendEos(w);
+            return;
+        };
         const col_name_raw = if (std.ascii.eqlIgnoreCase(maybe_col, "COLUMN"))
-            it.next() orelse { try sendEos(w); return; }
-        else maybe_col;
+            it.next() orelse {
+                try sendEos(w);
+                return;
+            }
+        else
+            maybe_col;
         const col_name = std.mem.trim(u8, col_name_raw, "`\";");
 
         // Build updated columns list: existing minus dropped col
@@ -1648,7 +1745,7 @@ fn parseInsertTarget(sql: []const u8) ?struct { db: []const u8, table: []const u
     var full = it.next() orelse return null;
     if (std.mem.indexOfScalar(u8, full, '(')) |p| full = full[0..p];
     if (std.mem.indexOfScalar(u8, full, '.')) |dot| {
-        return .{ .db = full[0..dot], .table = full[dot + 1..] };
+        return .{ .db = full[0..dot], .table = full[dot + 1 ..] };
     }
     return .{ .db = "default", .table = full };
 }

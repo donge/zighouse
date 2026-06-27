@@ -43,6 +43,17 @@ pub var dict_get_fn: ?*const fn (
 
 // ── Scalar expression evaluation ──────────────────────────────────────────────
 
+fn isTruthy(v: ?Value) bool {
+    return switch (v orelse return false) {
+        .bool_u8 => |b| b != 0,
+        .int64 => |i| i != 0,
+        .uint64 => |u| u != 0,
+        .float64 => |f| f != 0.0,
+        .string => |s| s.len > 0,
+        else => false,
+    };
+}
+
 /// Evaluate a scalar Expr against a single row of values.
 ///
 /// `row`: the input values for this row (col_ref indices into this slice).
@@ -118,14 +129,14 @@ fn evalExprFull(expr: Expr, row: []const ?Value, lambda_val: ?Value, lambda_val2
         // Logical
         .@"and" => |op| {
             const l = try evalExprFull(op.left, row, lambda_val, lambda_val2, arena);
-            if (l) |lv| if (lv.bool_u8 == 0) return Value{ .bool_u8 = 0 };
+            if (l != null and !isTruthy(l)) return Value{ .bool_u8 = 0 };
             const r = try evalExprFull(op.right, row, lambda_val, lambda_val2, arena);
             if (l == null or r == null) return null;
-            return Value{ .bool_u8 = if (l.?.bool_u8 != 0 and r.?.bool_u8 != 0) 1 else 0 };
+            return Value{ .bool_u8 = if (isTruthy(l) and isTruthy(r)) 1 else 0 };
         },
         .@"or" => |op| {
             const l = try evalExprFull(op.left, row, lambda_val, lambda_val2, arena);
-            if (l) |lv| if (lv.bool_u8 != 0) return Value{ .bool_u8 = 1 };
+            if (isTruthy(l)) return Value{ .bool_u8 = 1 };
             const r = try evalExprFull(op.right, row, lambda_val, lambda_val2, arena);
             // SQL three-valued OR truth table:
             //   TRUE  OR anything = TRUE  (handled by short-circuit above)
@@ -134,9 +145,7 @@ fn evalExprFull(expr: Expr, row: []const ?Value, lambda_val: ?Value, lambda_val2
             //   NULL  OR FALSE    = NULL
             //   NULL  OR NULL     = NULL
             if (l == null or r == null) return null;
-            const lv: u8 = l.?.bool_u8;
-            const rv: u8 = r.?.bool_u8;
-            return Value{ .bool_u8 = if (lv != 0 or rv != 0) 1 else 0 };
+            return Value{ .bool_u8 = if (isTruthy(l) or isTruthy(r)) 1 else 0 };
         },
         .not => |op| {
             const v = try evalExprFull(op.operand, row, lambda_val, lambda_val2, arena) orelse return null;
@@ -271,9 +280,12 @@ pub fn likeMatch(s: []const u8, pattern: []const u8, escape: ?u8) bool {
         if (pi < pattern.len and escape != null and pattern[pi] == escape.?) {
             pi += 1;
             if (pi < pattern.len and pattern[pi] == s[si]) {
-                si += 1; pi += 1;
+                si += 1;
+                pi += 1;
             } else if (star_pi != std.math.maxInt(usize)) {
-                star_si += 1; si = star_si; pi = star_pi + 1;
+                star_si += 1;
+                si = star_si;
+                pi = star_pi + 1;
             } else {
                 return false;
             }
@@ -497,18 +509,6 @@ fn evalFnCallFull(fc: *const plan.FnCall, row: []const ?Value, lambda_val: ?Valu
     // Logical operators encoded as fn_call by the planner
     if (std.mem.eql(u8, name, "and")) {
         if (args.len < 2) return null;
-        const isTruthy = struct {
-            fn check(v: ?Value) bool {
-                return switch (v orelse return false) {
-                    .bool_u8 => |b| b != 0,
-                    .int64 => |i| i != 0,
-                    .uint64 => |u| u != 0,
-                    .float64 => |f| f != 0.0,
-                    .string => |s| s.len > 0,
-                    else => false,
-                };
-            }
-        }.check;
         for (args) |a| {
             if (!isTruthy(a)) return Value{ .bool_u8 = 0 };
         }
@@ -516,18 +516,6 @@ fn evalFnCallFull(fc: *const plan.FnCall, row: []const ?Value, lambda_val: ?Valu
     }
     if (std.mem.eql(u8, name, "or")) {
         if (args.len < 2) return null;
-        const isTruthy = struct {
-            fn check(v: ?Value) bool {
-                return switch (v orelse return false) {
-                    .bool_u8 => |b| b != 0,
-                    .int64 => |i| i != 0,
-                    .uint64 => |u| u != 0,
-                    .float64 => |f| f != 0.0,
-                    .string => |s| s.len > 0,
-                    else => false,
-                };
-            }
-        }.check;
         for (args) |a| {
             if (isTruthy(a)) return Value{ .bool_u8 = 1 };
         }

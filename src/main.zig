@@ -315,6 +315,7 @@ fn runCommand(init: std.process.Init, allocator: std.mem.Allocator, args: *std.p
                 self.bridge.resetForNewQuery(pruned_cols);
 
                 var qctx = core.exec.pipeline.QueryContext.init(self.alloc, self.bridge.source());
+                qctx.setProfileLabel(query_text);
                 defer qctx.deinit();
                 const t_exec_start = std.Io.Clock.Timestamp.now(self.io, .awake);
                 var rs = core.exec.pipeline.executePlan(node.?, &qctx) catch |err| {
@@ -382,6 +383,7 @@ fn runCommand(init: std.process.Init, allocator: std.mem.Allocator, args: *std.p
         defer bridge2.deinit();
 
         var qctx2 = core2.exec.pipeline.QueryContext.init(allocator, bridge2.source());
+        qctx2.setProfileLabel(query_text2);
         defer qctx2.deinit();
         var rs2 = try core2.exec.pipeline.executePlan(node2, &qctx2);
         defer rs2.deinit();

@@ -31,6 +31,80 @@ pub const ResultSink = result.ResultSink;
 
 // ── QueryContext ──────────────────────────────────────────────────────────────
 
+pub const QueryProfile = struct {
+    enabled: bool = false,
+    label: ?[]const u8 = null,
+    started_ns: i128 = 0,
+    scannable_path: u64 = 0,
+    breaker_path: u64 = 0,
+    next_chunks: u64 = 0,
+    next_rows: u64 = 0,
+    range_pushdowns: u64 = 0,
+    raw_path_hits: u64 = 0,
+    fallback_rows: u64 = 0,
+    unsupported: u64 = 0,
+    execute_errors: u64 = 0,
+    last_reason: ?[]const u8 = null,
+
+    fn init() QueryProfile {
+        const enabled = profileEnvEnabled();
+        return .{
+            .enabled = enabled,
+            .started_ns = if (enabled) profileNowNs() else 0,
+        };
+    }
+
+    fn recordReason(self: *QueryProfile, reason: []const u8) void {
+        if (!self.enabled) return;
+        self.last_reason = reason;
+    }
+
+    fn emit(self: *const QueryProfile) void {
+        if (!self.enabled) return;
+        const elapsed_ns = profileNowNs() - self.started_ns;
+        const label = self.label orelse "";
+        const reason = self.last_reason orelse "";
+        std.debug.print(
+            "zighouse_profile query=\"{s}\" elapsed_ms={d:.3} scannable={d} breaker={d} next_chunks={d} next_rows={d} range_pushdowns={d} raw_hits={d} fallback_rows={d} unsupported={d} execute_errors={d} reason=\"{s}\"\n",
+            .{
+                label,
+                @as(f64, @floatFromInt(elapsed_ns)) / 1_000_000.0,
+                self.scannable_path,
+                self.breaker_path,
+                self.next_chunks,
+                self.next_rows,
+                self.range_pushdowns,
+                self.raw_path_hits,
+                self.fallback_rows,
+                self.unsupported,
+                self.execute_errors,
+                reason,
+            },
+        );
+    }
+};
+
+fn profileNowNs() i128 {
+    var ts: std.posix.timespec = undefined;
+    switch (std.posix.errno(std.posix.system.clock_gettime(.REALTIME, &ts))) {
+        .SUCCESS => return @as(i128, ts.sec) * std.time.ns_per_s + ts.nsec,
+        else => return 0,
+    }
+}
+
+pub fn profileEnvEnabled() bool {
+    return envFlag("ZIGHOUSE_PROFILE") or envFlag("ZIGHOUSE_QUERY_PROFILE");
+}
+
+fn envFlag(name: [:0]const u8) bool {
+    const raw = std.c.getenv(name) orelse return false;
+    const val = std.mem.span(raw);
+    return !(val.len == 0 or
+        std.mem.eql(u8, val, "0") or
+        std.ascii.eqlIgnoreCase(val, "false") or
+        std.ascii.eqlIgnoreCase(val, "off"));
+}
+
 /// Per-query execution context. Holds the arena for all intermediate
 /// allocations during one query's lifetime.
 pub const QueryContext = struct {
@@ -42,16 +116,20 @@ pub const QueryContext = struct {
     arena: std.heap.ArenaAllocator,
     /// Injected source implementations (set before executing a plan).
     source: SourceIface,
+    /// Optional profile counters, enabled by ZIGHOUSE_PROFILE=1.
+    profile: QueryProfile,
 
     pub fn init(parent_alloc: std.mem.Allocator, source: SourceIface) QueryContext {
         return .{
             .parent_alloc = parent_alloc,
             .arena = std.heap.ArenaAllocator.init(parent_alloc),
             .source = source,
+            .profile = QueryProfile.init(),
         };
     }
 
     pub fn deinit(self: *QueryContext) void {
+        self.profile.emit();
         self.arena.deinit();
     }
 
@@ -61,6 +139,14 @@ pub const QueryContext = struct {
 
     pub fn resultAllocator(self: *QueryContext) std.mem.Allocator {
         return self.parent_alloc;
+    }
+
+    pub fn setProfileLabel(self: *QueryContext, label: []const u8) void {
+        self.profile.label = label;
+    }
+
+    pub fn profileReason(self: *QueryContext, reason: []const u8) void {
+        self.profile.recordReason(reason);
     }
 };
 
@@ -119,7 +205,12 @@ pub const SourceIface = struct {
     };
 
     pub fn nextChunk(self: SourceIface, out: *DataChunk, ctx: *QueryContext) !bool {
-        return self.vtable.nextChunk(self.ptr, out, ctx);
+        const ok = try self.vtable.nextChunk(self.ptr, out, ctx);
+        if (ok and ctx.profile.enabled) {
+            ctx.profile.next_chunks += 1;
+            ctx.profile.next_rows += out.num_rows;
+        }
+        return ok;
     }
 
     pub fn reset(self: SourceIface) void {
@@ -584,6 +675,17 @@ const SimpleStrFilter = struct {
             return if (self.is_neq) non_empty else !non_empty;
         }
         const s: []const u8 = if (col.isRowNull(r)) "" else col.data.string[r];
+        return if (self.is_neq) !std.mem.eql(u8, s, self.value) else std.mem.eql(u8, s, self.value);
+    }
+
+    fn passesRaw(self: SimpleStrFilter, offsets: []const u64, bytes: ?[]const u8, row: usize) bool {
+        const lo: usize = @intCast(offsets[row]);
+        const hi: usize = @intCast(offsets[row + 1]);
+        if (self.value.len == 0) {
+            const non_empty = hi != lo;
+            return if (self.is_neq) non_empty else !non_empty;
+        }
+        const s = (bytes orelse return false)[lo..hi];
         return if (self.is_neq) !std.mem.eql(u8, s, self.value) else std.mem.eql(u8, s, self.value);
     }
 };
@@ -1677,6 +1779,10 @@ fn tryPushdownSortKeyRange(node: *const plan.PhysicalNode, ctx: *QueryContext) v
         const val = match_val orelse continue;
 
         if (ctx.source.findIntRange(sk, val)) |range| {
+            if (ctx.profile.enabled) {
+                ctx.profile.range_pushdowns += 1;
+                ctx.profile.recordReason("sort_key_range_pushdown");
+            }
             ctx.source.setRowRange(range.lo, range.hi);
             return;
         }
@@ -1690,6 +1796,10 @@ pub fn executePlan(
     node: *const plan.PhysicalNode,
     ctx: *QueryContext,
 ) !ResultSet {
+    errdefer {
+        ctx.profile.execute_errors += 1;
+        ctx.profile.recordReason("execute_error");
+    }
     const result_alloc = ctx.resultAllocator();
 
     // ── Sort-key range pushdown ────────────────────────────────────────────
@@ -1701,6 +1811,7 @@ pub fn executePlan(
 
     // ── Scannable path: stream chunks directly into ResultSink ─────────────
     if (isScannable(node)) {
+        ctx.profile.scannable_path += 1;
         // For large tables: try parallel filter-project when the only operators
         // are project + pure-AND-int-filter. Reduces Q20-style point lookups
         // from ~12ms (sequential) to ~3ms (parallel scan, 4 threads).
@@ -1729,6 +1840,7 @@ pub fn executePlan(
     }
 
     // ── Breaker path: existing RowList → ResultSet (single copy) ───────────
+    ctx.profile.breaker_path += 1;
     var rl = try executeNode(node, ctx);
     return rl.toResultSet(result_alloc);
 }
@@ -2276,7 +2388,7 @@ fn executeScalarAggChunked(
             if (lim_state) |ls| if (ls.done()) break;
             continue;
         }
-        try updateAccumsFromChunk(accums, aggs, &c, alloc);
+        try updateAccumsFromChunk(accums, aggs, &c, alloc, ctx);
         // Rescue str_min/str_max slices that point into the chunk's arena
         // before freeing the chunk.  All other accumulators hold numeric values.
         for (accums) |*acc| switch (acc.*) {
@@ -2428,6 +2540,8 @@ fn executeScalarAggParallel(
                             }
                             var raw_rl = RowList.init(metas);
                             try raw_rl.append(alloc, out_row);
+                            ctx.profile.raw_path_hits += 1;
+                            ctx.profile.recordReason("raw_like_count");
                             return raw_rl;
                         }
                     }
@@ -2499,6 +2613,8 @@ fn executeScalarAggParallel(
                 }
                 var i16cnt_rl = RowList.init(i16cnt_metas);
                 try i16cnt_rl.append(alloc, i16cnt_row);
+                ctx.profile.raw_path_hits += 1;
+                ctx.profile.recordReason("raw_i16_count");
                 return i16cnt_rl;
             }
         }
@@ -2591,6 +2707,8 @@ fn executeScalarAggParallel(
         }
         var i16_rl = RowList.init(metas_i16);
         try i16_rl.append(alloc, out_row_i16);
+        ctx.profile.raw_path_hits += 1;
+        ctx.profile.recordReason("raw_i16_sum");
         return i16_rl;
     } // end blk_i16
 
@@ -2671,6 +2789,8 @@ fn executeScalarAggParallel(
         }
         var raw_scalar_rl = RowList.init(raw_scalar_metas);
         try raw_scalar_rl.append(alloc, raw_scalar_row);
+        ctx.profile.raw_path_hits += 1;
+        ctx.profile.recordReason("raw_scalar_agg");
         return raw_scalar_rl;
     }
 
@@ -2803,6 +2923,8 @@ fn executeScalarAggParallel(
         cd_row[0] = Value{ .uint64 = cd_total };
         var cd_rl = RowList.init(cd_metas);
         try cd_rl.append(alloc, cd_row);
+        ctx.profile.raw_path_hits += 1;
+        ctx.profile.recordReason("raw_i64_count_distinct");
         return cd_rl;
     } // end blk_cdf
 
@@ -2900,7 +3022,7 @@ fn executeScalarAggParallel(
                     try fs.apply(&c, &fake_ctx);
                 }
                 if (c.num_rows == 0) continue;
-                try updateAccumsFromChunk(self.accums, self.aggs, &c, talloc);
+                try updateAccumsFromChunk(self.accums, self.aggs, &c, talloc, null);
                 chunk_arena.deinit();
             }
         }
@@ -4246,6 +4368,7 @@ fn updateAccumsFromChunk(
     aggs: []const plan.ProjectItem,
     c: *const DataChunk,
     alloc: std.mem.Allocator,
+    ctx: ?*QueryContext,
 ) !void {
     // Track which aggs need a per-row fallback pass (one pass covers all of them).
     var needs_fallback = false;
@@ -4637,6 +4760,10 @@ fn updateAccumsFromChunk(
     }
 
     if (!needs_fallback) return;
+    if (ctx) |qctx| {
+        qctx.profile.fallback_rows += c.num_rows;
+        qctx.profile.recordReason("scalar_agg_row_fallback");
+    }
 
     // Collect referenced columns for all fallback aggs.
     const ref_mask2 = try alloc.alloc(bool, c.columns.len);
@@ -4751,7 +4878,7 @@ fn executeFilterProjectParallel(
             // Per-thread QueryContext so FilterState.apply can lazily init its SIMD buffers.
             var fake_arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
             defer fake_arena.deinit();
-            var fake_ctx = QueryContext{ .parent_alloc = self.parent_alloc, .arena = fake_arena, .source = self.source };
+            var fake_ctx = QueryContext{ .parent_alloc = self.parent_alloc, .arena = fake_arena, .source = self.source, .profile = .{} };
             var fs = FilterState{ .predicate = self.filter_pred };
 
             while (self.morsel_src.next()) |m| {
@@ -5162,6 +5289,7 @@ fn executeTopKLateMat(
         .parent_alloc = ctx.resultAllocator(),
         .arena = std.heap.ArenaAllocator.init(chunk_arena.allocator()),
         .source = ctx.source,
+        .profile = .{},
     };
 
     // Pre-compile LikeGuards from filter predicate (once per query).
@@ -10620,13 +10748,23 @@ fn executeTwoPhaseHashAgg(
             // directly.  For Q41 (5 filter + 2 key narrow cols): eliminates scalar
             // per-row filter loop (~50M ops) and i32→i64 widening (~250MB bandwidth).
             raw_scatter: {
-                if (self.str_filter != null) break :raw_scatter;
                 const ics: []const IntCmpCond = if (self.int_filter) |ic| ic else &.{};
                 // Allow raw_scatter for count_only or for compact numeric aggs whose
                 // inputs are backed by raw mmap slices. This keeps Q9/Q10 off the
                 // fetchRange/DataChunk widening path while still feeding the existing
                 // partitioned phase-2 aggregator.
                 const sch = self.source.schema();
+                const raw_sf_offsets: ?[]const u64 = blk: {
+                    const sf = self.str_filter orelse break :blk null;
+                    const nm = if (sf.col_idx < sch.len) sch[sf.col_idx].name else break :raw_scatter;
+                    break :blk self.source.getRawStrOffsets(nm) orelse break :raw_scatter;
+                };
+                const raw_sf_bytes: ?[]const u8 = blk: {
+                    const sf = self.str_filter orelse break :blk null;
+                    if (sf.value.len == 0) break :blk null;
+                    const nm = if (sf.col_idx < sch.len) sch[sf.col_idx].name else break :raw_scatter;
+                    break :blk self.source.getRawStrBytes(nm) orelse break :raw_scatter;
+                };
                 // Resolve filter condition columns to raw slices.
                 var rf: [16]RawColSlice = undefined;
                 for (ics, 0..) |cond, ci| {
@@ -10657,6 +10795,9 @@ fn executeTwoPhaseHashAgg(
                     var rec: [18]u64 = undefined;
                     while (self.morsel_src.next()) |m| {
                         for (m.start..m.end) |row| {
+                            if (self.str_filter) |sf| {
+                                if (!sf.passesRaw(raw_sf_offsets.?, raw_sf_bytes, row)) continue;
+                            }
                             var kv: [4]i64 = undefined;
                             for (0..self.n_eff_keys) |ki|
                                 kv[ki] = rk[ki].getI64(row) +% self.key_offs[ki];
@@ -10741,6 +10882,9 @@ fn executeTwoPhaseHashAgg(
                         for (r..r + CHUNK) |ri| {
                             if (rs_mask[ri] == 0) continue;
                             const row = start + ri;
+                            if (self.str_filter) |sf| {
+                                if (!sf.passesRaw(raw_sf_offsets.?, raw_sf_bytes, row)) continue;
+                            }
                             var kv: [4]i64 = undefined;
                             for (0..self.n_eff_keys) |ki| {
                                 kv[ki] = rk[ki].getI64(row) +% self.key_offs[ki];
@@ -10783,6 +10927,9 @@ fn executeTwoPhaseHashAgg(
                     while (r < nr) : (r += 1) {
                         if (rs_mask[r] == 0) continue;
                         const row = start + r;
+                        if (self.str_filter) |sf| {
+                            if (!sf.passesRaw(raw_sf_offsets.?, raw_sf_bytes, row)) continue;
+                        }
                         var kv: [4]i64 = undefined;
                         for (0..self.n_eff_keys) |ki| {
                             kv[ki] = rk[ki].getI64(row) +% self.key_offs[ki];
@@ -11079,8 +11226,13 @@ fn executeTwoPhaseHashAgg(
         // Using c_allocator avoids new page faults on hot runs (memory recycled from
         // previous query run; same rationale as buf_arena using c_allocator).
         {
-            const expected_rows = total_rows / @max(n_threads, 1) / N_PARTS;
-            const expected_per_part: usize = expected_rows * row_stride * 4 + row_stride * 64;
+            const base_expected_rows = total_rows / @max(n_threads, 1) / N_PARTS;
+            const expected_rows = if (str_filter != null)
+                @max(@as(usize, 1), base_expected_rows / 8)
+            else
+                base_expected_rows;
+            const reserve_mul: usize = if (int_filter != null) 1 else 4;
+            const expected_per_part: usize = expected_rows * row_stride * reserve_mul + row_stride * 64;
             const ba = sc.buf_arena.allocator();
             for (&sc.bufs) |*b| {
                 b.ensureTotalCapacity(ba, expected_per_part) catch {};

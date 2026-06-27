@@ -960,6 +960,7 @@ pub const Server = struct {
 
         // ── 3. Execute plan through pipeline ─────────────────────────────────
         var qctx = core.exec.pipeline.QueryContext.init(self.allocator, bridge.source());
+        qctx.setProfileLabel(orig_sql);
         defer qctx.deinit();
 
         const rs = core.exec.pipeline.executePlan(node.?, &qctx) catch |err| {
@@ -1334,6 +1335,10 @@ pub const Server = struct {
         }
 
         // IR path returned null — unsupported query shape, return empty.
+        if (strictUnsupportedSelect()) {
+            try sendResponse(request, out, .not_implemented, "unsupported SELECT\n");
+            return;
+        }
         if (want_tsv) try sendResponse(request, out, .ok, "") else try self.sendEmptyNativeBlock(request, out);
     }
 
@@ -1348,7 +1353,6 @@ pub const Server = struct {
             try sendResponse(request, out, .bad_request, "Expected: INSERT INTO <db>.<table> FORMAT RowBinary[WithNamesAndTypes]\n");
             return;
         };
-
 
         // VALUES INSERT is entirely in the SQL string — data part is empty; handle first.
         if (insert_info.values_fmt) {
@@ -2409,7 +2413,10 @@ fn dedupResultSetByPk(
     _ = table;
     var pk_idx: ?usize = null;
     for (rs.metas, 0..) |meta, i| {
-        if (std.mem.eql(u8, meta.name, pk_name)) { pk_idx = i; break; }
+        if (std.mem.eql(u8, meta.name, pk_name)) {
+            pk_idx = i;
+            break;
+        }
     }
     const pki = pk_idx orelse return null;
 
@@ -2572,6 +2579,15 @@ fn splitDbTable(name: []const u8) DbTable {
         return .{ .db = name[0..dot], .table = name[dot + 1 ..] };
     }
     return .{ .db = "default", .table = name };
+}
+
+fn strictUnsupportedSelect() bool {
+    const raw = std.c.getenv("ZIGHOUSE_STRICT_UNSUPPORTED") orelse return false;
+    const val = std.mem.span(raw);
+    return !(val.len == 0 or
+        std.mem.eql(u8, val, "0") or
+        std.ascii.eqlIgnoreCase(val, "false") or
+        std.ascii.eqlIgnoreCase(val, "off"));
 }
 
 /// Parse "INSERT INTO [db.]table [(col1, col2, ...)] FORMAT RowBinary[WithNamesAndTypes|Native]"

@@ -1138,7 +1138,7 @@ fn rewriteAggregatePostAgg(
     var changed = false;
     var i: usize = 0;
     while (i < col_text.len) {
-            if (i + 4 <= col_text.len and std.ascii.eqlIgnoreCase(col_text[i .. i + 4], "max(")) {
+        if (i + 4 <= col_text.len and std.ascii.eqlIgnoreCase(col_text[i .. i + 4], "max(")) {
             const before_ok = i == 0 or !std.ascii.isAlphanumeric(col_text[i - 1]) and col_text[i - 1] != '_';
             if (before_ok) {
                 const close_idx = findMatchingParen(col_text, i + 3) orelse {
@@ -1983,23 +1983,24 @@ fn isDictFn(name: []const u8) bool {
 
 fn canonFnName(name: []const u8) []const u8 {
     const canon_names = [_][]const u8{
-        "lower",             "upper",                    "length",           "char_length",      "lowerUTF8",         "upperUTF8",
-        "toDate",            "toDateOrZero",             "toYYYYMMDD",       "toUnixTimestamp",  "toFloat64",         "toUInt64",
-        "toInt64",           "toString",                 "toStartOfMinute",  "toStartOfHour",    "toStartOfDay",      "toStartOfWeek",
-        "toStartOfMonth",    "toStartOfYear",            "toYear",           "toMonth",          "toDayOfMonth",      "toDayOfWeek",
-        "toHour",            "toMinute",                 "toSecond",         "abs",              "round",             "floor",
-        "ceil",              "log",                      "log2",             "log10",            "sqrt",              "exp",
-        "not",               "isNull",                   "isNotNull",        "isIPv4String",     "isIPv6String",      "IPv4StringToNumOrDefault",
-        "IPv4NumToString",   "IPv6StringToNumOrDefault", "IPv6NumToString",  "greatest",         "least",             "intDiv",
-        "modulo",            "positionCaseInsensitive",  "splitByChar",      "concat",           "format",            "if",
-        "position",          "locate",                   "multiIf",           "substring",        "substr",           "startsWith",       "endsWith",          "mapGet",
-        "has",               "hasAny",                   "hasAll",           "arrayConcat",      "arrayDistinct",     "arrayFlatten",
-        "arrayStringConcat", "array_to_string",          "arrayReverse",     "arraySlice",       "arrayMax",          "arrayMin",
-        "arrayMap",          "arrayFilter",              "arrayExists",      "arrayJoin",        "mapKeys",           "mapValues",
-        "tuple",             "regexp_replace",           "replaceRegexpOne", "now",              "today",             "toHour",
-        "hour",              "toMinute",                 "toSecond",         "sqrt",             "arrayElement",      "arraySum",
-        "arrayAvg",          "array",                    "arrayIntersect",   "toIntervalSecond", "toIntervalMinute",  "toIntervalHour",
-        "toIntervalDay",     "toIntervalWeek",           "toIntervalMonth",  "toIntervalYear",   "CAST_array_string", "toDateTime64",
+        "lower",             "upper",                    "length",            "char_length",     "lowerUTF8",        "upperUTF8",
+        "toDate",            "toDateOrZero",             "toYYYYMMDD",        "toUnixTimestamp", "toFloat64",        "toUInt64",
+        "toInt64",           "toString",                 "toStartOfMinute",   "toStartOfHour",   "toStartOfDay",     "toStartOfWeek",
+        "toStartOfMonth",    "toStartOfYear",            "toYear",            "toMonth",         "toDayOfMonth",     "toDayOfWeek",
+        "toHour",            "toMinute",                 "toSecond",          "abs",             "round",            "floor",
+        "ceil",              "log",                      "log2",              "log10",           "sqrt",             "exp",
+        "not",               "isNull",                   "isNotNull",         "isIPv4String",    "isIPv6String",     "IPv4StringToNumOrDefault",
+        "IPv4NumToString",   "IPv6StringToNumOrDefault", "IPv6NumToString",   "greatest",        "least",            "intDiv",
+        "modulo",            "positionCaseInsensitive",  "splitByChar",       "concat",          "format",           "if",
+        "position",          "locate",                   "multiIf",           "substring",       "substr",           "startsWith",
+        "endsWith",          "mapGet",                   "has",               "hasAny",          "hasAll",           "arrayConcat",
+        "arrayDistinct",     "arrayFlatten",             "arrayStringConcat", "array_to_string", "arrayReverse",     "arraySlice",
+        "arrayMax",          "arrayMin",                 "arrayMap",          "arrayFilter",     "arrayExists",      "arrayJoin",
+        "mapKeys",           "mapValues",                "tuple",             "regexp_replace",  "replaceRegexpOne", "now",
+        "today",             "toHour",                   "hour",              "toMinute",        "toSecond",         "sqrt",
+        "arrayElement",      "arraySum",                 "arrayAvg",          "array",           "arrayIntersect",   "toIntervalSecond",
+        "toIntervalMinute",  "toIntervalHour",           "toIntervalDay",     "toIntervalWeek",  "toIntervalMonth",  "toIntervalYear",
+        "CAST_array_string", "toDateTime64",
     };
     for (canon_names) |cn| {
         if (std.ascii.eqlIgnoreCase(cn, name)) return cn;
@@ -2825,6 +2826,8 @@ fn inferExprType(ctx: *PlannerCtx, expr: Expr) ColumnType {
         .mod => .int64,
         // Comparison operators yield bool_u8
         .eq, .neq, .lt, .lte, .gt, .gte => .bool_u8,
+        .@"and" => .bool_u8,
+        .@"or" => |op| inferLogicalOrType(ctx, op.*),
         .case_when => |cw| inferCaseWhenType(ctx, cw.*),
         .fn_call => |fc| {
             for (scalar_fns) |sf| {
@@ -2857,7 +2860,8 @@ fn inferExprType(ctx: *PlannerCtx, expr: Expr) ColumnType {
             if (std.mem.eql(u8, fc.name, "arrayMax") or std.mem.eql(u8, fc.name, "arrayMin")) return .string;
             if (std.mem.eql(u8, fc.name, "arrayJoin")) return .string;
             if (std.mem.eql(u8, fc.name, "arrayMap") or std.mem.eql(u8, fc.name, "arrayFilter")) return .array_string;
-            if (std.mem.eql(u8, fc.name, "and") or std.mem.eql(u8, fc.name, "or")) return .bool_u8;
+            if (std.mem.eql(u8, fc.name, "and")) return .bool_u8;
+            if (std.mem.eql(u8, fc.name, "or")) return inferLogicalOrFnType(ctx, fc.args);
             if (std.mem.eql(u8, fc.name, "now") or std.mem.eql(u8, fc.name, "toDateTime64")) return .datetime64_ms;
             if (std.mem.eql(u8, fc.name, "today")) return .date_u16;
             if (std.mem.eql(u8, fc.name, "arrayElement")) return .string;
@@ -2893,6 +2897,19 @@ fn inferExprType(ctx: *PlannerCtx, expr: Expr) ColumnType {
     };
 }
 
+fn inferLogicalOrType(ctx: *PlannerCtx, op: plan.BinOp) ColumnType {
+    const lt = inferExprType(ctx, op.left);
+    const rt = inferExprType(ctx, op.right);
+    return if (lt == .bool_u8 and rt == .bool_u8) .bool_u8 else .uint64;
+}
+
+fn inferLogicalOrFnType(ctx: *PlannerCtx, args: []const Expr) ColumnType {
+    for (args) |arg| {
+        if (inferExprType(ctx, arg) != .bool_u8) return .uint64;
+    }
+    return .bool_u8;
+}
+
 fn mergeConditionalType(cur: ColumnType, next: ColumnType) ColumnType {
     if (cur == .array_string or next == .array_string) return .array_string;
     if (cur == .string and next == .string) return .string;
@@ -2900,6 +2917,7 @@ fn mergeConditionalType(cur: ColumnType, next: ColumnType) ColumnType {
     if (next == .string and cur != .float64) return .string;
     if (cur == .float64 or next == .float64) return .float64;
     if (cur == .uint64 or next == .uint64) return .uint64;
+    if ((cur == .bool_u8 and next == .int64) or (cur == .int64 and next == .bool_u8)) return .uint64;
     return cur;
 }
 
