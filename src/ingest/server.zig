@@ -1297,7 +1297,12 @@ pub const Server = struct {
         }
 
         const entry = self.schemas.find(db_table.db, db_table.table) orelse {
-            // Unknown table — return empty result.
+            std.log.warn("HTTP SELECT unknown table: {s}.{s} sql={s}", .{ db_table.db, db_table.table, sql_clean });
+            core.exec.pipeline.emitUnsupportedProfile(sql_clean, "unknown_table");
+            if (strictUnsupportedSelect()) {
+                try sendResponse(request, out, .not_implemented, "unknown table\n");
+                return;
+            }
             if (want_tsv) try sendResponse(request, out, .ok, "") else try self.sendEmptyNativeBlock(request, out);
             return;
         };
@@ -1335,6 +1340,7 @@ pub const Server = struct {
         }
 
         // IR path returned null — unsupported query shape, return empty.
+        core.exec.pipeline.emitUnsupportedProfile(sql_clean, "unsupported_select");
         if (strictUnsupportedSelect()) {
             try sendResponse(request, out, .not_implemented, "unsupported SELECT\n");
             return;

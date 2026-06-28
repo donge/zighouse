@@ -96,6 +96,14 @@ pub fn profileEnvEnabled() bool {
     return envFlag("ZIGHOUSE_PROFILE") or envFlag("ZIGHOUSE_QUERY_PROFILE");
 }
 
+pub fn emitUnsupportedProfile(label: []const u8, reason: []const u8) void {
+    if (!profileEnvEnabled()) return;
+    std.debug.print(
+        "zighouse_profile query=\"{s}\" elapsed_ms=0.000 scannable=0 breaker=0 next_chunks=0 next_rows=0 range_pushdowns=0 raw_hits=0 fallback_rows=0 unsupported=1 execute_errors=0 reason=\"{s}\"\n",
+        .{ label, reason },
+    );
+}
+
 fn envFlag(name: [:0]const u8) bool {
     const raw = std.c.getenv(name) orelse return false;
     const val = std.mem.span(raw);

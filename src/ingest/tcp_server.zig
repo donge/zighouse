@@ -1213,7 +1213,15 @@ fn handleSelect(ctx: *ServerCtx, a: std.mem.Allocator, w: *Io.Writer, sql: []con
     const scan_table = planScanTable(plan) orelse plan.table;
     const db_table = splitDbTable(scan_table);
     const entry_opt = ctx.schemas.find(db_table.db, db_table.table);
-    const table: *const schema.Table = if (entry_opt) |e| &e.table else return sendEmptyPlanBlock(a, w, plan);
+    const table: *const schema.Table = if (entry_opt) |e| &e.table else {
+        std.log.warn("tcp SELECT unknown table: {s}.{s} sql={s}", .{ db_table.db, db_table.table, sql });
+        core.exec.pipeline.emitUnsupportedProfile(sql, "unknown_table");
+        if (strictUnsupportedSelect()) {
+            try sendException(a, w, 60, "unknown table");
+            return;
+        }
+        return sendEmptyPlanBlock(a, w, plan);
+    };
 
     var parts = try part_scanner.scan(a, ctx.io, ctx.data_dir, db_table.db, db_table.table);
     defer parts.deinit();
@@ -1271,6 +1279,7 @@ fn handleSelect(ctx: *ServerCtx, a: std.mem.Allocator, w: *Io.Writer, sql: []con
 
     // IR returned null — unsupported shape, return empty result.
     std.log.warn("tcp returning empty block for unsupported SELECT: {s}", .{sql});
+    core.exec.pipeline.emitUnsupportedProfile(sql, "unsupported_select");
     if (strictUnsupportedSelect()) {
         try sendException(a, w, 48, "unsupported SELECT");
         return;
