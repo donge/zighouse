@@ -132,6 +132,23 @@ pub const SelectionVector = struct {
         return self.indices[0..self.len];
     }
 
+    pub fn isEmpty(self: SelectionVector) bool {
+        return self.len == 0;
+    }
+
+    pub fn isFull(self: SelectionVector, n: usize) bool {
+        if (self.len != n) return false;
+        for (self.slice(), 0..) |idx, i| {
+            if (idx != i) return false;
+        }
+        return true;
+    }
+
+    pub fn rowAt(self: SelectionVector, logical_row: usize) usize {
+        std.debug.assert(logical_row < self.len);
+        return @intCast(self.indices[logical_row]);
+    }
+
     pub fn full(buffer: []u32, n: usize) SelectionVector {
         std.debug.assert(buffer.len >= n);
         var sel = SelectionVector.init(buffer);
@@ -146,6 +163,41 @@ pub const SelectionVector = struct {
             if (m != 0) sel.append(i);
         }
         return sel;
+    }
+};
+
+/// A logical view over a DataChunk plus a row selection.
+///
+/// This is the migration bridge toward selection-aware operators: filters can
+/// hand downstream code a selected view without requiring immediate physical
+/// compaction. Existing operators may still call `materialize()` until they are
+/// taught to consume row ids directly.
+pub const SelectedChunk = struct {
+    chunk: *DataChunk,
+    selection: SelectionVector,
+
+    pub fn len(self: SelectedChunk) usize {
+        return self.selection.len;
+    }
+
+    pub fn isEmpty(self: SelectedChunk) bool {
+        return self.selection.isEmpty();
+    }
+
+    pub fn physicalRow(self: SelectedChunk, logical_row: usize) usize {
+        return self.selection.rowAt(logical_row);
+    }
+
+    pub fn getOpt(self: SelectedChunk, col_idx: usize, logical_row: usize) ?Value {
+        return self.chunk.columns[col_idx].getOpt(self.physicalRow(logical_row));
+    }
+
+    pub fn readRow(self: SelectedChunk, logical_row: usize, out_alloc: std.mem.Allocator) ![]?Value {
+        return self.chunk.readRow(self.physicalRow(logical_row), out_alloc);
+    }
+
+    pub fn materialize(self: SelectedChunk) void {
+        self.chunk.compactSelection(self.selection);
     }
 };
 
@@ -241,6 +293,10 @@ pub const DataChunk = struct {
         }
         self.num_rows = rows.len;
         for (self.columns) |*col| col.len = rows.len;
+    }
+
+    pub fn selected(self: *DataChunk, selection: SelectionVector) SelectedChunk {
+        return .{ .chunk = self, .selection = selection };
     }
 };
 
@@ -392,6 +448,36 @@ test "SelectionVector from mask and compactSelection" {
     try std.testing.expect(!b.chunk.columns[ci].isRowNull(2));
 }
 
+test "SelectedChunk reads logical rows before materialization" {
+    var b = ChunkBuilder.init(std.testing.allocator, 4);
+    defer b.chunk.deinit();
+
+    const ci = try b.addColumn("score", .int64);
+    for (b.chunk.columns[ci].data.int64, 0..) |*v, i| v.* = @intCast((i + 1) * 10);
+
+    var buf: [4]u32 = undefined;
+    const mask = [_]i16{ 0, 1, 0, 1 };
+    const sel = SelectionVector.fromI16Mask(&buf, &mask);
+    try std.testing.expect(!sel.isEmpty());
+    try std.testing.expect(!sel.isFull(4));
+    try std.testing.expectEqual(@as(usize, 1), sel.rowAt(0));
+    try std.testing.expectEqual(@as(usize, 3), sel.rowAt(1));
+
+    const view = b.chunk.selected(sel);
+    try std.testing.expectEqual(@as(usize, 2), view.len());
+    try std.testing.expectEqual(Value{ .int64 = 20 }, view.getOpt(ci, 0).?);
+    try std.testing.expectEqual(Value{ .int64 = 40 }, view.getOpt(ci, 1).?);
+
+    const row = try view.readRow(1, std.testing.allocator);
+    defer std.testing.allocator.free(row);
+    try std.testing.expectEqual(Value{ .int64 = 40 }, row[ci].?);
+
+    view.materialize();
+    try std.testing.expectEqual(@as(usize, 2), b.chunk.num_rows);
+    try std.testing.expectEqual(@as(i64, 20), b.chunk.columns[ci].data.int64[0]);
+    try std.testing.expectEqual(@as(i64, 40), b.chunk.columns[ci].data.int64[1]);
+}
+
 test "compactSelection handles empty and full selections" {
     var b = ChunkBuilder.init(std.testing.allocator, 3);
     defer b.chunk.deinit();
@@ -403,6 +489,7 @@ test "compactSelection handles empty and full selections" {
 
     var full_buf: [3]u32 = undefined;
     const full_sel = SelectionVector.full(&full_buf, 3);
+    try std.testing.expect(full_sel.isFull(3));
     b.chunk.compactSelection(full_sel);
     try std.testing.expectEqual(@as(usize, 3), b.chunk.num_rows);
     try std.testing.expectEqual(@as(i64, 7), b.chunk.columns[ci].data.int64[0]);
