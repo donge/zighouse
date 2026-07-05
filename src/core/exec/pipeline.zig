@@ -1284,6 +1284,23 @@ fn collectLikeGuards(expr: plan.Expr, guards: *std.ArrayListUnmanaged(LikeGuard)
     }
 }
 
+fn exprCanUseBatchSelection(expr: plan.Expr) bool {
+    return switch (expr) {
+        .eq, .neq, .lt, .lte, .gt, .gte => |op| blk: {
+            if (op.left == .col_ref) {
+                break :blk op.right == .lit_i64 or op.right == .lit_u64;
+            }
+            if (op.right == .col_ref) {
+                break :blk op.left == .lit_i64 or op.left == .lit_u64;
+            }
+            break :blk false;
+        },
+        .@"and", .@"or" => |op| exprCanUseBatchSelection(op.left) and exprCanUseBatchSelection(op.right),
+        .not => |op| exprCanUseBatchSelection(op.operand),
+        else => false,
+    };
+}
+
 /// Recursively collect column reference indices from an expression into a mask.
 fn collectColRefs(expr: plan.Expr, mask: []bool) void {
     switch (expr) {
@@ -1943,7 +1960,39 @@ fn executeScannableToSink(
     ctx.source.reset();
     var c: DataChunk = undefined;
     var project_state: ?ProjectState = if (project_items) |items| .{ .items = items } else null;
+    const use_selected_project =
+        filter_state != null and
+        project_state != null and
+        lim_state == null and
+        exprCanUseBatchSelection(filter_state.?.predicate);
+    var selection_buf: ?[]u32 = null;
+    var mask_buf: ?[]i16 = null;
     while (try ctx.source.nextChunk(&c, ctx)) {
+        if (use_selected_project) {
+            const n = c.num_rows;
+            if (selection_buf == null or selection_buf.?.len < n) selection_buf = try ctx.allocator().alloc(u32, n);
+            if (mask_buf == null or mask_buf.?.len < n) mask_buf = try ctx.allocator().alloc(i16, n);
+
+            const sel = try kernels.evalExprSelection(
+                filter_state.?.predicate,
+                c,
+                selection_buf.?[0..n],
+                mask_buf.?[0..n],
+                ctx.allocator(),
+            );
+            if (sel.isEmpty()) continue;
+
+            var out = DataChunk{
+                .columns = &.{},
+                .num_rows = 0,
+                .arena = c.arena,
+            };
+            try project_state.?.applySelected(c.selected(sel), &out, ctx);
+            if (ctx.profile.enabled) ctx.profile.recordReason("selected_project");
+            try sink.consume(out);
+            continue;
+        }
+
         if (filter_state) |*fs| try fs.apply(&c, ctx);
         if (lim_state) |*ls| ls.apply(&c);
         if (c.num_rows == 0) {
@@ -6582,6 +6631,46 @@ test "executePlan: filter + limit" {
     try std.testing.expectEqual(@as(usize, 2), rs.num_rows);
     try std.testing.expectEqual(Value{ .int64 = 3 }, rs.get(0, 0).?);
     try std.testing.expectEqual(Value{ .int64 = 4 }, rs.get(0, 1).?);
+}
+
+test "executePlan: batch filter + project" {
+    const alloc = std.testing.allocator;
+
+    var b = chunk.ChunkBuilder.init(alloc, 5);
+    const ci = try b.addColumn("n", .int64);
+    for (0..5) |i| b.chunk.columns[ci].data.int64[i] = @intCast(i + 1);
+    const mock_chunk = b.finish();
+
+    var src = MockSource{ .chunk = mock_chunk };
+
+    var gt_binop = plan.BinOp{
+        .left = .{ .col_ref = .{ .index = 0, .name = "n" } },
+        .right = .{ .lit_i64 = 2 },
+    };
+    var add_binop = plan.BinOp{
+        .left = .{ .col_ref = .{ .index = 0, .name = "n" } },
+        .right = .{ .lit_i64 = 10 },
+    };
+    var project_items = [_]plan.ProjectItem{.{
+        .expr = .{ .add = &add_binop },
+        .alias = "n10",
+        .out_type = .int64,
+    }};
+
+    const scan_node = plan.PhysicalNode{ .part_scan = .{ .db = "db", .table = "t", .columns = &.{}, .filter = null } };
+    const filter_node = plan.PhysicalNode{ .filter = .{ .input = @constCast(&scan_node), .predicate = .{ .gt = &gt_binop } } };
+    const project_node = plan.PhysicalNode{ .project = .{ .input = @constCast(&filter_node), .items = project_items[0..] } };
+
+    var ctx = QueryContext.init(alloc, src.iface());
+    defer ctx.deinit();
+
+    var rs = try executePlan(&project_node, &ctx);
+    defer rs.deinit();
+
+    try std.testing.expectEqual(@as(usize, 3), rs.num_rows);
+    try std.testing.expectEqual(Value{ .int64 = 13 }, rs.get(0, 0).?);
+    try std.testing.expectEqual(Value{ .int64 = 14 }, rs.get(0, 1).?);
+    try std.testing.expectEqual(Value{ .int64 = 15 }, rs.get(0, 2).?);
 }
 
 test "ProjectState applySelected projects logical rows" {
