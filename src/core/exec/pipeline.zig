@@ -1410,40 +1410,71 @@ pub const ProjectState = struct {
     pub fn apply(self: *ProjectState, c: *DataChunk, ctx: *QueryContext) !void {
         const alloc = ctx.allocator();
         const n = c.num_rows;
+        const out_cols = try allocProjectColumns(self.items, n, alloc);
 
-        // Build output column buffers.
-        var out_cols = try alloc.alloc(chunk.Column, self.items.len);
-        for (self.items, 0..) |item, ci| {
-            const nw = chunk.nullMaskWords(n);
-            const null_mask = try alloc.alloc(u64, nw);
-            @memset(null_mask, 0);
-            const data = allocColumnData(item.out_type, n, alloc) catch continue;
-            out_cols[ci] = .{
-                .name = item.alias,
-                .data = data,
-                .null_mask = null_mask,
-                .len = n,
-            };
-        }
-
-        // Evaluate each row.
         for (0..n) |r| {
             const row = try c.readRow(r, alloc);
-            for (self.items, 0..) |item, ci| {
-                const v_opt = try kernels.evalExpr(item.expr, row, null, alloc);
-                if (v_opt) |v| {
-                    setColumnValue(&out_cols[ci].data, r, v);
-                } else {
-                    chunk.setNull(out_cols[ci].null_mask, r);
-                    setColumnZero(&out_cols[ci].data, r);
-                }
-            }
+            try evalProjectRow(self.items, out_cols, r, row, alloc);
         }
 
         // Replace chunk columns (arena owns both old and new allocations).
         c.columns = out_cols;
     }
+
+    pub fn applySelected(
+        self: *ProjectState,
+        selected: chunk.SelectedChunk,
+        out: *DataChunk,
+        ctx: *QueryContext,
+    ) !void {
+        const alloc = ctx.allocator();
+        const n = selected.len();
+        const out_cols = try allocProjectColumns(self.items, n, alloc);
+
+        for (0..n) |r| {
+            const row = try selected.readRow(r, alloc);
+            try evalProjectRow(self.items, out_cols, r, row, alloc);
+        }
+
+        out.columns = out_cols;
+        out.num_rows = n;
+    }
 };
+
+fn allocProjectColumns(items: []const plan.ProjectItem, n: usize, alloc: std.mem.Allocator) ![]chunk.Column {
+    var out_cols = try alloc.alloc(chunk.Column, items.len);
+    for (items, 0..) |item, ci| {
+        const nw = chunk.nullMaskWords(n);
+        const null_mask = try alloc.alloc(u64, nw);
+        @memset(null_mask, 0);
+        const data = try allocColumnData(item.out_type, n, alloc);
+        out_cols[ci] = .{
+            .name = item.alias,
+            .data = data,
+            .null_mask = null_mask,
+            .len = n,
+        };
+    }
+    return out_cols;
+}
+
+fn evalProjectRow(
+    items: []const plan.ProjectItem,
+    out_cols: []chunk.Column,
+    row_idx: usize,
+    row: []const ?Value,
+    alloc: std.mem.Allocator,
+) !void {
+    for (items, 0..) |item, ci| {
+        const v_opt = try kernels.evalExpr(item.expr, row, null, alloc);
+        if (v_opt) |v| {
+            setColumnValue(&out_cols[ci].data, row_idx, v);
+        } else {
+            chunk.setNull(out_cols[ci].null_mask, row_idx);
+            setColumnZero(&out_cols[ci].data, row_idx);
+        }
+    }
+}
 
 fn allocColumnData(col_type: ColumnType, n: usize, alloc: std.mem.Allocator) !chunk.ColumnData {
     return switch (col_type) {
@@ -6570,6 +6601,49 @@ test "executePlan: filter + limit" {
     try std.testing.expectEqual(@as(usize, 2), rs.num_rows);
     try std.testing.expectEqual(Value{ .int64 = 3 }, rs.get(0, 0).?);
     try std.testing.expectEqual(Value{ .int64 = 4 }, rs.get(0, 1).?);
+}
+
+test "ProjectState applySelected projects logical rows" {
+    const alloc = std.testing.allocator;
+
+    var b = chunk.ChunkBuilder.init(alloc, 4);
+    defer b.chunk.deinit();
+    const ci = try b.addColumn("n", .int64);
+    for (0..4) |i| b.chunk.columns[ci].data.int64[i] = @intCast((i + 1) * 10);
+
+    var add_op = plan.BinOp{
+        .left = .{ .col_ref = .{ .index = 0, .name = "n" } },
+        .right = .{ .lit_i64 = 1 },
+    };
+    var items = [_]plan.ProjectItem{.{
+        .expr = .{ .add = &add_op },
+        .alias = "n1",
+        .out_type = .int64,
+    }};
+    var project = ProjectState{ .items = items[0..] };
+
+    var sel_buf: [4]u32 = undefined;
+    const mask = [_]i16{ 0, 1, 0, 1 };
+    const sel = chunk.SelectionVector.fromI16Mask(&sel_buf, &mask);
+    const selected = b.chunk.selected(sel);
+
+    var src = MockSource{ .chunk = b.chunk };
+    var ctx = QueryContext.init(alloc, src.iface());
+    defer ctx.deinit();
+
+    var out = chunk.DataChunk{
+        .columns = &.{},
+        .num_rows = 0,
+        .arena = std.heap.ArenaAllocator.init(alloc),
+    };
+    defer out.deinit();
+
+    try project.applySelected(selected, &out, &ctx);
+    try std.testing.expectEqual(@as(usize, 2), out.num_rows);
+    try std.testing.expectEqual(@as(usize, 1), out.columns.len);
+    try std.testing.expectEqual(@as(i64, 21), out.columns[0].data.int64[0]);
+    try std.testing.expectEqual(@as(i64, 41), out.columns[0].data.int64[1]);
+    try std.testing.expectEqual(@as(i64, 10), b.chunk.columns[ci].data.int64[0]);
 }
 
 /// Parallel hash aggregation for (i64, string) + count(*) queries (Q17/Q18).
