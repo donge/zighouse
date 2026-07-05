@@ -1411,10 +1411,12 @@ pub const ProjectState = struct {
         const alloc = ctx.allocator();
         const n = c.num_rows;
         const out_cols = try allocProjectColumns(self.items, n, alloc);
+        const row_buf = try alloc.alloc(?Value, c.columns.len);
+        @memset(row_buf, null);
 
         for (0..n) |r| {
-            const row = try c.readRow(r, alloc);
-            try evalProjectRow(self.items, out_cols, r, row, alloc);
+            c.fillRow(r, row_buf);
+            try evalProjectRow(self.items, out_cols, r, row_buf, alloc);
         }
 
         // Replace chunk columns (arena owns both old and new allocations).
@@ -1430,10 +1432,12 @@ pub const ProjectState = struct {
         const alloc = ctx.allocator();
         const n = selected.len();
         const out_cols = try allocProjectColumns(self.items, n, alloc);
+        const row_buf = try alloc.alloc(?Value, selected.chunk.columns.len);
+        @memset(row_buf, null);
 
         for (0..n) |r| {
-            const row = try selected.readRow(r, alloc);
-            try evalProjectRow(self.items, out_cols, r, row, alloc);
+            selected.fillRow(r, row_buf);
+            try evalProjectRow(self.items, out_cols, r, row_buf, alloc);
         }
 
         out.columns = out_cols;

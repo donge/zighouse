@@ -192,6 +192,10 @@ pub const SelectedChunk = struct {
         return self.chunk.columns[col_idx].getOpt(self.physicalRow(logical_row));
     }
 
+    pub inline fn fillRow(self: SelectedChunk, logical_row: usize, out: []?Value) void {
+        self.chunk.fillRow(self.physicalRow(logical_row), out);
+    }
+
     pub fn readRow(self: SelectedChunk, logical_row: usize, out_alloc: std.mem.Allocator) ![]?Value {
         return self.chunk.readRow(self.physicalRow(logical_row), out_alloc);
     }
@@ -266,10 +270,15 @@ pub const DataChunk = struct {
     /// Column.isRowNull if they need to distinguish NULL from zero).
     pub fn readRow(self: DataChunk, row: usize, out_alloc: std.mem.Allocator) ![]?Value {
         const vals = try out_alloc.alloc(?Value, self.columns.len);
-        for (self.columns, 0..) |col, ci| {
-            vals[ci] = if (col.isRowNull(row)) null else col.data.get(row);
-        }
+        self.fillRow(row, vals);
         return vals;
+    }
+
+    pub inline fn fillRow(self: DataChunk, row: usize, out: []?Value) void {
+        std.debug.assert(out.len >= self.columns.len);
+        for (self.columns, 0..) |col, ci| {
+            out[ci] = if (col.isRowNull(row)) null else col.data.get(row);
+        }
     }
 
     /// Physically compact this chunk in-place according to `selection`.
@@ -467,6 +476,10 @@ test "SelectedChunk reads logical rows before materialization" {
     try std.testing.expectEqual(@as(usize, 2), view.len());
     try std.testing.expectEqual(Value{ .int64 = 20 }, view.getOpt(ci, 0).?);
     try std.testing.expectEqual(Value{ .int64 = 40 }, view.getOpt(ci, 1).?);
+
+    var row_buf: [1]?Value = undefined;
+    view.fillRow(1, &row_buf);
+    try std.testing.expectEqual(Value{ .int64 = 40 }, row_buf[0].?);
 
     const row = try view.readRow(1, std.testing.allocator);
     defer std.testing.allocator.free(row);
