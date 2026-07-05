@@ -1405,14 +1405,19 @@ inline fn copyRowActive(c: *DataChunk, from: usize, to: usize, active: []const u
 
 /// Project: evaluate SELECT list expressions, producing a new DataChunk.
 pub const ProjectState = struct {
-    items: []plan.ProjectItem,
+    items: []const plan.ProjectItem,
+    row_buf: ?[]?Value = null,
 
     pub fn apply(self: *ProjectState, c: *DataChunk, ctx: *QueryContext) !void {
         const alloc = ctx.allocator();
         const n = c.num_rows;
         const out_cols = try allocProjectColumns(self.items, n, alloc);
-        const row_buf = try alloc.alloc(?Value, c.columns.len);
-        @memset(row_buf, null);
+        if (self.row_buf == null or self.row_buf.?.len < c.columns.len) {
+            const row_buf = try alloc.alloc(?Value, c.columns.len);
+            @memset(row_buf, null);
+            self.row_buf = row_buf;
+        }
+        const row_buf = self.row_buf.?;
 
         for (0..n) |r| {
             c.fillRow(r, row_buf);
@@ -1432,8 +1437,12 @@ pub const ProjectState = struct {
         const alloc = ctx.allocator();
         const n = selected.len();
         const out_cols = try allocProjectColumns(self.items, n, alloc);
-        const row_buf = try alloc.alloc(?Value, selected.chunk.columns.len);
-        @memset(row_buf, null);
+        if (self.row_buf == null or self.row_buf.?.len < selected.chunk.columns.len) {
+            const row_buf = try alloc.alloc(?Value, selected.chunk.columns.len);
+            @memset(row_buf, null);
+            self.row_buf = row_buf;
+        }
+        const row_buf = self.row_buf.?;
 
         for (0..n) |r| {
             selected.fillRow(r, row_buf);
@@ -1906,7 +1915,6 @@ fn executeScannableToSink(
     ctx: *QueryContext,
     sink: *ResultSink,
 ) !void {
-    const alloc = ctx.allocator();
     var filter_state: ?FilterState = null;
     var project_items: ?[]const plan.ProjectItem = null;
     var lim_state: ?LimitState = null;
@@ -1934,8 +1942,7 @@ fn executeScannableToSink(
 
     ctx.source.reset();
     var c: DataChunk = undefined;
-    // Row buffer for projection; allocated once on first non-empty chunk.
-    var row_buf: ?[]?Value = null;
+    var project_state: ?ProjectState = if (project_items) |items| .{ .items = items } else null;
     while (try ctx.source.nextChunk(&c, ctx)) {
         if (filter_state) |*fs| try fs.apply(&c, ctx);
         if (lim_state) |*ls| ls.apply(&c);
@@ -1943,38 +1950,8 @@ fn executeScannableToSink(
             if (lim_state) |ls| if (ls.done()) break;
             continue;
         }
-        if (project_items) |items| {
-            // Lazy-init row_buf once on first non-empty chunk.
-            if (row_buf == null) {
-                const rb = try alloc.alloc(?Value, c.columns.len);
-                @memset(rb, null);
-                row_buf = rb;
-            }
-            const rb = row_buf.?;
-            const n = c.num_rows;
-            const out_cols = try alloc.alloc(chunk.Column, items.len);
-            for (items, 0..) |item, ci| {
-                const nw = chunk.nullMaskWords(n);
-                const null_mask = try alloc.alloc(u64, nw);
-                @memset(null_mask, 0);
-                const data = try allocColumnData(item.out_type, n, alloc);
-                out_cols[ci] = .{ .name = item.alias, .data = data, .null_mask = null_mask, .len = n };
-            }
-            for (0..n) |r| {
-                for (c.columns, 0..) |col, j| {
-                    rb[j] = if (col.isRowNull(r)) null else col.data.get(r);
-                }
-                for (items, 0..) |item, ci| {
-                    const v_opt = try kernels.evalExpr(item.expr, rb, null, alloc);
-                    if (v_opt) |v| {
-                        setColumnValue(&out_cols[ci].data, r, v);
-                    } else {
-                        chunk.setNull(out_cols[ci].null_mask, r);
-                        setColumnZero(&out_cols[ci].data, r);
-                    }
-                }
-            }
-            c.columns = out_cols;
+        if (project_state) |*project| {
+            try project.apply(&c, ctx);
         }
         try sink.consume(c);
         if (lim_state) |ls| if (ls.done()) break;
