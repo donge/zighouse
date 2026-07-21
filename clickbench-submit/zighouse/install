@@ -2,9 +2,10 @@
 set -e
 
 : "${ZIGHOUSE_VERSION:=v1.0.0}"
-: "${ZIGHOUSE_SHA256:=cc43f986f1c65152ca77e10ac29933f75b3ff8530b884e84f448ad171a7d5807}"
+: "${ZIGHOUSE_SHA256:=dcb7b1f22b1b0651f2e158b9ca79432d461be2238545b676d9aa89e1945f8bbe}"
 
-url="https://github.com/donge/zighouse/releases/download/${ZIGHOUSE_VERSION}/zighouse-linux-x86_64"
-curl -L --fail -o zighouse "$url"
-printf '%s  zighouse\n' "$ZIGHOUSE_SHA256" | sha256sum -c -
+url="https://github.com/donge/zighouse/releases/download/${ZIGHOUSE_VERSION}/zighouse-linux-x86_64.gz"
+curl -L --fail -o zighouse.gz "$url"
+printf '%s  zighouse.gz\n' "$ZIGHOUSE_SHA256" | sha256sum -c -
+gunzip zighouse.gz
 chmod +x zighouse
