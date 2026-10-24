@@ -2321,20 +2321,14 @@ fn executeHashAggScannable(
     if (fallback_strategy != ha.strategy) {
         if (try executeHashAggStrategy(fallback_strategy, ha, sort_keys, top_k, top_offset, ctx)) |rl| return rl;
     }
-    const res = try executeHashAggChunked(ha.input, ha.keys, ha.aggs, ctx);
-    const rl = try chunkResultToRowList(res, ctx.allocator());
+    var res = try executeHashAggChunked(ha.input, ha.keys, ha.aggs, ctx);
     if (top_k > 0 and sort_keys.len > 0) {
-        const alloc = ctx.allocator();
-        if (top_k <= 1024 and rl.rows.items.len > top_k * 4) {
-            return executeTopK(rl, sort_keys, top_k, alloc);
-        }
-        const sorted = try executeOrderBy(rl, sort_keys, alloc);
-        const take = @min(sorted.rows.items.len, top_k);
-        var out = RowList.init(sorted.metas);
-        for (sorted.rows.items[0..take]) |row| try out.append(alloc, row);
+        const out = try executeTopKFromChunkResult(res, sort_keys, top_k, ctx.allocator());
+        res.deinit(ctx.allocator());
         return out;
     }
-    return rl;
+    // No top-K: keep the temporary row bridge until project/limit consume chunks.
+    return try chunkResultToRowList(res, ctx.allocator());
 }
 
 fn executeHashAggStrategy(
@@ -3651,6 +3645,52 @@ const ChunkRowSink = struct {
         try self.sink.append(row);
     }
 };
+
+fn dupeOwnedValue(alloc: std.mem.Allocator, v: Value) !Value {
+    return switch (v) {
+        .string => |s| .{ .string = try alloc.dupe(u8, s) },
+        .array_string => |arr| blk: {
+            const out = try alloc.alloc([]const u8, arr.len);
+            for (arr, 0..) |s, i| out[i] = try alloc.dupe(u8, s);
+            break :blk .{ .array_string = out };
+        },
+        else => v,
+    };
+}
+
+fn materializeChunkRowOwned(c: *const DataChunk, row_idx: usize, alloc: std.mem.Allocator) ![]?Value {
+    const row = try alloc.alloc(?Value, c.columns.len);
+    for (c.columns, 0..) |col, i| {
+        row[i] = if (col.isRowNull(row_idx)) null else try dupeOwnedValue(alloc, col.data.get(row_idx));
+    }
+    return row;
+}
+
+/// Streaming top-K over a chunk result. Only rows that can enter the heap are
+/// materialized; everything else is compared on the sort-key columns.
+fn executeTopKFromChunkResult(
+    res: chunk_sink_mod.ChunkSink.Result,
+    keys: []const plan.SortKey,
+    k: usize,
+    alloc: std.mem.Allocator,
+) !RowList {
+    var collector = try TopKCollector.init(alloc, keys, k);
+    const key_buf = try alloc.alloc(?Value, res.metas.len);
+    @memset(key_buf, null);
+    for (res.chunks) |*c| {
+        for (0..c.num_rows) |r| {
+            for (keys) |key| {
+                if (key.col_idx >= c.columns.len) continue;
+                const col = &c.columns[key.col_idx];
+                key_buf[key.col_idx] = if (col.isRowNull(r)) null else col.data.get(r);
+            }
+            if (!collector.shouldOfferKeys(key_buf)) continue;
+            collector.offer(try materializeChunkRowOwned(c, r, alloc));
+        }
+    }
+    const metas = try alloc.dupe(result.ColMeta, res.metas);
+    return try collector.finish(metas);
+}
 
 /// Temporary bridge for callers that still consume RowList. The chunk sink
 /// owns its chunks; chunk pages stay alive in the query arena, so row string
@@ -5413,6 +5453,28 @@ const TopKCollector = struct {
             .heap = try alloc.alloc([]?Value, k),
             .count_col = count_col,
         };
+    }
+
+    /// Compare only the sort-key columns. Returns null when the keys are equal,
+    /// in which case the caller must materialize the row for the full tiebreak.
+    fn betterThanKeys(keys: []const plan.SortKey, a: []const ?Value, b: []const ?Value) ?bool {
+        for (keys) |key| {
+            const av: ?Value = if (key.col_idx < a.len) a[key.col_idx] else null;
+            const bv: ?Value = if (key.col_idx < b.len) b[key.col_idx] else null;
+            const ord: std.math.Order = if (av != null and bv != null)
+                Value.order(av.?, bv.?)
+            else if (av == null and bv == null) .eq else if (av == null) .lt else .gt;
+            if (ord == .eq) continue;
+            return if (key.desc) ord == .gt else ord == .lt;
+        }
+        return null;
+    }
+
+    /// Decide from key columns only whether a candidate can enter the heap.
+    fn shouldOfferKeys(self: *const TopKCollector, key_row: []const ?Value) bool {
+        if (self.k == 0) return false;
+        if (self.len < self.k) return true;
+        return betterThanKeys(self.keys, key_row, self.heap[0]) orelse true;
     }
 
     /// Fast reject for `ORDER BY count DESC LIMIT k`: if the candidate count is
