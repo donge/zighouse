@@ -2296,8 +2296,11 @@ fn executeNode(node: *const plan.PhysicalNode, ctx: *QueryContext) !ChunkResult 
         .hash_join => |hj| {
             const left = try executeNode(hj.left, ctx);
             const right = try executeNode(hj.right, ctx);
-            const left_rl = try chunkResultToRowBuffer(left, alloc);
             const right_rl = try chunkResultToRowBuffer(right, alloc);
+            if (hj.join_type == .inner or hj.join_type == .left) {
+                return try executeHashJoinProbeChunks(left, right_rl, hj, alloc);
+            }
+            const left_rl = try chunkResultToRowBuffer(left, alloc);
             return try rowListToChunkResult(try executeHashJoin(left_rl, right_rl, hj, alloc), alloc);
         },
     }
@@ -6702,6 +6705,93 @@ fn executeOrderBy(inner: RowBuffer, keys: []const plan.SortKey, alloc: std.mem.A
 }
 
 // ── HashJoin helper ───────────────────────────────────────────────────────────
+
+/// Build the right side once, then probe the left side chunk-by-chunk.
+/// Avoids materializing the left input, which is the common fact-table side.
+fn executeHashJoinProbeChunks(
+    left: ChunkResult,
+    right_rl: RowBuffer,
+    hj: plan.HashJoinNode,
+    alloc: std.mem.Allocator,
+) !ChunkResult {
+    var jht = try ht.JoinHashTable.init(alloc);
+    const key_buf = try alloc.alloc(Value, hj.equi_keys.len);
+    for (right_rl.rows.items, 0..) |row, ri| {
+        for (hj.equi_keys, 0..) |ek, ki| {
+            key_buf[ki] = (if (ek.right_col_idx < row.len) row[ek.right_col_idx] else null) orelse Value{ .int64 = 0 };
+        }
+        try jht.insert(key_buf, @intCast(ri));
+    }
+
+    const combined_metas = try alloc.alloc(result.ColMeta, left.metas.len + right_rl.metas.len);
+    @memcpy(combined_metas[0..left.metas.len], left.metas);
+    @memcpy(combined_metas[left.metas.len..], right_rl.metas);
+
+    var sink = try chunk_sink_mod.ChunkSink.init(alloc, combined_metas);
+    defer sink.deinit();
+    const lrow = try alloc.alloc(?Value, left.metas.len);
+
+    for (left.chunks) |*c| {
+        for (0..c.num_rows) |r| {
+            c.fillRow(r, lrow);
+            for (hj.equi_keys, 0..) |ek, ki| {
+                key_buf[ki] = (if (ek.left_col_idx < lrow.len) lrow[ek.left_col_idx] else null) orelse Value{ .int64 = 0 };
+            }
+            const matches = jht.probe(key_buf);
+            if (matches.len == 0 and hj.join_type == .left) {
+                const combined = try alloc.alloc(?Value, combined_metas.len);
+                @memcpy(combined[0..lrow.len], lrow);
+                for (combined[lrow.len..]) |*v| v.* = null;
+                try sink.append(combined);
+                continue;
+            }
+            for (matches) |ri| {
+                const rrow = right_rl.rows.items[ri];
+                const combined = try alloc.alloc(?Value, combined_metas.len);
+                @memcpy(combined[0..lrow.len], lrow);
+                @memcpy(combined[lrow.len..], rrow);
+                try sink.append(combined);
+            }
+        }
+    }
+    return try sink.finishResult();
+}
+
+test "streaming join probe matches row join" {
+    const alloc = std.testing.allocator;
+    const lmetas = [_]result.ColMeta{
+        .{ .name = "id", .col_type = .int64, .ch_type = "Int64" },
+        .{ .name = "v", .col_type = .int64, .ch_type = "Int64" },
+    };
+    var lsink = try chunk_sink_mod.ChunkSink.init(alloc, &lmetas);
+    try lsink.append(&.{ .{ .int64 = 1 }, .{ .int64 = 10 } });
+    try lsink.append(&.{ .{ .int64 = 2 }, .{ .int64 = 20 } });
+    try lsink.append(&.{ .{ .int64 = 3 }, .{ .int64 = 30 } });
+    const left = try lsink.finishResult();
+
+    var right = RowBuffer.init(&lmetas);
+    try right.append(alloc, try alloc.dupe(?Value, &.{ .{ .int64 = 1 }, .{ .int64 = 100 } }));
+    try right.append(alloc, try alloc.dupe(?Value, &.{ .{ .int64 = 3 }, .{ .int64 = 300 } }));
+    try right.append(alloc, try alloc.dupe(?Value, &.{ .{ .int64 = 3 }, .{ .int64 = 301 } }));
+
+    var dummy = plan.PhysicalNode{ .mem_scan = .{ .table = "x", .table_ref = 0 } };
+    const eq = [_]plan.EquiKey{.{ .left_col_idx = 0, .right_col_idx = 0 }};
+    const hj = plan.HashJoinNode{
+        .left = &dummy,
+        .right = &dummy,
+        .join_type = .inner,
+        .equi_keys = &eq,
+        .filter = null,
+    };
+    const out = try executeHashJoinProbeChunks(left, right, hj, alloc);
+    try std.testing.expectEqual(@as(usize, 3), out.chunks[0].num_rows);
+    try std.testing.expectEqual(@as(i64, 1), out.chunks[0].columns[0].data.int64[0]);
+    try std.testing.expectEqual(@as(i64, 100), out.chunks[0].columns[3].data.int64[0]);
+    try std.testing.expectEqual(@as(i64, 3), out.chunks[0].columns[0].data.int64[1]);
+    try std.testing.expectEqual(@as(i64, 300), out.chunks[0].columns[3].data.int64[1]);
+    try std.testing.expectEqual(@as(i64, 3), out.chunks[0].columns[0].data.int64[2]);
+    try std.testing.expectEqual(@as(i64, 301), out.chunks[0].columns[3].data.int64[2]);
+}
 
 fn executeHashJoin(
     left_rl: RowBuffer,
