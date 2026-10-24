@@ -112,25 +112,46 @@ pub fn importParquet(
     var str_tmp_open: usize = 0;
     errdefer for (str_tmp_files[0..str_tmp_open]) |f| f.close(io);
 
-    const str_offsets = try allocator.alloc([]u64, n_str);
-    defer allocator.free(str_offsets);
+    // Offsets are spilled to temp files as well: keeping total_rows+1 u64 per
+    // string column in memory made import memory grow with the input size.
+    const str_offset_paths = try allocator.alloc([]u8, n_str);
+    defer {
+        for (str_offset_paths) |p| allocator.free(p);
+        allocator.free(str_offset_paths);
+    }
+    const str_offset_files = try allocator.alloc(std.Io.File, n_str);
+    defer allocator.free(str_offset_files);
+    const str_offset_bufs = try allocator.alloc([]u8, n_str);
+    defer {
+        for (str_offset_bufs) |b| allocator.free(b);
+        allocator.free(str_offset_bufs);
+    }
+    const str_offset_lens = try allocator.alloc(usize, n_str);
+    defer allocator.free(str_offset_lens);
+    var str_offset_open: usize = 0;
+    errdefer for (str_offset_files[0..str_offset_open]) |f| f.close(io);
+
     const str_byte_counts = try allocator.alloc(u64, n_str);
     defer allocator.free(str_byte_counts);
-    var str_offsets_alloc: usize = 0;
-    errdefer for (str_offsets[0..str_offsets_alloc]) |off| allocator.free(off);
 
     for (str_table_indices.items, 0..) |ti, i| {
         const col_name = table.columns[ti].name;
         const str_path = try generic_store.columnStrBinPath(allocator, part_path, col_name);
         const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp", .{str_path});
+        const off_path = try std.fmt.allocPrint(allocator, "{s}.offsets.tmp", .{str_path});
         allocator.free(str_path);
         str_tmp_paths[i] = tmp_path;
+        str_offset_paths[i] = off_path;
         str_tmp_files[i] = try std.Io.Dir.cwd().createFile(io, tmp_path, .{ .truncate = true });
         str_tmp_open += 1;
-        str_offsets[i] = try allocator.alloc(u64, total_rows + 1);
-        str_offsets[i][0] = 0;
-        str_offsets_alloc += 1;
+        str_offset_files[i] = try std.Io.Dir.cwd().createFile(io, off_path, .{ .truncate = true });
+        str_offset_open += 1;
+        str_offset_bufs[i] = try allocator.alloc(u8, 64 * 1024);
+        str_offset_lens[i] = 0;
         str_byte_counts[i] = 0;
+        // First offset is always zero.
+        std.mem.writeInt(u64, str_offset_bufs[i][0..8], 0, .little);
+        str_offset_lens[i] = 8;
     }
 
     const ctx = GenericAllColsCtx{
@@ -142,7 +163,9 @@ pub fn importParquet(
             break :blk tys;
         },
         .str_tmp_files = str_tmp_files,
-        .str_offsets = str_offsets,
+        .str_offset_files = str_offset_files,
+        .str_offset_bufs = str_offset_bufs,
+        .str_offset_lens = str_offset_lens,
         .str_byte_counts = str_byte_counts,
         .str_row_counts = blk: {
             const rc = try allocator.alloc(u64, n_str);
@@ -175,28 +198,35 @@ pub fn importParquet(
         const str_path = try generic_store.columnStrBinPath(allocator, part_path, col_name);
         defer allocator.free(str_path);
 
+        if (str_offset_lens[i] > 0) {
+            try str_offset_files[i].writeStreamingAll(io, str_offset_bufs[i][0..str_offset_lens[i]]);
+            str_offset_lens[i] = 0;
+        }
+        str_offset_files[i].close(io);
+
         const out = try std.Io.Dir.cwd().createFile(io, str_path, .{ .truncate = true });
         defer out.close(io);
 
         var hdr: [8]u8 = undefined;
         std.mem.writeInt(u64, &hdr, total_rows, .little);
         try out.writeStreamingAll(io, &hdr);
-        try out.writeStreamingAll(io, std.mem.sliceAsBytes(str_offsets[i][0 .. total_rows + 1]));
 
-        const tmp_in = try std.Io.Dir.cwd().openFile(io, str_tmp_paths[i], .{});
-        defer tmp_in.close(io);
+        // Copy the spilled offsets, then the string bytes.
         var cpbuf: [65536]u8 = undefined;
-        while (true) {
-            const n = tmp_in.readStreaming(io, &.{&cpbuf}) catch |err| switch (err) {
-                error.EndOfStream => 0,
-                else => return err,
-            };
-            if (n == 0) break;
-            try out.writeStreamingAll(io, cpbuf[0..n]);
+        inline for (.{ str_offset_paths[i], str_tmp_paths[i] }) |src_path| {
+            const tmp_in = try std.Io.Dir.cwd().openFile(io, src_path, .{});
+            defer tmp_in.close(io);
+            while (true) {
+                const n = tmp_in.readStreaming(io, &.{&cpbuf}) catch |err| switch (err) {
+                    error.EndOfStream => 0,
+                    else => return err,
+                };
+                if (n == 0) break;
+                try out.writeStreamingAll(io, cpbuf[0..n]);
+            }
+            std.Io.Dir.cwd().deleteFile(io, src_path) catch {};
         }
-
-        std.Io.Dir.cwd().deleteFile(io, str_tmp_paths[i]) catch {};
-        allocator.free(str_offsets[i]);
+        // str_offset_bufs / str_offset_paths are freed by the deferred loops above.
     }
 
     // Write count.txt last (so a partial import leaves no count.txt).
@@ -295,7 +325,9 @@ const GenericAllColsCtx = struct {
     fixed_writers: []generic_store.v2.Writer,
     fixed_col_types: []schema.ColumnType,
     str_tmp_files: []std.Io.File,
-    str_offsets: [][]u64,
+    str_offset_files: []std.Io.File,
+    str_offset_bufs: [][]u8,
+    str_offset_lens: []usize,
     str_byte_counts: []u64,
     str_row_counts: []u64,
 };
@@ -328,8 +360,16 @@ fn genericAllStrValue(ctx: GenericAllColsCtx, slot: usize, value: []const u8) an
     }
     ctx.str_byte_counts[slot] += value.len;
     ctx.str_row_counts[slot] += 1;
-    const row = ctx.str_row_counts[slot];
-    ctx.str_offsets[slot][row] = ctx.str_byte_counts[slot];
+    ctx.str_row_counts[slot] += 0;
+    const off = ctx.str_byte_counts[slot];
+    var buf = ctx.str_offset_bufs[slot];
+    var len = ctx.str_offset_lens[slot];
+    if (len + 8 > buf.len) {
+        try ctx.str_offset_files[slot].writeStreamingAll(ctx.io, buf[0..len]);
+        len = 0;
+    }
+    std.mem.writeInt(u64, buf[len..][0..8], off, .little);
+    ctx.str_offset_lens[slot] = len + 8;
 }
 
 /// Import a Parquet file into a ClickHouse MergeTree-compatible part directory.
