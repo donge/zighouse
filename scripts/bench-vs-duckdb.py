@@ -56,8 +56,13 @@ from typing import List, Optional, Tuple
 
 # ── Argument parsing ──────────────────────────────────────────────────────────
 
+DUCKDB_BIN = "duckdb"
+
+
 def parse_args():
     p = argparse.ArgumentParser(description="ZigHouse vs DuckDB benchmark gate")
+    p.add_argument("--duckdb", default=os.environ.get("DUCKDB_BIN", "duckdb"),
+                   help="DuckDB CLI binary (default: duckdb; use a DuckDB 2.0 build)")
     p.add_argument("--zighouse", required=True, help="Path to zighouse binary")
     p.add_argument("--store",    required=True, help="ZigHouse IR store directory")
     p.add_argument("--parquet",  required=True, help="Parquet file (hits_Nm_snappy.parquet)")
@@ -84,8 +89,11 @@ def check_prereqs(args):
         errors.append(f"parquet file not found: {args.parquet}")
     if not os.path.isfile(args.queries):
         errors.append(f"queries file not found: {args.queries}")
-    if shutil_which("duckdb") is None:
-        errors.append("duckdb not found in PATH")
+    if os.path.sep in DUCKDB_BIN:
+        if not os.path.isfile(DUCKDB_BIN):
+            errors.append(f"duckdb binary not found: {DUCKDB_BIN}")
+    elif shutil_which(DUCKDB_BIN) is None:
+        errors.append(f"{DUCKDB_BIN} not found in PATH")
     if errors:
         for e in errors:
             print(f"ERROR: {e}", file=sys.stderr)
@@ -108,7 +116,7 @@ def ensure_duckdb_db(parquet: str, db_path: str) -> None:
     print(f"  Importing {parquet} → {db_path} ...")
     sql = f"CREATE TABLE hits AS SELECT * FROM '{parquet}';"
     r = subprocess.run(
-        ["duckdb", db_path, "-c", sql],
+        [DUCKDB_BIN, db_path, "-c", sql],
         capture_output=True, text=True, timeout=600,
     )
     if r.returncode != 0:
@@ -265,7 +273,7 @@ def run_duckdb_query_csv(db_path: str, sql: str) -> Optional[str]:
     duck_sql = adapt_query_for_duckdb(sql)
     try:
         r = subprocess.run(
-            ["duckdb", db_path, "-csv", "-c", duck_sql],
+            [DUCKDB_BIN, db_path, "-csv", "-c", duck_sql],
             capture_output=True, text=True, timeout=120,
         )
         return r.stdout if r.returncode == 0 else None
@@ -331,7 +339,7 @@ def run_duckdb(db_path: str, queries: List[str], runs: int) -> List[Optional[flo
         script += "\n".join(q + ";" for q in duck_queries) + "\n"
 
     proc = subprocess.run(
-        ["duckdb", db_path],
+        [DUCKDB_BIN, db_path],
         input=script,
         capture_output=True,
         text=True,
@@ -551,6 +559,8 @@ def print_summary(zh_sum, duck_sum, nulls, issues, rows):
 
 def main():
     args = parse_args()
+    global DUCKDB_BIN
+    DUCKDB_BIN = args.duckdb
     check_prereqs(args)
 
     queries = [
