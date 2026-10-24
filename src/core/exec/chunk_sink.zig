@@ -62,6 +62,26 @@ pub const ChunkSink = struct {
         self.rows = 0;
     }
 
+    pub const Result = struct {
+        chunks: []DataChunk,
+        metas: []ColMeta,
+
+        pub fn deinit(self: *Result, alloc: std.mem.Allocator) void {
+            for (self.chunks) |*c| c.deinit();
+            alloc.free(self.chunks);
+            alloc.free(self.metas);
+            self.* = undefined;
+        }
+    };
+
+    /// Finish and transfer both chunks and metadata.
+    pub fn finishResult(self: *ChunkSink) !Result {
+        const chunks = try self.finish();
+        const metas = self.metas;
+        self.metas = &.{};
+        return .{ .chunks = chunks, .metas = metas };
+    }
+
     /// Flush and transfer the chunk list to the caller. The sink is empty
     /// afterwards; call `deinit` to release its metadata.
     pub fn finish(self: *ChunkSink) ![]DataChunk {

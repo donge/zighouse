@@ -21,6 +21,7 @@ const hashmap = @import("hashmap");
 const simd = @import("../simd_ops.zig");
 const simd_batch = @import("../simd_batch.zig");
 const parallel = @import("parallel");
+const chunk_sink_mod = @import("chunk_sink.zig");
 
 pub const Value = types.Value;
 pub const AggAccum = types.AggAccum;
@@ -2320,7 +2321,8 @@ fn executeHashAggScannable(
     if (fallback_strategy != ha.strategy) {
         if (try executeHashAggStrategy(fallback_strategy, ha, sort_keys, top_k, top_offset, ctx)) |rl| return rl;
     }
-    const rl = try executeHashAggChunked(ha.input, ha.keys, ha.aggs, ctx);
+    const res = try executeHashAggChunked(ha.input, ha.keys, ha.aggs, ctx);
+    const rl = try chunkResultToRowList(res, ctx.allocator());
     if (top_k > 0 and sort_keys.len > 0) {
         const alloc = ctx.allocator();
         if (top_k <= 1024 and rl.rows.items.len > top_k * 4) {
@@ -3641,12 +3643,34 @@ inline fn updateCompactVals(
     }
 }
 
+/// Temporary adapter: breakers still build logical rows, but the chunk sink
+/// packs them into DataChunks at the output boundary.
+const ChunkRowSink = struct {
+    sink: *chunk_sink_mod.ChunkSink,
+    fn append(self: *ChunkRowSink, _: std.mem.Allocator, row: []const ?Value) !void {
+        try self.sink.append(row);
+    }
+};
+
+/// Temporary bridge for callers that still consume RowList. The chunk sink
+/// owns its chunks; chunk pages stay alive in the query arena, so row string
+/// slices remain valid until the result is materialized.
+fn chunkResultToRowList(res: chunk_sink_mod.ChunkSink.Result, alloc: std.mem.Allocator) !RowList {
+    var rl = RowList.init(res.metas);
+    for (res.chunks) |*c| {
+        for (0..c.num_rows) |r| {
+            try rl.append(alloc, try c.readRow(r, alloc));
+        }
+    }
+    return rl;
+}
+
 fn executeHashAggChunked(
     input: *const plan.PhysicalNode,
     keys: []const plan.ProjectItem,
     aggs: []const plan.ProjectItem,
     ctx: *QueryContext,
-) !RowList {
+) !chunk_sink_mod.ChunkSink.Result {
     const alloc = ctx.allocator();
     // Pre-size hash table when input is a bare scan (no filter reduces cardinality).
     // Use min(row_count, 2M) to avoid excessive memory that degrades subsequent queries.
@@ -4388,13 +4412,14 @@ fn executeHashAggChunked(
     }
 
     const out_metas = try buildAggResultMetas(keys, aggs, alloc);
-    var rl = RowList.init(out_metas);
+    var sink = try chunk_sink_mod.ChunkSink.init(alloc, out_metas);
+    var rl = ChunkRowSink{ .sink = &sink };
 
     if (use_pair_count_path) {
         // Emit from PairCountHashTable: restore key order (i64, str or str, i64).
         const k0_is_i64 = keys[0].expr.col_ref.index == pair_i64_col_idx;
         const EmitCtxP = struct {
-            rl: *RowList,
+            rl: *ChunkRowSink,
             alloc: std.mem.Allocator,
             k0_is_i64: bool,
         };
@@ -4417,7 +4442,7 @@ fn executeHashAggChunked(
         // Emit from TripleCountHashTable: restore key order per triple_desc.key_order.
         const td = triple_desc;
         const EmitCtxT = struct {
-            rl: *RowList,
+            rl: *ChunkRowSink,
             alloc: std.mem.Allocator,
             key_order: [3]u8,
         };
@@ -4441,7 +4466,7 @@ fn executeHashAggChunked(
         // Handles literal keys alongside the col_ref key (e.g. Q35: GROUP BY 1, URL).
         // Also used when regexp_replace key path routed to ht_str_agg (Q29).
         const EmitCtxSA = struct {
-            rl: *RowList,
+            rl: *ChunkRowSink,
             alloc: std.mem.Allocator,
             aggs: []const plan.ProjectItem,
             keys: []const plan.ProjectItem,
@@ -4478,7 +4503,7 @@ fn executeHashAggChunked(
         if (ht_compact) |*htc| {
             // Emit from CompactIntKeyHashTable: u64 vals → Values.
             const EmitCtxC = struct {
-                rl: *RowList,
+                rl: *ChunkRowSink,
                 alloc: std.mem.Allocator,
                 keys: []const plan.ProjectItem,
                 aggs: []const plan.ProjectItem,
@@ -4507,7 +4532,7 @@ fn executeHashAggChunked(
         } else {
             // Emit from IntKeyHashTable: convert i64 keys back to Values.
             const EmitCtxI = struct {
-                rl: *RowList,
+                rl: *ChunkRowSink,
                 alloc: std.mem.Allocator,
                 keys: []const plan.ProjectItem,
                 aggs: []const plan.ProjectItem,
@@ -4537,7 +4562,7 @@ fn executeHashAggChunked(
         } // end else (regular IntKeyHashTable emit)
     } else {
         const CtxT = struct {
-            rl: *RowList,
+            rl: *ChunkRowSink,
             alloc: std.mem.Allocator,
             keys_len: usize,
             aggs: []const plan.ProjectItem,
@@ -4554,7 +4579,9 @@ fn executeHashAggChunked(
             }
         }.cb);
     }
-    return rl;
+    const chunks = try sink.finish();
+    sink.deinit();
+    return .{ .chunks = chunks, .metas = out_metas };
 }
 
 /// Accumulate aggregate state from one DataChunk without building a row slice.
