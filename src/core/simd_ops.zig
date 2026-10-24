@@ -348,3 +348,29 @@ test "sumI16ToI64 does not overflow i32" {
     try std.testing.expectEqual(@as(i64, 3_000_000_000), sumI16ToI64(data));
     try std.testing.expectEqual(@as(i64, 3_000_000_000), sumI16(data));
 }
+
+/// SIMD min/max over a typed slice (used by raw MIN/MAX aggregation).
+pub fn minMax(comptime T: type, values: []const T) struct { min: T, max: T } {
+    const lanes = switch (T) {
+        i16 => 16,
+        i32 => 8,
+        i64 => 4,
+        else => @compileError("unsupported minMax type"),
+    };
+    const V = @Vector(lanes, T);
+    var lo_acc: V = @splat(std.math.maxInt(T));
+    var hi_acc: V = @splat(std.math.minInt(T));
+    var i: usize = 0;
+    while (i + lanes <= values.len) : (i += lanes) {
+        const v: V = values[i..][0..lanes].*;
+        lo_acc = @min(lo_acc, v);
+        hi_acc = @max(hi_acc, v);
+    }
+    var lo = @reduce(.Min, lo_acc);
+    var hi = @reduce(.Max, hi_acc);
+    while (i < values.len) : (i += 1) {
+        lo = @min(lo, values[i]);
+        hi = @max(hi, values[i]);
+    }
+    return .{ .min = lo, .max = hi };
+}

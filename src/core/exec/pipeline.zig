@@ -500,6 +500,23 @@ pub const RawColSlice = union(enum) {
         };
     }
 
+    pub fn minMax(self: RawColSlice) struct { min: i64, max: i64 } {
+        return switch (self) {
+            .i16s => |a| blk: {
+                const mm = simd.minMax(i16, a);
+                break :blk .{ .min = mm.min, .max = mm.max };
+            },
+            .i32s => |a| blk: {
+                const mm = simd.minMax(i32, a);
+                break :blk .{ .min = mm.min, .max = mm.max };
+            },
+            .i64s => |a| blk: {
+                const mm = simd.minMax(i64, a);
+                break :blk .{ .min = mm.min, .max = mm.max };
+            },
+        };
+    }
+
     pub fn sumI64Range(self: RawColSlice, start: usize, end: usize) i64 {
         var total: i64 = 0;
         switch (self) {
@@ -1972,6 +1989,13 @@ pub fn executePlan(
     tryPushdownSortKeyRange(node, ctx);
     defer ctx.source.setRowRange(0, total_rows);
 
+    // Raw integer point lookup (e.g. Q20) bypasses the chunk/evalExpr path.
+    if (node.* == .project) {
+        if (try executeRawIntPointLookup(node.project.input, node.project.items, ctx)) |rl| {
+            return rl.toResultSet(result_alloc);
+        }
+    }
+
     // ── Scannable path: stream chunks directly into ResultSink ─────────────
     if (isScannable(node)) {
         ctx.profile.scannable_path += 1;
@@ -2202,6 +2226,9 @@ fn executeNode(node: *const plan.PhysicalNode, ctx: *QueryContext) !ChunkResult 
         .project => |p| {
             const phase_started = ctx.profile.timestamp();
             defer ctx.profile.addElapsed(.project, phase_started);
+            if (try executeRawIntPointLookup(p.input, p.items, ctx)) |rl| {
+                return try rowListToChunkResult(rl, alloc);
+            }
             if (!projectItemsContainArrayJoin(p.items) and isScannable(p.input)) {
                 return try rowListToChunkResult(try executeLimitChunked(node, ctx), alloc);
             }
@@ -2611,11 +2638,161 @@ fn executeScalarAggChunked(
 
 /// Parallel scalar aggregation: split rows into T morsels, merge partial accumulators.
 /// Falls back to single-threaded if source does not support fetchRange.
+fn collectRawEqIndices(raw: RawColSlice, target: i64, alloc: std.mem.Allocator) ![]u32 {
+    var out: std.ArrayListUnmanaged(u32) = .empty;
+    errdefer out.deinit(alloc);
+    switch (raw) {
+        .i16s => |a| {
+            const t: i16 = std.math.cast(i16, target) orelse return try out.toOwnedSlice(alloc);
+            const L = 16;
+            const V = @Vector(L, i16);
+            var i: usize = 0;
+            while (i + L <= a.len) : (i += L) {
+                const v: V = a[i..][0..L].*;
+                const eq = v == @as(V, @splat(t));
+                if (@reduce(.Or, eq)) {
+                    inline for (0..L) |k| if (eq[k]) try out.append(alloc, @intCast(i + k));
+                }
+            }
+            while (i < a.len) : (i += 1) if (a[i] == t) try out.append(alloc, @intCast(i));
+        },
+        .i32s => |a| {
+            const t: i32 = std.math.cast(i32, target) orelse return try out.toOwnedSlice(alloc);
+            const L = 8;
+            const V = @Vector(L, i32);
+            var i: usize = 0;
+            while (i + L <= a.len) : (i += L) {
+                const v: V = a[i..][0..L].*;
+                const eq = v == @as(V, @splat(t));
+                if (@reduce(.Or, eq)) {
+                    inline for (0..L) |k| if (eq[k]) try out.append(alloc, @intCast(i + k));
+                }
+            }
+            while (i < a.len) : (i += 1) if (a[i] == t) try out.append(alloc, @intCast(i));
+        },
+        .i64s => |a| {
+            const L = 4;
+            const V = @Vector(L, i64);
+            var i: usize = 0;
+            while (i + L <= a.len) : (i += L) {
+                const v: V = a[i..][0..L].*;
+                const eq = v == @as(V, @splat(target));
+                if (@reduce(.Or, eq)) {
+                    inline for (0..L) |k| if (eq[k]) try out.append(alloc, @intCast(i + k));
+                }
+            }
+            while (i < a.len) : (i += 1) if (a[i] == target) try out.append(alloc, @intCast(i));
+        },
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
+/// Raw integer equality point lookup: `SELECT int_cols ... WHERE int_col = lit`.
+/// Avoids fetchRange/evalExpr per row; useful for Q20-style point queries.
+fn executeRawIntPointLookup(input: *const plan.PhysicalNode, items: []const plan.ProjectItem, ctx: *QueryContext) !?RowBuffer {
+    if (input.* != .filter) return null;
+    const pred = input.filter.predicate;
+    if (pred != .eq) return null;
+    const op = pred.eq;
+    if (op.left != .col_ref or op.right != .lit_i64) return null;
+    const filter_ci = op.left.col_ref.index;
+    const target = op.right.lit_i64;
+    for (items) |item| {
+        if (item.expr != .col_ref) return null;
+        switch (item.out_type) {
+            .int64, .uint64, .date_u16, .datetime64_ms => {},
+            else => return null,
+        }
+    }
+    const inner = input.filter.input;
+    if (inner.* != .part_scan and inner.* != .mem_scan) return null;
+
+    const alloc = ctx.allocator();
+    const sm = ctx.source.schema();
+    var scan_request: ScanRequest = .{};
+    scan_request.addIndex(filter_ci);
+    scan_request.addItems(items);
+    var scan_scope = scan_request.apply(ctx.source, .any_reduction);
+    defer scan_scope.deinit();
+    {
+        var dummy: DataChunk = undefined;
+        ctx.source.fetchRange(0, 0, &dummy, alloc) catch {};
+    }
+    const raw_filter = RawColSlice.resolve(ctx.source, sm, filter_ci) orelse return null;
+    const matches = try collectRawEqIndices(raw_filter, target, alloc);
+    defer alloc.free(matches);
+
+    const metas = try alloc.alloc(result.ColMeta, items.len);
+    for (items, 0..) |item, i| {
+        metas[i] = .{ .name = item.alias, .col_type = item.out_type, .ch_type = item.ch_type };
+    }
+    var rl = RowBuffer.init(metas);
+    for (matches) |row_idx| {
+        const row = try alloc.alloc(?Value, items.len);
+        for (items, 0..) |item, i| {
+            const ci = item.expr.col_ref.index;
+            const raw = RawColSlice.resolve(ctx.source, sm, ci) orelse {
+                row[i] = null;
+                continue;
+            };
+            const v = raw.getI64(row_idx);
+            row[i] = switch (item.out_type) {
+                .int64 => .{ .int64 = v },
+                .uint64 => .{ .uint64 = @intCast(v) },
+                .date_u16 => .{ .date_u16 = @intCast(v) },
+                .datetime64_ms => .{ .datetime64_ms = v },
+                else => unreachable,
+            };
+        }
+        try rl.append(alloc, row);
+    }
+    return rl;
+}
+
+/// MIN/MAX over raw mmap'd integer columns: no per-row Value materialization.
+fn executeRawMinMaxAgg(input: *const plan.PhysicalNode, aggs: []const plan.ProjectItem, ctx: *QueryContext) !?RowBuffer {
+    if (input.* != .part_scan and input.* != .mem_scan) return null;
+    if (aggs.len == 0) return null;
+    for (aggs) |item| {
+        if (item.expr != .agg_call) return null;
+        const ac = item.expr.agg_call;
+        if (ac.kind != .min and ac.kind != .max) return null;
+        if (ac.distinct or ac.arg == null or ac.arg.? != .col_ref) return null;
+        switch (item.out_type) {
+            .int64, .uint64, .date_u16, .datetime64_ms => {},
+            else => return null,
+        }
+    }
+    const alloc = ctx.allocator();
+    const sm = ctx.source.schema();
+    const metas = try buildAggResultMetas(&.{}, aggs, alloc);
+    var rl = RowBuffer.init(metas);
+    const row = try alloc.alloc(?Value, aggs.len);
+    for (aggs, 0..) |item, i| {
+        const ac = item.expr.agg_call;
+        const ci = ac.arg.?.col_ref.index;
+        if (ci >= sm.len) return null;
+        const raw = RawColSlice.resolve(ctx.source, sm, ci) orelse return null;
+        const mm = raw.minMax();
+        const v = if (ac.kind == .min) mm.min else mm.max;
+        row[i] = switch (item.out_type) {
+            .int64 => .{ .int64 = v },
+            .uint64 => .{ .uint64 = @intCast(v) },
+            .date_u16 => .{ .date_u16 = @intCast(v) },
+            .datetime64_ms => .{ .datetime64_ms = v },
+            else => unreachable,
+        };
+    }
+    try rl.append(alloc, row);
+    return rl;
+}
+
 fn executeScalarAggParallel(
     input: *const plan.PhysicalNode,
     aggs: []const plan.ProjectItem,
     ctx: *QueryContext,
 ) !?RowBuffer {
+    if (try executeRawMinMaxAgg(input, aggs, ctx)) |rl| return rl;
     if (!ctx.source.supportsRange()) return null;
     const total_rows = ctx.source.rowCount();
     if (total_rows == 0) return null;
