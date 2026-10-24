@@ -2177,6 +2177,19 @@ fn chunkResultToResultSet(res: ChunkResult, query_alloc: std.mem.Allocator, resu
     return try sink.finish();
 }
 
+fn rowListToChunkResult(rl: RowList, alloc: std.mem.Allocator) !ChunkResult {
+    var sink = try chunk_sink_mod.ChunkSink.init(alloc, rl.metas);
+    defer sink.deinit();
+    for (rl.rows.items) |row| try sink.append(row);
+    return try sink.finishResult();
+}
+
+fn filterChunkResult(res: ChunkResult, predicate: plan.Expr, ctx: *QueryContext) !ChunkResult {
+    var state = FilterState{ .predicate = predicate };
+    for (res.chunks) |*c| try state.apply(c, ctx);
+    return res;
+}
+
 fn executeNode(node: *const plan.PhysicalNode, ctx: *QueryContext) !ExecResult {
     const alloc = ctx.allocator();
     switch (node.*) {
@@ -2205,14 +2218,18 @@ fn executeNode(node: *const plan.PhysicalNode, ctx: *QueryContext) !ExecResult {
         .filter => |f| {
             const phase_started = ctx.profile.timestamp();
             defer ctx.profile.addElapsed(.filter, phase_started);
-            var inner = try executeNode(f.input, ctx);
-            const inner_rl = try inner.toRows(alloc);
-            var rl = RowList.init(inner_rl.metas);
-            for (inner_rl.rows.items) |row| {
-                const v_opt = try kernels.evalExpr(f.predicate, row, null, alloc);
-                if (valueToBool(v_opt)) try rl.append(alloc, row);
-            }
-            return .{ .rows = rl };
+            const inner = try executeNode(f.input, ctx);
+            return switch (inner) {
+                .chunks => |res| .{ .chunks = try filterChunkResult(res, f.predicate, ctx) },
+                .rows => |inner_rl| blk: {
+                    var rl = RowList.init(inner_rl.metas);
+                    for (inner_rl.rows.items) |row| {
+                        const v_opt = try kernels.evalExpr(f.predicate, row, null, alloc);
+                        if (valueToBool(v_opt)) try rl.append(alloc, row);
+                    }
+                    break :blk .{ .rows = rl };
+                },
+            };
         },
         .project => |p| {
             const phase_started = ctx.profile.timestamp();
@@ -2306,7 +2323,8 @@ fn executeNode(node: *const plan.PhysicalNode, ctx: *QueryContext) !ExecResult {
             const phase_started = ctx.profile.timestamp();
             defer ctx.profile.addElapsed(.topk, phase_started);
             var inner = try executeNode(ob.input, ctx);
-            return .{ .rows = try executeOrderBy(try inner.toRows(alloc), ob.keys, alloc) };
+            const sorted = try executeOrderBy(try inner.toRows(alloc), ob.keys, alloc);
+            return .{ .chunks = try rowListToChunkResult(sorted, alloc) };
         },
         .top_k => |tk| {
             const phase_started = ctx.profile.timestamp();
@@ -2344,7 +2362,8 @@ fn executeNode(node: *const plan.PhysicalNode, ctx: *QueryContext) !ExecResult {
             var right = try executeNode(hj.right, ctx);
             const left_rl = try left.toRows(alloc);
             const right_rl = try right.toRows(alloc);
-            return .{ .rows = try executeHashJoin(left_rl, right_rl, hj, alloc) };
+            const joined = try executeHashJoin(left_rl, right_rl, hj, alloc);
+            return .{ .chunks = try rowListToChunkResult(joined, alloc) };
         },
     }
 }
