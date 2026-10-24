@@ -2004,8 +2004,11 @@ pub fn executePlan(
 
     // ── Breaker path: existing RowList → ResultSet (single copy) ───────────
     ctx.profile.breaker_path += 1;
-    var rl = try executeNode(node, ctx);
-    return rl.toResultSet(result_alloc);
+    const er = try executeNode(node, ctx);
+    return switch (er) {
+        .rows => |rl| rl.toResultSet(result_alloc),
+        .chunks => |res| chunkResultToResultSet(res, ctx.allocator(), result_alloc),
+    };
 }
 
 fn findProjectItems(node: *const plan.PhysicalNode) ?[]const plan.ProjectItem {
@@ -2119,66 +2122,107 @@ fn executeScannableToSink(
         if (lim_state) |ls| if (ls.done()) break;
     }
 }
-fn executeNode(node: *const plan.PhysicalNode, ctx: *QueryContext) !RowList {
+const ChunkResult = chunk_sink_mod.ChunkSink.Result;
+
+const ExecResult = union(enum) {
+    rows: RowList,
+    chunks: ChunkResult,
+
+    fn toRows(self: *ExecResult, alloc: std.mem.Allocator) !RowList {
+        return switch (self.*) {
+            .rows => |rl| rl,
+            .chunks => |res| try chunkResultToRowList(res, alloc),
+        };
+    }
+};
+
+fn projectChunkResult(res: ChunkResult, items: []const plan.ProjectItem, ctx: *QueryContext) !ChunkResult {
+    var state = ProjectState{ .items = items };
+    for (res.chunks) |*c| try state.apply(c, ctx);
+    const alloc = ctx.allocator();
+    const metas = try alloc.alloc(result.ColMeta, items.len);
+    for (items, 0..) |item, i| {
+        metas[i] = .{ .name = item.alias, .col_type = item.out_type, .ch_type = item.ch_type };
+    }
+    return .{ .chunks = res.chunks, .metas = metas };
+}
+
+fn limitChunkResult(res: ChunkResult, limit: u64, offset: u64, ctx: *QueryContext) !ChunkResult {
+    const alloc = ctx.allocator();
+    var sink = try chunk_sink_mod.ChunkSink.init(alloc, res.metas);
+    defer sink.deinit();
+    const row_buf = try alloc.alloc(?Value, res.metas.len);
+    var skipped: u64 = 0;
+    var emitted: u64 = 0;
+    outer: for (res.chunks) |*c| {
+        for (0..c.num_rows) |r| {
+            if (skipped < offset) {
+                skipped += 1;
+                continue;
+            }
+            if (emitted >= limit) break :outer;
+            c.fillRow(r, row_buf);
+            try sink.append(row_buf);
+            emitted += 1;
+        }
+    }
+    return try sink.finishResult();
+}
+
+fn chunkResultToResultSet(res: ChunkResult, query_alloc: std.mem.Allocator, result_alloc: std.mem.Allocator) !ResultSet {
+    var sink = ResultSink.init(result_alloc);
+    for (res.chunks) |c| try sink.consume(c);
+    query_alloc.free(res.chunks);
+    query_alloc.free(res.metas);
+    return try sink.finish();
+}
+
+fn executeNode(node: *const plan.PhysicalNode, ctx: *QueryContext) !ExecResult {
     const alloc = ctx.allocator();
     switch (node.*) {
-        // ── Sources ───────────────────────────────────────────────────────────
         .chunk_source => |cs| {
-            // Expose the inner sub-plan as a stable intermediate row source for
-            // outer filter/project/aggregate operators.
             const inner = try executeNode(cs.input, ctx);
-            return cloneRowList(inner, alloc);
+            return switch (inner) {
+                .rows => |rl| .{ .rows = try cloneRowList(rl, alloc) },
+                .chunks => inner,
+            };
         },
         .part_scan, .mem_scan => {
             const phase_started = ctx.profile.timestamp();
             defer ctx.profile.addElapsed(.scan, phase_started);
-            // Fall through to the ctx.source scan path below only for
-            // part_scan and mem_scan (not chunk_source — that must execute
-            // its inner plan to apply filter/project/agg operators).
             const schema_metas = ctx.source.schema();
             const metas = try alloc.dupe(result.ColMeta, schema_metas);
             var rl = RowList.init(metas);
             var c: DataChunk = undefined;
             while (try ctx.source.nextChunk(&c, ctx)) {
-                // Note: do NOT defer c.deinit() here — row values hold slices
-                // into the chunk's arena (e.g. array_string elems). Those
-                // slices remain valid until qctx.deinit() frees the parent
-                // arena that owns the chunk sub-arenas.
                 for (0..c.num_rows) |r| {
                     const row = try c.readRow(r, alloc);
                     try rl.append(alloc, row);
                 }
             }
-            return rl;
+            return .{ .rows = rl };
         },
         .filter => |f| {
             const phase_started = ctx.profile.timestamp();
             defer ctx.profile.addElapsed(.filter, phase_started);
-            const inner = try executeNode(f.input, ctx);
-            var rl = RowList.init(inner.metas);
-            for (inner.rows.items) |row| {
+            var inner = try executeNode(f.input, ctx);
+            const inner_rl = try inner.toRows(alloc);
+            var rl = RowList.init(inner_rl.metas);
+            for (inner_rl.rows.items) |row| {
                 const v_opt = try kernels.evalExpr(f.predicate, row, null, alloc);
-                const keep = valueToBool(v_opt);
-                if (keep) try rl.append(alloc, row);
+                if (valueToBool(v_opt)) try rl.append(alloc, row);
             }
-            return rl;
+            return .{ .rows = rl };
         },
-
-        // ── Project ───────────────────────────────────────────────────────────
         .project => |p| {
             const phase_started = ctx.profile.timestamp();
             defer ctx.profile.addElapsed(.project, phase_started);
             if (!projectItemsContainArrayJoin(p.items) and isScannable(p.input)) {
-                return executeLimitChunked(node, ctx);
+                return .{ .rows = try executeLimitChunked(node, ctx) };
             }
-            // Detect: project → top_k → scannable  (e.g. SELECT col … ORDER BY col LIMIT k)
-            // Stream scannable input directly into heap to avoid materialising all rows.
-            // The top_k sort keys may use output-column indices (from findOutputColIdx in
-            // planner). Remap them to schema indices so HeapChunkLoop operates on raw rows.
             if (p.input.* == .top_k) {
                 const tk = p.input.top_k;
                 if (isScannable(tk.input)) {
-                    // Remap sort keys: output index → schema col_ref index.
                     const remapped_keys = try alloc.dupe(plan.SortKey, tk.keys);
                     var all_remapped = true;
                     for (remapped_keys) |*rk| {
@@ -2194,104 +2238,113 @@ fn executeNode(node: *const plan.PhysicalNode, ctx: *QueryContext) !RowList {
                     }
                     if (all_remapped) {
                         var proj_over_scan = plan.PhysicalNode{ .project = .{ .input = tk.input, .items = p.items } };
-                        return executeTopKFromScannable(&proj_over_scan, remapped_keys, @intCast(tk.k), ctx);
+                        return .{ .rows = try executeTopKFromScannable(&proj_over_scan, remapped_keys, @intCast(tk.k), ctx) };
                     }
                 }
             }
             const inner = try executeNode(p.input, ctx);
-            return projectRowList(inner, p.items, alloc);
+            return switch (inner) {
+                .rows => |rl| .{ .rows = try projectRowList(rl, p.items, alloc) },
+                .chunks => |res| blk: {
+                    if (projectItemsContainArrayJoin(p.items)) {
+                        const rl = try chunkResultToRowList(res, alloc);
+                        break :blk .{ .rows = try projectRowList(rl, p.items, alloc) };
+                    }
+                    break :blk .{ .chunks = try projectChunkResult(res, p.items, ctx) };
+                },
+            };
         },
-
-        // ── Limit ─────────────────────────────────────────────────────────────
         .limit => |lim| {
             if (isScannable(node)) {
-                return executeLimitChunked(node, ctx);
+                return .{ .rows = try executeLimitChunked(node, ctx) };
             }
             if (lim.offset == 0 and lim.input.* == .hash_agg and isScannable(lim.input.hash_agg.input)) {
                 const ha = lim.input.hash_agg;
                 const k = @as(usize, @intCast(lim.limit));
-                if (try executeHashAggParallelPairCount(ha.input, ha.keys, ha.aggs, &.{}, k, ctx)) |rl| return rl;
+                if (try executeHashAggParallelPairCount(ha.input, ha.keys, ha.aggs, &.{}, k, ctx)) |rl| return .{ .rows = rl };
             }
             const inner = try executeNode(lim.input, ctx);
-            var rl = RowList.init(inner.metas);
-            var skipped: u64 = 0;
-            var emitted: u64 = 0;
-            for (inner.rows.items) |row| {
-                if (skipped < lim.offset) {
-                    skipped += 1;
-                    continue;
-                }
-                if (emitted >= lim.limit) break;
-                try rl.append(alloc, row);
-                emitted += 1;
-            }
-            return rl;
+            return switch (inner) {
+                .chunks => |res| .{ .chunks = try limitChunkResult(res, lim.limit, lim.offset, ctx) },
+                .rows => |inner_rl| blk: {
+                    var rl = RowList.init(inner_rl.metas);
+                    var skipped: u64 = 0;
+                    var emitted: u64 = 0;
+                    for (inner_rl.rows.items) |row| {
+                        if (skipped < lim.offset) {
+                            skipped += 1;
+                            continue;
+                        }
+                        if (emitted >= lim.limit) break;
+                        try rl.append(alloc, row);
+                        emitted += 1;
+                    }
+                    break :blk .{ .rows = rl };
+                },
+            };
         },
-
-        // ── ScalarAgg ─────────────────────────────────────────────────────────
         .scalar_agg => |sa| {
             const phase_started = ctx.profile.timestamp();
             defer ctx.profile.addElapsed(.aggregate, phase_started);
             if (isScannable(sa.input)) {
-                // Try parallel path first (requires fetchRange support and no LIMIT).
-                if (try executeScalarAggParallel(sa.input, sa.aggs, ctx)) |r| return r;
-                return executeScalarAggChunked(sa.input, sa.aggs, ctx);
+                if (try executeScalarAggParallel(sa.input, sa.aggs, ctx)) |r| return .{ .rows = r };
+                return .{ .rows = try executeScalarAggChunked(sa.input, sa.aggs, ctx) };
             }
-            const inner = try executeNode(sa.input, ctx);
-            return executeScalarAgg(inner, sa.aggs, alloc);
+            var inner = try executeNode(sa.input, ctx);
+            return .{ .rows = try executeScalarAgg(try inner.toRows(alloc), sa.aggs, alloc) };
         },
-
-        // ── HashAgg ───────────────────────────────────────────────────────────
         .hash_agg => |ha| {
             const phase_started = ctx.profile.timestamp();
             defer ctx.profile.addElapsed(.aggregate, phase_started);
             if (isScannable(ha.input)) {
-                return executeHashAggScannable(ha, &.{}, 0, 0, ctx);
+                return try executeHashAggScannable(ha, &.{}, 0, 0, ctx);
             }
-            const inner = try executeNode(ha.input, ctx);
-            return executeHashAgg(inner, ha.keys, ha.aggs, alloc);
+            var inner = try executeNode(ha.input, ctx);
+            return .{ .rows = try executeHashAgg(try inner.toRows(alloc), ha.keys, ha.aggs, alloc) };
         },
-
-        // ── OrderBy ───────────────────────────────────────────────────────────
         .order_by => |ob| {
             const phase_started = ctx.profile.timestamp();
             defer ctx.profile.addElapsed(.topk, phase_started);
-            const inner = try executeNode(ob.input, ctx);
-            return executeOrderBy(inner, ob.keys, alloc);
+            var inner = try executeNode(ob.input, ctx);
+            return .{ .rows = try executeOrderBy(try inner.toRows(alloc), ob.keys, alloc) };
         },
-
-        // ── TopK ──────────────────────────────────────────────────────────────
         .top_k => |tk| {
             const phase_started = ctx.profile.timestamp();
             defer ctx.profile.addElapsed(.topk, phase_started);
             const k = @as(usize, @intCast(tk.k));
-            // Fast path: stream scannable input directly into heap — avoids
-            // materialising all rows into a RowList before sorting.
             if (isScannable(tk.input)) {
-                return executeTopKFromScannable(tk.input, tk.keys, k, ctx);
+                return .{ .rows = try executeTopKFromScannable(tk.input, tk.keys, k, ctx) };
             }
-            // Fusion: top_k(hash_agg(scannable)) — avoid building full RowList.
             if (tk.input.* == .hash_agg and isScannable(tk.input.hash_agg.input)) {
                 const ha = tk.input.hash_agg;
-                return executeHashAggScannable(ha, tk.keys, k, @intCast(tk.offset), ctx);
+                return try executeHashAggScannable(ha, tk.keys, k, @intCast(tk.offset), ctx);
             }
             const inner = try executeNode(tk.input, ctx);
-            // For small K, use a partial selection (heap-based) instead of full sort.
-            if (k <= 1024 and inner.rows.items.len > k * 4) {
-                return executeTopK(inner, tk.keys, k, alloc);
+            switch (inner) {
+                .chunks => |res_in| {
+                    var res = res_in;
+                    const out = try executeTopKFromChunkResult(res, tk.keys, k, alloc);
+                    res.deinit(alloc);
+                    return .{ .rows = out };
+                },
+                .rows => |inner_rl| {
+                    if (k <= 1024 and inner_rl.rows.items.len > k * 4) {
+                        return .{ .rows = try executeTopK(inner_rl, tk.keys, k, alloc) };
+                    }
+                    const sorted = try executeOrderBy(inner_rl, tk.keys, alloc);
+                    const take = @min(sorted.rows.items.len, k);
+                    var rl = RowList.init(sorted.metas);
+                    for (sorted.rows.items[0..take]) |row| try rl.append(alloc, row);
+                    return .{ .rows = rl };
+                },
             }
-            const sorted = try executeOrderBy(inner, tk.keys, alloc);
-            const take = @min(sorted.rows.items.len, k);
-            var rl = RowList.init(sorted.metas);
-            for (sorted.rows.items[0..take]) |row| try rl.append(alloc, row);
-            return rl;
         },
-
-        // ── HashJoin ──────────────────────────────────────────────────────────
         .hash_join => |hj| {
-            const left_rl = try executeNode(hj.left, ctx);
-            const right_rl = try executeNode(hj.right, ctx);
-            return executeHashJoin(left_rl, right_rl, hj, alloc);
+            var left = try executeNode(hj.left, ctx);
+            var right = try executeNode(hj.right, ctx);
+            const left_rl = try left.toRows(alloc);
+            const right_rl = try right.toRows(alloc);
+            return .{ .rows = try executeHashJoin(left_rl, right_rl, hj, alloc) };
         },
     }
 }
@@ -2302,13 +2355,13 @@ fn executeHashAggScannable(
     top_k: usize,
     top_offset: usize,
     ctx: *QueryContext,
-) !RowList {
+) !ExecResult {
     // Strategy selection happens once in agg_strategy.select(). If the chosen
     // implementation rejects the query at runtime, try the one generic fallback
     // for its key shape (string-key or compact-int) and then the chunked path.
     // Older code probed up to eight strategies, rescanning the input each time.
     if (ha.strategy != .auto) {
-        if (try executeHashAggStrategy(ha.strategy, ha, sort_keys, top_k, top_offset, ctx)) |rl| return rl;
+        if (try executeHashAggStrategy(ha.strategy, ha, sort_keys, top_k, top_offset, ctx)) |rl| return .{ .rows = rl };
     }
     var has_string_key = false;
     for (ha.keys) |k| {
@@ -2319,16 +2372,15 @@ fn executeHashAggScannable(
     }
     const fallback_strategy: plan.HashAggNode.Strategy = if (has_string_key) .string_key else .compact_int;
     if (fallback_strategy != ha.strategy) {
-        if (try executeHashAggStrategy(fallback_strategy, ha, sort_keys, top_k, top_offset, ctx)) |rl| return rl;
+        if (try executeHashAggStrategy(fallback_strategy, ha, sort_keys, top_k, top_offset, ctx)) |rl| return .{ .rows = rl };
     }
     var res = try executeHashAggChunked(ha.input, ha.keys, ha.aggs, ctx);
     if (top_k > 0 and sort_keys.len > 0) {
         const out = try executeTopKFromChunkResult(res, sort_keys, top_k, ctx.allocator());
         res.deinit(ctx.allocator());
-        return out;
+        return .{ .rows = out };
     }
-    // No top-K: keep the temporary row bridge until project/limit consume chunks.
-    return try chunkResultToRowList(res, ctx.allocator());
+    return .{ .chunks = res };
 }
 
 fn executeHashAggStrategy(
