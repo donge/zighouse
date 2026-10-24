@@ -17,6 +17,7 @@ pub const result  = @import("result.zig");
 
 pub const exec = struct {
     pub const plan      = @import("exec/plan.zig");
+    pub const chunk_sink = @import("exec/chunk_sink.zig");
     pub const kernels   = @import("exec/kernels.zig");
     pub const hash_table = @import("exec/hash_table.zig");
     pub const pipeline  = @import("exec/pipeline.zig");
@@ -26,6 +27,7 @@ pub const simd_batch = @import("simd_batch.zig");
 
 pub const source = struct {
     pub const mem_table   = @import("source/mem_table.zig");
+    pub const chunk_stream = @import("source/chunk_stream.zig");
     pub const chunk_source = @import("source/chunk_source.zig");
     pub const part_scan   = @import("source/part_scan.zig");
 };

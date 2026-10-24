@@ -101,6 +101,21 @@ pub const ColumnData = union(ColumnType) {
         }
     }
 
+    /// Return a view of the first `n` elements (used when flushing a
+    /// partially filled 2048-row output chunk).
+    pub fn truncate(self: ColumnData, n: usize) ColumnData {
+        return switch (self) {
+            .bool_u8 => |s| .{ .bool_u8 = s[0..n] },
+            .int64 => |s| .{ .int64 = s[0..n] },
+            .uint64 => |s| .{ .uint64 = s[0..n] },
+            .float64 => |s| .{ .float64 = s[0..n] },
+            .date_u16 => |s| .{ .date_u16 = s[0..n] },
+            .datetime64_ms => |s| .{ .datetime64_ms = s[0..n] },
+            .string => |s| .{ .string = s[0..n] },
+            .array_string => |s| .{ .array_string = s[0..n] },
+        };
+    }
+
     /// Copy one value within the same typed column buffer.
     pub fn copyWithin(self: ColumnData, from: usize, to: usize) void {
         switch (self) {
