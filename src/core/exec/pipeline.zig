@@ -7109,6 +7109,128 @@ test "ProjectState applySelected projects logical rows" {
 /// thread's HT small (fits in L3) with no scatter buffers or string copies.
 /// Strings point directly into mmap data (valid for query lifetime).
 /// Returns null if unable to handle; falls back to sequential executeHashAggChunked.
+/// LIMIT without ORDER BY, pair (int, string) count.
+///
+/// Any K groups are valid, so choose K keys from a small sample, then count
+/// only those keys in a parallel full scan. This avoids building a hash table
+/// over every distinct pair when the query only returns K rows (Q18).
+fn executeHashAggParallelPairCountBounded(
+    input: *const plan.PhysicalNode,
+    keys: []const plan.ProjectItem,
+    aggs: []const plan.ProjectItem,
+    limit: usize,
+    ctx: *QueryContext,
+) !?RowList {
+    if (limit == 0 or limit > 1024) return null;
+    if (input.* != .part_scan and input.* != .mem_scan) return null;
+    if (keys.len != 2 or aggs.len != 1) return null;
+    if (aggs[0].expr != .agg_call or aggs[0].expr.agg_call.kind != .count_star) return null;
+    for (keys) |k| if (k.expr != .col_ref) return null;
+
+    const sm = ctx.source.schema();
+    const ci0 = keys[0].expr.col_ref.index;
+    const ci1 = keys[1].expr.col_ref.index;
+    if (ci0 >= sm.len or ci1 >= sm.len) return null;
+    const t0 = sm[ci0].col_type;
+    const t1 = sm[ci1].col_type;
+    const i64_ci: usize = blk: {
+        if (t0 == .int64 and t1 == .string) break :blk ci0;
+        if (t1 == .int64 and t0 == .string) break :blk ci1;
+        return null;
+    };
+    const str_ci: usize = if (i64_ci == ci0) ci1 else ci0;
+    const k0_is_i64 = (i64_ci == ci0);
+
+    var scan_request: ScanRequest = .{};
+    scan_request.addIndex(i64_ci);
+    scan_request.addIndex(str_ci);
+    var scan_scope = scan_request.apply(ctx.source, .any_reduction);
+    defer scan_scope.deinit();
+    {
+        var dummy: DataChunk = undefined;
+        ctx.source.fetchRange(0, 0, &dummy, ctx.allocator()) catch {};
+    }
+    const raw_i64 = ctx.source.getRawInt64Col(sm[i64_ci].name) orelse return null;
+    const raw_offs = ctx.source.getRawStrOffsets(sm[str_ci].name) orelse return null;
+    const raw_bytes = ctx.source.getRawStrBytes(sm[str_ci].name) orelse return null;
+    const total_rows: usize = @intCast(ctx.source.rowCount());
+    if (total_rows == 0 or raw_offs.len < total_rows + 1) return null;
+
+    const alloc = ctx.allocator();
+    const out_metas = try buildAggResultMetas(keys, aggs, alloc);
+
+    // Choose up to K keys from a small prefix. This is valid because LIMIT
+    // without ORDER BY may return any K groups.
+    var key_table = try ht.PairCountHashTable.initWithCapacity(alloc, @as(u64, limit) * 4);
+    const sample_n = @min(total_rows, 8192);
+    for (0..sample_n) |row| {
+        const lo: usize = @intCast(raw_offs[row]);
+        const hi: usize = @intCast(raw_offs[row + 1]);
+        if (hi > raw_bytes.len or lo > hi) continue;
+        _ = key_table.incrementBounded(raw_i64[row], raw_bytes[lo..hi], limit);
+    }
+    if (key_table.count == 0) return RowList.init(out_metas);
+    key_table.resetCounts();
+
+    const n_threads = parallel.defaultThreads();
+    if (n_threads <= 1) return null;
+    const local = try alloc.alloc(ht.PairCountHashTable, n_threads);
+    for (local) |*t| t.* = try key_table.cloneForCounting(alloc);
+
+    const Worker = struct {
+        raw_i64: []const i64,
+        raw_offs: []const u64,
+        raw_bytes: []const u8,
+        table: *ht.PairCountHashTable,
+        err: ?anyerror = null,
+        fn work(self: *@This(), morsel_src: *parallel.MorselSource) void {
+            while (morsel_src.next()) |m| {
+                for (m.start..m.end) |row| {
+                    const lo: usize = @intCast(self.raw_offs[row]);
+                    const hi: usize = @intCast(self.raw_offs[row + 1]);
+                    if (hi > self.raw_bytes.len or lo > hi) continue;
+                    _ = self.table.incrementExisting(self.raw_i64[row], self.raw_bytes[lo..hi]);
+                }
+            }
+        }
+    };
+    const workers = try alloc.alloc(Worker, n_threads);
+    for (workers, 0..) |*w, i| {
+        w.* = .{
+            .raw_i64 = raw_i64,
+            .raw_offs = raw_offs,
+            .raw_bytes = raw_bytes,
+            .table = &local[i],
+        };
+    }
+    var morsel_src = parallel.MorselSource.init(total_rows, parallel.default_morsel_size);
+    try parallel.parallelFor(alloc, Worker, Worker.work, workers, &morsel_src);
+    for (workers) |w| if (w.err) |e| return e;
+    for (local) |*t| key_table.addCountsFrom(t);
+
+    var rl = RowList.init(out_metas);
+    const Emit = struct {
+        rl: *RowList,
+        alloc: std.mem.Allocator,
+        k0_is_i64: bool,
+        fn cb(self: *@This(), i64_key: i64, str_key: []const u8, count: u64) void {
+            const row = self.alloc.alloc(?Value, 3) catch return;
+            if (self.k0_is_i64) {
+                row[0] = .{ .int64 = i64_key };
+                row[1] = .{ .string = str_key };
+            } else {
+                row[0] = .{ .string = str_key };
+                row[1] = .{ .int64 = i64_key };
+            }
+            row[2] = .{ .uint64 = count };
+            self.rl.append(self.alloc, row) catch {};
+        }
+    };
+    var emit = Emit{ .rl = &rl, .alloc = alloc, .k0_is_i64 = k0_is_i64 };
+    key_table.iterate(&emit, Emit.cb);
+    return rl;
+}
+
 fn executeHashAggParallelPairCount(
     input: *const plan.PhysicalNode,
     keys: []const plan.ProjectItem,
@@ -7126,6 +7248,13 @@ fn executeHashAggParallelPairCount(
 
     // Only handle unfiltered scans (no WHERE clause support yet in this path).
     if (input.* != .part_scan and input.* != .mem_scan) return null;
+
+    // LIMIT without ORDER BY: only K groups are needed. Choose the keys from a
+    // tiny sample and count them in a parallel scan instead of building a table
+    // over every distinct pair.
+    if (top_k > 0 and sort_keys.len == 0) {
+        if (try executeHashAggParallelPairCountBounded(input, keys, aggs, top_k, ctx)) |rl| return rl;
+    }
 
     // Guard: exactly 2 col_ref keys, exactly 1 agg (count(*)).
     if (keys.len != 2) return null;

@@ -389,6 +389,81 @@ pub const PairCountHashTable = struct {
         }
     }
 
+    /// Increment without growing. Returns false when the key is new and the
+    /// table already holds `max_groups` distinct keys.
+    pub fn incrementBounded(self: *PairCountHashTable, i64_key: i64, str_key: []const u8, max_groups: usize) bool {
+        const mask = self.capacity - 1;
+        const h = tagHash(hashPair(i64_key, str_key));
+        var slot = h & mask;
+        while (true) : (slot = (slot + 1) & mask) {
+            if (self.slots[slot].hash == EMPTY) {
+                if (self.count >= max_groups) return false;
+                self.slots[slot] = .{ .hash = h, .i64_key = i64_key, .str_key = str_key, .count = 1 };
+                self.count += 1;
+                return true;
+            }
+            if (self.slots[slot].hash == h and
+                self.slots[slot].i64_key == i64_key and
+                std.mem.eql(u8, self.slots[slot].str_key, str_key))
+            {
+                self.slots[slot].count += 1;
+                return true;
+            }
+        }
+    }
+
+    /// Increment only when the key already exists; never insert. Used by the
+    /// bounded LIMIT path, where the key set is chosen from a small sample.
+    pub fn incrementExisting(self: *PairCountHashTable, i64_key: i64, str_key: []const u8) bool {
+        const mask = self.capacity - 1;
+        const h = tagHash(hashPair(i64_key, str_key));
+        var slot = h & mask;
+        while (true) : (slot = (slot + 1) & mask) {
+            if (self.slots[slot].hash == EMPTY) return false;
+            if (self.slots[slot].hash == h and
+                self.slots[slot].i64_key == i64_key and
+                std.mem.eql(u8, self.slots[slot].str_key, str_key))
+            {
+                self.slots[slot].count += 1;
+                return true;
+            }
+        }
+    }
+
+    /// Copy the key set with zeroed counts for a worker-local counter table.
+    pub fn cloneForCounting(self: *const PairCountHashTable, alloc: std.mem.Allocator) !PairCountHashTable {
+        const slots = try alloc.dupe(Slot, self.slots);
+        for (slots) |*s| {
+            if (s.hash != EMPTY) s.count = 0;
+        }
+        return .{ .slots = slots, .capacity = self.capacity, .count = self.count, .arena = alloc };
+    }
+
+    pub fn resetCounts(self: *PairCountHashTable) void {
+        for (self.slots) |*s| {
+            if (s.hash != EMPTY) s.count = 0;
+        }
+    }
+
+    /// Add counts from a table with the same key set (no insert).
+    pub fn addCountsFrom(self: *PairCountHashTable, other: *const PairCountHashTable) void {
+        for (other.slots) |s| {
+            if (s.hash == EMPTY or s.count == 0) continue;
+            const mask = self.capacity - 1;
+            var slot = s.hash & mask;
+            while (true) : (slot = (slot + 1) & mask) {
+                if (self.slots[slot].hash == EMPTY) break;
+                if (self.slots[slot].hash == s.hash and
+                    self.slots[slot].i64_key == s.i64_key and
+                    std.mem.eql(u8, self.slots[slot].str_key, s.str_key))
+                {
+                    self.slots[slot].count += s.count;
+                    break;
+                }
+            }
+        }
+    }
+
     pub fn hashPair(n: i64, s: []const u8) u64 {
         var h = std.hash.Wyhash.init(0);
         h.update(std.mem.asBytes(&n));
