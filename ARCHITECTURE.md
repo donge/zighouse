@@ -1,8 +1,9 @@
 # ZigHouse Architecture
 
 Status: working notes for the single-node engine. This file records the
-architectural constraints we intentionally keep, and the refactor needed to
-remove `RowList` from breaker boundaries.
+architectural constraints we intentionally keep. `RowList` has been removed
+from executor boundaries: breakers exchange chunks and only use bounded
+`RowBuffer`s internally.
 
 ## Goals
 
@@ -69,53 +70,53 @@ Already streaming:
 
 - mmap/range reads and `fetchRange` / `nextChunk`
 - scan -> filter -> project -> limit scannable path
-- hash-aggregation input loops (`executeHashAggChunked`)
+- hash-aggregation input and output chunks (`executeHashAggChunked`, `ChunkSink`)
 - parallel top-K (`TopKCollector`, late materialisation)
+- inner/left hash-join probe side; output chunks
+- generic Parquet import string offsets spill to temp files
 
-Still materialising:
+Still materialising or unbounded:
 
-- `executeNode()` scan/filter/project produces a full `RowList`
-- hash-aggregation output is emitted as `RowList` when there is no top-K
-- `order_by` sorts a full `RowList`
-- hash join builds both sides as `RowList`
-- subqueries/CTEs go through `ResultSet -> cloneRowList`
+- `order_by` without `LIMIT` uses an in-memory `RowBuffer`
+- hash-join build side and right/full joins use `RowBuffer`
+- subqueries/CTEs go through `ResultSet`
 - final results are accumulated in `ResultSet` before serialization
+- query mmap working set is bounded by the OS page cache, not an explicit
+  per-query budget
+- `importParquetCHHttp` still buffers the entire request
 
-`RowList` is therefore still the universal breaker boundary. Removing it is
-the main architectural task.
+`RowBuffer` is now an internal breaker buffer, not the executor boundary.
+Remaining work is spill/budgeting for unbounded operators and streaming the
+final result.
 
 ## Refactor phases
 
-### Phase 1: contract and adapters
+### Phase 1: contract and adapters (done)
 
-- Add `ChunkView` and `Source`/`Operator`/`Sink` in `src/core/exec/`.
-- Add a `RowList -> Source` adapter so existing operators keep working during
-  the transition. The adapter is temporary and must be identifiable in
-  profiles.
-- Keep `SourceIface` as the scan/range source.
+- `ChunkView`, `ChunkSink`, `ChunkResult`, and owned `ChunkStream` sources.
+- `SourceIface` remains the scan/range source.
+- Temporary row adapters are gone from the executor boundary.
 
-### Phase 2: hash aggregation sink
+### Phase 2: hash aggregation sink (done)
 
-- Make the generic hash aggregation emit `DataChunk`s directly through a
-  `ChunkSink`; do not build a `RowList` of groups.
-- Migrate specialised layouts (`CompactIntKeyHashTable`, `PairCountHashTable`,
-  `TripleCountHashTable`, string-key tables) one at a time behind the same
-  sink. The planner selects the layout once; no runtime probing.
-- For `ORDER BY count DESC LIMIT k`, the sink keeps a bounded top-K and emits
-  only K rows (already implemented for triple/string-key paths).
+- Generic and specialised hash aggregations emit `DataChunk`s.
+- `ORDER BY count DESC LIMIT k` keeps a bounded top-K and never emits all
+  groups.
+- Compact int-key, pair/triple-count, string-key and distinct layouts share
+  the same sink contract.
 
-### Phase 3: chunk operators above breakers
+### Phase 3: chunk operators above breakers (partial)
 
-- `top_k`, `sort`, `project`, `limit` consume/produce chunks.
-- `order_by` becomes an external sort with fixed-size runs and a k-way merge;
-  small sorts stay in memory.
+- `top_k`, `project`, `limit` consume/produce chunks.
+- `order_by` still needs an external sort with fixed-size runs and a k-way
+  merge; small sorts stay in memory.
 - `top_k` remains a bounded heap; no full sort.
 
-### Phase 4: joins
+### Phase 4: joins (partial)
 
-- Build side: `HashJoinBuildSink` (partitioned, spillable).
-- Probe side: streamed chunks, emitting output chunks directly.
-- No `executeNode(left)` / `executeNode(right)` row materialisation.
+- Inner/left probe side is streamed and emits chunks.
+- Build side still materialises; add `HashJoinBuildSink` (partitioned,
+  spillable) and stream right/full output.
 
 ### Phase 5: subqueries/CTE
 
@@ -133,9 +134,13 @@ the main architectural task.
 - Keep the ClickHouse-compatible part layout and codecs. Compression is a
   storage concern, not a reason to add execution branches.
 - Prefer ZSTD/LZ4 per column based on width/cardinality; keep the existing
-  low-cardinality dictionary path.
-- mmap for local files. No eager whole-file copy. Use range reads + morsels;
-  keep a block cache and read-ahead for cold scans.
+  low-cardinality dictionary path. Store V2 already writes 64K-row blocks
+  with per-block LZ4/raw selection, checksums, and min/max stats.
+- mmap for local files. No eager whole-file copy. Raw (uncompressed) blocks
+  are exposed as zero-copy slices; whole-block LZ4 decodes straight into the
+  destination. Use range reads + morsels and sequential read-ahead.
+- Block min/max stats are written but not yet used for scan pruning; wiring
+  them into the fixed plan is the next I/O win.
 - Spill hash aggregation, sort, and join build to local SSD with a global
   memory budget. Single-node means spill is the scale-out mechanism.
 
@@ -171,6 +176,24 @@ python3 scripts/bench-vs-duckdb.py \
   --parquet /tmp/hits_3m.parquet \
   --queries clickbench-submit/zighouse/queries.sql
 ```
+
+Use a DuckDB 2.0 binary for the comparison:
+
+```sh
+python3 scripts/bench-vs-duckdb.py \
+  --duckdb /path/to/duckdb-2.0 \
+  --zighouse ./zig-out/bin/zighouse \
+  --store /tmp/zh3m \
+  --parquet /tmp/hits_3m.parquet \
+  --queries clickbench-submit/zighouse/queries.sql
+```
+
+Current reference (Apple M2 Pro, 4 performance cores):
+
+- 3M: ZigHouse 605.7ms vs DuckDB 2.0 849.0ms (0.713x), 32/32 results.
+- 10M: ZigHouse 1730.7ms vs DuckDB 2.0 2266.0ms (0.764x), best of 3 rounds.
+- Q7 `MIN/MAX(EventDate)`: 10M in ~1.3ms via raw integer min/max.
+- Q20 `UserID = literal`: 10M in ~1.1ms via SIMD raw equality.
 
 For each phase record:
 
