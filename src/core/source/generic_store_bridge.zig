@@ -60,10 +60,13 @@ fn toCoreColType(ty: schema.ColumnType) ColumnType {
 
 const MappedFixedCol = struct {
     mapped: generic_store.v2.MappedColumn,
-    full_bytes: ?[]u8 = null,
+    full_bytes: ?[]const u8 = null,
+    full_borrowed: bool = false,
 
     fn deinit(self: MappedFixedCol, allocator: std.mem.Allocator) void {
-        if (self.full_bytes) |bytes| allocator.free(bytes);
+        if (self.full_bytes) |bytes| {
+            if (!self.full_borrowed) allocator.free(bytes);
+        }
         self.mapped.deinit(allocator);
     }
 };
@@ -390,8 +393,9 @@ const ScanState = struct {
         return switch (self.col_data[ci]) {
             .fixed => |m| blk: {
                 _ = self.profile_bytes_read.fetchAdd(m.mapped.compressedBytesForRange(start, n), .monotonic);
+                const view = try m.mapped.decodeRangeView(allocator, start, n);
                 break :blk .{
-                    .bytes = try m.mapped.decodeRange(allocator, start, n),
+                    .bytes = view.bytes,
                     .row_base = 0,
                 };
             },
@@ -403,7 +407,9 @@ const ScanState = struct {
         if (self.col_data[ci] != .fixed) return null;
         const m = &self.col_data[ci].fixed;
         if (m.full_bytes == null) {
-            m.full_bytes = m.mapped.decodeRange(self.alloc, 0, @intCast(self.row_count)) catch return null;
+            const view = m.mapped.decodeRangeView(self.alloc, 0, @intCast(self.row_count)) catch return null;
+            m.full_bytes = view.bytes;
+            m.full_borrowed = !view.owned;
             _ = self.profile_bytes_read.fetchAdd(
                 m.mapped.compressedBytesForRange(0, @intCast(self.row_count)),
                 .monotonic,

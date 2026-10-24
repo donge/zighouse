@@ -75,7 +75,7 @@ fn encodeHeader(
     @memset(out, 0);
     @memcpy(out[0..magic.len], magic);
     std.mem.writeInt(u16, out[8..10], 2, .little);
-    out[10] = @intFromEnum(ty);
+    out[10] = @backingInt(ty);
     out[11] = try typeWidth(ty);
     std.mem.writeInt(u32, out[12..16], block_rows, .little);
     std.mem.writeInt(u64, out[16..24], row_count, .little);
@@ -91,8 +91,8 @@ fn encodeEntry(out: *[directory_entry_size]u8, entry: BlockEntry) void {
     std.mem.writeInt(u32, out[16..20], entry.row_count, .little);
     std.mem.writeInt(u32, out[20..24], entry.compressed_size, .little);
     std.mem.writeInt(u32, out[24..28], entry.uncompressed_size, .little);
-    out[28] = @intFromEnum(entry.codec);
-    out[29] = @intFromEnum(entry.stats_kind);
+    out[28] = @backingInt(entry.codec);
+    out[29] = @backingInt(entry.stats_kind);
     std.mem.writeInt(u64, out[32..40], entry.checksum, .little);
     std.mem.writeInt(u64, out[40..48], entry.min_bits, .little);
     std.mem.writeInt(u64, out[48..56], entry.max_bits, .little);
@@ -330,7 +330,7 @@ pub const MappedColumn = struct {
         errdefer std.posix.munmap(ptr);
         if (!std.mem.eql(u8, ptr[0..magic.len], magic)) return error.BadMagic;
         if (std.mem.readInt(u16, ptr[8..10], .little) != 2) return error.UnsupportedVersion;
-        if (ptr[10] != @intFromEnum(expected_ty)) return error.InvalidHeader;
+        if (ptr[10] != @backingInt(expected_ty)) return error.InvalidHeader;
         const width = ptr[11];
         if (width != try typeWidth(expected_ty)) return error.InvalidHeader;
         const block_rows = std.mem.readInt(u32, ptr[12..16], .little);
@@ -371,6 +371,54 @@ pub const MappedColumn = struct {
         std.posix.munmap(self.ptr);
     }
 
+    pub const RangeView = struct {
+        bytes: []const u8,
+        owned: bool,
+    };
+
+    /// Zero-copy view when the requested rows are backed by raw (uncompressed)
+    /// blocks. Borrowed slices stay valid for the lifetime of the mapping.
+    pub fn decodeRangeView(
+        self: MappedColumn,
+        allocator: std.mem.Allocator,
+        start: u64,
+        count: usize,
+    ) !RangeView {
+        if (start > self.row_count or count > self.row_count - start) return error.InvalidRange;
+        if (count == 0) return .{ .bytes = &.{}, .owned = false };
+        if (self.rawPayload()) |payload| {
+            const byte_start: usize = @intCast(start * self.width);
+            return .{ .bytes = payload[byte_start..][0 .. count * self.width], .owned = false };
+        }
+        const block_index: usize = @intCast(start / self.block_rows);
+        if (block_index < self.entries.len) {
+            const entry = self.entries[block_index];
+            if (entry.codec == .raw and
+                start >= entry.row_start and
+                start + count <= entry.row_start + entry.row_count)
+            {
+                const local: usize = @intCast(start - entry.row_start);
+                return .{
+                    .bytes = self.ptr[entry.data_offset + local * self.width ..][0 .. count * self.width],
+                    .owned = false,
+                };
+            }
+        }
+        return .{ .bytes = try self.decodeRange(allocator, start, count), .owned = true };
+    }
+
+    /// All payloads are raw and stored back-to-back: the whole column is one
+    /// contiguous slice in the mapping.
+    fn rawPayload(self: MappedColumn) ?[]const u8 {
+        if (self.entries.len == 0) return null;
+        var expected_offset = self.entries[0].data_offset;
+        for (self.entries) |entry| {
+            if (entry.codec != .raw or entry.data_offset != expected_offset) return null;
+            expected_offset += entry.compressed_size;
+        }
+        return self.ptr[self.entries[0].data_offset..][0 .. self.row_count * self.width];
+    }
+
     pub fn decodeRange(
         self: MappedColumn,
         allocator: std.mem.Allocator,
@@ -392,6 +440,32 @@ pub const MappedColumn = struct {
             if (block_end <= start) continue;
 
             const payload = self.ptr[entry.data_offset..][0..entry.compressed_size];
+            const copy_start = @max(start, entry.row_start);
+            const copy_end = @min(end, block_end);
+            const local_start: usize = @intCast(copy_start - entry.row_start);
+            const rows: usize = @intCast(copy_end - copy_start);
+            const dest = out[out_rows * self.width ..][0 .. rows * self.width];
+
+            // Whole blocks can decode straight into the result, avoiding a
+            // per-block temporary allocation and copy.
+            if (local_start == 0 and rows == entry.row_count) {
+                switch (entry.codec) {
+                    .raw => @memcpy(dest, payload),
+                    .lz4 => {
+                        const n = LZ4_decompress_safe(
+                            payload.ptr,
+                            dest.ptr,
+                            @intCast(payload.len),
+                            @intCast(dest.len),
+                        );
+                        if (n < 0 or n != dest.len) return error.CorruptBlock;
+                    },
+                }
+                if (std.hash.Wyhash.hash(0, dest) != entry.checksum) return error.CorruptBlock;
+                out_rows += rows;
+                continue;
+            }
+
             const decoded = try allocator.alloc(u8, entry.uncompressed_size);
             defer allocator.free(decoded);
             switch (entry.codec) {
@@ -407,13 +481,8 @@ pub const MappedColumn = struct {
                 },
             }
             if (std.hash.Wyhash.hash(0, decoded) != entry.checksum) return error.CorruptBlock;
-
-            const copy_start = @max(start, entry.row_start);
-            const copy_end = @min(end, block_end);
-            const local_start: usize = @intCast(copy_start - entry.row_start);
-            const rows: usize = @intCast(copy_end - copy_start);
             @memcpy(
-                out[out_rows * self.width ..][0 .. rows * self.width],
+                dest,
                 decoded[local_start * self.width ..][0 .. rows * self.width],
             );
             out_rows += rows;
@@ -455,6 +524,47 @@ test "Store V2 fixed column round trip and range decode" {
     try std.testing.expectEqualSlices(i32, &.{ 9, 12, 15, 18, 21 }, values);
     try std.testing.expectEqual(@as(i64, 0), @as(i64, @bitCast(mapped.entries[0].min_bits)));
     try std.testing.expectEqual(@as(i64, 9), @as(i64, @bitCast(mapped.entries[0].max_bits)));
+}
+
+test "Store V2 raw ranges are borrowed from the mapping" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const path = "/tmp/zighouse_store_v2_raw_view.bin";
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    var writer = try Writer.open(allocator, io, path, .int64, 16, 8);
+    defer writer.deinit();
+    for (0..16) |i| try writer.writeI64(@intCast(i * 10));
+    try writer.finish();
+
+    const mapped = try MappedColumn.open(allocator, io, path, .int64, 16);
+    defer mapped.deinit(allocator);
+    const view = try mapped.decodeRangeView(allocator, 3, 5);
+    defer if (view.owned) allocator.free(view.bytes);
+    try std.testing.expect(!view.owned);
+    const values = std.mem.bytesAsSlice(i64, view.bytes);
+    try std.testing.expectEqualSlices(i64, &.{ 30, 40, 50, 60, 70 }, values);
+}
+
+test "Store V2 compressed ranges own their decoded bytes" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const path = "/tmp/zighouse_store_v2_lz4_view.bin";
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    var writer = try Writer.open(allocator, io, path, .int64, 1000, 1000);
+    defer writer.deinit();
+    for (0..1000) |_| try writer.writeI64(7);
+    try writer.finish();
+
+    const mapped = try MappedColumn.open(allocator, io, path, .int64, 1000);
+    defer mapped.deinit(allocator);
+    const view = try mapped.decodeRangeView(allocator, 10, 20);
+    defer if (view.owned) allocator.free(view.bytes);
+    try std.testing.expect(view.owned);
+    const values = std.mem.bytesAsSlice(i64, view.bytes);
+    try std.testing.expectEqual(@as(usize, 20), values.len);
+    for (values) |v| try std.testing.expectEqual(@as(i64, 7), v);
 }
 
 test "Store V2 detects payload corruption" {
