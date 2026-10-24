@@ -2302,21 +2302,23 @@ fn executeHashAggScannable(
     top_offset: usize,
     ctx: *QueryContext,
 ) !RowList {
-    if (try executeHashAggStrategy(ha.strategy, ha, sort_keys, top_k, top_offset, ctx)) |rl| return rl;
-    const fallback_order = [_]plan.HashAggNode.Strategy{
-        .compact_int,
-        .single_int_count_topk,
-        .single_int_distinct_topk,
-        .pair_count,
-        .triple_count,
-        .string_key,
-        .string_distinct_topk,
-        .case_string_key_topk,
-    };
-    for (fallback_order) |strategy| {
-        if (strategy == ha.strategy) continue;
-        if (ha.strategy == .grouped_distinct and strategy == .compact_int) continue;
-        if (try executeHashAggStrategy(strategy, ha, sort_keys, top_k, top_offset, ctx)) |rl| return rl;
+    // Strategy selection happens once in agg_strategy.select(). If the chosen
+    // implementation rejects the query at runtime, try the one generic fallback
+    // for its key shape (string-key or compact-int) and then the chunked path.
+    // Older code probed up to eight strategies, rescanning the input each time.
+    if (ha.strategy != .auto) {
+        if (try executeHashAggStrategy(ha.strategy, ha, sort_keys, top_k, top_offset, ctx)) |rl| return rl;
+    }
+    var has_string_key = false;
+    for (ha.keys) |k| {
+        if (k.out_type == .string or k.out_type == .array_string) {
+            has_string_key = true;
+            break;
+        }
+    }
+    const fallback_strategy: plan.HashAggNode.Strategy = if (has_string_key) .string_key else .compact_int;
+    if (fallback_strategy != ha.strategy) {
+        if (try executeHashAggStrategy(fallback_strategy, ha, sort_keys, top_k, top_offset, ctx)) |rl| return rl;
     }
     const rl = try executeHashAggChunked(ha.input, ha.keys, ha.aggs, ctx);
     if (top_k > 0 and sort_keys.len > 0) {
