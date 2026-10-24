@@ -112,7 +112,7 @@ pub fn parse(allocator: std.mem.Allocator, sql: []const u8) !MatViewEntry {
     // Simple approach: find "FROM" keyword in select_sql, grab the next identifier.
     var src_db: []const u8 = "default";
     var src_table: []const u8 = "";
-    if (std.ascii.indexOfIgnoreCase(select_sql_raw, "FROM ")) |from_pos| {
+    if (std.ascii.findIgnoreCasePos(select_sql_raw, 0, "FROM ")) |from_pos| {
         const after_from = std.mem.trim(u8, select_sql_raw[from_pos + 5 ..], " \t\r\n");
         var src_tok = Tokenizer.init(after_from);
         const s_first = src_tok.next() orelse "";

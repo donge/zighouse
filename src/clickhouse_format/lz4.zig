@@ -9,9 +9,11 @@
 ///   exe.root_module.addIncludePath(.{ .cwd_relative = "/opt/homebrew/opt/lz4/include" });
 
 const std = @import("std");
-const c = @cImport({
-    @cInclude("lz4.h");
-});
+
+// Zig 0.17 removed @cImport; declare the small LZ4 block API directly.
+extern fn LZ4_compressBound(input_size: c_int) c_int;
+extern fn LZ4_compress_default(src: [*]const u8, dst: [*]u8, src_size: c_int, dst_capacity: c_int) c_int;
+extern fn LZ4_decompress_safe(src: [*]const u8, dst: [*]u8, compressed_size: c_int, dst_capacity: c_int) c_int;
 
 pub const Error = error{
     LZ4CompressFailed,
@@ -21,14 +23,14 @@ pub const Error = error{
 
 /// Maximum compressed size for a given source size (upper bound).
 pub fn compressBound(source_size: usize) usize {
-    return @intCast(c.LZ4_compressBound(@intCast(source_size)));
+    return @intCast(LZ4_compressBound(@intCast(source_size)));
 }
 
 /// Compress `src` into `dst`.  `dst` must be at least `compressBound(src.len)` bytes.
 /// Returns the number of bytes written into `dst`.
 pub fn compress(src: []const u8, dst: []u8) !usize {
     if (dst.len < compressBound(src.len)) return error.OutputTooSmall;
-    const n = c.LZ4_compress_default(
+    const n = LZ4_compress_default(
         src.ptr,
         dst.ptr,
         @intCast(src.len),
@@ -42,7 +44,7 @@ pub fn compress(src: []const u8, dst: []u8) !usize {
 /// (size is known from the ClickHouse block header).
 /// Returns the number of bytes written.
 pub fn decompress(src: []const u8, dst: []u8) !usize {
-    const n = c.LZ4_decompress_safe(
+    const n = LZ4_decompress_safe(
         src.ptr,
         dst.ptr,
         @intCast(src.len),

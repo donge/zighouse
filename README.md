@@ -24,7 +24,7 @@ Binary releases are available on the [releases page](https://github.com/donge/zi
 
 ### From source
 
-Requires [Zig 0.14+](https://ziglang.org/download/).
+Requires [Zig 0.17+](https://ziglang.org/download/).
 
 ```sh
 zig build -Doptimize=ReleaseFast -Dstrip=true -Dstatic-libs=true

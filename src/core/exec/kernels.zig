@@ -1913,6 +1913,12 @@ test {
 
 // ── Dictionary function evaluation ───────────────────────────────────────────
 
+fn dupeZ(alloc: std.mem.Allocator, s: []const u8) ![:0]u8 {
+    const out = try alloc.allocSentinel(u8, s.len, 0);
+    @memcpy(out[0..s.len], s);
+    return out;
+}
+
 fn evalDictCall(dc: *const plan.DictCall, row: []const ?Value, lambda_val: ?Value, arena: std.mem.Allocator) !?Value {
     const store = dict_store orelse {
         // No dict store — return safe defaults.
@@ -1926,13 +1932,13 @@ fn evalDictCall(dc: *const plan.DictCall, row: []const ?Value, lambda_val: ?Valu
     for (dc.keys, 0..) |key_expr, i| {
         const kv = try evalExpr(key_expr, row, lambda_val, arena);
         const ks = if (kv) |v| v.toStr() orelse "" else "";
-        key_strs[i] = try arena.dupeZ(u8, ks);
+        key_strs[i] = try dupeZ(arena, ks);
     }
     // Build C-string pointer array.
     const keys_ptrs = try arena.alloc([*:0]const u8, key_strs.len);
     for (key_strs, 0..) |ks, i| keys_ptrs[i] = ks.ptr;
 
-    const dict_namez = try arena.dupeZ(u8, dc.dict_name);
+    const dict_namez = try dupeZ(arena, dc.dict_name);
 
     if (std.mem.eql(u8, dc.fn_name, "dictHas")) {
         const has_fn = dict_has_fn orelse return Value{ .bool_u8 = 0 };
@@ -1945,7 +1951,7 @@ fn evalDictCall(dc: *const plan.DictCall, row: []const ?Value, lambda_val: ?Valu
         if (dc.default_expr) |de| return evalExpr(de, row, lambda_val, arena);
         return null;
     };
-    const attr_namez = try arena.dupeZ(u8, dc.attr_name orelse "");
+    const attr_namez = try dupeZ(arena, dc.attr_name orelse "");
     const result_ptr = get_fn(store, dict_namez.ptr, attr_namez.ptr, keys_ptrs.ptr, key_strs.len);
 
     if (result_ptr) |ptr| {

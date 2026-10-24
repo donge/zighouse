@@ -265,6 +265,12 @@ print(json.dumps({
 }, indent=2))
 PY
 
+echo "pre-commit perf: verifying all 43 query results"
+scripts/verify-result-baseline.py \
+  --store "$STORE_DIR" \
+  --baseline "${ROOT}/perf/baselines/local-10m-ir-results.json" \
+  --zighouse "$ZIGHOUSE"
+
 scripts/perf-compare.py \
   --query-threshold 15 \
   --import-threshold 20 \

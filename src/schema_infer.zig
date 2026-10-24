@@ -22,7 +22,6 @@
 ///
 /// The returned Table's column slice and all names are allocated from
 /// `allocator`.  Free with `freeInferredSchema`.
-
 const std = @import("std");
 const parquet = @import("parquet");
 const schema = @import("schema");
@@ -146,8 +145,7 @@ fn inferColumn(name: []const u8, parquet_idx: usize, pt: i32, ct: ?i32) schema.C
         }
         if (pt == PT_INT64) {
             if (ct) |c| switch (c) {
-                CT_TIMESTAMP_MILLIS, CT_TIMESTAMP_MICROS,
-                CT_TIME_MILLIS, CT_TIME_MICROS => break :blk .timestamp,
+                CT_TIMESTAMP_MILLIS, CT_TIMESTAMP_MICROS, CT_TIME_MILLIS, CT_TIME_MICROS => break :blk .timestamp,
                 CT_INT_64 => break :blk .int64,
                 else => {},
             };
@@ -155,8 +153,8 @@ fn inferColumn(name: []const u8, parquet_idx: usize, pt: i32, ct: ?i32) schema.C
         }
         if (pt == PT_INT96) break :blk .timestamp;
         if (pt == PT_BOOLEAN) break :blk .int16;
-        if (pt == PT_FLOAT) break :blk .int32;   // bit-cast; caller beware
-        if (pt == PT_DOUBLE) break :blk .int64;  // bit-cast; caller beware
+        if (pt == PT_FLOAT) break :blk .int32; // bit-cast; caller beware
+        if (pt == PT_DOUBLE) break :blk .int64; // bit-cast; caller beware
         // BYTE_ARRAY, FIXED_LEN_BYTE_ARRAY, unknown → text
         break :blk .text;
     };
@@ -175,20 +173,20 @@ fn inferColumn(name: []const u8, parquet_idx: usize, pt: i32, ct: ?i32) schema.C
 
 // ── Schema loading from columns.txt ──────────────────────────────────────────
 
-/// Parse a ColumnType from a string as written by ColumnBinWriter / generic_store.
+/// Parse a ColumnType from a string as written by the generic store manifest.
 /// Returns null for unrecognised type strings.
 fn parseColType(s: []const u8) ?schema.ColumnType {
-    if (std.mem.eql(u8, s, "int8"))      return .int8;
-    if (std.mem.eql(u8, s, "int16"))     return .int16;
-    if (std.mem.eql(u8, s, "int32"))     return .int32;
-    if (std.mem.eql(u8, s, "int64"))     return .int64;
-    if (std.mem.eql(u8, s, "date"))      return .date;
+    if (std.mem.eql(u8, s, "int8")) return .int8;
+    if (std.mem.eql(u8, s, "int16")) return .int16;
+    if (std.mem.eql(u8, s, "int32")) return .int32;
+    if (std.mem.eql(u8, s, "int64")) return .int64;
+    if (std.mem.eql(u8, s, "date")) return .date;
     if (std.mem.eql(u8, s, "timestamp")) return .timestamp;
-    if (std.mem.eql(u8, s, "float32"))   return .float32;
-    if (std.mem.eql(u8, s, "float64"))   return .float64;
-    if (std.mem.eql(u8, s, "text"))      return .text;
-    if (std.mem.eql(u8, s, "char"))      return .char;
-    if (std.mem.eql(u8, s, "low_card"))  return .low_card;
+    if (std.mem.eql(u8, s, "float32")) return .float32;
+    if (std.mem.eql(u8, s, "float64")) return .float64;
+    if (std.mem.eql(u8, s, "text")) return .text;
+    if (std.mem.eql(u8, s, "char")) return .char;
+    if (std.mem.eql(u8, s, "low_card")) return .low_card;
     return null;
 }
 
@@ -252,7 +250,7 @@ pub fn loadSchemaFromColumnsTxt(
 
     // Trim to actual count (in case of blank lines).
     const final_columns = columns[0..ci];
-    const final_names   = names[0..n_init];
+    const final_names = names[0..n_init];
 
     // Wire up hash-sidecar: for any string column "X" where "XHash" (Int64/UInt64)
     // also exists in the schema, set X.physical.lazy_text.hash_column = "XHash".
@@ -274,10 +272,10 @@ pub fn loadSchemaFromColumnsTxt(
     }
 
     return .{
-        .table     = .{ .name = table_name, .columns = final_columns },
+        .table = .{ .name = table_name, .columns = final_columns },
         .allocator = allocator,
-        .columns   = columns,
-        .names     = final_names,
+        .columns = columns,
+        .names = final_names,
     };
 }
 

@@ -14,7 +14,6 @@
 /// The ClickBench `hits` table is registered as a builtin entry with layout
 /// .clickbench_hot so existing specialized/generic paths continue to work
 /// unchanged.
-
 const std = @import("std");
 const schema = @import("schema");
 const schema_infer = @import("schema_infer.zig");
@@ -28,7 +27,7 @@ pub const catalog_manifest_name = "catalog.zig-house";
 
 /// Part storage format tag.
 pub const PartFormat = enum {
-    /// ZigHouse generic store: raw LE binary, no compression, no marks.
+    /// ZigHouse generic store: Store V2 block files with LZ4/raw payloads.
     generic,
     /// ClickHouse MergeTree-compatible: LZ4 compressed .bin, .mrk2, checksums.txt.
     ch_mergetree,
@@ -244,5 +243,3 @@ test "catalog replace entry on duplicate name" {
     try std.testing.expectEqual(@as(usize, 1), cat.entries.items.len);
     try std.testing.expectEqualStrings("/b", cat.find("foo").?.store_dir.?);
 }
-
-

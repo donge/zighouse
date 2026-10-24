@@ -92,6 +92,11 @@ def main() -> None:
     parser.add_argument("--zighouse", default="./zig-out/bin/zighouse")
     parser.add_argument("--queries",
         default="clickbench-submit/zighouse/queries.sql")
+    parser.add_argument(
+        "--require-all-checksums",
+        action="store_true",
+        help="Fail when any query lacks a deterministic stored checksum.",
+    )
     args = parser.parse_args()
 
     baseline_path = Path(args.baseline)
@@ -104,25 +109,17 @@ def main() -> None:
     stored: dict = {e["q"]: e for e in doc.get("results", [])}
 
     queries = load_queries(args.queries)
+    if len(queries) != 43:
+        print(f"verify-result-baseline: expected 43 queries, found {len(queries)}",
+              file=sys.stderr)
+        sys.exit(1)
 
     mismatches = []
     errors = []
-    skipped = []
+    missing_checksums = []
 
     for i, sql in enumerate(queries, 1):
         entry = stored.get(i)
-        if entry is None:
-            skipped.append(i)
-            continue
-        if entry.get("error"):
-            skipped.append(i)
-            continue
-        expected_sha = entry.get("sorted_sha256")
-        expected_rows = entry.get("rows")
-        if not expected_sha:
-            skipped.append(i)
-            continue
-
         print(f"  Q{i:02d} … ", end="", flush=True)
         raw = run_zighouse_query(args.zighouse, args.store, sql)
         if raw is None:
@@ -131,9 +128,28 @@ def main() -> None:
             continue
 
         _, rows = parse_csv(raw)
-        actual_sha = checksum_of(rows)
         actual_rows = len(rows)
+        if entry is None:
+            print(f"NO_BASELINE  ({actual_rows} rows)")
+            missing_checksums.append(i)
+            continue
+        if entry.get("error"):
+            print(f"STALE_ERROR_BASELINE  ({actual_rows} rows)")
+            missing_checksums.append(i)
+            continue
 
+        expected_sha = entry.get("sorted_sha256")
+        expected_rows = entry.get("rows")
+        if expected_rows is not None and actual_rows != expected_rows:
+            print(f"ROW_MISMATCH  ({actual_rows} rows, expected {expected_rows})")
+            mismatches.append(i)
+            continue
+        if not expected_sha:
+            print(f"EXEC_OK  ({actual_rows} rows, checksum pending)")
+            missing_checksums.append(i)
+            continue
+
+        actual_sha = checksum_of(rows)
         if actual_sha == expected_sha:
             print(f"OK  ({actual_rows} rows)")
         else:
@@ -146,10 +162,12 @@ def main() -> None:
             mismatches.append(i)
 
     print()
-    total_checked = len(queries) - len(skipped) - len(errors)
-    passed = total_checked - len(mismatches)
-    print(f"Result check: {passed}/{total_checked} correct"
-          + (f"  (skipped {len(skipped)} without stored checksum)" if skipped else ""))
+    executed = len(queries) - len(errors)
+    checksum_checked = len(queries) - len(errors) - len(missing_checksums)
+    checksum_passed = checksum_checked - len(mismatches)
+    print(f"Execution coverage: {executed}/{len(queries)}")
+    print(f"Checksum coverage: {checksum_passed}/{len(queries)}"
+          + (f"  (pending Q{sorted(missing_checksums)})" if missing_checksums else ""))
 
     if errors:
         print(f"ERRORS (could not run): Q{sorted(errors)}", file=sys.stderr)
@@ -163,6 +181,13 @@ def main() -> None:
         sys.exit(1)
 
     if errors:
+        sys.exit(1)
+
+    if args.require_all_checksums and missing_checksums:
+        print(
+            f"Missing deterministic checksums for Q{sorted(missing_checksums)}",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
 

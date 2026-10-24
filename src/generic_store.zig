@@ -4,26 +4,18 @@
 ///   <store_dir>/<table_name>/parts/all_1_1_0/
 ///     columns.txt     — tab-separated "name\ttype_tag\n" lines
 ///     count.txt       — row count as a decimal string
-///     <col>.bin       — raw fixed-width column data (little-endian)
-///                       size = row_count * sizeof(type)
+///     <col>.bin       — Store V2 fixed-width block file
 ///     <col>.str.bin   — variable-length string column (future; not yet written)
 ///
-/// The store layout is deliberately simple: no compression, no marks, no
-/// primary index.  The goal is correct end-to-end import + query without the
-/// complexity of a full MergeTree layout.
-///
-/// Supported column types for writing:
-///   int16, int32, int64, date (i32), timestamp (i64)
-/// String / text columns are recorded in columns.txt but no .bin is written
-/// in this revision (marked "text" in columns.txt; generic_executor will
-/// skip them until PR-H4 adds string writing).
-
 const std = @import("std");
 const schema = @import("schema");
+pub const v2 = @import("store_v2");
 
 pub const part_dir_name = "all_1_1_0";
 pub const columns_txt_name = "columns.txt";
 pub const count_txt_name = "count.txt";
+pub const manifest_bin_name = "manifest.bin";
+const manifest_magic = "ZHMANV2\x00";
 
 /// Return the part directory path for a given store root and table name.
 /// Caller owns the result.
@@ -40,67 +32,6 @@ pub fn columnBinPath(allocator: std.mem.Allocator, part: []const u8, col_name: [
 pub fn columnStrBinPath(allocator: std.mem.Allocator, part: []const u8, col_name: []const u8) ![]u8 {
     return std.fmt.allocPrint(allocator, "{s}/{s}.str.bin", .{ part, col_name });
 }
-
-/// Writer: streams fixed-width column values directly to a .bin file.
-/// Write buffer size for ColumnBinWriter (64 KiB reduces syscall overhead).
-const col_buf_size: usize = 64 * 1024;
-
-pub const ColumnBinWriter = struct {
-    io: std.Io,
-    file: std.Io.File,
-    count: u64,
-    buf: [col_buf_size]u8,
-    buf_len: usize,
-
-    pub fn open(io: std.Io, path: []const u8) !ColumnBinWriter {
-        const file = try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = true });
-        return .{ .io = io, .file = file, .count = 0, .buf = undefined, .buf_len = 0 };
-    }
-
-    inline fn append(self: *ColumnBinWriter, bytes: []const u8) !void {
-        if (self.buf_len + bytes.len > col_buf_size) try self.flush();
-        @memcpy(self.buf[self.buf_len..][0..bytes.len], bytes);
-        self.buf_len += bytes.len;
-    }
-
-    pub fn flush(self: *ColumnBinWriter) !void {
-        if (self.buf_len == 0) return;
-        try self.file.writeStreamingAll(self.io, self.buf[0..self.buf_len]);
-        self.buf_len = 0;
-    }
-
-    pub fn writeI8(self: *ColumnBinWriter, value: i8) !void {
-        try self.append(&[1]u8{@bitCast(value)});
-        self.count += 1;
-    }
-
-    pub fn writeI16(self: *ColumnBinWriter, value: i16) !void {
-        var buf: [2]u8 = undefined;
-        std.mem.writeInt(i16, &buf, value, .little);
-        try self.append(&buf);
-        self.count += 1;
-    }
-
-    pub fn writeI32(self: *ColumnBinWriter, value: i32) !void {
-        var buf: [4]u8 = undefined;
-        std.mem.writeInt(i32, &buf, value, .little);
-        try self.append(&buf);
-        self.count += 1;
-    }
-
-    pub fn writeI64(self: *ColumnBinWriter, value: i64) !void {
-        var buf: [8]u8 = undefined;
-        std.mem.writeInt(i64, &buf, value, .little);
-        try self.append(&buf);
-        self.count += 1;
-    }
-
-    pub fn close(self: *ColumnBinWriter) void {
-        // Flush remaining buffered data (best-effort; ignore errors on close).
-        self.flush() catch {};
-        self.file.close(self.io);
-    }
-};
 
 /// Write the columns.txt manifest for a part.
 pub fn writeColumnsTxt(
@@ -132,6 +63,14 @@ pub fn writeCountTxt(
     const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ part, count_txt_name });
     defer allocator.free(path);
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = text });
+
+    var manifest: [32]u8 = @as([32]u8, @splat(0));
+    @memcpy(manifest[0..manifest_magic.len], manifest_magic);
+    std.mem.writeInt(u16, manifest[8..10], 2, .little);
+    std.mem.writeInt(u64, manifest[16..24], row_count, .little);
+    const manifest_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ part, manifest_bin_name });
+    defer allocator.free(manifest_path);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = manifest_path, .data = &manifest });
 }
 
 /// Create the part directory tree (store_dir/table_name/parts/all_1_1_0/).
@@ -150,42 +89,21 @@ pub fn initPart(io: std.Io, store_dir: []const u8, table_name: []const u8, alloc
     return part; // caller owns
 }
 
-/// Read count.txt from a part directory.
+/// Read the Store V2 binary manifest from a part directory.
 pub fn readCountTxt(io: std.Io, allocator: std.mem.Allocator, part: []const u8) !u64 {
-    const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ part, count_txt_name });
-    defer allocator.free(path);
-    var file = try std.Io.Dir.cwd().openFile(io, path, .{});
-    defer file.close(io);
-    var buf: [32]u8 = undefined;
-    const n = try file.readPositionalAll(io, &buf, 0);
-    const trimmed = std.mem.trimEnd(u8, buf[0..n], " \t\r\n");
-    return std.fmt.parseInt(u64, trimmed, 10);
-}
-
-/// Memory-map a fixed-width column .bin file as a typed slice.
-/// The file must be mmap-able (regular file, non-empty).
-pub fn MapResult(comptime T: type) type {
-    return struct {
-        values: []const T,
-        ptr: []align(std.heap.page_size_min) u8,
-
-        pub fn deinit(self: @This(), allocator: std.mem.Allocator) void {
-            _ = allocator;
-            std.posix.munmap(self.ptr);
-        }
-    };
-}
-
-pub fn mmapColumn(comptime T: type, io: std.Io, allocator: std.mem.Allocator, part: []const u8, col_name: []const u8) !MapResult(T) {
-    const path = try columnBinPath(allocator, part, col_name);
-    defer allocator.free(path);
-    const file = try std.Io.Dir.cwd().openFile(io, path, .{});
-    defer file.close(io);
-    const stat = try file.stat(io);
-    if (stat.size == 0) return error.EmptyColumn;
-    const ptr = try std.posix.mmap(null, stat.size, .{ .READ = true }, .{ .TYPE = .PRIVATE }, file.handle, 0);
-    const values = std.mem.bytesAsSlice(T, ptr[0..stat.size]);
-    return .{ .values = values, .ptr = ptr };
+    const manifest_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ part, manifest_bin_name });
+    defer allocator.free(manifest_path);
+    if (std.Io.Dir.cwd().openFile(io, manifest_path, .{})) |manifest_file_value| {
+        var manifest_file = manifest_file_value;
+        defer manifest_file.close(io);
+        var manifest: [32]u8 = undefined;
+        const n = try manifest_file.readPositionalAll(io, &manifest, 0);
+        if (n != manifest.len or
+            !std.mem.eql(u8, manifest[0..manifest_magic.len], manifest_magic) or
+            std.mem.readInt(u16, manifest[8..10], .little) != 2)
+            return error.InvalidManifest;
+        return std.mem.readInt(u64, manifest[16..24], .little);
+    } else |err| return err;
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -204,28 +122,24 @@ test "columnBinPath returns expected path" {
     try std.testing.expectEqualStrings("/tmp/store/orders/parts/all_1_1_0/price.bin", p);
 }
 
-test "ColumnBinWriter writes and can be reopened" {
+test "Store V2 is exposed through generic_store" {
     const io = std.testing.io;
 
     // Write to a temp file
     const path = "/tmp/zig_test_col_writer.bin";
     {
-        var w = try ColumnBinWriter.open(io, path);
+        var w = try v2.Writer.open(std.testing.allocator, io, path, .int32, 3, 2);
+        defer w.deinit();
         try w.writeI32(42);
         try w.writeI32(-1);
         try w.writeI32(100);
-        w.close();
-        try std.testing.expectEqual(@as(u64, 3), w.count);
+        try w.finish();
     }
-    // Read back
-    {
-        var file = try std.Io.Dir.cwd().openFile(io, path, .{});
-        defer file.close(io);
-        var buf: [12]u8 = undefined;
-        const n = try file.readPositionalAll(io, &buf, 0);
-        try std.testing.expectEqual(@as(usize, 12), n);
-        try std.testing.expectEqual(@as(i32, 42), std.mem.readInt(i32, buf[0..4], .little));
-        try std.testing.expectEqual(@as(i32, -1), std.mem.readInt(i32, buf[4..8], .little));
-        try std.testing.expectEqual(@as(i32, 100), std.mem.readInt(i32, buf[8..12], .little));
-    }
+    const mapped = try v2.MappedColumn.open(std.testing.allocator, io, path, .int32, 3);
+    defer mapped.deinit(std.testing.allocator);
+    const bytes = try mapped.decodeRange(std.testing.allocator, 0, 3);
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expectEqual(@as(i32, 42), std.mem.readInt(i32, bytes[0..4], .little));
+    try std.testing.expectEqual(@as(i32, -1), std.mem.readInt(i32, bytes[4..8], .little));
+    try std.testing.expectEqual(@as(i32, 100), std.mem.readInt(i32, bytes[8..12], .little));
 }

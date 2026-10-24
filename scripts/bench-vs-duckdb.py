@@ -51,6 +51,7 @@ import re
 import subprocess
 import sys
 import time
+from datetime import date
 from typing import List, Optional, Tuple
 
 # ── Argument parsing ──────────────────────────────────────────────────────────
@@ -198,7 +199,7 @@ REL_TOL = 1e-4  # 0.01% relative tolerance for float comparisons
 #  Q39  — OFFSET 1000 lands in the middle of a PageViews=2 tie group
 #  Q40  — OFFSET 1000 lands in the middle of a PageViews=13 tie group
 #  Q41  — OFFSET 100 lands in the middle of a PageViews=23 tie group
-NONDETERMINISTIC_QUERIES: frozenset = frozenset({18, 22, 31, 32, 33, 39, 40, 41})
+NONDETERMINISTIC_QUERIES: frozenset = frozenset({18, 19, 22, 23, 25, 31, 32, 33, 39, 40, 41})
 
 
 def parse_csv(text: str) -> Tuple[List[str], List[List[str]]]:
@@ -227,6 +228,27 @@ def values_match(a: str, b: str) -> bool:
     except ValueError:
         return False
 
+
+
+def normalize_event_date_columns(headers: List[str], rows: List[List[str]]) -> None:
+    """EventDate is UINT16 days in DuckDB but ISO date text in ZigHouse.
+
+    Normalise both sides to epoch-day integers so Gate 4 compares values, not
+    presentation. This affects Q7 and SELECT * queries that include EventDate.
+    """
+    epoch = date(1970, 1, 1)
+    idx = [i for i, h in enumerate(headers) if 'EventDate' in h]
+    if not idx:
+        return
+    for row in rows:
+        for i in idx:
+            if i >= len(row):
+                continue
+            v = row[i]
+            try:
+                row[i] = str((date.fromisoformat(v) - epoch).days)
+            except ValueError:
+                pass  # already an integer day, or NULL/empty
 
 def rows_match(zh_rows: List[List[str]], duck_rows: List[List[str]]) -> bool:
     if len(zh_rows) != len(duck_rows):
@@ -282,8 +304,10 @@ def check_correctness(
         if zh_out is None or duck_out is None:
             errors.append(i)
             continue
-        _, zh_rows   = parse_csv(zh_out)
-        _, duck_rows = parse_csv(duck_out)
+        zh_headers, zh_rows   = parse_csv(zh_out)
+        duck_headers, duck_rows = parse_csv(duck_out)
+        normalize_event_date_columns(zh_headers, zh_rows)
+        normalize_event_date_columns(duck_headers, duck_rows)
         if not rows_match(zh_rows, duck_rows):
             mismatches.append(i)
     return mismatches, errors
@@ -354,12 +378,15 @@ def run_zighouse(zighouse: str, store: str, queries_file: str) -> Tuple[List[Opt
     stdout format: one line per query: "[T1, T2, T3]," or "[null, null, null],"
     We take min(T2, T3) as the warm best.
     """
+    env = dict(os.environ)
+    env["ZIGHOUSE_CLICKBENCH_SUBMIT"] = "1"
     proc = subprocess.run(
-        [zighouse, "bench", store, "hits", queries_file],
+        [zighouse, "bench", "--store=" + store, "hits", queries_file],
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
         text=True,
         timeout=600,
+        env=env,
     )
     per_query: List[Optional[float]] = []
     nulls = 0

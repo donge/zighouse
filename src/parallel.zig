@@ -48,6 +48,11 @@ pub const MorselSource = struct {
 /// `getCpuCount()` on other platforms. Capped at 16 to bound per-thread
 /// state allocations (Q12 bitsets are 140 MB each; T=16 would be 2.2 GB).
 pub fn defaultThreads() usize {
+    if (std.c.getenv("ZIGHOUSE_THREADS")) |raw| {
+        const value = std.mem.span(raw);
+        const requested = std.fmt.parseInt(usize, value, 10) catch 0;
+        if (requested > 0) return @min(requested, 16);
+    }
     if (@import("builtin").os.tag == .macos) {
         var p_cores: c_int = 0;
         var len: usize = @sizeOf(c_int);
@@ -94,21 +99,21 @@ const c = std.c;
 const WorkFn = *const fn (*anyopaque, *MorselSource) void;
 
 const Pool = struct {
-    mutex:    c.pthread_mutex_t = c.PTHREAD_MUTEX_INITIALIZER,
-    cv_work:  c.pthread_cond_t  = c.PTHREAD_COND_INITIALIZER,
-    cv_done:  c.pthread_cond_t  = c.PTHREAD_COND_INITIALIZER,
-    work_fn:  ?WorkFn = null,
-    ctxs_raw: []usize = &.{},      // raw pointers to worker Ctx structs
-    source:   ?*MorselSource = null,
-    n_busy:   usize = 0,
-    quit:     bool = false,
-    inited:   bool = false,
-    threads:  [16]std.Thread = undefined,
+    mutex: c.pthread_mutex_t = c.PTHREAD_MUTEX_INITIALIZER,
+    cv_work: c.pthread_cond_t = c.PTHREAD_COND_INITIALIZER,
+    cv_done: c.pthread_cond_t = c.PTHREAD_COND_INITIALIZER,
+    work_fn: ?WorkFn = null,
+    ctxs_raw: []usize = &.{}, // raw pointers to worker Ctx structs
+    source: ?*MorselSource = null,
+    n_busy: usize = 0,
+    quit: bool = false,
+    inited: bool = false,
+    threads: [16]std.Thread = undefined,
     n_threads: usize = 0,
     /// Monotonically increasing dispatch counter. Workers only execute a
     /// dispatch if their local gen is behind the pool gen.
     dispatch_gen: u64 = 0,
-    worker_gen:   [16]u64 = [_]u64{0} ** 16,
+    worker_gen: [16]u64 = @as([16]u64, @splat(0)),
 };
 
 var global_pool: Pool = .{};
@@ -125,10 +130,13 @@ fn workerLoop(worker_idx: usize) void {
         while (pool.worker_gen[worker_idx] >= pool.dispatch_gen and !pool.quit) {
             _ = c.pthread_cond_wait(&pool.cv_work, &pool.mutex);
         }
-        if (pool.quit) { _ = c.pthread_mutex_unlock(&pool.mutex); return; }
+        if (pool.quit) {
+            _ = c.pthread_mutex_unlock(&pool.mutex);
+            return;
+        }
         const fn_ptr = pool.work_fn.?;
         const ctx_raw = pool.ctxs_raw[worker_idx];
-        const src     = pool.source.?;
+        const src = pool.source.?;
         pool.worker_gen[worker_idx] = pool.dispatch_gen; // mark as consumed
         _ = c.pthread_mutex_unlock(&pool.mutex);
 
@@ -186,7 +194,7 @@ pub fn parallelFor(
     // Type-erase worker function.
     const EraseCtx = struct {
         fn run(raw: *anyopaque, src: *MorselSource) void {
-            worker(@alignCast(@ptrCast(raw)), src);
+            worker(@ptrCast(@alignCast(raw)), src);
         }
     };
 
@@ -202,8 +210,8 @@ pub fn parallelFor(
         // Activate workers.
         _ = c.pthread_mutex_lock(&pool.mutex);
         pool.work_fn = EraseCtx.run;
-        pool.source  = source;
-        pool.n_busy  = n_bg;
+        pool.source = source;
+        pool.n_busy = n_bg;
         pool.dispatch_gen += 1;
         _ = c.pthread_mutex_unlock(&pool.mutex);
         _ = c.pthread_cond_broadcast(&pool.cv_work);
@@ -310,4 +318,3 @@ test "defaultThreads is sane" {
     try std.testing.expect(n >= 1);
     try std.testing.expect(n <= 16);
 }
-

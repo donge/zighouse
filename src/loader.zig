@@ -19,7 +19,6 @@
 /// The caller is responsible for ensuring that `table` schema matches the
 /// Parquet file layout (column count and order) — `inferSchema` produces a
 /// compatible table from the same file.
-
 const std = @import("std");
 const parquet = @import("parquet");
 const schema = @import("schema");
@@ -59,7 +58,7 @@ pub fn importParquet(
     // original column index in `table` so callbacks can dispatch correctly.
     var fixed_parquet_indices: std.ArrayListUnmanaged(usize) = .empty;
     defer fixed_parquet_indices.deinit(allocator);
-    var fixed_table_indices: std.ArrayListUnmanaged(usize) = .empty;  // index into table.columns
+    var fixed_table_indices: std.ArrayListUnmanaged(usize) = .empty; // index into table.columns
     defer fixed_table_indices.deinit(allocator);
     var str_parquet_indices: std.ArrayListUnmanaged(usize) = .empty;
     defer str_parquet_indices.deinit(allocator);
@@ -79,18 +78,25 @@ pub fn importParquet(
         }
     }
 
-    // Open a ColumnBinWriter for every fixed column.
     const n_fixed = fixed_parquet_indices.items.len;
-    const fixed_writers = try allocator.alloc(generic_store.ColumnBinWriter, n_fixed);
+    const fixed_writers = try allocator.alloc(generic_store.v2.Writer, n_fixed);
     defer allocator.free(fixed_writers);
     var fixed_open: usize = 0;
-    errdefer for (fixed_writers[0..fixed_open]) |*w| w.close();
+    errdefer for (fixed_writers[0..fixed_open]) |*w| w.deinit();
 
     for (fixed_table_indices.items, 0..) |ti, i| {
-        const col_name = table.columns[ti].name;
+        const col = table.columns[ti];
+        const col_name = col.name;
         const bin_path = try generic_store.columnBinPath(allocator, part_path, col_name);
         defer allocator.free(bin_path);
-        fixed_writers[i] = try generic_store.ColumnBinWriter.open(io, bin_path);
+        fixed_writers[i] = try generic_store.v2.Writer.open(
+            allocator,
+            io,
+            bin_path,
+            col.ty,
+            total_rows,
+            generic_store.v2.default_block_rows,
+        );
         fixed_open += 1;
     }
 
@@ -158,8 +164,9 @@ pub fn importParquet(
         genericAllStrValue,
     );
 
-    // Close fixed writers.
-    for (fixed_writers) |*w| w.close();
+    // Finalize directories only after every expected row has been written.
+    for (fixed_writers) |*w| try w.finish();
+    for (fixed_writers) |*w| w.deinit();
 
     // Flush string columns: close temp files, write final .str.bin files.
     for (str_table_indices.items, 0..) |ti, i| {
@@ -209,9 +216,9 @@ pub fn importParquet(
 /// Returns a heap-allocated slice of column name strings owned by the caller.
 pub fn detectSortKeys(
     allocator: std.mem.Allocator,
-    io:        std.Io,
+    io: std.Io,
     part_path: []const u8,
-    table:     schema.Table,
+    table: schema.Table,
 ) ![]const []const u8 {
     const N_SAMPLES: usize = 64;
 
@@ -223,11 +230,11 @@ pub fn detectSortKeys(
 
     for (table.columns) |col| {
         const bytes_per_val: usize = switch (col.ty) {
-            .int8  => 1,
+            .int8 => 1,
             .int16 => 2,
             .int32 => 4,
             .int64 => 8,
-            else   => continue, // skip strings, floats, date, timestamp
+            else => continue, // skip strings, floats, date, timestamp
         };
 
         const bin_path = try generic_store.columnBinPath(allocator, part_path, col.name);
@@ -253,17 +260,24 @@ pub fn detectSortKeys(
         while (si < n_rows and is_sorted) : (si += step) {
             var buf: [8]u8 = undefined;
             const n_read = file.readPositionalAll(io, buf[0..bytes_per_val], si * bytes_per_val) catch {
-                is_sorted = false; break;
+                is_sorted = false;
+                break;
             };
-            if (n_read < bytes_per_val) { is_sorted = false; break; }
+            if (n_read < bytes_per_val) {
+                is_sorted = false;
+                break;
+            }
             const val: i64 = switch (col.ty) {
-                .int8  => @as(i8,  @bitCast(buf[0])),
+                .int8 => @as(i8, @bitCast(buf[0])),
                 .int16 => std.mem.readInt(i16, buf[0..2], .little),
                 .int32 => std.mem.readInt(i32, buf[0..4], .little),
                 .int64 => std.mem.readInt(i64, buf[0..8], .little),
-                else   => unreachable,
+                else => unreachable,
             };
-            if (val < prev) { is_sorted = false; break; }
+            if (val < prev) {
+                is_sorted = false;
+                break;
+            }
             prev = val;
         }
 
@@ -278,7 +292,7 @@ pub fn detectSortKeys(
 
 const GenericAllColsCtx = struct {
     io: std.Io,
-    fixed_writers: []generic_store.ColumnBinWriter,
+    fixed_writers: []generic_store.v2.Writer,
     fixed_col_types: []schema.ColumnType,
     str_tmp_files: []std.Io.File,
     str_offsets: [][]u64,
@@ -298,10 +312,10 @@ fn genericAllFixedBatch(ctx: GenericAllColsCtx, fi: usize, batches: []const []co
                 .int32, .date => try writer.writeI32(@intCast(v)),
                 .int64, .timestamp => try writer.writeI64(v),
                 .float32 => {
-                    const bits: i32 = @bitCast(@as(u32, @intCast(v & 0xFFFF_FFFF)));
-                    try writer.writeI32(bits);
+                    const bits: u32 = @intCast(v & 0xFFFF_FFFF);
+                    try writer.writeF32(@bitCast(bits));
                 },
-                .float64 => try writer.writeI64(v),
+                .float64 => try writer.writeF64(@bitCast(v)),
                 else => {},
             }
         }
@@ -566,9 +580,9 @@ const CHHttpCtx = struct {
     n_fixed: usize,
     n_str: usize,
     fixed_cols: []std.ArrayListUnmanaged(i64), // [n_fixed][rows]
-    str_cols: []std.ArrayListUnmanaged([]u8),   // [n_str][rows] — each []u8 is owned
-    str_bytes: []std.ArrayListUnmanaged(u8),    // backing storage for each string (concatenated)
-    rows_in_group: usize,                       // total rows accumulated
+    str_cols: []std.ArrayListUnmanaged([]u8), // [n_str][rows] — each []u8 is owned
+    str_bytes: []std.ArrayListUnmanaged(u8), // backing storage for each string (concatenated)
+    rows_in_group: usize, // total rows accumulated
 };
 
 fn chHttpFixedBatch(ctx: *CHHttpCtx, slot_start: usize, batches: []const []const i64) anyerror!void {
@@ -601,7 +615,7 @@ fn chHttpStrValue(ctx: *CHHttpCtx, slot: usize, value: []const u8) anyerror!void
 const CHAllColsCtx = struct {
     part: *ch_part.Part,
     fixed_col_map: []const usize, // slot -> part col_idx
-    str_col_map: []const usize,   // slot -> part col_idx
+    str_col_map: []const usize, // slot -> part col_idx
 };
 
 fn chAllFixedBatch(ctx: CHAllColsCtx, slot_start: usize, batches: []const []const i64) anyerror!void {
@@ -695,9 +709,9 @@ pub fn importParquetCompact(
     }
 
     const ctx = CompactAllColsCtx{
-        .part         = &part,
+        .part = &part,
         .fixed_col_map = fixed_col_map.items,
-        .str_col_map   = str_col_map.items,
+        .str_col_map = str_col_map.items,
     };
 
     _ = try parquet.streamAllColumnsPath(
@@ -717,9 +731,9 @@ pub fn importParquetCompact(
 }
 
 const CompactAllColsCtx = struct {
-    part:          *ch_part.CompactPart,
+    part: *ch_part.CompactPart,
     fixed_col_map: []const usize,
-    str_col_map:   []const usize,
+    str_col_map: []const usize,
 };
 
 fn compactAllFixedBatch(ctx: CompactAllColsCtx, slot_start: usize, batches: []const []const i64) anyerror!void {
@@ -792,7 +806,6 @@ fn scanStrValue(ctx: *ScanCtx, slot: usize, value: []const u8) anyerror!void {
     _ = value;
 }
 
-
 fn importCHStringColumn(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -861,8 +874,23 @@ fn importFixedColumn(
     const path = try generic_store.columnBinPath(allocator, part, col_name);
     defer allocator.free(path);
 
-    var writer = try generic_store.ColumnBinWriter.open(io, path);
-    defer writer.close();
+    var writer = try generic_store.v2.Writer.open(
+        allocator,
+        io,
+        path,
+        @as(schema.ColumnType, switch (T) {
+            i8 => .int8,
+            i16 => .int16,
+            i32 => .int32,
+            i64 => .int64,
+            f32 => .float32,
+            f64 => .float64,
+            else => @compileError("unsupported fixed type"),
+        }),
+        try generic_store.readCountTxt(io, allocator, part),
+        generic_store.v2.default_block_rows,
+    );
+    defer writer.deinit();
 
     const ctx = FixedWriteCtx(T){ .writer = &writer };
 
@@ -875,11 +903,12 @@ fn importFixedColumn(
         ctx,
         writeFixedBatch(T),
     );
+    try writer.finish();
 }
 
 fn FixedWriteCtx(comptime T: type) type {
     _ = T;
-    return struct { writer: *generic_store.ColumnBinWriter };
+    return struct { writer: *generic_store.v2.Writer };
 }
 
 fn writeFixedBatch(comptime T: type) fn (FixedWriteCtx(T), []const i64) anyerror!void {
@@ -891,16 +920,8 @@ fn writeFixedBatch(comptime T: type) fn (FixedWriteCtx(T), []const i64) anyerror
                     i16 => try ctx.writer.writeI16(@intCast(v)),
                     i32 => try ctx.writer.writeI32(@intCast(v)),
                     i64 => try ctx.writer.writeI64(v),
-                    f32 => {
-                        // Parquet stores f32 as i64 with lower 32 bits = raw float bits
-                        const bits: i32 = @bitCast(@as(u32, @intCast(v & 0xFFFF_FFFF)));
-                        try ctx.writer.writeI32(bits);
-                    },
-                    f64 => {
-                        // Parquet stores f64 as i64 = raw float bits
-                        const bits: i64 = v;
-                        try ctx.writer.writeI64(bits);
-                    },
+                    f32 => try ctx.writer.writeF32(@bitCast(@as(u32, @intCast(v & 0xFFFF_FFFF)))),
+                    f64 => try ctx.writer.writeF64(@bitCast(v)),
                     else => @compileError("unsupported fixed type"),
                 }
             }

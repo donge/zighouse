@@ -36,28 +36,27 @@ fn buildZstd(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     zstd_mod.addCSourceFiles(.{
         .root = b.path("vendor/zstd/common"),
         .files = &.{
-            "debug.c", "entropy_common.c", "error_private.c",
-            "fse_decompress.c", "pool.c", "threading.c", "xxhash.c",
-            "zstd_common.c",
+            "debug.c",          "entropy_common.c", "error_private.c",
+            "fse_decompress.c", "pool.c",           "threading.c",
+            "xxhash.c",         "zstd_common.c",
         },
         .flags = flags,
     });
     zstd_mod.addCSourceFiles(.{
         .root = b.path("vendor/zstd/compress"),
         .files = &.{
-            "fse_compress.c", "hist.c", "huf_compress.c",
-            "zstd_compress.c", "zstd_compress_literals.c",
-            "zstd_compress_sequences.c", "zstd_compress_superblock.c",
-            "zstd_double_fast.c", "zstd_fast.c", "zstd_lazy.c",
-            "zstd_ldm.c", "zstd_opt.c", "zstdmt_compress.c",
-            "zstd_preSplit.c",
+            "fse_compress.c",             "hist.c",                   "huf_compress.c",
+            "zstd_compress.c",            "zstd_compress_literals.c", "zstd_compress_sequences.c",
+            "zstd_compress_superblock.c", "zstd_double_fast.c",       "zstd_fast.c",
+            "zstd_lazy.c",                "zstd_ldm.c",               "zstd_opt.c",
+            "zstdmt_compress.c",          "zstd_preSplit.c",
         },
         .flags = flags,
     });
     zstd_mod.addCSourceFiles(.{
         .root = b.path("vendor/zstd/decompress"),
         .files = &.{
-            "huf_decompress.c", "zstd_ddict.c",
+            "huf_decompress.c",  "zstd_ddict.c",
             "zstd_decompress.c", "zstd_decompress_block.c",
         },
         .flags = flags,
@@ -138,17 +137,25 @@ pub fn build(b: *std.Build) void {
     // Build vendored zstd early so unit_tests / generic_sql_tests can use it.
     const vendored_zstd_early = if (use_vendored) buildZstd(b, target, optimize) else null;
     const ZstdCtxType = struct {
-        zstd_include: []const u8, zstd_lib: []const u8, zstd_static_path: []const u8,
-        static_libs: bool, vendored: ?*std.Build.Step.Compile,
+        zstd_include: []const u8,
+        zstd_lib: []const u8,
+        zstd_static_path: []const u8,
+        static_libs: bool,
+        vendored: ?*std.Build.Step.Compile,
         fn link(self: @This(), mod: *std.Build.Module) void {
-            if (self.vendored) |vl| { linkZstdVendored(mod, vl); }
-            else { linkZstd(mod, self.zstd_include, self.zstd_lib, self.zstd_static_path, self.static_libs); }
+            if (self.vendored) |vl| {
+                linkZstdVendored(mod, vl);
+            } else {
+                linkZstd(mod, self.zstd_include, self.zstd_lib, self.zstd_static_path, self.static_libs);
+            }
         }
     };
     const zstdctx_early = ZstdCtxType{
-        .zstd_include = zstd_include_early, .zstd_lib = zstd_lib_early,
+        .zstd_include = zstd_include_early,
+        .zstd_lib = zstd_lib_early,
         .zstd_static_path = b.fmt("{s}/lib/libzstd.a", .{zstd_prefix_early}),
-        .static_libs = static_libs, .vendored = vendored_zstd_early,
+        .static_libs = static_libs,
+        .vendored = vendored_zstd_early,
     };
     const install_bench_tools = b.option(bool, "bench-tools", "Install benchmark helper executables") orelse true;
 
@@ -183,9 +190,6 @@ pub fn build(b: *std.Build) void {
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| {
-        run_cmd.addArgs(args);
-    }
 
     const run_step = b.step("run", "Run zighouse");
     run_step.dependOn(&run_cmd.step);
@@ -228,7 +232,6 @@ pub fn build(b: *std.Build) void {
     });
     const hashmap_test_cmd = b.addRunArtifact(hashmap_tests);
 
-
     const generic_sql_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/generic_sql.zig"),
@@ -268,7 +271,6 @@ pub fn build(b: *std.Build) void {
     });
     const schema_test_cmd = b.addRunArtifact(schema_tests);
 
-
     const schema_infer_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/schema_infer.zig"),
@@ -280,20 +282,27 @@ pub fn build(b: *std.Build) void {
 
     const generic_store_mod = b.createModule(.{
         .root_source_file = b.path("src/generic_store.zig"),
-        .target   = target,
+        .target = target,
         .optimize = optimize,
     });
     generic_store_mod.addImport("schema", schema_mod);
+    const store_v2_mod = b.createModule(.{
+        .root_source_file = b.path("src/store_v2.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    store_v2_mod.addImport("schema", schema_mod);
+    generic_store_mod.addImport("store_v2", store_v2_mod);
 
     const parallel_mod = b.createModule(.{
         .root_source_file = b.path("src/parallel.zig"),
-        .target   = target,
+        .target = target,
         .optimize = optimize,
     });
 
     const hashmap_mod = b.createModule(.{
         .root_source_file = b.path("src/hashmap.zig"),
-        .target   = target,
+        .target = target,
         .optimize = optimize,
     });
 
@@ -358,6 +367,8 @@ pub fn build(b: *std.Build) void {
             }
         }
     }{ .lz4_include = lz4_include, .lz4_lib = lz4_lib, .lz4_static_path = lz4_static_path, .static_libs = static_libs, .vendored = vendored_lz4 };
+    store_v2_mod.link_libc = true;
+    lz4ctx.link(store_v2_mod);
 
     const zstdctx = struct {
         zstd_include: []const u8,
@@ -652,10 +663,10 @@ pub fn build(b: *std.Build) void {
     const ingest_server_test_cmd = b.addRunArtifact(ingest_server_tests);
 
     // Wire ingest modules into main exe and unit tests
-     exe.root_module.addImport("ingest_server", ingest_server_mod);
-     exe.root_module.addImport("ingest_schema_config", schema_config_mod);
-     exe.root_module.addImport("ingest_schema_persist", schema_persist_mod);
-     exe.root_module.addImport("generic_sql", generic_sql_mod);
+    exe.root_module.addImport("ingest_server", ingest_server_mod);
+    exe.root_module.addImport("ingest_schema_config", schema_config_mod);
+    exe.root_module.addImport("ingest_schema_persist", schema_persist_mod);
+    exe.root_module.addImport("generic_sql", generic_sql_mod);
     exe.root_module.addImport("parquet", parquet_mod);
     exe.root_module.addImport("mv_persist", mv_persist_mod);
     exe.root_module.addImport("mv_parse", mv_parse_mod);
@@ -678,10 +689,10 @@ pub fn build(b: *std.Build) void {
     zstdctx.link(compactor_mod);
     exe.root_module.addImport("compactor", compactor_mod);
 
-     unit_tests.root_module.addImport("ingest_server", ingest_server_mod);
-     unit_tests.root_module.addImport("ingest_schema_config", schema_config_mod);
-     unit_tests.root_module.addImport("ingest_schema_persist", schema_persist_mod);
-     unit_tests.root_module.addImport("generic_sql", generic_sql_mod);
+    unit_tests.root_module.addImport("ingest_server", ingest_server_mod);
+    unit_tests.root_module.addImport("ingest_schema_config", schema_config_mod);
+    unit_tests.root_module.addImport("ingest_schema_persist", schema_persist_mod);
+    unit_tests.root_module.addImport("generic_sql", generic_sql_mod);
     unit_tests.root_module.addImport("parquet", parquet_mod);
 
     // ── core module (shared engine, no external deps) ───────────────────────
@@ -689,11 +700,11 @@ pub fn build(b: *std.Build) void {
     // @import paths resolve correctly when run as a test target.
     const core_mod = b.createModule(.{
         .root_source_file = b.path("src/core/core.zig"),
-        .target   = target,
+        .target = target,
         .optimize = optimize,
     });
     core_mod.addImport("parallel", parallel_mod);
-    core_mod.addImport("hashmap",  hashmap_mod);
+    core_mod.addImport("hashmap", hashmap_mod);
     const core_tests = b.addTest(.{ .root_module = core_mod });
     const core_test_cmd = b.addRunArtifact(core_tests);
     unit_tests.root_module.addImport("parallel", parallel_mod);
@@ -701,19 +712,19 @@ pub fn build(b: *std.Build) void {
     // ── ir_planner module (generic_sql.Plan → PhysicalNode IR) ───────────────
     const ir_planner_mod = b.createModule(.{
         .root_source_file = b.path("src/core/exec/planner.zig"),
-        .target   = target,
+        .target = target,
         .optimize = optimize,
     });
     ir_planner_mod.addImport("generic_sql", generic_sql_mod);
-    ir_planner_mod.addImport("schema",      schema_mod);
-    ir_planner_mod.addImport("core",        core_mod);
-    const ir_planner_tests   = b.addTest(.{ .root_module = ir_planner_mod });
+    ir_planner_mod.addImport("schema", schema_mod);
+    ir_planner_mod.addImport("core", core_mod);
+    const ir_planner_tests = b.addTest(.{ .root_module = ir_planner_mod });
     const ir_planner_test_cmd = b.addRunArtifact(ir_planner_tests);
 
     // ── generic_store_bridge module (generic part → SourceIface bridge) ─────
     const generic_store_bridge_mod = b.createModule(.{
         .root_source_file = b.path("src/core/source/generic_store_bridge.zig"),
-        .target   = target,
+        .target = target,
         .optimize = optimize,
     });
     generic_store_bridge_mod.addImport("schema", schema_mod);
@@ -725,12 +736,12 @@ pub fn build(b: *std.Build) void {
     // ── part_scan_bridge module (part.zig → SourceIface bridge) ─────────────
     const part_scan_bridge_mod = b.createModule(.{
         .root_source_file = b.path("src/core/source/part_scan_bridge.zig"),
-        .target   = target,
+        .target = target,
         .optimize = optimize,
     });
     part_scan_bridge_mod.addImport("schema", schema_mod);
-    part_scan_bridge_mod.addImport("core",   core_mod);
-    part_scan_bridge_mod.addImport("part",   ch_part_mod);
+    part_scan_bridge_mod.addImport("core", core_mod);
+    part_scan_bridge_mod.addImport("part", ch_part_mod);
     part_scan_bridge_mod.addImport("generic_store", generic_store_mod);
     part_scan_bridge_mod.addImport("generic_store_bridge", generic_store_bridge_mod);
     part_scan_bridge_mod.link_libc = true;
@@ -738,16 +749,16 @@ pub fn build(b: *std.Build) void {
     const part_scan_bridge_tests = b.addTest(.{ .root_module = part_scan_bridge_mod });
     const part_scan_bridge_test_cmd = b.addRunArtifact(part_scan_bridge_tests);
 
-     exe.root_module.addImport("ir_planner", ir_planner_mod);
-     exe.root_module.addImport("core",       core_mod);
-     exe.root_module.addImport("parallel",   parallel_mod);
-     exe.root_module.addImport("generic_store_bridge", generic_store_bridge_mod);
-     unit_tests.root_module.addImport("generic_store_bridge", generic_store_bridge_mod);
+    exe.root_module.addImport("ir_planner", ir_planner_mod);
+    exe.root_module.addImport("core", core_mod);
+    exe.root_module.addImport("parallel", parallel_mod);
+    exe.root_module.addImport("generic_store_bridge", generic_store_bridge_mod);
+    unit_tests.root_module.addImport("generic_store_bridge", generic_store_bridge_mod);
 
     // ── serializer module (ResultSet → Native block) ─────────────────────────
     const serializer_mod = b.createModule(.{
         .root_source_file = b.path("src/ingest/serializer.zig"),
-        .target   = target,
+        .target = target,
         .optimize = optimize,
     });
     serializer_mod.addImport("core", core_mod);
@@ -832,7 +843,6 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(bench_simd);
     const bench_simd_run = b.addRunArtifact(bench_simd);
     bench_simd_run.step.dependOn(b.getInstallStep());
-    if (b.args) |args| bench_simd_run.addArgs(args);
     const bench_simd_step = b.step("bench-simd", "Run A.1 SIMD vs scalar micro-benchmarks");
     bench_simd_step.dependOn(&bench_simd_run.step);
 
@@ -847,7 +857,6 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(bench_parallel);
     const bench_parallel_run = b.addRunArtifact(bench_parallel);
     bench_parallel_run.step.dependOn(b.getInstallStep());
-    if (b.args) |args| bench_parallel_run.addArgs(args);
     const bench_parallel_step = b.step("bench-parallel", "Run A.3 parallel fan-out micro-benchmark");
     bench_parallel_step.dependOn(&bench_parallel_run.step);
 
@@ -863,7 +872,6 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(bench_mmap);
     const bench_mmap_run = b.addRunArtifact(bench_mmap);
     bench_mmap_run.step.dependOn(b.getInstallStep());
-    if (b.args) |args| bench_mmap_run.addArgs(args);
     const bench_mmap_step = b.step("bench-mmap", "Run A.4 mmap vs readAlloc micro-benchmark");
     bench_mmap_step.dependOn(&bench_mmap_run.step);
 
@@ -871,7 +879,7 @@ pub fn build(b: *std.Build) void {
         .name = "bench-filter",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/bench_filter.zig"),
-            .target   = target,
+            .target = target,
             .optimize = optimize,
         }),
     });
@@ -879,7 +887,6 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(bench_filter);
     const bench_filter_run = b.addRunArtifact(bench_filter);
     bench_filter_run.step.dependOn(b.getInstallStep());
-    if (b.args) |args| bench_filter_run.addArgs(args);
     const bench_filter_step = b.step("bench-filter", "A.5 scalar evalExpr vs IntCmpCond vs evalExprBatch SIMD filter");
     bench_filter_step.dependOn(&bench_filter_run.step);
 
@@ -887,7 +894,7 @@ pub fn build(b: *std.Build) void {
         .name = "bench-distinct",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/bench_distinct.zig"),
-            .target   = target,
+            .target = target,
             .optimize = optimize,
         }),
     });
@@ -895,7 +902,6 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(bench_distinct);
     const bench_distinct_run = b.addRunArtifact(bench_distinct);
     bench_distinct_run.step.dependOn(b.getInstallStep());
-    if (b.args) |args| bench_distinct_run.addArgs(args);
     const bench_distinct_step = b.step("bench-distinct", "COUNT DISTINCT hash-set strategy micro-benchmark");
     bench_distinct_step.dependOn(&bench_distinct_run.step);
 }

@@ -368,11 +368,11 @@ fn appendParamLiteral(a: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), p:
     const ty = p.ty;
     const v = p.value;
     const quote =
-        std.ascii.indexOfIgnoreCase(ty, "String") != null or
-        std.ascii.indexOfIgnoreCase(ty, "Date") != null or
-        std.ascii.indexOfIgnoreCase(ty, "Time") != null or
-        std.ascii.indexOfIgnoreCase(ty, "UUID") != null or
-        std.ascii.indexOfIgnoreCase(ty, "IPv") != null;
+        std.ascii.findIgnoreCasePos(ty, 0, "String") != null or
+        std.ascii.findIgnoreCasePos(ty, 0, "Date") != null or
+        std.ascii.findIgnoreCasePos(ty, 0, "Time") != null or
+        std.ascii.findIgnoreCasePos(ty, 0, "UUID") != null or
+        std.ascii.findIgnoreCasePos(ty, 0, "IPv") != null;
     if (!quote) {
         try out.appendSlice(a, v);
         return;
@@ -990,7 +990,7 @@ fn extractWhereTableName(sql: []const u8) ?[]const u8 {
 fn extractWhereNameField(sql: []const u8, field: []const u8) ?[]const u8 {
     var pos: usize = 0;
     while (pos < sql.len) {
-        const idx = std.ascii.indexOfIgnoreCase(sql[pos..], field) orelse break;
+        const idx = std.ascii.findIgnoreCasePos(sql[pos..], 0, field) orelse break;
         pos += idx + field.len;
         // Must be followed by whitespace or '='
         if (pos < sql.len and std.ascii.isAlphanumeric(sql[pos])) continue; // part of longer word
@@ -1070,22 +1070,22 @@ fn handleSelect(ctx: *ServerCtx, a: std.mem.Allocator, w: *Io.Writer, sql: []con
     }
 
     // ── SELECT version() ─────────────────────────────────────────────────
-    if (std.ascii.indexOfIgnoreCase(sql, "version()") != null) {
+    if (std.ascii.findIgnoreCasePos(sql, 0, "version()") != null) {
         try sendScalarString(a, w, "version()", "24.3.0.1-ZigHouse");
         return;
     }
 
     // ── SELECT currentDatabase() ──────────────────────────────────────────
-    if (std.ascii.indexOfIgnoreCase(sql, "currentDatabase()") != null or
-        std.ascii.indexOfIgnoreCase(sql, "current_database()") != null)
+    if (std.ascii.findIgnoreCasePos(sql, 0, "currentDatabase()") != null or
+        std.ascii.findIgnoreCasePos(sql, 0, "current_database()") != null)
     {
         try sendScalarString(a, w, "currentDatabase()", "default");
         return;
     }
 
     // ── SELECT count(*) FROM system.tables WHERE ... ─────────────────────
-    if (std.ascii.indexOfIgnoreCase(sql, "system.tables") != null and
-        std.ascii.indexOfIgnoreCase(sql, "count(") != null)
+    if (std.ascii.findIgnoreCasePos(sql, 0, "system.tables") != null and
+        std.ascii.findIgnoreCasePos(sql, 0, "count(") != null)
     {
         const table_filter = extractWhereNameField(sql, "name");
         var count: u64 = 0;
@@ -1097,8 +1097,8 @@ fn handleSelect(ctx: *ServerCtx, a: std.mem.Allocator, w: *Io.Writer, sql: []con
     }
 
     // ── SELECT count(*) FROM system.columns WHERE ... ─────────────────────
-    if (std.ascii.indexOfIgnoreCase(sql, "system.columns") != null and
-        std.ascii.indexOfIgnoreCase(sql, "count(") != null)
+    if (std.ascii.findIgnoreCasePos(sql, 0, "system.columns") != null and
+        std.ascii.findIgnoreCasePos(sql, 0, "count(") != null)
     {
         const table_filter = extractWhereTableName(sql);
         const col_filter = extractWhereNameField(sql, "name");
@@ -1122,7 +1122,7 @@ fn handleSelect(ctx: *ServerCtx, a: std.mem.Allocator, w: *Io.Writer, sql: []con
     }
 
     // ── SELECT engine_full FROM system.tables WHERE ... ──────────────────
-    if (std.ascii.indexOfIgnoreCase(sql, "system.tables") != null) {
+    if (std.ascii.findIgnoreCasePos(sql, 0, "system.tables") != null) {
         const table_filter = extractWhereTableName(sql);
         var block_buf: std.ArrayListUnmanaged(u8) = .empty;
         defer block_buf.deinit(a);
@@ -1157,7 +1157,7 @@ fn handleSelect(ctx: *ServerCtx, a: std.mem.Allocator, w: *Io.Writer, sql: []con
 
     // ── SELECT name FROM system.columns WHERE ... ─────────────────────────
     // ── SELECT name, type, ... FROM system.columns WHERE ... ──────────────
-    if (std.ascii.indexOfIgnoreCase(sql, "system.columns") != null) {
+    if (std.ascii.findIgnoreCasePos(sql, 0, "system.columns") != null) {
         const table_filter = extractWhereTableName(sql);
         var block_buf: std.ArrayListUnmanaged(u8) = .empty;
         defer block_buf.deinit(a);
@@ -1395,11 +1395,11 @@ fn inferEmptyNameType(name: []const u8) core.ColumnType {
     if (std.ascii.eqlIgnoreCase(name, "as_dst") or
         std.ascii.eqlIgnoreCase(name, "as_src") or
         std.ascii.eqlIgnoreCase(name, "cnt") or
-        std.ascii.indexOfIgnoreCase(name, "count") != null)
+        std.ascii.findIgnoreCasePos(name, 0, "count") != null)
         return .uint64;
     if (std.ascii.eqlIgnoreCase(name, "ls") or
-        std.ascii.indexOfIgnoreCase(name, "timestamp") != null or
-        std.ascii.indexOfIgnoreCase(name, "time") != null)
+        std.ascii.findIgnoreCasePos(name, 0, "timestamp") != null or
+        std.ascii.findIgnoreCasePos(name, 0, "time") != null)
         return .datetime64_ms;
     return .string;
 }
@@ -1430,10 +1430,10 @@ fn inferEmptyColType(p: generic_sql.Expr) core.ColumnType {
         .sum, .avg, .min_if, .max_if, .sum_array, .sum_array_if => .float64,
         .min, .max => blk: {
             const c = p.column orelse "";
-            if (std.ascii.indexOfIgnoreCase(c, "timestamp") != null or
-                std.ascii.indexOfIgnoreCase(c, "time") != null)
+            if (std.ascii.findIgnoreCasePos(c, 0, "timestamp") != null or
+                std.ascii.findIgnoreCasePos(c, 0, "time") != null)
                 break :blk .datetime64_ms;
-            if (std.ascii.indexOfIgnoreCase(c, "date") != null)
+            if (std.ascii.findIgnoreCasePos(c, 0, "date") != null)
                 break :blk .date_u16;
             break :blk .string;
         },
@@ -1442,12 +1442,12 @@ fn inferEmptyColType(p: generic_sql.Expr) core.ColumnType {
         .group_uniq_array, .group_array => .array_string,
         .column_ref, .case_when, .cmp_expr, .any_val => blk: {
             const c = p.column orelse p.alias orelse "";
-            if (std.ascii.indexOfIgnoreCase(c, "count") != null or
-                std.ascii.indexOfIgnoreCase(c, "as_dst") != null or
-                std.ascii.indexOfIgnoreCase(c, "as_src") != null)
+            if (std.ascii.findIgnoreCasePos(c, 0, "count") != null or
+                std.ascii.findIgnoreCasePos(c, 0, "as_dst") != null or
+                std.ascii.findIgnoreCasePos(c, 0, "as_src") != null)
                 break :blk .uint64;
-            if (std.ascii.indexOfIgnoreCase(c, "timestamp") != null or
-                std.ascii.indexOfIgnoreCase(c, "last_seen") != null or
+            if (std.ascii.findIgnoreCasePos(c, 0, "timestamp") != null or
+                std.ascii.findIgnoreCasePos(c, 0, "last_seen") != null or
                 std.ascii.eqlIgnoreCase(c, "ls"))
                 break :blk .datetime64_ms;
             break :blk .string;

@@ -393,12 +393,12 @@ pub const Server = struct {
             }))
         {
             // Parse: CREATE [OR REPLACE] VIEW [db.]name AS <select>
-            const view_kw_pos = std.ascii.indexOfIgnoreCase(sql, "VIEW ") orelse {
+            const view_kw_pos = std.ascii.findIgnoreCasePos(sql, 0, "VIEW ") orelse {
                 try respondOk(self, request, out, native_path);
                 return;
             };
             const after_view = sql[view_kw_pos + 5 ..];
-            const as_pos = std.ascii.indexOfIgnoreCase(after_view, " AS ") orelse {
+            const as_pos = std.ascii.findIgnoreCasePos(after_view, 0, " AS ") orelse {
                 try respondOk(self, request, out, native_path);
                 return;
             };
@@ -433,7 +433,7 @@ pub const Server = struct {
         if (std.ascii.eqlIgnoreCase(second, "FUNCTION") or
             (std.ascii.eqlIgnoreCase(second, "OR") and std.ascii.eqlIgnoreCase(third, "REPLACE")))
         {
-            const fn_kw_pos = std.ascii.indexOfIgnoreCase(sql, "FUNCTION ") orelse {
+            const fn_kw_pos = std.ascii.findIgnoreCasePos(sql, 0, "FUNCTION ") orelse {
                 try respondOk(self, request, out, native_path);
                 return;
             };
@@ -443,7 +443,7 @@ pub const Server = struct {
                 try respondOk(self, request, out, native_path);
                 return;
             };
-            const as_pos2 = std.ascii.indexOfIgnoreCase(after_fn, " AS ") orelse {
+            const as_pos2 = std.ascii.findIgnoreCasePos(after_fn, 0, " AS ") orelse {
                 try respondOk(self, request, out, native_path);
                 return;
             };
@@ -525,14 +525,14 @@ pub const Server = struct {
 
     fn handleInsert(self: *Server, request: *std.http.Server.Request, out: *std.Io.Writer, sql: []const u8) !void {
         // VALUES INSERT: INSERT INTO table VALUES (...)
-        if (std.ascii.indexOfIgnoreCase(sql, " VALUES") != null) {
+        if (std.ascii.findIgnoreCasePos(sql, 0, " VALUES") != null) {
             try self.handleInsertValues(request, out, sql);
             return;
         }
 
         // INSERT INTO table SELECT ...: detect SELECT keyword after table name
-        if (std.ascii.indexOfIgnoreCase(sql, " SELECT ") != null or
-            std.ascii.indexOfIgnoreCase(sql, "\nSELECT ") != null or
+        if (std.ascii.findIgnoreCasePos(sql, 0, " SELECT ") != null or
+            std.ascii.findIgnoreCasePos(sql, 0, "\nSELECT ") != null or
             std.ascii.endsWithIgnoreCase(sql, " SELECT *"))
         {
             try self.handleInsertSelect(request, out, sql);
@@ -1094,9 +1094,9 @@ pub const Server = struct {
 
     fn handleSelectNoDrainEx(self: *Server, request: *std.http.Server.Request, out: *std.Io.Writer, sql: []const u8, want_tsv: bool, skip_header: bool) !void {
         // Detect and strip FORMAT JSON — switch to JSON output mode.
-        const want_json = std.ascii.indexOfIgnoreCase(sql, "FORMAT JSON") != null or
-            std.ascii.indexOfIgnoreCase(sql, "FORMAT JSONCompact") != null or
-            std.ascii.indexOfIgnoreCase(sql, "FORMAT JSONEachRow") != null;
+        const want_json = std.ascii.findIgnoreCasePos(sql, 0, "FORMAT JSON") != null or
+            std.ascii.findIgnoreCasePos(sql, 0, "FORMAT JSONCompact") != null or
+            std.ascii.findIgnoreCasePos(sql, 0, "FORMAT JSONEachRow") != null;
         const sql_clean_input: []const u8 = if (want_json) stripFormatClause(sql) else sql;
 
         // Fast path: SELECT 1
@@ -1117,7 +1117,7 @@ pub const Server = struct {
         }
 
         // Fast path: system.disks — return one stub row (large free space, no cleanup triggered)
-        if (std.ascii.indexOfIgnoreCase(sql_clean_input, "system.disks") != null) {
+        if (std.ascii.findIgnoreCasePos(sql_clean_input, 0, "system.disks") != null) {
             const data_dir = self.config.data_dir;
             if (want_json) {
                 // ClickHouse FORMAT JSON with fields tequila expects
@@ -1138,7 +1138,7 @@ pub const Server = struct {
         }
 
         // Fast path: system.parts — return empty result set (no partitions to drop)
-        if (std.ascii.indexOfIgnoreCase(sql_clean_input, "system.parts") != null) {
+        if (std.ascii.findIgnoreCasePos(sql_clean_input, 0, "system.parts") != null) {
             if (want_json) {
                 try sendResponse(request, out, .ok,
                     \\{"meta":[{"name":"table","type":"String"},{"name":"partition","type":"String"},{"name":"data_compressed_bytes","type":"UInt64"},{"name":"disk_name","type":"String"}],"data":[],"rows":0,"statistics":{"elapsed":0.001,"rows_read":0,"bytes_read":0}}
@@ -1152,7 +1152,7 @@ pub const Server = struct {
         }
 
         // Fast path: system.tables — return empty (no tables visible externally)
-        if (std.ascii.indexOfIgnoreCase(sql_clean_input, "system.tables") != null) {
+        if (std.ascii.findIgnoreCasePos(sql_clean_input, 0, "system.tables") != null) {
             if (want_json) {
                 try sendResponse(request, out, .ok,
                     \\{"meta":[{"name":"engine_full","type":"String"}],"data":[],"rows":0,"statistics":{"elapsed":0.001,"rows_read":0,"bytes_read":0}}
@@ -1166,7 +1166,7 @@ pub const Server = struct {
         }
 
         // Fast path: system.columns — return empty (GORM AutoMigrate compatibility)
-        if (std.ascii.indexOfIgnoreCase(sql_clean_input, "system.columns") != null) {
+        if (std.ascii.findIgnoreCasePos(sql_clean_input, 0, "system.columns") != null) {
             if (want_json) {
                 try sendResponse(request, out, .ok,
                     \\{"meta":[{"name":"name","type":"String"},{"name":"type","type":"String"}],"data":[],"rows":0,"statistics":{"elapsed":0.001,"rows_read":0,"bytes_read":0}}
@@ -1180,7 +1180,7 @@ pub const Server = struct {
         }
 
         // Fast path: system.one — return single stub row
-        if (std.ascii.indexOfIgnoreCase(sql_clean_input, "system.one") != null) {
+        if (std.ascii.findIgnoreCasePos(sql_clean_input, 0, "system.one") != null) {
             if (want_json) {
                 try sendResponse(request, out, .ok,
                     \\{"meta":[{"name":"1","type":"UInt8"}],"data":[{"1":1}],"rows":1,"statistics":{"elapsed":0.001,"rows_read":1,"bytes_read":0}}
@@ -1204,7 +1204,7 @@ pub const Server = struct {
         const final_was_stripped = sql_after_final.ptr != sql_clean_input.ptr;
         errdefer if (final_was_stripped) self.allocator.free(sql_after_final);
         const sql_clean: []const u8 = blk_sc: {
-            if (final_was_stripped and std.ascii.indexOfIgnoreCase(sql_after_final, "ORDER BY") == null) {
+            if (final_was_stripped and std.ascii.findIgnoreCasePos(sql_after_final, 0, "ORDER BY") == null) {
                 const s = try std.fmt.allocPrint(self.allocator, "{s} ORDER BY version DESC", .{sql_after_final});
                 self.allocator.free(sql_after_final);
                 break :blk_sc s;
@@ -1235,8 +1235,8 @@ pub const Server = struct {
                 defer self.allocator.free(from_short);
                 const from_sub = try std.fmt.allocPrint(self.allocator, "FROM ({s})", .{view_sql});
                 defer self.allocator.free(from_sub);
-                const needle = if (std.ascii.indexOfIgnoreCase(sql_clean, from_full) != null) from_full else from_short;
-                if (std.ascii.indexOfIgnoreCase(sql_clean, needle)) |pos| {
+                const needle = if (std.ascii.findIgnoreCasePos(sql_clean, 0, from_full) != null) from_full else from_short;
+                if (std.ascii.findIgnoreCasePos(sql_clean, 0, needle)) |pos| {
                     const rewritten = try std.fmt.allocPrint(self.allocator, "{s}{s}{s}", .{
                         sql_clean[0..pos], from_sub, sql_clean[pos + needle.len ..],
                     });
@@ -1790,7 +1790,7 @@ fn appendParsedField(
             for (elems) |e| {
                 if (fix_w) |w| {
                     const v = std.fmt.parseInt(i64, std.mem.trim(u8, e, " \t"), 10) catch 0;
-                    var tmp = [_]u8{0} ** 8;
+                    var tmp = @as([8]u8, @splat(0));
                     std.mem.writeInt(i64, &tmp, v, .little);
                     try blob.appendSlice(allocator, tmp[0..w]);
                 } else {
@@ -1957,7 +1957,7 @@ fn csvToTsv(allocator: std.mem.Allocator, csv: []const u8, skip_header: bool) ![
             return allocator.dupe(u8, "");
         }
     }
-    var out = std.ArrayListUnmanaged(u8){ .items = &.{}, .capacity = 0 };
+    var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(allocator);
     var i: usize = 0;
     while (i < src.len) {
@@ -2034,13 +2034,13 @@ fn csvToTsv(allocator: std.mem.Allocator, csv: []const u8, skip_header: bool) ![
 /// Output: {"meta":[{"name":"col","type":"String"}],"data":[{"col":"val",...}],"rows":N,"statistics":{"elapsed":0.001,"rows_read":N,"bytes_read":0}}
 /// col_types: parallel slice of ch_type strings for each column (or null to default to "String").
 fn csvToJson(allocator: std.mem.Allocator, csv: []const u8, col_types: ?[]const ?[]const u8) ![]u8 {
-    var out = std.ArrayListUnmanaged(u8){ .items = &.{}, .capacity = 0 };
+    var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(allocator);
 
     // Parse header line to get column names.
     const hdr_end = std.mem.indexOfScalar(u8, csv, '\n') orelse csv.len;
     const hdr_line = csv[0..hdr_end];
-    var col_names = std.ArrayListUnmanaged([]const u8){ .items = &.{}, .capacity = 0 };
+    var col_names = std.ArrayListUnmanaged([]const u8).empty;
     defer col_names.deinit(allocator);
     {
         var pos: usize = 0;
@@ -2105,7 +2105,7 @@ fn csvToJson(allocator: std.mem.Allocator, csv: []const u8, col_types: ?[]const 
             if (pos < row_line.len and row_line[pos] == '"') {
                 // Quoted field — unescape
                 pos += 1;
-                var fbuf = std.ArrayListUnmanaged(u8){ .items = &.{}, .capacity = 0 };
+                var fbuf = std.ArrayListUnmanaged(u8).empty;
                 defer fbuf.deinit(allocator);
                 while (pos < row_line.len) {
                     if (row_line[pos] == '"') {
@@ -2250,7 +2250,7 @@ fn substituteParams(allocator: std.mem.Allocator, target: []const u8, sql: []con
 
     // Collect param_N=value entries.  Support up to 16 params.
     const max_params = 16;
-    var param_vals: [max_params]?[]u8 = [_]?[]u8{null} ** max_params;
+    var param_vals: [max_params]?[]u8 = @as([max_params]?[]u8, @splat(null));
     defer {
         for (param_vals) |pv| if (pv) |v| allocator.free(v);
     }

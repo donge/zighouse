@@ -16,21 +16,21 @@
 ///
 ///   const rs = try pipeline.executePlan(node, &qctx);
 ///
-const std     = @import("std");
-const schema  = @import("schema");
-const core    = @import("core");
-const chunk   = core.chunk;
-const result  = core.result;
+const std = @import("std");
+const schema = @import("schema");
+const core = @import("core");
+const chunk = core.chunk;
+const result = core.result;
 const pipeline = core.exec.pipeline;
 const generic_store = @import("generic_store");
 const generic_store_bridge = @import("generic_store_bridge");
-const part_mod = @import("part");       // clickhouse_format/part.zig
+const part_mod = @import("part"); // clickhouse_format/part.zig
 
-pub const DataChunk    = chunk.DataChunk;
-pub const ColumnType   = chunk.ColumnType;
-pub const SourceIface  = pipeline.SourceIface;
+pub const DataChunk = chunk.DataChunk;
+pub const ColumnType = chunk.ColumnType;
+pub const SourceIface = pipeline.SourceIface;
 pub const QueryContext = pipeline.QueryContext;
-pub const ColMeta      = result.ColMeta;
+pub const ColMeta = result.ColMeta;
 const plan = core.exec.plan;
 
 const RAW_MATERIALIZE_MAX_COMPACT_BYTES: u64 = 256 * 1024 * 1024;
@@ -69,10 +69,10 @@ const RawColData = union(enum) {
 fn toCoreColType(ty: schema.ColumnType) ColumnType {
     return switch (ty) {
         .int8, .int16, .int32, .int64 => .int64,
-        .float32, .float64            => .float64,
-        .date                         => .date_u16,
-        .timestamp                    => .datetime64_ms,
-        .text, .char, .low_card          => .string,
+        .float32, .float64 => .float64,
+        .date => .date_u16,
+        .timestamp => .datetime64_ms,
+        .text, .char, .low_card => .string,
     };
 }
 
@@ -91,19 +91,19 @@ fn toCoreColTypeFull(col: schema.Column) ColumnType {
 /// Internal scan state: walks through a list of part directories, reading
 /// one chunk per call to nextChunk().
 const ScanState = struct {
-    alloc:       std.mem.Allocator,
-    io:          std.Io,
-    table:       schema.Table,
-    part_dirs:   []const []const u8,
-    part_idx:    usize,                          // which part we're on
-    opened:      ?part_mod.OpenedPartAny,        // currently-open part (wide or compact)
-    rows_read:   u64,                            // rows read from current part
-    row_count:   u64,                            // total rows across all parts
-    col_readers: []?part_mod.ColumnReader,       // one per table column; null if unopened
-    raw_cols:    []RawColData,                   // lazy all-part raw views
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    table: schema.Table,
+    part_dirs: []const []const u8,
+    part_idx: usize, // which part we're on
+    opened: ?part_mod.OpenedPartAny, // currently-open part (wide or compact)
+    rows_read: u64, // rows read from current part
+    row_count: u64, // total rows across all parts
+    col_readers: []?part_mod.ColumnReader, // one per table column; null if unopened
+    raw_cols: []RawColData, // lazy all-part raw views
     raw_materialize_allowed: bool,
-    raw_lock:    std.atomic.Value(u32),
-    metas:       []ColMeta,                      // schema metas (allocated once)
+    raw_lock: std.atomic.Value(u32),
+    metas: []ColMeta, // schema metas (allocated once)
     /// If non-null, only columns marked `true` are read from disk.
     /// Length == table.columns.len.  null means read all.
     needed_cols: ?[]bool,
@@ -126,7 +126,7 @@ const ScanState = struct {
         const metas = try alloc.alloc(ColMeta, table.columns.len);
         for (table.columns, 0..) |col, i| {
             metas[i] = .{
-                .name    = col.name,
+                .name = col.name,
                 .col_type = toCoreColTypeFull(col),
             };
         }
@@ -151,30 +151,33 @@ const ScanState = struct {
             @memset(mask, false);
             for (pruned_columns) |name| {
                 for (table.columns, 0..) |col, i| {
-                    if (std.mem.eql(u8, col.name, name)) { mask[i] = true; break; }
+                    if (std.mem.eql(u8, col.name, name)) {
+                        mask[i] = true;
+                        break;
+                    }
                 }
             }
             break :blk mask;
         };
 
         return .{
-            .alloc       = alloc,
-            .io          = io,
-            .table       = table,
-            .part_dirs   = part_dirs,
-            .part_idx    = 0,
-            .opened      = null,
-            .rows_read   = 0,
-            .row_count   = total_rows,
+            .alloc = alloc,
+            .io = io,
+            .table = table,
+            .part_dirs = part_dirs,
+            .part_idx = 0,
+            .opened = null,
+            .rows_read = 0,
+            .row_count = total_rows,
             .col_readers = col_readers,
-            .raw_cols    = raw_cols,
+            .raw_cols = raw_cols,
             .raw_materialize_allowed = raw_materialize_allowed,
-            .raw_lock    = .init(0),
-            .metas       = metas,
+            .raw_lock = .init(0),
+            .metas = metas,
             .needed_cols = needed_cols,
-            .override_needed = [_]bool{false} ** 256,
+            .override_needed = @as([256]bool, @splat(false)),
             .override_active = false,
-            .nonempty_bool = [_]bool{false} ** 256,
+            .nonempty_bool = @as([256]bool, @splat(false)),
             .scan_lo = 0,
             .scan_hi = std.math.maxInt(u64),
         };
@@ -191,9 +194,15 @@ const ScanState = struct {
 
     fn closeCurrentPart(self: *ScanState) void {
         for (self.col_readers) |*mr| {
-            if (mr.*) |*cr| { cr.deinit(); mr.* = null; }
+            if (mr.*) |*cr| {
+                cr.deinit();
+                mr.* = null;
+            }
         }
-        if (self.opened) |*op| { op.deinit(); self.opened = null; }
+        if (self.opened) |*op| {
+            op.deinit();
+            self.opened = null;
+        }
         self.rows_read = 0;
     }
 
@@ -410,7 +419,9 @@ const ScanState = struct {
             defer cr.deinit();
             while (ctx.row < total) {
                 const remaining = total - ctx.row;
-                const got = try cr.readStrings(@min(remaining, chunk.CHUNK_SIZE), &ctx,
+                const got = try cr.readStrings(
+                    @min(remaining, chunk.CHUNK_SIZE),
+                    &ctx,
                     struct {
                         fn cb(c: *Ctx, str: []const u8) !void {
                             try c.bytes.appendSlice(c.alloc, str);
@@ -426,7 +437,7 @@ const ScanState = struct {
         self.raw_cols[ci] = .{ .string = .{
             .offsets = offsets,
             .bytes = try bytes.toOwnedSlice(self.alloc),
-        }};
+        } };
     }
 
     fn readFixedRange(self: *ScanState, ci: usize, start: u64, n: usize, out: []i64) !void {
@@ -571,7 +582,10 @@ const ScanState = struct {
                 idx: usize,
             };
             var ctx = Ctx{ .out = out, .idx = dst };
-            _ = cr.readArrayStrings(want, alloc, &ctx,
+            _ = cr.readArrayStrings(
+                want,
+                alloc,
+                &ctx,
                 struct {
                     fn cb(c: *Ctx, arr: [][]const u8) !void {
                         c.out[c.idx] = arr;
@@ -753,12 +767,12 @@ const ScanState = struct {
         const arena_alloc = ctx.allocator();
         // Build chunk
         out.* = .{
-            .columns  = try arena_alloc.alloc(chunk.Column, self.table.columns.len),
+            .columns = try arena_alloc.alloc(chunk.Column, self.table.columns.len),
             .num_rows = n,
-            .arena    = std.heap.ArenaAllocator.init(arena_alloc),
+            .arena = std.heap.ArenaAllocator.init(arena_alloc),
         };
         const chunk_alloc = out.arena.allocator();
-        const null_words  = chunk.nullMaskWords(n);
+        const null_words = chunk.nullMaskWords(n);
         const use_range_readers = switch (op.*) {
             .compact => true,
             .wide => true,
@@ -842,7 +856,9 @@ const ScanState = struct {
                                 tmp_cr = try op.columnReaderRange(ci, self.rows_read, n);
                                 break :cr_blk &tmp_cr.?;
                             } else &self.col_readers[ci].?;
-                            const actual = cr.readStrings(n, &sctx,
+                            const actual = cr.readStrings(
+                                n,
+                                &sctx,
                                 struct {
                                     fn cb(c: *Ctx, str: []const u8) !void {
                                         c.buf[c.idx] = if (str.len != 0) 1 else 0;
@@ -865,8 +881,8 @@ const ScanState = struct {
                         @memset(sbuf, "");
                     } else {
                         const Ctx = struct {
-                            buf:   [][]const u8,
-                            idx:   usize,
+                            buf: [][]const u8,
+                            idx: usize,
                             alloc: std.mem.Allocator,
                         };
                         var sctx = Ctx{ .buf = sbuf, .idx = 0, .alloc = chunk_alloc };
@@ -876,7 +892,9 @@ const ScanState = struct {
                             tmp_cr = try op.columnReaderRange(ci, self.rows_read, n);
                             break :cr_blk &tmp_cr.?;
                         } else &self.col_readers[ci].?;
-                        const actual2 = cr.readStrings(n, &sctx,
+                        const actual2 = cr.readStrings(
+                            n,
+                            &sctx,
                             struct {
                                 fn cb(c: *Ctx, str: []const u8) !void {
                                     c.buf[c.idx] = try c.alloc.dupe(u8, str);
@@ -899,43 +917,46 @@ const ScanState = struct {
                     if (is_pruned) {
                         @memset(sbuf, &.{});
                     } else {
-                    // Use readArrayStrings to decode Array(String) columns from parts.
+                        // Use readArrayStrings to decode Array(String) columns from parts.
                         var tmp_cr: ?part_mod.ColumnReader = null;
                         defer if (tmp_cr) |*cr| cr.deinit();
                         const cr = if (use_range_readers) cr_blk: {
                             tmp_cr = try op.columnReaderRange(ci, self.rows_read, n);
                             break :cr_blk &tmp_cr.?;
                         } else &self.col_readers[ci].?;
-                    {
-                        const Ctx2 = struct {
-                            buf:   [][][]const u8,
-                            idx:   usize,
-                        };
-                        var ctx2 = Ctx2{ .buf = sbuf, .idx = 0 };
-                        _ = cr.readArrayStrings(n, chunk_alloc, &ctx2,
-                            struct {
-                                fn cb(c: *Ctx2, arr: [][]const u8) !void {
-                                    c.buf[c.idx] = arr;
-                                    c.idx += 1;
-                                }
-                            }.cb,
-                        ) catch |err| {
-                            // If readArrayStrings fails (wrong format), fall back to empty
-                            std.log.warn("readArrayStrings error at row {}: {}", .{ctx2.idx, err});
-                            @memset(sbuf[ctx2.idx..], &.{});
-                        };
-                        // Fill any unread rows with empty
-                        while (ctx2.idx < n) : (ctx2.idx += 1) sbuf[ctx2.idx] = &.{};
-                    }
+                        {
+                            const Ctx2 = struct {
+                                buf: [][][]const u8,
+                                idx: usize,
+                            };
+                            var ctx2 = Ctx2{ .buf = sbuf, .idx = 0 };
+                            _ = cr.readArrayStrings(
+                                n,
+                                chunk_alloc,
+                                &ctx2,
+                                struct {
+                                    fn cb(c: *Ctx2, arr: [][]const u8) !void {
+                                        c.buf[c.idx] = arr;
+                                        c.idx += 1;
+                                    }
+                                }.cb,
+                            ) catch |err| {
+                                // If readArrayStrings fails (wrong format), fall back to empty
+                                std.log.warn("readArrayStrings error at row {}: {}", .{ ctx2.idx, err });
+                                @memset(sbuf[ctx2.idx..], &.{});
+                            };
+                            // Fill any unread rows with empty
+                            while (ctx2.idx < n) : (ctx2.idx += 1) sbuf[ctx2.idx] = &.{};
+                        }
                     } // end else (not pruned)
                     break :blk .{ .array_string = sbuf };
                 },
             };
             out.columns[ci] = .{
-                .name      = col.name,
-                .data      = col_data,
+                .name = col.name,
+                .data = col_data,
                 .null_mask = null_mask,
-                .len       = n,
+                .len = n,
             };
         }
         self.rows_read += n;
@@ -1142,21 +1163,21 @@ pub const PartScanBridge = struct {
     }
 
     const vtable = SourceIface.VTable{
-        .nextChunk             = nextChunkFn,
-        .reset                 = resetFn,
-        .schema                = schemaFn,
-        .rowCount              = rowCountFn,
-        .fetchRange            = fetchRangeFn,
-        .setNeededCols         = setNeededColsFn,
+        .nextChunk = nextChunkFn,
+        .reset = resetFn,
+        .schema = schemaFn,
+        .rowCount = rowCountFn,
+        .fetchRange = fetchRangeFn,
+        .setNeededCols = setNeededColsFn,
         .setStringNonEmptyBool = setStringNonEmptyBoolFn,
-        .getRawInt16Col        = getRawInt16ColFn,
-        .getRawInt32Col        = getRawInt32ColFn,
-        .getRawInt64Col        = getRawInt64ColFn,
-        .getRawStrOffsets      = getRawStrOffsetsFn,
-        .getRawStrBytes        = getRawStrBytesFn,
-        .setRowRange           = setRowRangeFn,
-        .getSortKeys           = getSortKeysFn,
-        .findIntRange          = findIntRangeFn,
+        .getRawInt16Col = getRawInt16ColFn,
+        .getRawInt32Col = getRawInt32ColFn,
+        .getRawInt64Col = getRawInt64ColFn,
+        .getRawStrOffsets = getRawStrOffsetsFn,
+        .getRawStrBytes = getRawStrBytesFn,
+        .setRowRange = setRowRangeFn,
+        .getSortKeys = getSortKeysFn,
+        .findIntRange = findIntRangeFn,
     };
 };
 
@@ -1476,21 +1497,21 @@ fn writeBytes(io: std.Io, alloc: std.mem.Allocator, path: []const u8, bytes: []c
 }
 
 fn writeGenericInt32(io: std.Io, alloc: std.mem.Allocator, part_dir: []const u8, name: []const u8, values: []const i32) !void {
-    var bytes = try alloc.alloc(u8, values.len * 4);
-    defer alloc.free(bytes);
-    for (values, 0..) |v, i| std.mem.writeInt(i32, bytes[i * 4 ..][0..4], v, .little);
     const path = try generic_store.columnBinPath(alloc, part_dir, name);
     defer alloc.free(path);
-    try writeBytes(io, alloc, path, bytes);
+    var writer = try generic_store.v2.Writer.open(alloc, io, path, .int32, values.len, generic_store.v2.default_block_rows);
+    defer writer.deinit();
+    for (values) |v| try writer.writeI32(v);
+    try writer.finish();
 }
 
 fn writeGenericInt64(io: std.Io, alloc: std.mem.Allocator, part_dir: []const u8, name: []const u8, values: []const i64) !void {
-    var bytes = try alloc.alloc(u8, values.len * 8);
-    defer alloc.free(bytes);
-    for (values, 0..) |v, i| std.mem.writeInt(i64, bytes[i * 8 ..][0..8], v, .little);
     const path = try generic_store.columnBinPath(alloc, part_dir, name);
     defer alloc.free(path);
-    try writeBytes(io, alloc, path, bytes);
+    var writer = try generic_store.v2.Writer.open(alloc, io, path, .int64, values.len, generic_store.v2.default_block_rows);
+    defer writer.deinit();
+    for (values) |v| try writer.writeI64(v);
+    try writer.finish();
 }
 
 fn writeGenericString(io: std.Io, alloc: std.mem.Allocator, part_dir: []const u8, name: []const u8, values: []const []const u8) !void {
@@ -1680,7 +1701,7 @@ test "generic and compact sources produce consistent pipeline results" {
         .table = table.name,
         .columns = scan_cols[0..],
         .filter = null,
-    }};
+    } };
 
     var count_call: plan.AggCall = undefined;
     var count_aggs = [_]plan.ProjectItem{.{
@@ -1718,7 +1739,7 @@ test "generic and compact sources produce consistent pipeline results" {
         .keys = group_keys[0..],
         .aggs = count_aggs[0..],
         .strategy = .single_int_count_topk,
-    }};
+    } };
     var count_sort_keys = [_]plan.SortKey{.{ .col_idx = 1, .desc = true, .nulls_first = false }};
     var grouped_topk = plan.PhysicalNode{ .top_k = .{ .input = &grouped_count, .keys = count_sort_keys[0..], .k = 2 } };
     try compareGenericAndCompact(allocator, generic_source, compact_source, &grouped_topk);

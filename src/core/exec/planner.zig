@@ -749,7 +749,7 @@ pub fn plan_query(
 
     // ── Column pruning: push down only referenced columns to part_scan ────────
     if (ctx.tbl) |tbl| {
-        var used = std.bit_set.IntegerBitSet(256).initEmpty();
+        var used = std.bit_set.Integer(256).empty;
         collectPlanCols(source, &used);
         try pushdownColumns(source, used, tbl, ctx.alloc);
     }

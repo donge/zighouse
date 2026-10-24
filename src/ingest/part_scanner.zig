@@ -268,7 +268,7 @@ test "overlap filter: all_3_7_1 hides level-0 parts 3..7" {
         .{ .min_seq = 8, .max_seq = 8, .level = 0, .full_path = "" },
     };
     const n = metas_arr.len;
-    var keep = [_]bool{true} ** 9;
+    var keep = @as([9]bool, @splat(true));
     for (0..n) |i| {
         const a = metas_arr[i];
         for (0..n) |j| {

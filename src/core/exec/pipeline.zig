@@ -31,6 +31,19 @@ pub const ResultSink = result.ResultSink;
 
 // ── QueryContext ──────────────────────────────────────────────────────────────
 
+pub const ProfilePhase = enum {
+    open,
+    mmap,
+    scan,
+    filter,
+    project,
+    scatter,
+    aggregate,
+    merge,
+    topk,
+    output,
+};
+
 pub const QueryProfile = struct {
     enabled: bool = false,
     label: ?[]const u8 = null,
@@ -44,6 +57,20 @@ pub const QueryProfile = struct {
     fallback_rows: u64 = 0,
     unsupported: u64 = 0,
     execute_errors: u64 = 0,
+    open_ns: u64 = 0,
+    mmap_ns: u64 = 0,
+    scan_ns: u64 = 0,
+    filter_ns: u64 = 0,
+    project_ns: u64 = 0,
+    scatter_ns: u64 = 0,
+    aggregate_ns: u64 = 0,
+    merge_ns: u64 = 0,
+    topk_ns: u64 = 0,
+    output_ns: u64 = 0,
+    bytes_read: u64 = 0,
+    bytes_mapped: u64 = 0,
+    peak_groups: u64 = 0,
+    hash_table_grows: u64 = 0,
     last_reason: ?[]const u8 = null,
 
     fn init() QueryProfile {
@@ -65,10 +92,24 @@ pub const QueryProfile = struct {
         const label = self.label orelse "";
         const reason = self.last_reason orelse "";
         std.debug.print(
-            "zighouse_profile query=\"{s}\" elapsed_ms={d:.3} scannable={d} breaker={d} next_chunks={d} next_rows={d} range_pushdowns={d} raw_hits={d} fallback_rows={d} unsupported={d} execute_errors={d} reason=\"{s}\"\n",
+            "zighouse_profile query=\"{s}\" elapsed_ms={d:.3} open_ms={d:.3} mmap_ms={d:.3} scan_ms={d:.3} filter_ms={d:.3} project_ms={d:.3} scatter_ms={d:.3} aggregate_ms={d:.3} merge_ms={d:.3} topk_ms={d:.3} output_ms={d:.3} bytes_read={d} bytes_mapped={d} peak_groups={d} hash_table_grows={d} scannable={d} breaker={d} next_chunks={d} next_rows={d} range_pushdowns={d} raw_hits={d} fallback_rows={d} unsupported={d} execute_errors={d} reason=\"{s}\"\n",
             .{
                 label,
-                @as(f64, @floatFromInt(elapsed_ns)) / 1_000_000.0,
+                nsToMs(elapsed_ns),
+                nsToMs(self.open_ns),
+                nsToMs(self.mmap_ns),
+                nsToMs(self.scan_ns),
+                nsToMs(self.filter_ns),
+                nsToMs(self.project_ns),
+                nsToMs(self.scatter_ns),
+                nsToMs(self.aggregate_ns),
+                nsToMs(self.merge_ns),
+                nsToMs(self.topk_ns),
+                nsToMs(self.output_ns),
+                self.bytes_read,
+                self.bytes_mapped,
+                self.peak_groups,
+                self.hash_table_grows,
                 self.scannable_path,
                 self.breaker_path,
                 self.next_chunks,
@@ -82,11 +123,38 @@ pub const QueryProfile = struct {
             },
         );
     }
+
+    pub fn timestamp(self: *const QueryProfile) i128 {
+        return if (self.enabled) profileNowNs() else 0;
+    }
+
+    pub fn addElapsed(self: *QueryProfile, phase: ProfilePhase, started_ns: i128) void {
+        if (!self.enabled or started_ns == 0) return;
+        const elapsed = profileNowNs() - started_ns;
+        if (elapsed <= 0) return;
+        const elapsed_ns: u64 = @intCast(elapsed);
+        switch (phase) {
+            .open => self.open_ns +|= elapsed_ns,
+            .mmap => self.mmap_ns +|= elapsed_ns,
+            .scan => self.scan_ns +|= elapsed_ns,
+            .filter => self.filter_ns +|= elapsed_ns,
+            .project => self.project_ns +|= elapsed_ns,
+            .scatter => self.scatter_ns +|= elapsed_ns,
+            .aggregate => self.aggregate_ns +|= elapsed_ns,
+            .merge => self.merge_ns +|= elapsed_ns,
+            .topk => self.topk_ns +|= elapsed_ns,
+            .output => self.output_ns +|= elapsed_ns,
+        }
+    }
 };
 
-fn profileNowNs() i128 {
+fn nsToMs(ns: anytype) f64 {
+    return @as(f64, @floatFromInt(ns)) / 1_000_000.0;
+}
+
+pub fn profileNowNs() i128 {
     var ts: std.posix.timespec = undefined;
-    switch (std.posix.errno(std.posix.system.clock_gettime(.REALTIME, &ts))) {
+    switch (std.posix.errno(std.posix.system.clock_gettime(.MONOTONIC, &ts))) {
         .SUCCESS => return @as(i128, ts.sec) * std.time.ns_per_s + ts.nsec,
         else => return 0,
     }
@@ -113,6 +181,10 @@ fn envFlag(name: [:0]const u8) bool {
         std.ascii.eqlIgnoreCase(val, "off"));
 }
 
+fn topkCollectorDisabled() bool {
+    return envFlag("ZIGHOUSE_NO_TOPK_COLLECTOR");
+}
+
 /// Per-query execution context. Holds the arena for all intermediate
 /// allocations during one query's lifetime.
 pub const QueryContext = struct {
@@ -137,6 +209,13 @@ pub const QueryContext = struct {
     }
 
     pub fn deinit(self: *QueryContext) void {
+        if (self.profile.enabled) {
+            const source_stats = self.source.profileStats();
+            self.profile.open_ns = source_stats.open_ns;
+            self.profile.mmap_ns = source_stats.mmap_ns;
+            self.profile.bytes_read = source_stats.bytes_read;
+            self.profile.bytes_mapped = source_stats.bytes_mapped;
+        }
         self.profile.emit();
         self.arena.deinit();
     }
@@ -170,6 +249,13 @@ pub const SourceIface = struct {
     pub const RowRange = struct {
         lo: u64,
         hi: u64,
+    };
+
+    pub const ProfileStats = struct {
+        open_ns: u64 = 0,
+        mmap_ns: u64 = 0,
+        bytes_read: u64 = 0,
+        bytes_mapped: u64 = 0,
     };
 
     pub const VTable = struct {
@@ -210,6 +296,8 @@ pub const SourceIface = struct {
         getSortKeys: ?*const fn (ptr: *anyopaque) []const []const u8 = null,
         /// Optional: find the exact row range for an equality on a sorted int key.
         findIntRange: ?*const fn (ptr: *anyopaque, col_name: []const u8, value: i64) ?RowRange = null,
+        /// Optional: return cumulative source setup and I/O counters.
+        profileStats: ?*const fn (ptr: *anyopaque) ProfileStats = null,
     };
 
     pub fn nextChunk(self: SourceIface, out: *DataChunk, ctx: *QueryContext) !bool {
@@ -299,6 +387,11 @@ pub const SourceIface = struct {
     pub fn findIntRange(self: SourceIface, col_name: []const u8, value: i64) ?RowRange {
         const f = self.vtable.findIntRange orelse return null;
         return f(self.ptr, col_name, value);
+    }
+
+    pub fn profileStats(self: SourceIface) ProfileStats {
+        const f = self.vtable.profileStats orelse return .{};
+        return f(self.ptr);
     }
 };
 
@@ -921,7 +1014,7 @@ pub const FilterState = struct {
             @memset(row, null);
             self.row_buf = row;
             // Collect LIKE/NOT_LIKE guards; only keep if all guard columns are string type.
-            var guards_list = std.ArrayListUnmanaged(LikeGuard){ .items = &.{}, .capacity = 0 };
+            var guards_list = std.ArrayListUnmanaged(LikeGuard).empty;
             collectLikeGuards(self.predicate, &guards_list, alloc);
             const raw_guards = try guards_list.toOwnedSlice(alloc);
             var guards_ok = true;
@@ -1345,7 +1438,7 @@ const ScanPrunePolicy = enum { any_reduction, half };
 /// SourceIface currently caps runtime column overrides at 256 columns, so wide
 /// schemas outside that contract conservatively skip pruning.
 const ScanRequest = struct {
-    needed: [256]bool = [_]bool{false} ** 256,
+    needed: [256]bool = @as([256]bool, @splat(false)),
 
     fn addExpr(self: *ScanRequest, expr: plan.Expr) void {
         collectColRefs(expr, &self.needed);
@@ -1967,12 +2060,18 @@ fn executeScannableToSink(
         exprCanUseBatchSelection(filter_state.?.predicate);
     var selection_buf: ?[]u32 = null;
     var mask_buf: ?[]i16 = null;
-    while (try ctx.source.nextChunk(&c, ctx)) {
+    while (true) {
+        const scan_started = ctx.profile.timestamp();
+        const has_chunk = try ctx.source.nextChunk(&c, ctx);
+        ctx.profile.addElapsed(.scan, scan_started);
+        if (!has_chunk) break;
+
         if (use_selected_project) {
             const n = c.num_rows;
             if (selection_buf == null or selection_buf.?.len < n) selection_buf = try ctx.allocator().alloc(u32, n);
             if (mask_buf == null or mask_buf.?.len < n) mask_buf = try ctx.allocator().alloc(i16, n);
 
+            const filter_started = ctx.profile.timestamp();
             const sel = try kernels.evalExprSelection(
                 filter_state.?.predicate,
                 c,
@@ -1980,6 +2079,7 @@ fn executeScannableToSink(
                 mask_buf.?[0..n],
                 ctx.allocator(),
             );
+            ctx.profile.addElapsed(.filter, filter_started);
             if (sel.isEmpty()) continue;
 
             var out = DataChunk{
@@ -1987,22 +2087,34 @@ fn executeScannableToSink(
                 .num_rows = 0,
                 .arena = c.arena,
             };
+            const project_started = ctx.profile.timestamp();
             try project_state.?.applySelected(c.selected(sel), &out, ctx);
+            ctx.profile.addElapsed(.project, project_started);
             if (ctx.profile.enabled) ctx.profile.recordReason("selected_project");
+            const output_started = ctx.profile.timestamp();
             try sink.consume(out);
+            ctx.profile.addElapsed(.output, output_started);
             continue;
         }
 
-        if (filter_state) |*fs| try fs.apply(&c, ctx);
+        if (filter_state) |*fs| {
+            const filter_started = ctx.profile.timestamp();
+            try fs.apply(&c, ctx);
+            ctx.profile.addElapsed(.filter, filter_started);
+        }
         if (lim_state) |*ls| ls.apply(&c);
         if (c.num_rows == 0) {
             if (lim_state) |ls| if (ls.done()) break;
             continue;
         }
         if (project_state) |*project| {
+            const project_started = ctx.profile.timestamp();
             try project.apply(&c, ctx);
+            ctx.profile.addElapsed(.project, project_started);
         }
+        const output_started = ctx.profile.timestamp();
         try sink.consume(c);
+        ctx.profile.addElapsed(.output, output_started);
         if (lim_state) |ls| if (ls.done()) break;
     }
 }
@@ -2017,6 +2129,8 @@ fn executeNode(node: *const plan.PhysicalNode, ctx: *QueryContext) !RowList {
             return cloneRowList(inner, alloc);
         },
         .part_scan, .mem_scan => {
+            const phase_started = ctx.profile.timestamp();
+            defer ctx.profile.addElapsed(.scan, phase_started);
             // Fall through to the ctx.source scan path below only for
             // part_scan and mem_scan (not chunk_source — that must execute
             // its inner plan to apply filter/project/agg operators).
@@ -2037,6 +2151,8 @@ fn executeNode(node: *const plan.PhysicalNode, ctx: *QueryContext) !RowList {
             return rl;
         },
         .filter => |f| {
+            const phase_started = ctx.profile.timestamp();
+            defer ctx.profile.addElapsed(.filter, phase_started);
             const inner = try executeNode(f.input, ctx);
             var rl = RowList.init(inner.metas);
             for (inner.rows.items) |row| {
@@ -2049,6 +2165,8 @@ fn executeNode(node: *const plan.PhysicalNode, ctx: *QueryContext) !RowList {
 
         // ── Project ───────────────────────────────────────────────────────────
         .project => |p| {
+            const phase_started = ctx.profile.timestamp();
+            defer ctx.profile.addElapsed(.project, phase_started);
             if (!projectItemsContainArrayJoin(p.items) and isScannable(p.input)) {
                 return executeLimitChunked(node, ctx);
             }
@@ -2111,6 +2229,8 @@ fn executeNode(node: *const plan.PhysicalNode, ctx: *QueryContext) !RowList {
 
         // ── ScalarAgg ─────────────────────────────────────────────────────────
         .scalar_agg => |sa| {
+            const phase_started = ctx.profile.timestamp();
+            defer ctx.profile.addElapsed(.aggregate, phase_started);
             if (isScannable(sa.input)) {
                 // Try parallel path first (requires fetchRange support and no LIMIT).
                 if (try executeScalarAggParallel(sa.input, sa.aggs, ctx)) |r| return r;
@@ -2122,6 +2242,8 @@ fn executeNode(node: *const plan.PhysicalNode, ctx: *QueryContext) !RowList {
 
         // ── HashAgg ───────────────────────────────────────────────────────────
         .hash_agg => |ha| {
+            const phase_started = ctx.profile.timestamp();
+            defer ctx.profile.addElapsed(.aggregate, phase_started);
             if (isScannable(ha.input)) {
                 return executeHashAggScannable(ha, &.{}, 0, 0, ctx);
             }
@@ -2131,12 +2253,16 @@ fn executeNode(node: *const plan.PhysicalNode, ctx: *QueryContext) !RowList {
 
         // ── OrderBy ───────────────────────────────────────────────────────────
         .order_by => |ob| {
+            const phase_started = ctx.profile.timestamp();
+            defer ctx.profile.addElapsed(.topk, phase_started);
             const inner = try executeNode(ob.input, ctx);
             return executeOrderBy(inner, ob.keys, alloc);
         },
 
         // ── TopK ──────────────────────────────────────────────────────────────
         .top_k => |tk| {
+            const phase_started = ctx.profile.timestamp();
+            defer ctx.profile.addElapsed(.topk, phase_started);
             const k = @as(usize, @intCast(tk.k));
             // Fast path: stream scannable input directly into heap — avoids
             // materialising all rows into a RowList before sorting.
@@ -4892,7 +5018,7 @@ fn executeFilterProjectParallel(
 ) !?RowList {
     if (!ctx.source.supportsRange()) return null;
     const total_rows = ctx.source.rowCount();
-    if (total_rows < 2_000_000) return null;
+    if (total_rows < 1_000_000) return null;
     const n_threads = parallel.defaultThreads();
     if (n_threads <= 1) return null;
     const alloc = ctx.allocator();
@@ -4922,14 +5048,17 @@ fn executeFilterProjectParallel(
 
     const ParFpCtx = struct {
         source: SourceIface,
-        parent_alloc: std.mem.Allocator,
         proj_items: []const plan.ProjectItem,
         filter_pred: plan.Expr,
         morsel_src: *parallel.MorselSource,
+        profile_enabled: bool,
         // Per-thread output: allocated via thread-local c_allocator arena.
         // Rows are moved into the global arena after completion.
         row_arena: std.heap.ArenaAllocator,
         rows: std.ArrayListUnmanaged([]?Value),
+        scan_ns: u64 = 0,
+        filter_ns: u64 = 0,
+        project_ns: u64 = 0,
         err: ?anyerror = null,
 
         fn work(self: *@This(), _: *parallel.MorselSource) void {
@@ -4944,28 +5073,40 @@ fn executeFilterProjectParallel(
             defer ta.deinit();
             const tall = ta.allocator();
 
-            // Per-thread QueryContext so FilterState.apply can lazily init its SIMD buffers.
-            var fake_arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
-            defer fake_arena.deinit();
-            var fake_ctx = QueryContext{ .parent_alloc = self.parent_alloc, .arena = fake_arena, .source = self.source, .profile = .{} };
-            var fs = FilterState{ .predicate = self.filter_pred };
+            const selection_buf = try tall.alloc(u32, parallel.default_morsel_size);
+            const mask_buf = try tall.alloc(i16, parallel.default_morsel_size);
+            const row_buf = try tall.alloc(?Value, self.source.schema().len);
+            @memset(row_buf, null);
 
             while (self.morsel_src.next()) |m| {
                 var ca = std.heap.ArenaAllocator.init(tall);
                 defer ca.deinit();
                 var c: DataChunk = undefined;
+                const scan_started = if (self.profile_enabled) profileNowNs() else 0;
                 try self.source.fetchRange(m.start, m.end - m.start, &c, ca.allocator());
+                if (self.profile_enabled) self.scan_ns +|= @intCast(@max(0, profileNowNs() - scan_started));
                 if (c.num_rows == 0) continue;
 
-                // SIMD filter: compacts c in-place, sets c.num_rows = passing rows.
-                try fs.apply(&c, &fake_ctx);
-                if (c.num_rows == 0) continue;
+                // Keep fetched columns immutable. GenericStoreBridge may expose native-width
+                // columns as zero-copy slices over a read-only mmap; physically compacting
+                // such a chunk writes into PROT_READ memory (the former Q20 crash).
+                const filter_started = if (self.profile_enabled) profileNowNs() else 0;
+                const selected = try kernels.evalExprSelection(
+                    self.filter_pred,
+                    c,
+                    selection_buf[0..c.num_rows],
+                    mask_buf[0..c.num_rows],
+                    tall,
+                );
+                if (self.profile_enabled) self.filter_ns +|= @intCast(@max(0, profileNowNs() - filter_started));
+                if (selected.isEmpty()) continue;
 
                 // Project matching rows to output.
-                for (0..c.num_rows) |r| {
-                    const row_buf = try ca.allocator().alloc(?Value, c.columns.len);
+                const project_started = if (self.profile_enabled) profileNowNs() else 0;
+                for (selected.slice()) |physical_row| {
                     for (c.columns, 0..) |col, j| {
-                        row_buf[j] = if (col.isRowNull(r)) null else col.data.get(r);
+                        if (col.pruned) continue;
+                        row_buf[j] = if (col.isRowNull(physical_row)) null else col.data.get(physical_row);
                     }
                     const out_row = try row_alloc.alloc(?Value, self.proj_items.len);
                     for (self.proj_items, 0..) |item, i| {
@@ -4973,6 +5114,7 @@ fn executeFilterProjectParallel(
                     }
                     try self.rows.append(row_alloc, out_row);
                 }
+                if (self.profile_enabled) self.project_ns +|= @intCast(@max(0, profileNowNs() - project_started));
             }
         }
     };
@@ -4982,12 +5124,12 @@ fn executeFilterProjectParallel(
     for (par_ctxs) |*pc| {
         pc.* = .{
             .source = ctx.source,
-            .parent_alloc = ctx.resultAllocator(),
             .proj_items = proj_items,
             .filter_pred = filter_pred,
             .morsel_src = &morsel_src,
+            .profile_enabled = ctx.profile.enabled,
             .row_arena = std.heap.ArenaAllocator.init(std.heap.c_allocator),
-            .rows = .{ .items = &.{}, .capacity = 0 },
+            .rows = .empty,
         };
     }
     try parallel.parallelFor(alloc, ParFpCtx, ParFpCtx.work, par_ctxs, &morsel_src);
@@ -4995,6 +5137,9 @@ fn executeFilterProjectParallel(
     // Merge per-thread row lists into global output; copy strings to query arena.
     var rl = RowList.init(out_metas);
     for (par_ctxs) |*pc| {
+        ctx.profile.scan_ns +|= pc.scan_ns;
+        ctx.profile.filter_ns +|= pc.filter_ns;
+        ctx.profile.project_ns +|= pc.project_ns;
         if (pc.err) |e| {
             for (par_ctxs) |*p2| p2.row_arena.deinit();
             return e;
@@ -5182,6 +5327,142 @@ fn executeHashAgg(
 
 /// Heap-based top-K selection: O(n log k) time, O(k) extra memory.
 /// Returns exactly min(k, n) rows in sorted order.
+/// Total-order comparator shared by TopK/OrderBy and the streaming collector.
+/// `lessThan(a, b)` means a should appear before b in the output.
+fn rowLessThan(keys: []const plan.SortKey, a: []?Value, b: []?Value) bool {
+    for (keys) |key| {
+        const av: ?Value = if (key.col_idx < a.len) a[key.col_idx] else null;
+        const bv: ?Value = if (key.col_idx < b.len) b[key.col_idx] else null;
+        const ord: std.math.Order = if (av != null and bv != null)
+            Value.order(av.?, bv.?)
+        else if (av == null and bv == null)
+            .eq
+        else if (av == null)
+            .lt
+        else
+            .gt;
+        if (ord == .eq) continue;
+        return if (key.desc) ord == .gt else ord == .lt;
+    }
+    // Stable tiebreaker: full lexicographic comparison on all row values.
+    for (0..@min(a.len, b.len)) |ci| {
+        const av2 = a[ci];
+        const bv2 = b[ci];
+        const ord2: std.math.Order = if (av2 != null and bv2 != null)
+            Value.order(av2.?, bv2.?)
+        else if (av2 == null and bv2 == null) .eq else if (av2 == null) .lt else .gt;
+        if (ord2 == .eq) continue;
+        return ord2 == .lt;
+    }
+    return a.len < b.len;
+}
+
+const TopKSortCtx = struct {
+    keys: []const plan.SortKey,
+    fn lessThan(self: @This(), a: []?Value, b: []?Value) bool {
+        return rowLessThan(self.keys, a, b);
+    }
+};
+
+/// Streaming top-K sink. Keeps only the best K rows in a worst-at-root heap,
+/// so hash aggregation can avoid materialising every group into a RowList.
+const TopKCollector = struct {
+    alloc: std.mem.Allocator,
+    keys: []const plan.SortKey,
+    k: usize,
+    heap: [][]?Value,
+    len: usize = 0,
+    count_col: ?usize = null,
+
+    fn init(alloc: std.mem.Allocator, keys: []const plan.SortKey, k: usize) !TopKCollector {
+        var count_col: ?usize = null;
+        if (keys.len == 1 and keys[0].desc) count_col = keys[0].col_idx;
+        return .{
+            .alloc = alloc,
+            .keys = keys,
+            .k = k,
+            .heap = try alloc.alloc([]?Value, k),
+            .count_col = count_col,
+        };
+    }
+
+    /// Fast reject for `ORDER BY count DESC LIMIT k`: if the candidate count is
+    /// below the current worst, skip building/duplicating the row entirely.
+    fn shouldSkipCount(self: *const TopKCollector, count: u64) bool {
+        if (self.len < self.k) return false;
+        const col = self.count_col orelse return false;
+        const root = self.heap[0];
+        if (col >= root.len) return false;
+        const rv = root[col] orelse return false;
+        const root_count: u64 = switch (rv) {
+            .uint64 => |v| v,
+            .int64 => |v| if (v < 0) 0 else @intCast(v),
+            else => return false,
+        };
+        return count < root_count;
+    }
+
+    fn offer(self: *TopKCollector, row: []?Value) void {
+        if (self.k == 0) return;
+        if (self.len < self.k) {
+            self.heap[self.len] = row;
+            self.len += 1;
+            var i = self.len - 1;
+            while (i > 0) {
+                const parent = (i - 1) / 2;
+                if (rowLessThan(self.keys, self.heap[parent], self.heap[i])) {
+                    const tmp = self.heap[i];
+                    self.heap[i] = self.heap[parent];
+                    self.heap[parent] = tmp;
+                    i = parent;
+                } else break;
+            }
+        } else if (rowLessThan(self.keys, row, self.heap[0])) {
+            self.heap[0] = row;
+            var i: usize = 0;
+            while (true) {
+                const l = 2 * i + 1;
+                const r = 2 * i + 2;
+                var smallest = i;
+                if (l < self.len and rowLessThan(self.keys, self.heap[smallest], self.heap[l])) smallest = l;
+                if (r < self.len and rowLessThan(self.keys, self.heap[smallest], self.heap[r])) smallest = r;
+                if (smallest == i) break;
+                const tmp = self.heap[i];
+                self.heap[i] = self.heap[smallest];
+                self.heap[smallest] = tmp;
+                i = smallest;
+            }
+        }
+    }
+
+    fn finish(self: *TopKCollector, metas: []result.ColMeta) !RowList {
+        std.sort.pdq([]?Value, self.heap[0..self.len], TopKSortCtx{ .keys = self.keys }, TopKSortCtx.lessThan);
+        var rl = RowList.init(metas);
+        for (self.heap[0..self.len]) |row| try rl.append(self.alloc, row);
+        return rl;
+    }
+};
+
+test "TopKCollector keeps best k by count desc" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const keys = [_]plan.SortKey{.{ .col_idx = 0, .desc = true, .nulls_first = false }};
+    var c = try TopKCollector.init(a, &keys, 3);
+    for ([_]u64{ 5, 1, 9, 3, 7 }) |v| {
+        const row = try a.alloc(?Value, 1);
+        row[0] = .{ .uint64 = v };
+        c.offer(row);
+    }
+    const metas = [_]result.ColMeta{.{ .name = "c", .col_type = .uint64, .ch_type = "UInt64" }};
+    const rl = try c.finish(&metas);
+    try std.testing.expectEqual(@as(usize, 3), rl.rows.items.len);
+    try std.testing.expectEqual(@as(u64, 9), rl.rows.items[0][0].?.uint64);
+    try std.testing.expectEqual(@as(u64, 7), rl.rows.items[1][0].?.uint64);
+    try std.testing.expectEqual(@as(u64, 5), rl.rows.items[2][0].?.uint64);
+}
+
 fn executeTopK(inner: RowList, keys: []const plan.SortKey, k: usize, alloc: std.mem.Allocator) !RowList {
     const rows = inner.rows.items;
     if (rows.len == 0 or k == 0) return RowList.init(inner.metas);
@@ -5363,7 +5644,7 @@ fn executeTopKLateMat(
 
     // Pre-compile LikeGuards from filter predicate (once per query).
     // Used in phase 1 to fast-reject rows before evalExpr.
-    var phase1_like_guards_list = std.ArrayListUnmanaged(LikeGuard){ .items = &.{}, .capacity = 0 };
+    var phase1_like_guards_list = std.ArrayListUnmanaged(LikeGuard).empty;
     collectLikeGuards(filter_pred, &phase1_like_guards_list, alloc);
     const phase1_like_guards = phase1_like_guards_list.items;
 
@@ -6673,6 +6954,110 @@ test "executePlan: batch filter + project" {
     try std.testing.expectEqual(Value{ .int64 = 15 }, rs.get(0, 2).?);
 }
 
+test "executePlan: parallel filter project keeps zero-copy input immutable" {
+    const alloc = std.testing.allocator;
+    const row_count = 2_000_000;
+    const target_row = 1000;
+
+    const RangeSource = struct {
+        values: []i64,
+
+        const metas = [_]result.ColMeta{
+            .{ .name = "UserID", .col_type = .int64 },
+        };
+
+        fn nextChunk(_: *anyopaque, _: *DataChunk, _: *QueryContext) !bool {
+            return false;
+        }
+
+        fn reset(_: *anyopaque) void {}
+
+        fn schema(_: *anyopaque) []const result.ColMeta {
+            return &metas;
+        }
+
+        fn rowCount(ptr: *anyopaque) u64 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.values.len;
+        }
+
+        fn fetchRange(
+            ptr: *anyopaque,
+            start: u64,
+            n: usize,
+            out: *DataChunk,
+            range_alloc: std.mem.Allocator,
+        ) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const begin: usize = @intCast(start);
+            const end = @min(begin + n, self.values.len);
+            const actual = end - begin;
+            const columns = try range_alloc.alloc(chunk.Column, 1);
+            const null_mask = try range_alloc.alloc(u64, chunk.nullMaskWords(actual));
+            @memset(null_mask, 0);
+            columns[0] = .{
+                .name = "UserID",
+                .data = .{ .int64 = self.values[begin..end] },
+                .null_mask = null_mask,
+                .len = actual,
+            };
+            out.* = .{
+                .columns = columns,
+                .num_rows = actual,
+                .arena = std.heap.ArenaAllocator.init(range_alloc),
+            };
+        }
+
+        fn setNeededCols(_: *anyopaque, _: ?[]const []const u8) void {}
+
+        const vtable = SourceIface.VTable{
+            .nextChunk = nextChunk,
+            .reset = reset,
+            .schema = schema,
+            .rowCount = rowCount,
+            .fetchRange = fetchRange,
+            .setNeededCols = setNeededCols,
+        };
+
+        fn iface(self: *@This()) SourceIface {
+            return .{ .ptr = self, .vtable = &vtable };
+        }
+    };
+
+    const values = try alloc.alloc(i64, row_count);
+    defer alloc.free(values);
+    for (values, 0..) |*value, i| value.* = @intCast(i);
+    var source = RangeSource{ .values = values };
+
+    var eq = plan.BinOp{
+        .left = .{ .col_ref = .{ .index = 0, .name = "UserID" } },
+        .right = .{ .lit_i64 = target_row },
+    };
+    var items = [_]plan.ProjectItem{.{
+        .expr = .{ .col_ref = .{ .index = 0, .name = "UserID" } },
+        .alias = "UserID",
+        .out_type = .int64,
+    }};
+    const scan_node = plan.PhysicalNode{ .part_scan = .{ .db = "db", .table = "hits", .columns = &.{}, .filter = null } };
+    const filter_node = plan.PhysicalNode{ .filter = .{
+        .input = @constCast(&scan_node),
+        .predicate = .{ .eq = &eq },
+    } };
+    const project_node = plan.PhysicalNode{ .project = .{
+        .input = @constCast(&filter_node),
+        .items = &items,
+    } };
+
+    var ctx = QueryContext.init(alloc, source.iface());
+    defer ctx.deinit();
+    var rs = try executePlan(&project_node, &ctx);
+    defer rs.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), rs.num_rows);
+    try std.testing.expectEqual(Value{ .int64 = target_row }, rs.get(0, 0).?);
+    try std.testing.expectEqual(@as(i64, 0), values[0]);
+}
+
 test "ProjectState applySelected projects logical rows" {
     const alloc = std.testing.allocator;
 
@@ -6732,7 +7117,7 @@ fn executeHashAggParallelPairCount(
 ) !?RowList {
     if (!ctx.source.supportsRange()) return null;
     const total_rows = ctx.source.rowCount();
-    if (total_rows < 2_000_000) return null;
+    if (total_rows < 1_000_000) return null;
     const n_threads = parallel.defaultThreads();
     if (n_threads <= 1) return null;
     const alloc = ctx.allocator();
@@ -6951,7 +7336,7 @@ fn executeHashAggParallelPairCount(
         const sc2_ctxs = try alloc.alloc(P2Scatter, n_threads);
         for (sc2_ctxs) |*sc| {
             sc.* = .{
-                .bufs = [_]std.ArrayListUnmanaged(P2Rec){.{ .items = &.{}, .capacity = 0 }} ** N_P2,
+                .bufs = @as([N_P2]std.ArrayListUnmanaged(P2Rec), @splat(.empty)),
                 .buf_arena = std.heap.ArenaAllocator.init(std.heap.c_allocator),
                 .morsel_src = undefined,
                 .ri64 = ri64,
@@ -7314,7 +7699,7 @@ fn executeHashAggParallelTripleCount(
 ) !?RowList {
     if (!ctx.source.supportsRange()) return null;
     const total_rows = ctx.source.rowCount();
-    if (total_rows < 2_000_000) return null;
+    if (total_rows < 1_000_000) return null;
     const n_threads = parallel.defaultThreads();
     if (n_threads <= 1) return null;
     const alloc = ctx.allocator();
@@ -7334,6 +7719,7 @@ fn executeHashAggParallelTripleCount(
         dp_col: usize,
         dp_unit: DatePartUnit,
         str_col: usize,
+        dp_scale: i64, // 1 for DateTime64(ms), 1000 for raw second timestamps
         key_order: [3]u8, // key_order[output_pos] = 0→n0, 1→dp, 2→str
     };
 
@@ -7402,6 +7788,7 @@ fn executeHashAggParallelTripleCount(
             .dp_col = dp_col,
             .dp_unit = dp_unit,
             .str_col = str_ci,
+            .dp_scale = if (sm[dp_col].col_type == .datetime64_ms) 1 else 1000,
             .key_order = order,
         };
     };
@@ -7479,7 +7866,7 @@ fn executeHashAggParallelTripleCount(
                     if (m.end > n0s.len or m.end > dps.len or m.end >= offs.len) break :raw_scan;
                     for (m.start..m.end) |row| {
                         const n0 = n0s[row];
-                        const n1 = @This().datePart(self.td.dp_unit, dps[row]);
+                        const n1 = @This().datePart(self.td.dp_unit, dps[row] * self.td.dp_scale);
                         const lo: usize = @intCast(offs[row]);
                         const hi: usize = @intCast(offs[row + 1]);
                         if (hi > bytes.len or lo > hi) continue;
@@ -7537,7 +7924,7 @@ fn executeHashAggParallelTripleCount(
     const per_worker_bufs = try alloc.alloc([]std.ArrayListUnmanaged(ht.TripleCountHashTable.Slot), n_threads);
     for (per_worker_bufs, 0..) |*pb, t| {
         pb.* = try ht_arenas[t].allocator().alloc(std.ArrayListUnmanaged(ht.TripleCountHashTable.Slot), N_TRIPLE_PARTS);
-        for (pb.*) |*list| list.* = .{ .items = &.{}, .capacity = 0 };
+        for (pb.*) |*list| list.* = .empty;
     }
 
     const raw_n0_pre = ctx.source.getRawInt64Col(sm[td.n0_col].name);
@@ -7630,16 +8017,29 @@ fn executeHashAggParallelTripleCount(
 
     const out_metas = try buildAggResultMetas(keys, aggs, alloc);
     var rl = RowList.init(out_metas);
+    var topk: ?TopKCollector = if (!topkCollectorDisabled() and top_k > 0 and sort_keys.len > 0)
+        try TopKCollector.init(alloc, sort_keys, top_k)
+    else
+        null;
 
     const EmitCtxTriple = struct {
         rl: *RowList,
+        topk: ?*TopKCollector,
         alloc: std.mem.Allocator,
         key_order: [3]u8,
     };
-    var emit_ctx = EmitCtxTriple{ .rl = &rl, .alloc = alloc, .key_order = td.key_order };
+    var emit_ctx = EmitCtxTriple{
+        .rl = &rl,
+        .topk = if (topk) |*tk| tk else null,
+        .alloc = alloc,
+        .key_order = td.key_order,
+    };
     for (0..N_TRIPLE_PARTS) |p| {
         part_hts_triple[p].iterate(&emit_ctx, struct {
             fn cb(ec: *EmitCtxTriple, n0: i64, n1: i64, s: []const u8, count: u64) void {
+                if (ec.topk) |tk| {
+                    if (tk.shouldSkipCount(count)) return;
+                }
                 const row = ec.alloc.alloc(?Value, 4) catch return;
                 for (ec.key_order, 0..) |kind, i| {
                     row[i] = switch (kind) {
@@ -7649,14 +8049,12 @@ fn executeHashAggParallelTripleCount(
                     };
                 }
                 row[3] = Value{ .uint64 = count };
-                ec.rl.append(ec.alloc, row) catch {};
+                if (ec.topk) |tk| tk.offer(row) else ec.rl.append(ec.alloc, row) catch {};
             }
         }.cb);
     }
 
-    if (top_k > 0 and sort_keys.len > 0 and rl.rows.items.len > top_k) {
-        return try executeTopK(rl, sort_keys, top_k, alloc);
-    }
+    if (topk) |*tk| return try tk.finish(out_metas);
     return rl;
 }
 
@@ -8309,7 +8707,7 @@ fn executeHashAggParallelStrKey(
                                 _ = extractAndStrConds(fp, &psc_buf, &psc_n, true);
 
                                 // Build like guards for fast pre-filtering.
-                                var guards_list = std.ArrayListUnmanaged(LikeGuard){ .items = &.{}, .capacity = 0 };
+                                var guards_list = std.ArrayListUnmanaged(LikeGuard).empty;
                                 collectLikeGuards(fp, &guards_list, calloc);
                                 const guards = guards_list.items;
 
@@ -8874,6 +9272,18 @@ fn executeHashAggParallelStrKey(
     const out_metas = try buildAggResultMetas(keys, aggs, alloc);
     var rl = RowList.init(out_metas);
 
+    // Streaming top-K: for `ORDER BY count DESC LIMIT k`, keep only the best
+    // K groups while emitting instead of materialising every group into RowList.
+    var topk: ?TopKCollector = null;
+    var topk_sort_ai: ?usize = null;
+    if (!topkCollectorDisabled() and top_k > 0 and sort_keys.len == 1 and sort_keys[0].desc) {
+        const sc = sort_keys[0].col_idx;
+        if (sc >= keys.len and sc < keys.len + aggs.len and compact_kinds[sc - keys.len] == .count) {
+            topk = try TopKCollector.init(alloc, sort_keys, top_k);
+            topk_sort_ai = sc - keys.len;
+        }
+    }
+
     // Build emit_int_key_n for emit decoding (same order as in runWork: col_ref non-str + lit_i64).
     // When all int keys are constants, int_prefix_len2 = 0 (not encoded in composite key).
     var emit_int_key_n: usize = 0;
@@ -8895,6 +9305,8 @@ fn executeHashAggParallelStrKey(
 
     const EmitCtx = struct {
         rl: *RowList,
+        topk: ?*TopKCollector,
+        topk_sort_ai: ?usize,
         alloc: std.mem.Allocator,
         aggs: []const plan.ProjectItem,
         kinds: []const ht.CompactAggKind,
@@ -8911,6 +9323,8 @@ fn executeHashAggParallelStrKey(
     const sm_emit = ctx.source.schema();
     var emit_ctx = EmitCtx{
         .rl = &rl,
+        .topk = if (topk) |*tk| tk else null,
+        .topk_sort_ai = topk_sort_ai,
         .alloc = alloc,
         .aggs = aggs,
         .kinds = compact_kinds,
@@ -8926,6 +9340,11 @@ fn executeHashAggParallelStrKey(
     };
     const EmitCb = struct {
         fn cb(ec: *EmitCtx, composite: []const u8, vals: []const u64, slot: usize) void {
+            if (ec.topk) |tk| {
+                if (ec.topk_sort_ai) |ai| {
+                    if (ai < vals.len and tk.shouldSkipCount(vals[ai])) return;
+                }
+            }
             const row = ec.alloc.alloc(?Value, ec.keys.len + vals.len) catch return;
             // Decode composite key into row slots.
             // Format (with CASE WHEN):   [int_prefix][cw_len:u16LE][cw_bytes][str_bytes]
@@ -8993,7 +9412,7 @@ fn executeHashAggParallelStrKey(
                 }
             }
             emitCompactValsWithSidecar(vals, ec.kinds, ec.aggs, row[ec.keys.len..], ec.str_ht, slot, ec.sidecar_idx);
-            ec.rl.append(ec.alloc, row) catch {};
+            if (ec.topk) |tk| tk.offer(row) else ec.rl.append(ec.alloc, row) catch {};
         }
     };
     // Emit from all N_PARTS result hash tables.
@@ -9002,6 +9421,7 @@ fn executeHashAggParallelStrKey(
         pht.iterateWithSlot(&emit_ctx, EmitCb.cb);
     }
 
+    if (topk) |*tk| return try tk.finish(out_metas);
     return try finalizeAggRows(rl, sort_keys, top_k, alloc);
 }
 
@@ -10788,8 +11208,8 @@ fn executeTwoPhaseHashAgg(
     const N_PARTS: usize = 128;
     const n_keys = keys.len;
     const n_aggs = aggs.len;
-    var key_ci: [4]usize = [_]usize{0} ** 4;
-    var key_offs: [4]i64 = [_]i64{0} ** 4;
+    var key_ci: [4]usize = @as([4]usize, @splat(0));
+    var key_offs: [4]i64 = @as([4]i64, @splat(0));
     for (keys, 0..) |k, i| {
         switch (k.expr) {
             .col_ref => |cr| {
@@ -11353,7 +11773,7 @@ fn executeTwoPhaseHashAgg(
     const scatter_ctxs = try alloc.alloc(ScatterCtx, n_threads);
     for (scatter_ctxs) |*sc| {
         sc.* = .{
-            .bufs = [_]std.ArrayListUnmanaged(u64){.{ .items = &.{}, .capacity = 0 }} ** N_PARTS,
+            .bufs = @as([N_PARTS]std.ArrayListUnmanaged(u64), @splat(.empty)),
             .buf_arena = std.heap.ArenaAllocator.init(std.heap.c_allocator),
             .source = ctx.source,
             .morsel_src = &morsel_src1,
@@ -12117,8 +12537,8 @@ fn executeTwoPhaseHashAggStrKeySimple(
         err: ?anyerror = null,
         // Raw int column data for fast SIMD filter (bypasses i16→i64 / i32→i64 widen in fetchRange).
         // int16 → 32-lane SIMD; int32 → 16-lane SIMD; vs 8-lane for widened i64.
-        raw_ic_i16: [16]?[]const i16 = [_]?[]const i16{null} ** 16,
-        raw_ic_i32: [16]?[]const i32 = [_]?[]const i32{null} ** 16,
+        raw_ic_i16: [16]?[]const i16 = @as([16]?[]const i16, @splat(null)),
+        raw_ic_i32: [16]?[]const i32 = @as([16]?[]const i32, @splat(null)),
         // Raw string data for key column: skip building 122 880-entry fat-pointer array in fetchRange.
         // When set, key_col in DataChunk is decoded as bool_u8 (1=non-empty) via setStringNonEmptyBool.
         raw_key_offsets: ?[]const u64 = null,
@@ -12610,8 +13030,8 @@ fn executeTwoPhaseHashAggStrKeySimple(
     // For the key (string) column, grab offsets+bytes so doWork can skip the
     // per-morsel fat-pointer array allocation in fetchRange.
     const src_schema = ctx.source.schema();
-    var raw_ic_i16_pre: [16]?[]const i16 = [_]?[]const i16{null} ** 16;
-    var raw_ic_i32_pre: [16]?[]const i32 = [_]?[]const i32{null} ** 16;
+    var raw_ic_i16_pre: [16]?[]const i16 = @as([16]?[]const i16, @splat(null));
+    var raw_ic_i32_pre: [16]?[]const i32 = @as([16]?[]const i32, @splat(null));
     var n_raw_ic_covered: usize = 0; // count of int conditions covered by raw slices
     const n_ic_total: usize = if (int_filter) |ics| ics.len else 0;
     if (int_filter) |ics| {
@@ -12686,7 +13106,7 @@ fn executeTwoPhaseHashAggStrKeySimple(
     const scatter_ctxs = try alloc.alloc(ScatterCtx, n_threads);
     for (scatter_ctxs) |*sc| {
         sc.* = .{
-            .bufs = [_]std.ArrayListUnmanaged(u64){.{ .items = &.{}, .capacity = 0 }} ** N_PARTS,
+            .bufs = @as([N_PARTS]std.ArrayListUnmanaged(u64), @splat(.empty)),
             .buf_arena = std.heap.ArenaAllocator.init(std.heap.c_allocator),
             .source = ctx.source,
             .morsel_src = &morsel_src1,
@@ -13161,7 +13581,7 @@ fn executeTwoPhaseHashAggStrKeySimple(
         .current_ht = null,
         .rl = RowList.init(out_metas),
         .alloc = alloc,
-        .heap = .{ .items = &.{}, .capacity = 0 },
+        .heap = .empty,
         .heap_k = if (use_heap) top_k else 0,
         .sort_keys = sort_keys,
     };

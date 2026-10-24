@@ -6,30 +6,22 @@ const std = @import("std");
 /// SIMD sum of i16 slice, sign-extended and returned as i64 (wrapping).
 /// Uses 16-wide vectors (256-bit with AVX2).
 pub fn sumI16(values: []const i16) i64 {
-    const LANES = 32;
-    const V = @Vector(LANES, i16);
-    var acc: V = @splat(0);
-    var i: usize = 0;
-    while (i + LANES <= values.len) : (i += LANES) {
-        const v: V = values[i..][0..LANES].*;
-        acc +%= v;
-    }
-    var total: i32 = @reduce(.Add, acc);
-    while (i < values.len) : (i += 1) total +%= values[i];
-    return @as(i64, total);
+    return sumI16ToI64(values);
 }
 
 /// Correct SIMD sum of i16 slice with widened i32 lanes.
 pub fn sumI16ToI64(values: []const i16) i64 {
+    // Accumulate in i64 lanes: an i32 accumulator overflows at ~2.1B, which is
+    // reachable with a few million i16 rows (e.g. ClickBench ResolutionWidth).
     const LANES = 16;
     const V16 = @Vector(LANES, i16);
-    const V32 = @Vector(LANES, i32);
-    var acc: V32 = @splat(0);
+    const V64 = @Vector(LANES, i64);
+    var acc: V64 = @splat(0);
     var i: usize = 0;
     while (i + LANES <= values.len) : (i += LANES) {
         const v16: V16 = values[i..][0..LANES].*;
-        const v32: V32 = @intCast(v16);
-        acc +%= v32;
+        const v64: V64 = @intCast(v16);
+        acc +%= v64;
     }
     var total: i64 = @reduce(.Add, acc);
     while (i < values.len) : (i += 1) total +%= values[i];
@@ -345,4 +337,14 @@ pub fn filterI64(
         },
     }
     return n;
+}
+
+test "sumI16ToI64 does not overflow i32" {
+    const alloc = std.testing.allocator;
+    const n = 1_000_000;
+    const data = try alloc.alloc(i16, n);
+    defer alloc.free(data);
+    @memset(data, 3000);
+    try std.testing.expectEqual(@as(i64, 3_000_000_000), sumI16ToI64(data));
+    try std.testing.expectEqual(@as(i64, 3_000_000_000), sumI16(data));
 }
