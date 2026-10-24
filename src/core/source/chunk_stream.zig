@@ -1,5 +1,5 @@
 /// Owned chunk stream source. Used by the new Sink-based execution path so a
-/// breaker can expose its output as chunks instead of a `RowList`.
+/// breaker can expose its output as chunks instead of a `row buffer`.
 const std = @import("std");
 const chunk = @import("../chunk.zig");
 const result = @import("../result.zig");

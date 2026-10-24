@@ -1701,20 +1701,20 @@ pub const PhysicalOperator = union(enum) {
 
 /// Internal row list used during plan execution.
 /// Memory owned by the QueryContext arena.
-pub const RowList = struct {
+pub const RowBuffer = struct {
     metas: []result.ColMeta,
     rows: std.ArrayListUnmanaged([]?Value),
 
-    pub fn init(metas: []result.ColMeta) RowList {
+    pub fn init(metas: []result.ColMeta) RowBuffer {
         return .{ .metas = metas, .rows = .empty };
     }
 
-    pub fn append(self: *RowList, alloc: std.mem.Allocator, row: []?Value) !void {
+    pub fn append(self: *RowBuffer, alloc: std.mem.Allocator, row: []?Value) !void {
         try self.rows.append(alloc, row);
     }
 
     /// Materialise into a ResultSet.  All values are duped into a fresh arena.
-    pub fn toResultSet(self: RowList, parent_alloc: std.mem.Allocator) !ResultSet {
+    pub fn toResultSet(self: RowBuffer, parent_alloc: std.mem.Allocator) !ResultSet {
         var arena = std.heap.ArenaAllocator.init(parent_alloc);
         const ra = arena.allocator();
 
@@ -1784,7 +1784,7 @@ pub const RowList = struct {
     }
 };
 
-fn cloneValueForRowList(v: Value, alloc: std.mem.Allocator) !Value {
+fn cloneValueForRowBuffer(v: Value, alloc: std.mem.Allocator) !Value {
     return switch (v) {
         .string => |s| Value{ .string = try alloc.dupe(u8, s) },
         .array_string => |arr| blk: {
@@ -1807,12 +1807,12 @@ fn cloneMetas(metas: []const result.ColMeta, alloc: std.mem.Allocator) ![]result
     return out;
 }
 
-fn cloneRowList(src: RowList, alloc: std.mem.Allocator) !RowList {
-    var rl = RowList.init(try cloneMetas(src.metas, alloc));
+fn cloneRowBuffer(src: RowBuffer, alloc: std.mem.Allocator) !RowBuffer {
+    var rl = RowBuffer.init(try cloneMetas(src.metas, alloc));
     for (src.rows.items) |src_row| {
         const row = try alloc.alloc(?Value, src_row.len);
         for (src_row, 0..) |v_opt, i| {
-            row[i] = if (v_opt) |v| try cloneValueForRowList(v, alloc) else null;
+            row[i] = if (v_opt) |v| try cloneValueForRowBuffer(v, alloc) else null;
         }
         try rl.append(alloc, row);
     }
@@ -2002,13 +2002,10 @@ pub fn executePlan(
         return rs;
     }
 
-    // ── Breaker path: existing RowList → ResultSet (single copy) ───────────
+    // ── Breaker path: existing RowBuffer → ResultSet (single copy) ───────────
     ctx.profile.breaker_path += 1;
-    const er = try executeNode(node, ctx);
-    return switch (er) {
-        .rows => |rl| rl.toResultSet(result_alloc),
-        .chunks => |res| chunkResultToResultSet(res, ctx.allocator(), result_alloc),
-    };
+    const res = try executeNode(node, ctx);
+    return chunkResultToResultSet(res, ctx.allocator(), result_alloc);
 }
 
 fn findProjectItems(node: *const plan.PhysicalNode) ?[]const plan.ProjectItem {
@@ -2023,7 +2020,7 @@ fn findProjectItems(node: *const plan.PhysicalNode) ?[]const plan.ProjectItem {
 }
 
 /// Stream a scannable node (scan/filter/project/limit) directly to a ResultSink.
-/// Avoids building a RowList by operating on DataChunks throughout.
+/// Avoids building a RowBuffer by operating on DataChunks throughout.
 fn executeScannableToSink(
     node: *const plan.PhysicalNode,
     ctx: *QueryContext,
@@ -2124,18 +2121,6 @@ fn executeScannableToSink(
 }
 const ChunkResult = chunk_sink_mod.ChunkSink.Result;
 
-const ExecResult = union(enum) {
-    rows: RowList,
-    chunks: ChunkResult,
-
-    fn toRows(self: *ExecResult, alloc: std.mem.Allocator) !RowList {
-        return switch (self.*) {
-            .rows => |rl| rl,
-            .chunks => |res| try chunkResultToRowList(res, alloc),
-        };
-    }
-};
-
 fn projectChunkResult(res: ChunkResult, items: []const plan.ProjectItem, ctx: *QueryContext) !ChunkResult {
     var state = ProjectState{ .items = items };
     for (res.chunks) |*c| try state.apply(c, ctx);
@@ -2169,6 +2154,19 @@ fn limitChunkResult(res: ChunkResult, limit: u64, offset: u64, ctx: *QueryContex
     return try sink.finishResult();
 }
 
+fn filterChunkResult(res: ChunkResult, predicate: plan.Expr, ctx: *QueryContext) !ChunkResult {
+    var state = FilterState{ .predicate = predicate };
+    for (res.chunks) |*c| try state.apply(c, ctx);
+    return res;
+}
+
+fn rowListToChunkResult(rl: RowBuffer, alloc: std.mem.Allocator) !ChunkResult {
+    var sink = try chunk_sink_mod.ChunkSink.init(alloc, rl.metas);
+    defer sink.deinit();
+    for (rl.rows.items) |row| try sink.append(row);
+    return try sink.finishResult();
+}
+
 fn chunkResultToResultSet(res: ChunkResult, query_alloc: std.mem.Allocator, result_alloc: std.mem.Allocator) !ResultSet {
     var sink = ResultSink.init(result_alloc);
     for (res.chunks) |c| try sink.consume(c);
@@ -2177,65 +2175,35 @@ fn chunkResultToResultSet(res: ChunkResult, query_alloc: std.mem.Allocator, resu
     return try sink.finish();
 }
 
-fn rowListToChunkResult(rl: RowList, alloc: std.mem.Allocator) !ChunkResult {
-    var sink = try chunk_sink_mod.ChunkSink.init(alloc, rl.metas);
-    defer sink.deinit();
-    for (rl.rows.items) |row| try sink.append(row);
-    return try sink.finishResult();
-}
-
-fn filterChunkResult(res: ChunkResult, predicate: plan.Expr, ctx: *QueryContext) !ChunkResult {
-    var state = FilterState{ .predicate = predicate };
-    for (res.chunks) |*c| try state.apply(c, ctx);
-    return res;
-}
-
-fn executeNode(node: *const plan.PhysicalNode, ctx: *QueryContext) !ExecResult {
+fn executeNode(node: *const plan.PhysicalNode, ctx: *QueryContext) !ChunkResult {
     const alloc = ctx.allocator();
     switch (node.*) {
         .chunk_source => |cs| {
-            const inner = try executeNode(cs.input, ctx);
-            return switch (inner) {
-                .rows => |rl| .{ .rows = try cloneRowList(rl, alloc) },
-                .chunks => inner,
-            };
+            return try executeNode(cs.input, ctx);
         },
         .part_scan, .mem_scan => {
             const phase_started = ctx.profile.timestamp();
             defer ctx.profile.addElapsed(.scan, phase_started);
             const schema_metas = ctx.source.schema();
-            const metas = try alloc.dupe(result.ColMeta, schema_metas);
-            var rl = RowList.init(metas);
+            var sink = try chunk_sink_mod.ChunkSink.init(alloc, schema_metas);
+            defer sink.deinit();
             var c: DataChunk = undefined;
             while (try ctx.source.nextChunk(&c, ctx)) {
-                for (0..c.num_rows) |r| {
-                    const row = try c.readRow(r, alloc);
-                    try rl.append(alloc, row);
-                }
+                try sink.consumeChunk(c);
             }
-            return .{ .rows = rl };
+            return try sink.finishResult();
         },
         .filter => |f| {
             const phase_started = ctx.profile.timestamp();
             defer ctx.profile.addElapsed(.filter, phase_started);
             const inner = try executeNode(f.input, ctx);
-            return switch (inner) {
-                .chunks => |res| .{ .chunks = try filterChunkResult(res, f.predicate, ctx) },
-                .rows => |inner_rl| blk: {
-                    var rl = RowList.init(inner_rl.metas);
-                    for (inner_rl.rows.items) |row| {
-                        const v_opt = try kernels.evalExpr(f.predicate, row, null, alloc);
-                        if (valueToBool(v_opt)) try rl.append(alloc, row);
-                    }
-                    break :blk .{ .rows = rl };
-                },
-            };
+            return try filterChunkResult(inner, f.predicate, ctx);
         },
         .project => |p| {
             const phase_started = ctx.profile.timestamp();
             defer ctx.profile.addElapsed(.project, phase_started);
             if (!projectItemsContainArrayJoin(p.items) and isScannable(p.input)) {
-                return .{ .rows = try executeLimitChunked(node, ctx) };
+                return try rowListToChunkResult(try executeLimitChunked(node, ctx), alloc);
             }
             if (p.input.* == .top_k) {
                 const tk = p.input.top_k;
@@ -2255,60 +2223,43 @@ fn executeNode(node: *const plan.PhysicalNode, ctx: *QueryContext) !ExecResult {
                     }
                     if (all_remapped) {
                         var proj_over_scan = plan.PhysicalNode{ .project = .{ .input = tk.input, .items = p.items } };
-                        return .{ .rows = try executeTopKFromScannable(&proj_over_scan, remapped_keys, @intCast(tk.k), ctx) };
+                        return try rowListToChunkResult(try executeTopKFromScannable(&proj_over_scan, remapped_keys, @intCast(tk.k), ctx), alloc);
                     }
                 }
             }
             const inner = try executeNode(p.input, ctx);
-            return switch (inner) {
-                .rows => |rl| .{ .rows = try projectRowList(rl, p.items, alloc) },
-                .chunks => |res| blk: {
-                    if (projectItemsContainArrayJoin(p.items)) {
-                        const rl = try chunkResultToRowList(res, alloc);
-                        break :blk .{ .rows = try projectRowList(rl, p.items, alloc) };
-                    }
-                    break :blk .{ .chunks = try projectChunkResult(res, p.items, ctx) };
-                },
-            };
+            if (projectItemsContainArrayJoin(p.items)) {
+                const rl = try chunkResultToRowBuffer(inner, alloc);
+                return try rowListToChunkResult(try projectRowBuffer(rl, p.items, alloc), alloc);
+            }
+            return try projectChunkResult(inner, p.items, ctx);
         },
         .limit => |lim| {
             if (isScannable(node)) {
-                return .{ .rows = try executeLimitChunked(node, ctx) };
+                return try rowListToChunkResult(try executeLimitChunked(node, ctx), alloc);
             }
             if (lim.offset == 0 and lim.input.* == .hash_agg and isScannable(lim.input.hash_agg.input)) {
                 const ha = lim.input.hash_agg;
                 const k = @as(usize, @intCast(lim.limit));
-                if (try executeHashAggParallelPairCount(ha.input, ha.keys, ha.aggs, &.{}, k, ctx)) |rl| return .{ .rows = rl };
+                if (try executeHashAggParallelPairCount(ha.input, ha.keys, ha.aggs, &.{}, k, ctx)) |rl| {
+                    return try rowListToChunkResult(rl, alloc);
+                }
             }
             const inner = try executeNode(lim.input, ctx);
-            return switch (inner) {
-                .chunks => |res| .{ .chunks = try limitChunkResult(res, lim.limit, lim.offset, ctx) },
-                .rows => |inner_rl| blk: {
-                    var rl = RowList.init(inner_rl.metas);
-                    var skipped: u64 = 0;
-                    var emitted: u64 = 0;
-                    for (inner_rl.rows.items) |row| {
-                        if (skipped < lim.offset) {
-                            skipped += 1;
-                            continue;
-                        }
-                        if (emitted >= lim.limit) break;
-                        try rl.append(alloc, row);
-                        emitted += 1;
-                    }
-                    break :blk .{ .rows = rl };
-                },
-            };
+            return try limitChunkResult(inner, lim.limit, lim.offset, ctx);
         },
         .scalar_agg => |sa| {
             const phase_started = ctx.profile.timestamp();
             defer ctx.profile.addElapsed(.aggregate, phase_started);
             if (isScannable(sa.input)) {
-                if (try executeScalarAggParallel(sa.input, sa.aggs, ctx)) |r| return .{ .rows = r };
-                return .{ .rows = try executeScalarAggChunked(sa.input, sa.aggs, ctx) };
+                if (try executeScalarAggParallel(sa.input, sa.aggs, ctx)) |r| {
+                    return try rowListToChunkResult(r, alloc);
+                }
+                return try rowListToChunkResult(try executeScalarAggChunked(sa.input, sa.aggs, ctx), alloc);
             }
-            var inner = try executeNode(sa.input, ctx);
-            return .{ .rows = try executeScalarAgg(try inner.toRows(alloc), sa.aggs, alloc) };
+            const inner = try executeNode(sa.input, ctx);
+            const rl = try chunkResultToRowBuffer(inner, alloc);
+            return try rowListToChunkResult(try executeScalarAgg(rl, sa.aggs, alloc), alloc);
         },
         .hash_agg => |ha| {
             const phase_started = ctx.profile.timestamp();
@@ -2316,54 +2267,38 @@ fn executeNode(node: *const plan.PhysicalNode, ctx: *QueryContext) !ExecResult {
             if (isScannable(ha.input)) {
                 return try executeHashAggScannable(ha, &.{}, 0, 0, ctx);
             }
-            var inner = try executeNode(ha.input, ctx);
-            return .{ .rows = try executeHashAgg(try inner.toRows(alloc), ha.keys, ha.aggs, alloc) };
+            const inner = try executeNode(ha.input, ctx);
+            const rl = try chunkResultToRowBuffer(inner, alloc);
+            return try rowListToChunkResult(try executeHashAgg(rl, ha.keys, ha.aggs, alloc), alloc);
         },
         .order_by => |ob| {
             const phase_started = ctx.profile.timestamp();
             defer ctx.profile.addElapsed(.topk, phase_started);
-            var inner = try executeNode(ob.input, ctx);
-            const sorted = try executeOrderBy(try inner.toRows(alloc), ob.keys, alloc);
-            return .{ .chunks = try rowListToChunkResult(sorted, alloc) };
+            const inner = try executeNode(ob.input, ctx);
+            const rl = try chunkResultToRowBuffer(inner, alloc);
+            return try rowListToChunkResult(try executeOrderBy(rl, ob.keys, alloc), alloc);
         },
         .top_k => |tk| {
             const phase_started = ctx.profile.timestamp();
             defer ctx.profile.addElapsed(.topk, phase_started);
             const k = @as(usize, @intCast(tk.k));
             if (isScannable(tk.input)) {
-                return .{ .rows = try executeTopKFromScannable(tk.input, tk.keys, k, ctx) };
+                return try rowListToChunkResult(try executeTopKFromScannable(tk.input, tk.keys, k, ctx), alloc);
             }
             if (tk.input.* == .hash_agg and isScannable(tk.input.hash_agg.input)) {
                 const ha = tk.input.hash_agg;
                 return try executeHashAggScannable(ha, tk.keys, k, @intCast(tk.offset), ctx);
             }
             const inner = try executeNode(tk.input, ctx);
-            switch (inner) {
-                .chunks => |res_in| {
-                    var res = res_in;
-                    const out = try executeTopKFromChunkResult(res, tk.keys, k, alloc);
-                    res.deinit(alloc);
-                    return .{ .rows = out };
-                },
-                .rows => |inner_rl| {
-                    if (k <= 1024 and inner_rl.rows.items.len > k * 4) {
-                        return .{ .rows = try executeTopK(inner_rl, tk.keys, k, alloc) };
-                    }
-                    const sorted = try executeOrderBy(inner_rl, tk.keys, alloc);
-                    const take = @min(sorted.rows.items.len, k);
-                    var rl = RowList.init(sorted.metas);
-                    for (sorted.rows.items[0..take]) |row| try rl.append(alloc, row);
-                    return .{ .rows = rl };
-                },
-            }
+            const out = try executeTopKFromChunkResult(inner, tk.keys, k, alloc);
+            return try rowListToChunkResult(out, alloc);
         },
         .hash_join => |hj| {
-            var left = try executeNode(hj.left, ctx);
-            var right = try executeNode(hj.right, ctx);
-            const left_rl = try left.toRows(alloc);
-            const right_rl = try right.toRows(alloc);
-            const joined = try executeHashJoin(left_rl, right_rl, hj, alloc);
-            return .{ .chunks = try rowListToChunkResult(joined, alloc) };
+            const left = try executeNode(hj.left, ctx);
+            const right = try executeNode(hj.right, ctx);
+            const left_rl = try chunkResultToRowBuffer(left, alloc);
+            const right_rl = try chunkResultToRowBuffer(right, alloc);
+            return try rowListToChunkResult(try executeHashJoin(left_rl, right_rl, hj, alloc), alloc);
         },
     }
 }
@@ -2374,13 +2309,13 @@ fn executeHashAggScannable(
     top_k: usize,
     top_offset: usize,
     ctx: *QueryContext,
-) !ExecResult {
+) !ChunkResult {
     // Strategy selection happens once in agg_strategy.select(). If the chosen
     // implementation rejects the query at runtime, try the one generic fallback
     // for its key shape (string-key or compact-int) and then the chunked path.
     // Older code probed up to eight strategies, rescanning the input each time.
     if (ha.strategy != .auto) {
-        if (try executeHashAggStrategy(ha.strategy, ha, sort_keys, top_k, top_offset, ctx)) |rl| return .{ .rows = rl };
+        if (try executeHashAggStrategy(ha.strategy, ha, sort_keys, top_k, top_offset, ctx)) |rl| return try rowListToChunkResult(rl, ctx.allocator());
     }
     var has_string_key = false;
     for (ha.keys) |k| {
@@ -2391,15 +2326,15 @@ fn executeHashAggScannable(
     }
     const fallback_strategy: plan.HashAggNode.Strategy = if (has_string_key) .string_key else .compact_int;
     if (fallback_strategy != ha.strategy) {
-        if (try executeHashAggStrategy(fallback_strategy, ha, sort_keys, top_k, top_offset, ctx)) |rl| return .{ .rows = rl };
+        if (try executeHashAggStrategy(fallback_strategy, ha, sort_keys, top_k, top_offset, ctx)) |rl| return try rowListToChunkResult(rl, ctx.allocator());
     }
     var res = try executeHashAggChunked(ha.input, ha.keys, ha.aggs, ctx);
     if (top_k > 0 and sort_keys.len > 0) {
         const out = try executeTopKFromChunkResult(res, sort_keys, top_k, ctx.allocator());
         res.deinit(ctx.allocator());
-        return .{ .rows = out };
+        return try rowListToChunkResult(out, ctx.allocator());
     }
-    return .{ .chunks = res };
+    return res;
 }
 
 fn executeHashAggStrategy(
@@ -2409,7 +2344,7 @@ fn executeHashAggStrategy(
     top_k: usize,
     top_offset: usize,
     ctx: *QueryContext,
-) !?RowList {
+) !?RowBuffer {
     return switch (strategy) {
         .auto => null,
         .compact_int, .single_int_count_topk, .single_int_distinct_topk, .grouped_distinct => blk: {
@@ -2440,11 +2375,11 @@ fn buildAggResultMetas(
 }
 
 fn finalizeAggRows(
-    rows: RowList,
+    rows: RowBuffer,
     sort_keys: []const plan.SortKey,
     top_k: usize,
     alloc: std.mem.Allocator,
-) !RowList {
+) !RowBuffer {
     if (sort_keys.len == 0) return rows;
     if (top_k > 0 and rows.rows.items.len > top_k) return executeTopK(rows, sort_keys, top_k, alloc);
     return executeOrderBy(rows, sort_keys, alloc);
@@ -2460,13 +2395,13 @@ fn finalizeScalarAgg(
     accums: []AggAccum,
     aggs: []const plan.ProjectItem,
     alloc: std.mem.Allocator,
-) !RowList {
+) !RowBuffer {
     const row = try alloc.alloc(?Value, aggs.len);
     for (aggs, 0..) |item, i| {
         row[i] = try finalizeAccum(accums[i], item, alloc);
         deinitAccum(&accums[i]);
     }
-    var result_rows = RowList.init(try buildAggResultMetas(&.{}, aggs, alloc));
+    var result_rows = RowBuffer.init(try buildAggResultMetas(&.{}, aggs, alloc));
     try result_rows.append(alloc, row);
     return result_rows;
 }
@@ -2483,12 +2418,12 @@ fn valueToBool(v: ?Value) bool {
 
 // ── Project helper ────────────────────────────────────────────────────────────
 
-fn projectRowList(inner: RowList, items: []const plan.ProjectItem, alloc: std.mem.Allocator) !RowList {
+fn projectRowBuffer(inner: RowBuffer, items: []const plan.ProjectItem, alloc: std.mem.Allocator) !RowBuffer {
     const new_metas = try alloc.alloc(result.ColMeta, items.len);
     for (items, 0..) |item, ci| {
         new_metas[ci] = .{ .name = item.alias, .col_type = item.out_type, .ch_type = item.ch_type };
     }
-    var rl = RowList.init(new_metas);
+    var rl = RowBuffer.init(new_metas);
 
     // Detect arrayJoin(expr) calls among the projection items.
     // Collect all indices; they will be expanded in lockstep (element i for all).
@@ -2625,7 +2560,7 @@ fn executeScalarAggChunked(
     input: *const plan.PhysicalNode,
     aggs: []const plan.ProjectItem,
     ctx: *QueryContext,
-) !RowList {
+) !RowBuffer {
     const alloc = ctx.allocator();
     const accums = try initAggAccums(aggs, alloc);
 
@@ -2677,7 +2612,7 @@ fn executeScalarAggParallel(
     input: *const plan.PhysicalNode,
     aggs: []const plan.ProjectItem,
     ctx: *QueryContext,
-) !?RowList {
+) !?RowBuffer {
     if (!ctx.source.supportsRange()) return null;
     const total_rows = ctx.source.rowCount();
     if (total_rows == 0) return null;
@@ -2802,7 +2737,7 @@ fn executeScalarAggParallel(
                                 metas[ci] = .{ .name = item.alias, .col_type = item.out_type };
                                 out_row[ci] = try finalizeAccum(raw_merged[ci], item, alloc);
                             }
-                            var raw_rl = RowList.init(metas);
+                            var raw_rl = RowBuffer.init(metas);
                             try raw_rl.append(alloc, out_row);
                             ctx.profile.raw_path_hits += 1;
                             ctx.profile.recordReason("raw_like_count");
@@ -2875,7 +2810,7 @@ fn executeScalarAggParallel(
                     i16cnt_metas[ci] = .{ .name = item.alias, .col_type = item.out_type };
                     i16cnt_row[ci] = try finalizeAccum(i16cnt_merged[ci], item, alloc);
                 }
-                var i16cnt_rl = RowList.init(i16cnt_metas);
+                var i16cnt_rl = RowBuffer.init(i16cnt_metas);
                 try i16cnt_rl.append(alloc, i16cnt_row);
                 ctx.profile.raw_path_hits += 1;
                 ctx.profile.recordReason("raw_i16_count");
@@ -2969,7 +2904,7 @@ fn executeScalarAggParallel(
             metas_i16[ci] = .{ .name = item.alias, .col_type = item.out_type };
             out_row_i16[ci] = try finalizeAccum(i16_merged[ci], item, alloc);
         }
-        var i16_rl = RowList.init(metas_i16);
+        var i16_rl = RowBuffer.init(metas_i16);
         try i16_rl.append(alloc, out_row_i16);
         ctx.profile.raw_path_hits += 1;
         ctx.profile.recordReason("raw_i16_sum");
@@ -3051,7 +2986,7 @@ fn executeScalarAggParallel(
             raw_scalar_metas[ci] = .{ .name = item.alias, .col_type = item.out_type };
             raw_scalar_row[ci] = try finalizeAccum(raw_scalar_merged[ci], item, alloc);
         }
-        var raw_scalar_rl = RowList.init(raw_scalar_metas);
+        var raw_scalar_rl = RowBuffer.init(raw_scalar_metas);
         try raw_scalar_rl.append(alloc, raw_scalar_row);
         ctx.profile.raw_path_hits += 1;
         ctx.profile.recordReason("raw_scalar_agg");
@@ -3185,7 +3120,7 @@ fn executeScalarAggParallel(
         cd_metas[0] = .{ .name = aggs[0].alias, .col_type = aggs[0].out_type };
         const cd_row = try alloc.alloc(?Value, 1);
         cd_row[0] = Value{ .uint64 = cd_total };
-        var cd_rl = RowList.init(cd_metas);
+        var cd_rl = RowBuffer.init(cd_metas);
         try cd_rl.append(alloc, cd_row);
         ctx.profile.raw_path_hits += 1;
         ctx.profile.recordReason("raw_i64_count_distinct");
@@ -3744,7 +3679,7 @@ fn executeTopKFromChunkResult(
     keys: []const plan.SortKey,
     k: usize,
     alloc: std.mem.Allocator,
-) !RowList {
+) !RowBuffer {
     var collector = try TopKCollector.init(alloc, keys, k);
     const key_buf = try alloc.alloc(?Value, res.metas.len);
     @memset(key_buf, null);
@@ -3763,11 +3698,11 @@ fn executeTopKFromChunkResult(
     return try collector.finish(metas);
 }
 
-/// Temporary bridge for callers that still consume RowList. The chunk sink
+/// Temporary bridge for callers that still consume RowBuffer. The chunk sink
 /// owns its chunks; chunk pages stay alive in the query arena, so row string
 /// slices remain valid until the result is materialized.
-fn chunkResultToRowList(res: chunk_sink_mod.ChunkSink.Result, alloc: std.mem.Allocator) !RowList {
-    var rl = RowList.init(res.metas);
+fn chunkResultToRowBuffer(res: chunk_sink_mod.ChunkSink.Result, alloc: std.mem.Allocator) !RowBuffer {
+    var rl = RowBuffer.init(res.metas);
     for (res.chunks) |*c| {
         for (0..c.num_rows) |r| {
             try rl.append(alloc, try c.readRow(r, alloc));
@@ -5155,7 +5090,7 @@ fn executeFilterProjectParallel(
     proj_items: []const plan.ProjectItem,
     filter_pred: plan.Expr,
     ctx: *QueryContext,
-) !?RowList {
+) !?RowBuffer {
     if (!ctx.source.supportsRange()) return null;
     const total_rows = ctx.source.rowCount();
     if (total_rows < 1_000_000) return null;
@@ -5275,7 +5210,7 @@ fn executeFilterProjectParallel(
     try parallel.parallelFor(alloc, ParFpCtx, ParFpCtx.work, par_ctxs, &morsel_src);
 
     // Merge per-thread row lists into global output; copy strings to query arena.
-    var rl = RowList.init(out_metas);
+    var rl = RowBuffer.init(out_metas);
     for (par_ctxs) |*pc| {
         ctx.profile.scan_ns +|= pc.scan_ns;
         ctx.profile.filter_ns +|= pc.filter_ns;
@@ -5302,7 +5237,7 @@ fn executeFilterProjectParallel(
 // ── Chunked limit helper ──────────────────────────────────────────────────────
 
 /// Chunked streaming execution for limit/project/filter/scan patterns.
-fn executeLimitChunked(node: *const plan.PhysicalNode, ctx: *QueryContext) !RowList {
+fn executeLimitChunked(node: *const plan.PhysicalNode, ctx: *QueryContext) !RowBuffer {
     const alloc = ctx.allocator();
 
     var filter_state: ?FilterState = null;
@@ -5334,7 +5269,7 @@ fn executeLimitChunked(node: *const plan.PhysicalNode, ctx: *QueryContext) !RowL
         for (items, 0..) |item, i| m[i] = .{ .name = item.alias, .col_type = item.out_type, .ch_type = item.ch_type };
         break :blk m;
     } else try alloc.dupe(result.ColMeta, schema_metas);
-    var rl = RowList.init(out_metas);
+    var rl = RowBuffer.init(out_metas);
 
     ctx.source.reset();
     var c: DataChunk = undefined;
@@ -5401,7 +5336,7 @@ fn executeLimitChunked(node: *const plan.PhysicalNode, ctx: *QueryContext) !RowL
 
 // ── ScalarAgg helper ──────────────────────────────────────────────────────────
 
-fn executeScalarAgg(inner: RowList, aggs: []const plan.ProjectItem, alloc: std.mem.Allocator) !RowList {
+fn executeScalarAgg(inner: RowBuffer, aggs: []const plan.ProjectItem, alloc: std.mem.Allocator) !RowBuffer {
     const accums = try initAggAccums(aggs, alloc);
 
     for (inner.rows.items) |row| {
@@ -5417,11 +5352,11 @@ fn executeScalarAgg(inner: RowList, aggs: []const plan.ProjectItem, alloc: std.m
 // ── HashAgg helper ────────────────────────────────────────────────────────────
 
 fn executeHashAgg(
-    inner: RowList,
+    inner: RowBuffer,
     keys: []const plan.ProjectItem,
     aggs: []const plan.ProjectItem,
     alloc: std.mem.Allocator,
-) !RowList {
+) !RowBuffer {
     var ht_agg = try ht.AggHashTable.init(alloc, keys.len, aggs.len);
 
     const init_accums = try initAggAccums(aggs, alloc);
@@ -5440,10 +5375,10 @@ fn executeHashAgg(
     }
 
     const out_metas = try buildAggResultMetas(keys, aggs, alloc);
-    var rl = RowList.init(out_metas);
+    var rl = RowBuffer.init(out_metas);
 
     const CtxT = struct {
-        rl: *RowList,
+        rl: *RowBuffer,
         alloc: std.mem.Allocator,
         keys_len: usize,
         aggs: []const plan.ProjectItem,
@@ -5505,7 +5440,7 @@ const TopKSortCtx = struct {
 };
 
 /// Streaming top-K sink. Keeps only the best K rows in a worst-at-root heap,
-/// so hash aggregation can avoid materialising every group into a RowList.
+/// so hash aggregation can avoid materialising every group into a RowBuffer.
 const TopKCollector = struct {
     alloc: std.mem.Allocator,
     keys: []const plan.SortKey,
@@ -5597,9 +5532,9 @@ const TopKCollector = struct {
         }
     }
 
-    fn finish(self: *TopKCollector, metas: []result.ColMeta) !RowList {
+    fn finish(self: *TopKCollector, metas: []result.ColMeta) !RowBuffer {
         std.sort.pdq([]?Value, self.heap[0..self.len], TopKSortCtx{ .keys = self.keys }, TopKSortCtx.lessThan);
-        var rl = RowList.init(metas);
+        var rl = RowBuffer.init(metas);
         for (self.heap[0..self.len]) |row| try rl.append(self.alloc, row);
         return rl;
     }
@@ -5625,9 +5560,9 @@ test "TopKCollector keeps best k by count desc" {
     try std.testing.expectEqual(@as(u64, 5), rl.rows.items[2][0].?.uint64);
 }
 
-fn executeTopK(inner: RowList, keys: []const plan.SortKey, k: usize, alloc: std.mem.Allocator) !RowList {
+fn executeTopK(inner: RowBuffer, keys: []const plan.SortKey, k: usize, alloc: std.mem.Allocator) !RowBuffer {
     const rows = inner.rows.items;
-    if (rows.len == 0 or k == 0) return RowList.init(inner.metas);
+    if (rows.len == 0 or k == 0) return RowBuffer.init(inner.metas);
 
     // SortCtx: lessThan(a, b) = true means a should appear before b in the output.
     const SortCtx = struct {
@@ -5716,13 +5651,13 @@ fn executeTopK(inner: RowList, keys: []const plan.SortKey, k: usize, alloc: std.
     // Sort the heap to get the final ordered result.
     std.sort.pdq([]?Value, heap_buf[0..heap_len], ctx, SortCtx.lessThan);
 
-    var rl = RowList.init(inner.metas);
+    var rl = RowBuffer.init(inner.metas);
     for (heap_buf[0..heap_len]) |row| try rl.append(alloc, row);
     return rl;
 }
 
 /// Stream a scannable node (scan/filter/project/limit) directly into a min-heap
-/// of at most K rows, avoiding materialisation of all rows into a RowList.
+/// of at most K rows, avoiding materialisation of all rows into a RowBuffer.
 /// Late-materialization top-K: phase 1 scans only filter+sort columns using fetchRange
 /// (so global row indices are stable), phase 2 fetches all columns for the K winners.
 /// Returns null if unable to proceed (falls back to standard path).
@@ -5735,9 +5670,9 @@ fn executeTopKLateMat(
     k: usize,
     ctx: *QueryContext,
     alloc: std.mem.Allocator,
-) !?RowList {
+) !?RowBuffer {
     const total_rows = ctx.source.rowCount();
-    if (total_rows == 0) return RowList.init(@constCast(out_metas));
+    if (total_rows == 0) return RowBuffer.init(@constCast(out_metas));
 
     // Phase 1: restrict source to scan cols, iterate fetchRange morsels.
     var scan_request: ScanRequest = .{};
@@ -6154,7 +6089,7 @@ fn executeTopKLateMat(
 
         // Phase 2: load columns for top-k rows and project to output schema.
         ctx.source.setNeededCols(null);
-        var rl2 = RowList.init(@constCast(out_metas));
+        var rl2 = RowBuffer.init(@constCast(out_metas));
         for (merged[0..take]) |entry| {
             var full_chunk: DataChunk = undefined;
             try ctx.source.fetchRange(entry.global_row, 1, &full_chunk, alloc);
@@ -6396,7 +6331,7 @@ fn executeTopKLateMat(
 
     // Phase 2: fetch all columns for the K winner rows.
     ctx.source.setNeededCols(null); // restore full decode
-    var rl = RowList.init(@constCast(out_metas));
+    var rl = RowBuffer.init(@constCast(out_metas));
     for (heap_e[0..heap_e_len]) |entry| {
         var full_chunk: DataChunk = undefined;
         try ctx.source.fetchRange(entry.global_row, 1, &full_chunk, alloc);
@@ -6419,7 +6354,7 @@ fn executeTopKFromScannable(
     keys: []const plan.SortKey,
     k: usize,
     ctx: *QueryContext,
-) !RowList {
+) !RowBuffer {
     const alloc = ctx.allocator();
 
     // Traverse to extract filter / project / limit wrappers.
@@ -6452,7 +6387,7 @@ fn executeTopKFromScannable(
         break :blk m;
     } else try alloc.dupe(result.ColMeta, schema_metas);
 
-    if (k == 0) return RowList.init(out_metas);
+    if (k == 0) return RowBuffer.init(out_metas);
 
     // Remap sort keys: if keys use output-column indices (e.g. from findOutputColIdx
     // in the planner) but we sort raw schema rows, map output index → schema col_ref index.
@@ -6709,7 +6644,7 @@ fn executeTopKFromScannable(
     std.sort.pdq([]?Value, heap_buf[0..heap_len], sctx, SortCtx.lessThan);
 
     // Project the K winners (only K rows — negligible cost).
-    var rl = RowList.init(out_metas);
+    var rl = RowBuffer.init(out_metas);
     if (project_items) |items| {
         const row_buf = try alloc.alloc(?Value, schema_metas.len);
         for (heap_buf[0..heap_len]) |raw_row| {
@@ -6726,7 +6661,7 @@ fn executeTopKFromScannable(
     return rl;
 }
 
-fn executeOrderBy(inner: RowList, keys: []const plan.SortKey, alloc: std.mem.Allocator) !RowList {
+fn executeOrderBy(inner: RowBuffer, keys: []const plan.SortKey, alloc: std.mem.Allocator) !RowBuffer {
     const rows_copy = try alloc.dupe([]?Value, inner.rows.items);
 
     const SortCtx = struct {
@@ -6761,7 +6696,7 @@ fn executeOrderBy(inner: RowList, keys: []const plan.SortKey, alloc: std.mem.All
     };
     std.sort.pdq([]?Value, rows_copy, SortCtx{ .keys = keys }, SortCtx.lessThan);
 
-    var rl = RowList.init(inner.metas);
+    var rl = RowBuffer.init(inner.metas);
     for (rows_copy) |row| try rl.append(alloc, row);
     return rl;
 }
@@ -6769,11 +6704,11 @@ fn executeOrderBy(inner: RowList, keys: []const plan.SortKey, alloc: std.mem.All
 // ── HashJoin helper ───────────────────────────────────────────────────────────
 
 fn executeHashJoin(
-    left_rl: RowList,
-    right_rl: RowList,
+    left_rl: RowBuffer,
+    right_rl: RowBuffer,
     hj: plan.HashJoinNode,
     alloc: std.mem.Allocator,
-) !RowList {
+) !RowBuffer {
     var jht = try ht.JoinHashTable.init(alloc);
     const key_buf = try alloc.alloc(Value, hj.equi_keys.len);
 
@@ -6788,7 +6723,7 @@ fn executeHashJoin(
     @memcpy(combined_metas[0..left_rl.metas.len], left_rl.metas);
     @memcpy(combined_metas[left_rl.metas.len..], right_rl.metas);
 
-    var rl = RowList.init(combined_metas);
+    var rl = RowBuffer.init(combined_metas);
 
     for (left_rl.rows.items) |lrow| {
         for (hj.equi_keys, 0..) |ek, ki| {
@@ -7280,7 +7215,7 @@ fn executeHashAggParallelPairCountBounded(
     aggs: []const plan.ProjectItem,
     limit: usize,
     ctx: *QueryContext,
-) !?RowList {
+) !?RowBuffer {
     if (limit == 0 or limit > 1024) return null;
     if (input.* != .part_scan and input.* != .mem_scan) return null;
     if (keys.len != 2 or aggs.len != 1) return null;
@@ -7329,7 +7264,7 @@ fn executeHashAggParallelPairCountBounded(
         if (hi > raw_bytes.len or lo > hi) continue;
         _ = key_table.incrementBounded(raw_i64[row], raw_bytes[lo..hi], limit);
     }
-    if (key_table.count == 0) return RowList.init(out_metas);
+    if (key_table.count == 0) return RowBuffer.init(out_metas);
     key_table.resetCounts();
 
     const n_threads = parallel.defaultThreads();
@@ -7368,9 +7303,9 @@ fn executeHashAggParallelPairCountBounded(
     for (workers) |w| if (w.err) |e| return e;
     for (local) |*t| key_table.addCountsFrom(t);
 
-    var rl = RowList.init(out_metas);
+    var rl = RowBuffer.init(out_metas);
     const Emit = struct {
-        rl: *RowList,
+        rl: *RowBuffer,
         alloc: std.mem.Allocator,
         k0_is_i64: bool,
         fn cb(self: *@This(), i64_key: i64, str_key: []const u8, count: u64) void {
@@ -7398,7 +7333,7 @@ fn executeHashAggParallelPairCount(
     sort_keys: []const plan.SortKey,
     top_k: usize,
     ctx: *QueryContext,
-) !?RowList {
+) !?RowBuffer {
     if (!ctx.source.supportsRange()) return null;
     const total_rows = ctx.source.rowCount();
     if (total_rows < 1_000_000) return null;
@@ -7740,7 +7675,7 @@ fn executeHashAggParallelPairCount(
         metas[0] = if (k0_is_i64) result.ColMeta{ .name = keys[0].alias, .col_type = .int64 } else result.ColMeta{ .name = keys[0].alias, .col_type = .string };
         metas[1] = if (k0_is_i64) result.ColMeta{ .name = keys[1].alias, .col_type = .string } else result.ColMeta{ .name = keys[1].alias, .col_type = .int64 };
         metas[2] = result.ColMeta{ .name = aggs[0].alias, .col_type = .uint64 };
-        var rl2 = RowList.init(metas);
+        var rl2 = RowBuffer.init(metas);
 
         // Pre-allocate per-partition result arrays (all start empty; doWork fills them).
         const part_slots2 = try alloc.alloc([]P2Slot, N_P2);
@@ -7769,7 +7704,7 @@ fn executeHashAggParallelPairCount(
             if (ac.err) |e| return e;
         }
 
-        // Serial emit: collect results from all partition HTs into RowList.
+        // Serial emit: collect results from all partition HTs into RowBuffer.
         // If this path is driven by LIMIT(hash_agg(...)) without ORDER BY, the
         // aggregate has already seen all rows, so we can materialize only N groups.
         const unordered_limit = top_k > 0 and sort_keys.len == 0;
@@ -7780,7 +7715,7 @@ fn executeHashAggParallelPairCount(
             str_len: u32,
             count: u64,
 
-            fn appendTo(self: @This(), out: *RowList, allocator: std.mem.Allocator, bytes: []const u8, int_first: bool) !void {
+            fn appendTo(self: @This(), out: *RowBuffer, allocator: std.mem.Allocator, bytes: []const u8, int_first: bool) !void {
                 const str = bytes[self.str_start .. self.str_start + self.str_len];
                 const row = try allocator.alloc(?Value, 3);
                 if (int_first) {
@@ -7936,10 +7871,10 @@ fn executeHashAggParallelPairCount(
     metas[0] = if (k0_is_i64) result.ColMeta{ .name = keys[0].alias, .col_type = .int64 } else result.ColMeta{ .name = keys[0].alias, .col_type = .string };
     metas[1] = if (k0_is_i64) result.ColMeta{ .name = keys[1].alias, .col_type = .string } else result.ColMeta{ .name = keys[1].alias, .col_type = .int64 };
     metas[2] = result.ColMeta{ .name = aggs[0].alias, .col_type = .uint64 };
-    var rl = RowList.init(metas);
+    var rl = RowBuffer.init(metas);
 
     const EmitCtx = struct {
-        rl: *RowList,
+        rl: *RowBuffer,
         alloc: std.mem.Allocator,
         k0_is_i64: bool,
     };
@@ -7974,7 +7909,7 @@ fn executeHashAggParallelCompact(
     keys: []const plan.ProjectItem,
     aggs: []const plan.ProjectItem,
     ctx: *QueryContext,
-) !?RowList {
+) !?RowBuffer {
     return executeHashAggParallelCompactTopK(input, keys, aggs, &.{}, 0, 0, ctx);
 }
 
@@ -7987,7 +7922,7 @@ fn executeHashAggParallelTripleCount(
     sort_keys: []const plan.SortKey,
     top_k: usize,
     ctx: *QueryContext,
-) !?RowList {
+) !?RowBuffer {
     if (!ctx.source.supportsRange()) return null;
     const total_rows = ctx.source.rowCount();
     if (total_rows < 1_000_000) return null;
@@ -8307,14 +8242,14 @@ fn executeHashAggParallelTripleCount(
     }
 
     const out_metas = try buildAggResultMetas(keys, aggs, alloc);
-    var rl = RowList.init(out_metas);
+    var rl = RowBuffer.init(out_metas);
     var topk: ?TopKCollector = if (!topkCollectorDisabled() and top_k > 0 and sort_keys.len > 0)
         try TopKCollector.init(alloc, sort_keys, top_k)
     else
         null;
 
     const EmitCtxTriple = struct {
-        rl: *RowList,
+        rl: *RowBuffer,
         topk: ?*TopKCollector,
         alloc: std.mem.Allocator,
         key_order: [3]u8,
@@ -8391,7 +8326,7 @@ fn executeHashAggParallelStrKey(
     sort_keys: []const plan.SortKey,
     top_k: usize,
     ctx: *QueryContext,
-) !?RowList {
+) !?RowBuffer {
     if (!ctx.source.supportsRange()) return null;
     const total_rows = ctx.source.rowCount();
     if (total_rows < 500_000) return null;
@@ -9561,10 +9496,10 @@ fn executeHashAggParallelStrKey(
 
     // Emit result.
     const out_metas = try buildAggResultMetas(keys, aggs, alloc);
-    var rl = RowList.init(out_metas);
+    var rl = RowBuffer.init(out_metas);
 
     // Streaming top-K: for `ORDER BY count DESC LIMIT k`, keep only the best
-    // K groups while emitting instead of materialising every group into RowList.
+    // K groups while emitting instead of materialising every group into RowBuffer.
     var topk: ?TopKCollector = null;
     var topk_sort_ai: ?usize = null;
     if (!topkCollectorDisabled() and top_k > 0 and sort_keys.len == 1 and sort_keys[0].desc) {
@@ -9595,7 +9530,7 @@ fn executeHashAggParallelStrKey(
     const int_prefix_len2: usize = if (emit_all_const) 0 else emit_int_key_n * 8;
 
     const EmitCtx = struct {
-        rl: *RowList,
+        rl: *RowBuffer,
         topk: ?*TopKCollector,
         topk_sort_ai: ?usize,
         alloc: std.mem.Allocator,
@@ -9648,7 +9583,7 @@ fn executeHashAggParallelStrKey(
             const str_start: usize = cw_start + cw_len;
             // Strings extracted from composite may point into thread_key_arena which
             // is freed by a defer AFTER return — dupe them into ec.alloc so the
-            // returned RowList owns its string values.
+            // returned RowBuffer owns its string values.
             const cw_str_raw: []const u8 = if (ec.has_cw and cw_start + cw_len <= composite.len)
                 composite[cw_start .. cw_start + cw_len]
             else
@@ -9724,7 +9659,7 @@ fn executeBoundedCountTopDistinct(
     sort_keys: []const plan.SortKey,
     top_k: usize,
     ctx: *QueryContext,
-) !?RowList {
+) !?RowBuffer {
     if (filter_pred != null or keys.len != 1 or top_k == 0 or top_k > 255) return null;
     if (keys[0].expr != .col_ref or sort_keys.len == 0 or !sort_keys[0].desc) return null;
 
@@ -9850,7 +9785,7 @@ fn executeBoundedCountTopDistinct(
     }
 
     const out_metas = try buildAggResultMetas(keys, aggs, alloc);
-    var rl = RowList.init(out_metas);
+    var rl = RowBuffer.init(out_metas);
     for (candidates_buf[0..cand_len]) |c| {
         const row = try alloc.alloc(?Value, 1 + aggs.len);
         row[0] = .{ .int64 = min_key + @as(i64, @intCast(c.idx)) };
@@ -9876,7 +9811,7 @@ fn executeBoundedCountTopDistinct(
 }
 
 /// Same as executeHashAggParallelCompact but with optional top-K emit.
-/// When top_k > 0 and sort_keys is non-empty, emits into a min-heap instead of a full RowList.
+/// When top_k > 0 and sort_keys is non-empty, emits into a min-heap instead of a full RowBuffer.
 fn executeHashAggParallelCompactTopK(
     input: *const plan.PhysicalNode,
     keys: []const plan.ProjectItem,
@@ -9885,7 +9820,7 @@ fn executeHashAggParallelCompactTopK(
     top_k: usize,
     top_offset: usize,
     ctx: *QueryContext,
-) !?RowList {
+) !?RowBuffer {
     if (!ctx.source.supportsRange()) return null;
     const total_rows = ctx.source.rowCount();
     if (total_rows < 500_000) return null; // not worth parallelizing small inputs
@@ -10254,9 +10189,9 @@ fn executeHashAggParallelCompactTopK(
                 if (!pass) final_hist[ui] = 0;
             }
         }
-        // Build RowList from non-zero histogram entries.
+        // Build RowBuffer from non-zero histogram entries.
         const hist_out_metas = try buildAggResultMetas(keys, aggs, alloc);
-        var hist_rl = RowList.init(hist_out_metas);
+        var hist_rl = RowBuffer.init(hist_out_metas);
         for (0..HIST_SIZE) |ui| {
             if (final_hist[ui] == 0) continue;
             const kv: i64 = @as(i64, @as(i16, @bitCast(@as(u16, @intCast(ui)))));
@@ -10271,7 +10206,7 @@ fn executeHashAggParallelCompactTopK(
         if (sort_keys.len > 0 and top_k > 0) {
             const sorted = try executeOrderBy(hist_rl, sort_keys, alloc);
             const take = @min(sorted.rows.items.len, top_k);
-            var trimmed_rl = RowList.init(hist_out_metas);
+            var trimmed_rl = RowBuffer.init(hist_out_metas);
             for (sorted.rows.items[0..take]) |row| try trimmed_rl.append(alloc, row);
             return trimmed_rl;
         }
@@ -11235,16 +11170,16 @@ fn executeHashAggParallelCompactTopK(
     if (top_offset > 0 and top_k > 0 and sort_keys.len > 0) {
         var merged_count: usize = 0;
         for (part_hts) |*ph| merged_count += ph.count;
-        if (merged_count <= top_offset) return RowList.init(out_metas);
+        if (merged_count <= top_offset) return RowBuffer.init(out_metas);
     }
 
-    var rl = RowList.init(out_metas);
+    var rl = RowBuffer.init(out_metas);
     const MCtx = struct {
         keys_n: usize,
         aggs_n: usize,
         compact_kinds: []const ht.CompactAggKind,
         aggs: []const plan.ProjectItem,
-        rl: *RowList,
+        rl: *RowBuffer,
         alloc: std.mem.Allocator,
         err: ?anyerror = null,
         // Optional top-K heap (non-null → emit into heap instead of rl).
@@ -11458,7 +11393,7 @@ fn executeHashAggParallelCompactTopK(
             }
         };
         std.sort.pdq([]?Value, heap_rows, SortCtx2{ .sort_keys = sort_keys }, SortCtx2.lessThan);
-        var result_rl = RowList.init(out_metas);
+        var result_rl = RowBuffer.init(out_metas);
         for (heap_rows) |row| try result_rl.append(alloc, row);
         return result_rl;
     }
@@ -11495,7 +11430,7 @@ fn executeTwoPhaseHashAgg(
     top_k: usize,
     str_filter: ?SimpleStrFilter,
     int_filter: ?[]const IntCmpCond,
-) !?RowList {
+) !?RowBuffer {
     const N_PARTS: usize = 128;
     const n_keys = keys.len;
     const n_aggs = aggs.len;
@@ -12205,7 +12140,7 @@ fn executeTwoPhaseHashAgg(
         for (scatter_ctxs) |*sc| sc.buf_arena.deinit();
 
         const out_metas = try buildAggResultMetas(keys, aggs, alloc);
-        var rl = RowList.init(out_metas);
+        var rl = RowBuffer.init(out_metas);
         for (part_candidates) |c| {
             if (c.count == 0) continue;
             const row = try alloc.alloc(?Value, n_keys + n_aggs);
@@ -12316,7 +12251,7 @@ fn executeTwoPhaseHashAgg(
         for (scatter_ctxs) |*sc| sc.buf_arena.deinit();
 
         const out_metas = try buildAggResultMetas(keys, aggs, alloc);
-        var rl = RowList.init(out_metas);
+        var rl = RowBuffer.init(out_metas);
         for (counts, 0..) |count, idx| {
             if (count == 0) continue;
             const row = try alloc.alloc(?Value, n_keys + n_aggs);
@@ -12506,7 +12441,7 @@ fn executeTwoPhaseHashAgg(
     for (keys, 0..) |k, i| key_out_types_buf[i] = k.out_type;
     const out_metas = try buildAggResultMetas(keys, aggs, alloc);
 
-    var rl = RowList.init(out_metas);
+    var rl = RowBuffer.init(out_metas);
     const EmitCtx = struct {
         keys_n: usize,
         aggs_n: usize,
@@ -12514,7 +12449,7 @@ fn executeTwoPhaseHashAgg(
         key_offs_emit: [4]i64, // key_offs for reconstructing collapsed keys
         compact_kinds: []const ht.CompactAggKind,
         aggs: []const plan.ProjectItem,
-        rl: *RowList,
+        rl: *RowBuffer,
         alloc: std.mem.Allocator,
         key_out_types: []const ColumnType,
         heap: ?[][]?Value = null,
@@ -12727,7 +12662,7 @@ fn executeTwoPhaseHashAgg(
             }
         };
         std.sort.pdq([]?Value, heap_rows, SortCtx2{ .sort_keys = sort_keys }, SortCtx2.lessThan);
-        var result_rl = RowList.init(out_metas);
+        var result_rl = RowBuffer.init(out_metas);
         for (heap_rows) |row| try result_rl.append(alloc, row);
         return result_rl;
     }
@@ -12772,7 +12707,7 @@ fn executeTwoPhaseHashAggStrKeySimple(
     sidecar_col_idx: ?usize,
     /// Index within `keys` of the sidecar key (used at emit time).
     sidecar_key_pos: ?usize,
-) !?RowList {
+) !?RowBuffer {
     if (!ctx.source.supportsRange()) return null;
 
     const N_PARTS: usize = 64;
@@ -13718,7 +13653,7 @@ fn executeTwoPhaseHashAggStrKeySimple(
     // Release scatter buffers.
     for (scatter_ctxs) |*sc| sc.buf_arena.deinit();
 
-    // ── Emit: iterate all partition HTs, build output RowList ────────────────
+    // ── Emit: iterate all partition HTs, build output RowBuffer ────────────────
     const out_metas = try buildAggResultMetas(keys, aggs, alloc);
 
     const use_heap = top_k > 0 and sort_keys.len > 0;
@@ -13730,7 +13665,7 @@ fn executeTwoPhaseHashAggStrKeySimple(
         str_key_pos: usize,
         sidecar_key_pos: ?usize,
         current_ht: ?*const ht.StrAggHashTable,
-        rl: RowList,
+        rl: RowBuffer,
         alloc: std.mem.Allocator,
         heap: std.ArrayListUnmanaged([]?Value),
         heap_k: usize,
@@ -13870,7 +13805,7 @@ fn executeTwoPhaseHashAggStrKeySimple(
         .str_key_pos = str_key_pos,
         .sidecar_key_pos = sidecar_key_pos,
         .current_ht = null,
-        .rl = RowList.init(out_metas),
+        .rl = RowBuffer.init(out_metas),
         .alloc = alloc,
         .heap = .empty,
         .heap_k = if (use_heap) top_k else 0,
@@ -13902,7 +13837,7 @@ fn executeTwoPhaseHashAggStrKeySimple(
             }
         };
         std.sort.pdq([]?Value, items, SortCtxTP{ .sk = sort_keys }, SortCtxTP.lessThan);
-        var tp_rl = RowList.init(out_metas);
+        var tp_rl = RowBuffer.init(out_metas);
         for (items) |row| try tp_rl.append(alloc, row);
         return tp_rl;
     }
@@ -13943,7 +13878,7 @@ fn executeTwoPhaseHashAggWithCW(
     compact_init_vals: []const u64,
     sidecar_idx: []const usize,
     filter_pred: ?plan.Expr,
-) !?RowList {
+) !?RowBuffer {
     if (!ctx.source.supportsRange()) return null;
     const total_rows = ctx.source.rowCount();
     if (total_rows < 3_000_000) return null;
@@ -14239,7 +14174,7 @@ fn executeTwoPhaseHashAggWithCW(
 
     // ── Emit infrastructure ───────────────────────────────────────────────────
     const out_metas2 = try buildAggResultMetas(keys, aggs, alloc);
-    var rl = RowList.init(out_metas2);
+    var rl = RowBuffer.init(out_metas2);
 
     // Compute emit_all_const (mirrors executeHashAggParallelStrKey logic).
     var emit_int_key_n2: usize = 0;
@@ -14264,7 +14199,7 @@ fn executeTwoPhaseHashAggWithCW(
     const sm_emit2 = ctx.source.schema();
 
     const EmitCtx2 = struct {
-        rl: *RowList,
+        rl: *RowBuffer,
         alloc: std.mem.Allocator,
         aggs: []const plan.ProjectItem,
         kinds: []const ht.CompactAggKind,
@@ -14326,7 +14261,7 @@ fn executeTwoPhaseHashAggWithCW(
                 composite[str_start2..]
             else
                 "";
-            // Dupe so RowList owns the bytes after phase2_arena is freed.
+            // Dupe so RowBuffer owns the bytes after phase2_arena is freed.
             const cw_str2: []const u8 = ec.alloc.dupe(u8, cw_str_raw) catch cw_str_raw;
             const str_val2: []const u8 = ec.alloc.dupe(u8, str_val_raw) catch str_val_raw;
             var int_ki: usize = 0;
@@ -14389,17 +14324,17 @@ fn executeTwoPhaseHashAggWithCW(
     // ── Phase 2: parallel per-partition aggregation ───────────────────────────
     // Each partition gets its own ArenaAllocator for composite-key bytes.
     // Workers pull partitions from a MorselSource and emit into per-partition
-    // RowLists; those are merged into rl after all workers finish.
+    // RowBuffers; those are merged into rl after all workers finish.
     const part_arenas = try alloc.alloc(std.heap.ArenaAllocator, N_CW_PARTS);
     for (part_arenas) |*pa| pa.* = std.heap.ArenaAllocator.init(std.heap.c_allocator);
     defer for (part_arenas) |*pa| pa.deinit();
-    const part_rls = try alloc.alloc(?RowList, N_CW_PARTS);
+    const part_rls = try alloc.alloc(?RowBuffer, N_CW_PARTS);
     for (part_rls) |*pr| pr.* = null;
 
     const P2CwCtx = struct {
         scatter_ctxs: []ScatterCtx2,
         part_arenas: []std.heap.ArenaAllocator,
-        part_rls: []?RowList,
+        part_rls: []?RowBuffer,
         alloc: std.mem.Allocator,
         out_metas: []result.ColMeta,
         row_stride: usize,
@@ -14477,8 +14412,8 @@ fn executeTwoPhaseHashAggWithCW(
                     }
                 }
 
-                // Emit rows into a per-partition RowList (alloc is thread-safe c_allocator).
-                var part_rl = RowList.init(self.out_metas);
+                // Emit rows into a per-partition RowBuffer (alloc is thread-safe c_allocator).
+                var part_rl = RowBuffer.init(self.out_metas);
                 var local_emit = EmitCtx2{
                     .rl = &part_rl,
                     .alloc = self.alloc,
@@ -14538,7 +14473,7 @@ fn executeTwoPhaseHashAggWithCW(
         if (pc.err) |e| return e;
     }
 
-    // Merge per-partition RowLists into rl (order preserved: p=0..63).
+    // Merge per-partition RowBuffers into rl (order preserved: p=0..63).
     for (part_rls) |maybe_rl| {
         if (maybe_rl) |part_rl| {
             for (part_rl.rows.items) |row| try rl.append(alloc, row);

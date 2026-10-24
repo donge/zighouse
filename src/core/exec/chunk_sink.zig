@@ -1,4 +1,4 @@
-/// Row -> chunk sink used while migrating breakers off `RowList`.
+/// Row -> chunk sink used while migrating breakers off `row buffer`.
 ///
 /// Operators still produce logical rows internally for a while. The sink packs
 /// them into 2048-row `DataChunk`s so downstream code can consume columnar
@@ -47,6 +47,12 @@ pub const ChunkSink = struct {
             }
         }
         self.rows += 1;
+    }
+
+    /// Take ownership of an existing chunk (zero-copy scan/operator output).
+    pub fn consumeChunk(self: *ChunkSink, c: DataChunk) !void {
+        if (self.rows > 0) try self.flush();
+        try self.chunks.append(self.alloc, c);
     }
 
     fn flush(self: *ChunkSink) !void {
