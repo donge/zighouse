@@ -1,8 +1,8 @@
 #!/bin/bash
 set -e
 
-: "${ZIGHOUSE_VERSION:=v1.0.3}"
-: "${ZIGHOUSE_SHA256:=4f63353bfc9b09a649fb54c77c447a113b4bf2b331957aa65d4b33648ef56d5b}"
+: "${ZIGHOUSE_VERSION:=v1.0.4}"
+: "${ZIGHOUSE_SHA256:=d72037ae715a722ece316ef29abf22f200be9c7d118d237666fb16d9ff717683}"
 
 url="https://github.com/donge/zighouse/releases/download/${ZIGHOUSE_VERSION}/zighouse-linux-x86_64.gz"
 curl -L --fail -o zighouse.gz "$url"
