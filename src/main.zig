@@ -11,6 +11,7 @@ const parquet = @import("parquet");
 const storage = @import("storage.zig");
 const schema = @import("schema");
 const generic_store = @import("generic_store");
+const store_query = @import("store_query.zig");
 
 const usage =
     \\zighouse - ClickHouse-compatible analytical database
@@ -235,7 +236,6 @@ fn runCommand(init: std.process.Init, allocator: std.mem.Allocator, args: *std.p
         const QueryRange = duckdb.QueryRange;
         const ir_planner = @import("ir_planner");
         const core = @import("core");
-        const gsb = @import("generic_store_bridge");
 
         var store_dir: ?[]const u8 = null;
         var table_name: ?[]const u8 = null;
@@ -270,21 +270,15 @@ fn runCommand(init: std.process.Init, allocator: std.mem.Allocator, args: *std.p
         const tn = table_name orelse return error.MissingTableName;
         const qp = queries_path orelse return error.MissingQueriesPath;
 
-        const columns_txt = try std.fmt.allocPrint(allocator, "{s}/{s}/parts/all_1_1_0/columns.txt", .{ sd, tn });
-        defer allocator.free(columns_txt);
-        var inferred_schema = try schema_infer.loadSchemaFromColumnsTxt(allocator, init.io, columns_txt, tn);
-        defer inferred_schema.deinit();
-        const table: schema.Table = inferred_schema.table;
-
-        const part_dir = try std.fmt.allocPrint(allocator, "{s}/{s}/parts/all_1_1_0", .{ sd, tn });
-        defer allocator.free(part_dir);
+        var loaded_table = try store_query.loadTable(allocator, init.io, sd, tn);
+        defer loaded_table.deinit();
+        const table: schema.Table = loaded_table.table;
 
         const IrRunner = struct {
             alloc: std.mem.Allocator,
             io: std.Io,
-            part_dir: []const u8,
             table: schema.Table,
-            bridge: *gsb.GenericStoreBridge,
+            store: *store_query.StoreSource,
 
             pub fn runQuery(self: *const @This(), query_text: []const u8) !?[]u8 {
                 const maybe_gplan = generic_sql.parse(self.alloc, query_text) catch |err| {
@@ -312,9 +306,9 @@ fn runCommand(init: std.process.Init, allocator: std.mem.Allocator, args: *std.p
                 }
 
                 const pruned_cols = ir_planner.findPrunedCols(node.?);
-                self.bridge.resetForNewQuery(pruned_cols);
+                self.store.resetForNewQuery(pruned_cols);
 
-                var qctx = core.exec.pipeline.QueryContext.init(self.alloc, self.bridge.source());
+                var qctx = core.exec.pipeline.QueryContext.init(self.alloc, self.store.source());
                 qctx.setProfileLabel(query_text);
                 defer qctx.deinit();
                 const t_exec_start = std.Io.Clock.Timestamp.now(self.io, .awake);
@@ -334,41 +328,35 @@ fn runCommand(init: std.process.Init, allocator: std.mem.Allocator, args: *std.p
             }
         };
 
-        var shared_bridge = try gsb.GenericStoreBridge.init(
+        var shared_store = try store_query.StoreSource.open(
             allocator,
             init.io,
-            part_dir,
+            sd,
+            tn,
             table,
             &.{},
         );
-        defer shared_bridge.deinit();
+        defer shared_store.deinit();
 
         const runner = IrRunner{
             .alloc = allocator,
             .io = init.io,
-            .part_dir = part_dir,
             .table = table,
-            .bridge = &shared_bridge,
+            .store = &shared_store,
         };
         try duckdb.benchWithRunner(allocator, init.io, qp, bench_range, &runner);
     } else if (std.mem.eql(u8, command, "query")) {
         const ir_planner2 = @import("ir_planner");
         const core2 = @import("core");
-        const gsb2 = @import("generic_store_bridge");
         const serializer = @import("serializer");
 
         const store_dir2 = args.next() orelse return error.MissingStoreDir;
         const table_name2 = args.next() orelse return error.MissingTableName;
         const query_text2 = args.next() orelse return error.MissingQuery;
 
-        const columns_txt2 = try std.fmt.allocPrint(allocator, "{s}/{s}/parts/all_1_1_0/columns.txt", .{ store_dir2, table_name2 });
-        defer allocator.free(columns_txt2);
-        var inferred_schema2 = try schema_infer.loadSchemaFromColumnsTxt(allocator, init.io, columns_txt2, table_name2);
-        defer inferred_schema2.deinit();
-        const table2: schema.Table = inferred_schema2.table;
-
-        const part_dir2 = try std.fmt.allocPrint(allocator, "{s}/{s}/parts/all_1_1_0", .{ store_dir2, table_name2 });
-        defer allocator.free(part_dir2);
+        var loaded_table2 = try store_query.loadTable(allocator, init.io, store_dir2, table_name2);
+        defer loaded_table2.deinit();
+        const table2: schema.Table = loaded_table2.table;
 
         const gplan2 = (try generic_sql.parse(allocator, query_text2)) orelse return error.ParseFailed;
         defer generic_sql.deinit(allocator, gplan2);
@@ -379,10 +367,17 @@ fn runCommand(init: std.process.Init, allocator: std.mem.Allocator, args: *std.p
         const node2 = (try ir_planner2.plan_query(&pctx2, gplan2)) orelse return error.PlanFailed;
 
         const pruned2 = ir_planner2.findPrunedCols(node2);
-        var bridge2 = try gsb2.GenericStoreBridge.init(allocator, init.io, part_dir2, table2, pruned2);
-        defer bridge2.deinit();
+        var query_source = try store_query.StoreSource.open(
+            allocator,
+            init.io,
+            store_dir2,
+            table_name2,
+            table2,
+            pruned2,
+        );
+        defer query_source.deinit();
 
-        var qctx2 = core2.exec.pipeline.QueryContext.init(allocator, bridge2.source());
+        var qctx2 = core2.exec.pipeline.QueryContext.init(allocator, query_source.source());
         qctx2.setProfileLabel(query_text2);
         defer qctx2.deinit();
         var rs2 = try core2.exec.pipeline.executePlan(node2, &qctx2);

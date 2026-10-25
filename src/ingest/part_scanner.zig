@@ -16,14 +16,13 @@
 ///   defer parts.deinit();
 ///   for (parts.dirs()) |dir| { ... }           // []const []const u8
 ///   for (parts.metas()) |m| { _ = m.min_seq; } // []const PartMeta
-
 const std = @import("std");
 
 /// Parsed metadata for a single part directory.
 pub const PartMeta = struct {
-    min_seq:   u64,
-    max_seq:   u64,
-    level:     u32,
+    min_seq: u64,
+    max_seq: u64,
+    level: u32,
     /// Full path to the part directory (owned by PartList).
     full_path: []const u8,
 };
@@ -78,20 +77,29 @@ pub const PartList = struct {
 ///   higher-level merged part.
 pub fn scan(
     allocator: std.mem.Allocator,
-    io:        std.Io,
-    data_dir:  []const u8,
-    db:        []const u8,
+    io: std.Io,
+    data_dir: []const u8,
+    db: []const u8,
     table_name: []const u8,
+) !PartList {
+    const parts_path = try std.fmt.allocPrint(allocator, "{s}/{s}/{s}/parts", .{ data_dir, db, table_name });
+    defer allocator.free(parts_path);
+    return scanPath(allocator, io, parts_path);
+}
+
+/// Scan an explicit `<...>/parts` directory.  Used by the CLI, whose store
+/// roots do not necessarily have the `<data_dir>/<db>/<table>` server layout.
+pub fn scanPath(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    parts_path: []const u8,
 ) !PartList {
     var result = PartList{
         .allocator = allocator,
-        ._metas    = .empty,
-        ._dirs     = .empty,
+        ._metas = .empty,
+        ._dirs = .empty,
     };
     errdefer result.deinit();
-
-    const parts_path = try std.fmt.allocPrint(allocator, "{s}/{s}/{s}/parts", .{ data_dir, db, table_name });
-    defer allocator.free(parts_path);
 
     var parts_dir = std.Io.Dir.cwd().openDir(io, parts_path, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound, error.NotDir => return result,
@@ -111,9 +119,9 @@ pub fn scan(
         errdefer allocator.free(full_path);
 
         try result._metas.append(allocator, .{
-            .min_seq   = parsed.min_seq,
-            .max_seq   = parsed.max_seq,
-            .level     = parsed.level,
+            .min_seq = parsed.min_seq,
+            .max_seq = parsed.max_seq,
+            .level = parsed.level,
             .full_path = full_path,
         });
     }
@@ -224,11 +232,11 @@ test "parseName: basic cases" {
     try t.expectEqual(@as(u64, 20), r4.max_seq);
     try t.expectEqual(@as(u32, 3), r4.level);
 
-    try t.expect(parseName("tmp_abc")  == null);
-    try t.expect(parseName("all_")     == null);
-    try t.expect(parseName("other")    == null);
-    try t.expect(parseName("all_1_1")  == null); // missing level
-    try t.expect(parseName("_1_1_0")   == null); // missing partition prefix
+    try t.expect(parseName("tmp_abc") == null);
+    try t.expect(parseName("all_") == null);
+    try t.expect(parseName("other") == null);
+    try t.expect(parseName("all_1_1") == null); // missing level
+    try t.expect(parseName("_1_1_0") == null); // missing partition prefix
 }
 
 test "scan: empty when parts dir missing" {
@@ -241,8 +249,8 @@ test "scan: empty when parts dir missing" {
 test "numeric sort: all_10 comes after all_2" {
     var arr = [_]PartMeta{
         .{ .min_seq = 10, .max_seq = 10, .level = 0, .full_path = "" },
-        .{ .min_seq = 2,  .max_seq = 2,  .level = 0, .full_path = "" },
-        .{ .min_seq = 1,  .max_seq = 1,  .level = 0, .full_path = "" },
+        .{ .min_seq = 2, .max_seq = 2, .level = 0, .full_path = "" },
+        .{ .min_seq = 1, .max_seq = 1, .level = 0, .full_path = "" },
     };
     std.mem.sort(PartMeta, &arr, {}, struct {
         fn lt(_: void, a: PartMeta, b: PartMeta) bool {
@@ -250,8 +258,8 @@ test "numeric sort: all_10 comes after all_2" {
             return a.level > b.level;
         }
     }.lt);
-    try std.testing.expectEqual(@as(u64, 1),  arr[0].min_seq);
-    try std.testing.expectEqual(@as(u64, 2),  arr[1].min_seq);
+    try std.testing.expectEqual(@as(u64, 1), arr[0].min_seq);
+    try std.testing.expectEqual(@as(u64, 2), arr[1].min_seq);
     try std.testing.expectEqual(@as(u64, 10), arr[2].min_seq);
 }
 

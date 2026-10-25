@@ -18,7 +18,6 @@
 /// Usage:
 ///   try schema_persist.save(io, allocator, data_dir, db, table_entry);
 ///   const entry = try schema_persist.load(allocator, io, data_dir, db, table_name);
-
 const std = @import("std");
 const schema = @import("schema");
 const schema_config = @import("schema_config");
@@ -39,10 +38,10 @@ fn hasLoaded(keys: []const LoadedKey, db: []const u8, table: []const u8) bool {
 // ── Shared serialiser ─────────────────────────────────────────────────────────
 
 fn appendTableJson(
-    buf:       *std.ArrayList(u8),
+    buf: *std.ArrayList(u8),
     allocator: std.mem.Allocator,
-    db:        []const u8,
-    entry:     *const schema_config.TableEntry,
+    db: []const u8,
+    entry: *const schema_config.TableEntry,
 ) !void {
     try buf.appendSlice(allocator, "{\n  \"db\": \"");
     try writeJsonString(buf, allocator, db);
@@ -119,6 +118,40 @@ pub fn saveToDir(
     defer buf.deinit(allocator);
     try appendTableJson(&buf, allocator, db, entry);
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = file_path, .data = buf.items });
+}
+
+/// Load `<table_dir>/schema.json`.  Used by the CLI, where the store root may
+/// be an absolute path and there is no `<data_dir>/<db>/<table>` split.
+pub fn loadFromDir(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    table_dir: []const u8,
+) !?schema_config.SchemaConfig {
+    const file_path = try std.fmt.allocPrint(allocator, "{s}/schema.json", .{table_dir});
+    defer allocator.free(file_path);
+
+    const json_bytes = readFileAlloc(io, file_path, allocator, 256 * 1024) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    defer allocator.free(json_bytes);
+    const wrapped = try std.fmt.allocPrint(allocator, "{{\"tables\":[{s}]}}", .{json_bytes});
+    defer allocator.free(wrapped);
+    return try schema_config.loadFromSlice(allocator, wrapped);
+}
+
+fn readFileAlloc(io: std.Io, path: []const u8, allocator: std.mem.Allocator, max: usize) ![]u8 {
+    var file = if (std.fs.path.isAbsolute(path))
+        try std.Io.Dir.openFileAbsolute(io, path, .{})
+    else
+        try std.Io.Dir.cwd().openFile(io, path, .{});
+    defer file.close(io);
+    const stat = try file.stat(io);
+    if (stat.size > max) return error.FileTooBig;
+    const buf = try allocator.alloc(u8, @intCast(stat.size));
+    errdefer allocator.free(buf);
+    _ = try file.readPositionalAll(io, buf, 0);
+    return buf;
 }
 
 /// Load schema.json for a single table.
@@ -382,7 +415,7 @@ test "loadAll: loads ClickHouse metadata sql after schema json" {
     try std.Io.Dir.cwd().writeFile(io, .{
         .sub_path = json_dir ++ "/schema.json",
         .data =
-            \\{"db":"vprobe","name":"json_first","columns":[{"name":"id","type":"Int32"}],"sort_keys":["id"]}
+        \\{"db":"vprobe","name":"json_first","columns":[{"name":"id","type":"Int32"}],"sort_keys":["id"]}
         ,
     });
 
@@ -391,40 +424,40 @@ test "loadAll: loads ClickHouse metadata sql after schema json" {
     try std.Io.Dir.cwd().writeFile(io, .{
         .sub_path = meta_dir ++ "/json_first.sql",
         .data =
-            \\CREATE TABLE vprobe.json_first
-            \\(
-            \\  `id` UInt64,
-            \\  `ignored` String
-            \\)
-            \\ENGINE = MergeTree
-            \\ORDER BY (id)
+        \\CREATE TABLE vprobe.json_first
+        \\(
+        \\  `id` UInt64,
+        \\  `ignored` String
+        \\)
+        \\ENGINE = MergeTree
+        \\ORDER BY (id)
         ,
     });
     try std.Io.Dir.cwd().writeFile(io, .{
         .sub_path = meta_dir ++ "/from_metadata.sql",
         .data =
-            \\CREATE TABLE vprobe.from_metadata
-            \\(
-            \\  `event_type` LowCardinality(String),
-            \\  `ts` DateTime64(3),
-            \\  `features` Map(String, Float64)
-            \\)
-            \\ENGINE = ReplacingMergeTree(ts)
-            \\PARTITION BY toYYYYMM(ts)
-            \\ORDER BY (event_type, ts)
-            \\SETTINGS index_granularity = 8192
+        \\CREATE TABLE vprobe.from_metadata
+        \\(
+        \\  `event_type` LowCardinality(String),
+        \\  `ts` DateTime64(3),
+        \\  `features` Map(String, Float64)
+        \\)
+        \\ENGINE = ReplacingMergeTree(ts)
+        \\PARTITION BY toYYYYMM(ts)
+        \\ORDER BY (event_type, ts)
+        \\SETTINGS index_granularity = 8192
         ,
     });
     try std.Io.Dir.cwd().writeFile(io, .{
         .sub_path = meta_dir ++ "/atomic_name.sql",
         .data =
-            \\ATTACH TABLE _ UUID 'f0805669-b200-4cf8-8cb4-565fad8eb655'
-            \\(
-            \\  `code` String,
-            \\  `date` Date
-            \\)
-            \\ENGINE = ReplacingMergeTree
-            \\ORDER BY (code, date)
+        \\ATTACH TABLE _ UUID 'f0805669-b200-4cf8-8cb4-565fad8eb655'
+        \\(
+        \\  `code` String,
+        \\  `date` Date
+        \\)
+        \\ENGINE = ReplacingMergeTree
+        \\ORDER BY (code, date)
         ,
     });
 

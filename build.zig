@@ -749,11 +749,37 @@ pub fn build(b: *std.Build) void {
     const part_scan_bridge_tests = b.addTest(.{ .root_module = part_scan_bridge_mod });
     const part_scan_bridge_test_cmd = b.addRunArtifact(part_scan_bridge_tests);
 
+    // Shared CLI store reader: generic Store V2 or ClickHouse MergeTree parts.
+    const store_query_mod = b.createModule(.{
+        .root_source_file = b.path("src/store_query.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    store_query_mod.addImport("schema", schema_mod);
+    store_query_mod.addImport("core", core_mod);
+    store_query_mod.addImport("generic_store_bridge", generic_store_bridge_mod);
+    store_query_mod.addImport("part_scan_bridge", part_scan_bridge_mod);
+    store_query_mod.addImport("part_scanner", part_scanner_mod);
+    store_query_mod.addImport("schema_persist", schema_persist_mod);
+    store_query_mod.addImport("schema_config", schema_config_mod);
+    store_query_mod.link_libc = true;
+    lz4ctx.link(store_query_mod);
+    const store_query_tests = b.addTest(.{ .root_module = store_query_mod });
+    const store_query_test_cmd = b.addRunArtifact(store_query_tests);
+
     exe.root_module.addImport("ir_planner", ir_planner_mod);
     exe.root_module.addImport("core", core_mod);
     exe.root_module.addImport("parallel", parallel_mod);
     exe.root_module.addImport("generic_store_bridge", generic_store_bridge_mod);
+    exe.root_module.addImport("part_scan_bridge", part_scan_bridge_mod);
+    exe.root_module.addImport("part_scanner", part_scanner_mod);
+    exe.root_module.addImport("schema_persist", schema_persist_mod);
+    exe.root_module.addImport("schema_config", schema_config_mod);
     unit_tests.root_module.addImport("generic_store_bridge", generic_store_bridge_mod);
+    unit_tests.root_module.addImport("part_scan_bridge", part_scan_bridge_mod);
+    unit_tests.root_module.addImport("part_scanner", part_scanner_mod);
+    unit_tests.root_module.addImport("schema_persist", schema_persist_mod);
+    unit_tests.root_module.addImport("schema_config", schema_config_mod);
 
     // ── serializer module (ResultSet → Native block) ─────────────────────────
     const serializer_mod = b.createModule(.{
@@ -819,6 +845,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&type_mapping_test_cmd.step);
     test_step.dependOn(&generic_store_bridge_test_cmd.step);
     test_step.dependOn(&part_scan_bridge_test_cmd.step);
+    test_step.dependOn(&store_query_test_cmd.step);
     test_step.dependOn(&row_binary_decoder_test_cmd.step);
     test_step.dependOn(&schema_config_test_cmd.step);
     test_step.dependOn(&schema_persist_test_cmd.step);

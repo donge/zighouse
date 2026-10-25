@@ -1020,6 +1020,34 @@ pub const PartScanBridge = struct {
         self.alloc.destroy(self.state);
     }
 
+    /// Prepare the bridge for a new query reusing the same part list/mappings.
+    pub fn resetForNewQuery(self: *PartScanBridge, pruned_cols: []const []const u8) void {
+        const s = self.state;
+        s.reset();
+        s.scan_lo = 0;
+        s.scan_hi = std.math.maxInt(u64);
+        s.override_active = false;
+        @memset(&s.nonempty_bool, false);
+
+        if (pruned_cols.len == 0) {
+            if (s.needed_cols) |nc| s.alloc.free(nc);
+            s.needed_cols = null;
+            return;
+        }
+        if (s.needed_cols == null) {
+            s.needed_cols = s.alloc.alloc(bool, s.table.columns.len) catch return;
+        }
+        @memset(s.needed_cols.?, false);
+        for (pruned_cols) |name| {
+            for (s.table.columns, 0..) |col, i| {
+                if (std.mem.eql(u8, col.name, name)) {
+                    s.needed_cols.?[i] = true;
+                    break;
+                }
+            }
+        }
+    }
+
     pub fn source(self: *PartScanBridge) SourceIface {
         return .{ .ptr = self, .vtable = &vtable };
     }

@@ -305,4 +305,35 @@ expect_eq "non-default db values count" "1" "$(select_tsv "SELECT count(*) FROM 
 expect_eq "non-default db values id" "42" "$(select_tsv "SELECT id FROM test.values_events")"
 expect_eq "non-default db values string" "hello" "$(select_tsv "SELECT name FROM test.values_events")"
 
+# ── File import vs streamed write parity ─────────────────────────────────────
+# The same rows go through the Parquet importer (generic Store V2) and through
+# RowBinary INSERT (ClickHouse compact parts).  Both stores are queried through
+# the CLI, which selects the matching SourceIface but shares planner/pipeline.
+parity_parquet="$DATA_DIR/file_stream_parity.parquet"
+python3 - "$parity_parquet" <<'PY'
+import duckdb, sys
+path = sys.argv[1]
+con = duckdb.connect()
+con.execute("CREATE TABLE t(id INTEGER, user_id BIGINT, category VARCHAR, score INTEGER)")
+con.execute("INSERT INTO t VALUES (1,10,'alpha',5),(2,20,'',7),(3,10,'beta',4),(4,30,'alpha',9),(5,20,'gamma',3),(6,20,'beta',8)")
+con.execute(f"COPY t TO '{path}' (FORMAT PARQUET)")
+PY
+
+"$BINARY" import-parquet --format=generic "$parity_parquet" "$DATA_DIR/default" file_events >/dev/null
+stream_csv="$("$BINARY" query "$DATA_DIR/default" compact_events "SELECT id, user_id, category, score FROM compact_events ORDER BY id")"
+file_csv="$("$BINARY" query "$DATA_DIR/default" file_events "SELECT id, user_id, category, score FROM file_events ORDER BY id")"
+expect_eq "file-import vs streamed-write results" "$stream_csv" "$file_csv"
+expect_eq "streamed-write CLI results" $'id,user_id,category,score\n1,10,alpha,5\n2,20,,7\n3,10,beta,4\n4,30,alpha,9\n5,20,gamma,3\n6,20,beta,8' "$stream_csv"
+
+# The bench loop reuses one bridge across queries; verify the reset path on
+# streamed parts as well.
+printf 'SELECT count(*) FROM compact_events\n' > "$DATA_DIR/one.sql"
+bench_summary="$("$BINARY" bench --store="$DATA_DIR/default" compact_events "$DATA_DIR/one.sql" 2>/dev/null | grep '^summary:')"
+if [[ "$bench_summary" != *"queries=1 nulls=0"* ]]; then
+    echo "FAIL streamed bench reuse"
+    echo "$bench_summary"
+    exit 1
+fi
+echo "PASS streamed bench reuse"
+
 echo "PASS compact part query integration"
