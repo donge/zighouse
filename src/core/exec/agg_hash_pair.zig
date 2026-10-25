@@ -262,11 +262,6 @@ pub fn executeHashAggParallelPairCount(
         }
 
         fn runWork(self: *@This()) !void {
-            // Initialize local HT IN the worker thread so all 8 @memset ops run in
-            // parallel, eliminating the serial page-fault bottleneck in the main thread
-            // (8 × 80 MB = 640 MB of zeroing previously done single-threaded).
-            self.local_ht = try ht.PairCountHashTable.initWithCapacity(self.ht_alloc, self.est_per_thread_);
-
             // ── Fast path: all data available as raw mmap slices ─────────────────
             // Eliminates fetchRange overhead (~2.9 MB per morsel of arena allocations)
             // and the ~1.9 GB total query-arena accumulation across all morsels.
@@ -303,6 +298,10 @@ pub fn executeHashAggParallelPairCount(
                 }
                 return;
             }
+
+            // Initialize the local HT only for the fetchRange fallback.  The
+            // two-phase raw path below has its own partition tables.
+            self.local_ht = try ht.PairCountHashTable.initWithCapacity(self.ht_alloc, self.est_per_thread_);
 
             // ── Fallback: fetchRange path (columns not available as raw slices) ──
             var thread_arena = std.heap.ArenaAllocator.init(self.parent_alloc);
@@ -413,7 +412,7 @@ pub fn executeHashAggParallelPairCount(
                 .rsb = rsb,
             };
             const ba = sc.buf_arena.allocator();
-            const exp: usize = total_rows / @max(n_threads, 1) / N_P2 * 2 + 64;
+            const exp: usize = total_rows / @max(n_threads, 1) / N_P2 + 64;
             for (&sc.bufs) |*b| b.ensureTotalCapacity(ba, exp) catch {};
         }
         var ms2 = parallel.MorselSource.init(total_rows, parallel.default_morsel_size);

@@ -74,7 +74,7 @@ pub fn executeHashAggParallelCompactTopK(
     const total_rows = ctx.source.rowCount();
     if (total_rows < 500_000) return null; // not worth parallelizing small inputs
 
-    const n_threads = parallel.defaultThreads();
+    var n_threads = parallel.defaultThreads();
     if (n_threads <= 1) return null;
 
     const alloc = ctx.allocator();
@@ -161,6 +161,22 @@ pub fn executeHashAggParallelCompactTopK(
         },
         else => null,
     };
+
+    // Memory-bounded parallelism: 100M-row high-cardinality plans allocate
+    // several GB per worker.  Keep those queries on fewer workers instead of
+    // letting the OOM killer terminate them.
+    if (total_rows > 50_000_000) {
+        var has_distinct = false;
+        for (compact_kinds) |k| if (k == .count_distinct_u64) {
+            has_distinct = true;
+            break;
+        };
+        if (has_distinct) {
+            n_threads = @min(n_threads, 4);
+        } else if (filter_pred != null) {
+            n_threads = if (keys.len >= 2 and aggs.len > 1) @min(n_threads, 4) else @min(n_threads, 8);
+        }
+    }
 
     // No-filter path now supports COUNT, i64_sum, f64_sum, and count_distinct_u64.
     // Only fall back for unusual agg kinds (i64_min/max, u64_*) without filter.
