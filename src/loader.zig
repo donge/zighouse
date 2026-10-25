@@ -19,6 +19,9 @@
 /// The caller is responsible for ensuring that `table` schema matches the
 /// Parquet file layout (column count and order) — `inferSchema` produces a
 /// compatible table from the same file.
+extern fn LZ4_compressBound(input_size: c_int) c_int;
+extern fn LZ4_compress_default(source: [*]const u8, dest: [*]u8, source_size: c_int, max_dest_size: c_int) c_int;
+
 const std = @import("std");
 const parquet = @import("parquet");
 const schema = @import("schema");
@@ -229,6 +232,16 @@ pub fn importParquet(
         // str_offset_bufs / str_offset_paths are freed by the deferred loops above.
     }
 
+    // Compress large string columns into LZ4 blocks. Keep small stores raw so
+    // short scans do not pay decompression + arena allocation.
+    if (total_rows > 20_000_000 or std.c.getenv("ZIGHOUSE_STR_BLOCK_FORCE") != null) {
+        for (str_table_indices.items) |ti| {
+            const str_path = try generic_store.columnStrBinPath(allocator, part_path, table.columns[ti].name);
+            defer allocator.free(str_path);
+            try compressStringFile(allocator, io, str_path);
+        }
+    }
+
     // Write count.txt last (so a partial import leaves no count.txt).
     try generic_store.writeCountTxt(io, allocator, part_path, total_rows);
 
@@ -381,6 +394,97 @@ fn genericAllStrValue(ctx: GenericAllColsCtx, slot: usize, value: []const u8) an
 ///     <col>.mrk2 (mark file)
 ///
 /// Each column is streamed independently from the Parquet file.
+const STR_BLOCK_MAGIC = "ZHSTRB1\x00";
+const STR_BLOCK_ROWS: u32 = 65_536;
+const STR_DIR_ENTRY: usize = 32;
+
+fn compressStringFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !void {
+    const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch return;
+    defer file.close(io);
+    const stat = try file.stat(io);
+    if (stat.size < 8) return;
+    const ptr = try std.posix.mmap(null, stat.size, .{ .READ = true }, .{ .TYPE = .PRIVATE }, file.handle, 0);
+    var mapped = true;
+    defer if (mapped) std.posix.munmap(ptr);
+    if (stat.size >= 8 and std.mem.eql(u8, ptr[0..8], STR_BLOCK_MAGIC)) return;
+    const row_count = std.mem.readInt(u64, ptr[0..8], .little);
+    const offsets_bytes = (row_count + 1) * @sizeOf(u64);
+    if (8 + offsets_bytes > stat.size) return;
+    const offsets = @as([*]const u64, @ptrCast(@alignCast(ptr.ptr + 8)))[0..@intCast(row_count + 1)];
+    const bytes = ptr[8 + offsets_bytes .. stat.size];
+
+    const block_count: u32 = @intCast((row_count + STR_BLOCK_ROWS - 1) / STR_BLOCK_ROWS);
+    const tmp_path = try std.fmt.allocPrint(allocator, "{s}.blk.tmp", .{path});
+    defer allocator.free(tmp_path);
+    const out = try std.Io.Dir.cwd().createFile(io, tmp_path, .{ .truncate = true });
+    defer out.close(io);
+
+    var hdr: [32]u8 = @splat(0);
+    @memcpy(hdr[0..8], STR_BLOCK_MAGIC);
+    std.mem.writeInt(u64, hdr[8..16], row_count, .little);
+    std.mem.writeInt(u32, hdr[16..20], STR_BLOCK_ROWS, .little);
+    std.mem.writeInt(u32, hdr[20..24], block_count, .little);
+    std.mem.writeInt(u64, hdr[24..32], 32, .little); // directory offset
+    try out.writeStreamingAll(io, &hdr);
+    // Reserve directory.
+    const dir_bytes_len = @as(usize, block_count) * STR_DIR_ENTRY;
+    const zeros = try allocator.alloc(u8, dir_bytes_len);
+    defer allocator.free(zeros);
+    @memset(zeros, 0);
+    try out.writeStreamingAll(io, zeros);
+
+    const entries = try allocator.alloc([STR_DIR_ENTRY]u8, block_count);
+    defer allocator.free(entries);
+    var payload_offset: u64 = 32 + dir_bytes_len;
+    var block_i: usize = 0;
+    while (block_i < block_count) : (block_i += 1) {
+        const start_row: usize = block_i * STR_BLOCK_ROWS;
+        const n: usize = @intCast(@min(@as(u64, STR_BLOCK_ROWS), row_count - start_row));
+        const first = offsets[start_row];
+        const last = offsets[start_row + n];
+        const data_len: usize = @intCast(last - first);
+        const raw = try allocator.alloc(u8, n * 4 + data_len);
+        defer allocator.free(raw);
+        var pos: usize = 0;
+        for (0..n) |r| {
+            const len: u32 = @intCast(offsets[start_row + r + 1] - offsets[start_row + r]);
+            std.mem.writeInt(u32, raw[pos..][0..4], len, .little);
+            pos += 4;
+        }
+        @memcpy(raw[pos..][0..data_len], bytes[@intCast(first)..@intCast(last)]);
+        const bound: usize = @intCast(LZ4_compressBound(@intCast(raw.len)));
+        const compressed = try allocator.alloc(u8, bound);
+        defer allocator.free(compressed);
+        const c_len_raw = LZ4_compress_default(raw.ptr, compressed.ptr, @intCast(raw.len), @intCast(bound));
+        if (c_len_raw < 0) return error.CompressionFailed;
+        const c_len: usize = @intCast(c_len_raw);
+        const use_lz4 = c_len < raw.len;
+        const payload = if (use_lz4) compressed[0..c_len] else raw;
+        try out.writeStreamingAll(io, payload);
+        var e: [STR_DIR_ENTRY]u8 = @splat(0);
+        std.mem.writeInt(u64, e[0..8], start_row, .little);
+        std.mem.writeInt(u64, e[8..16], payload_offset, .little);
+        std.mem.writeInt(u32, e[16..20], @intCast(payload.len), .little);
+        std.mem.writeInt(u32, e[20..24], @intCast(raw.len), .little);
+        e[24] = if (use_lz4) 1 else 0;
+        entries[block_i] = e;
+        payload_offset += payload.len;
+    }
+    // Write directory at offset 32.
+    const dir_bytes = std.mem.sliceAsBytes(entries);
+    try out.writePositionalAll(io, dir_bytes, 32);
+    if (payload_offset >= stat.size) {
+        // Not smaller; discard.
+        out.close(io);
+        std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+        return;
+    }
+    std.posix.munmap(ptr);
+    mapped = false;
+    std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    try std.Io.Dir.rename(std.Io.Dir.cwd(), tmp_path, std.Io.Dir.cwd(), path, io);
+}
+
 pub fn importParquetCH(
     allocator: std.mem.Allocator,
     io: std.Io,

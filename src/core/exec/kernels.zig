@@ -1861,19 +1861,18 @@ pub fn updateAccum(accum: *AggAccum, v: ?Value, arena: std.mem.Allocator) !void 
         },
         .str_min => if (v) |val| {
             if (val.toStr()) |s| {
-                // Borrow the pointer directly — string slices from DataChunk columns
-                // point into store memory (mmapped) or chunk arenas that are not freed
-                // during hash_agg / scalar_agg processing.  No dupe needed.
+                // Block-compressed chunks own their decoded strings; copy only when
+                // the accumulated minimum actually changes.
                 if (accum.str_min) |cur| {
-                    if (std.mem.lessThan(u8, s, cur)) accum.str_min = s;
-                } else accum.str_min = s;
+                    if (std.mem.lessThan(u8, s, cur)) accum.str_min = try arena.dupe(u8, s);
+                } else accum.str_min = try arena.dupe(u8, s);
             }
         },
         .str_max => if (v) |val| {
             if (val.toStr()) |s| {
                 if (accum.str_max) |cur| {
-                    if (std.mem.lessThan(u8, cur, s)) accum.str_max = s;
-                } else accum.str_max = s;
+                    if (std.mem.lessThan(u8, cur, s)) accum.str_max = try arena.dupe(u8, s);
+                } else accum.str_max = try arena.dupe(u8, s);
             }
         },
         .uniq_strs => if (v) |val| {

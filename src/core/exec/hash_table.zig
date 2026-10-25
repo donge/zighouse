@@ -988,12 +988,12 @@ pub const StrAggHashTable = struct {
         const idx = slot * self.num_str_aggs + sidecar_i;
         if (self.str_sidecar[idx]) |cur| {
             if (is_min) {
-                if (std.mem.lessThan(u8, s, cur)) self.str_sidecar[idx] = s;
+                if (std.mem.lessThan(u8, s, cur)) self.str_sidecar[idx] = self.arena.dupe(u8, s) catch s;
             } else {
-                if (std.mem.lessThan(u8, cur, s)) self.str_sidecar[idx] = s;
+                if (std.mem.lessThan(u8, cur, s)) self.str_sidecar[idx] = self.arena.dupe(u8, s) catch s;
             }
         } else {
-            self.str_sidecar[idx] = s;
+            self.str_sidecar[idx] = self.arena.dupe(u8, s) catch s;
         }
     }
 

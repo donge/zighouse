@@ -24,6 +24,8 @@
 ///   defer qctx.deinit();
 ///
 ///   const rs = try pipeline.executePlan(node, &qctx);
+extern fn LZ4_decompress_safe(source: [*]const u8, dest: [*]u8, compressed_size: c_int, max_decompressed_size: c_int) c_int;
+
 const std = @import("std");
 const schema = @import("schema");
 const core = @import("core");
@@ -78,9 +80,79 @@ const MappedStringCol = struct {
     }
 };
 
+const STR_BLOCK_MAGIC = "ZHSTRB1\x00";
+
+const MappedBlockStringCol = struct {
+    ptr: []align(std.heap.page_size_min) u8,
+    row_count: u64,
+    block_rows: u32,
+    block_count: u32,
+    dir_offset: u64,
+
+    const Entry = struct {
+        row_start: u64,
+        data_offset: u64,
+        comp_size: u32,
+        raw_size: u32,
+        codec: u8,
+    };
+
+    fn deinit(self: MappedBlockStringCol) void {
+        std.posix.munmap(self.ptr);
+    }
+
+    fn entry(self: MappedBlockStringCol, i: usize) Entry {
+        const off: usize = @intCast(self.dir_offset + @as(u64, i) * 32);
+        const e = self.ptr[off..][0..32];
+        return .{
+            .row_start = std.mem.readInt(u64, e[0..8], .little),
+            .data_offset = std.mem.readInt(u64, e[8..16], .little),
+            .comp_size = std.mem.readInt(u32, e[16..20], .little),
+            .raw_size = std.mem.readInt(u32, e[20..24], .little),
+            .codec = e[24],
+        };
+    }
+
+    fn decode(self: MappedBlockStringCol, e: Entry, alloc: std.mem.Allocator) ![]const u8 {
+        const src = self.ptr[@intCast(e.data_offset)..@intCast(e.data_offset + e.comp_size)];
+        if (e.codec == 0) return src;
+        if (e.codec != 1) return error.InvalidStringBlock;
+        const out = try alloc.alloc(u8, e.raw_size);
+        const n = LZ4_decompress_safe(src.ptr, out.ptr, @intCast(src.len), @intCast(out.len));
+        if (n < 0 or @as(usize, @intCast(n)) != out.len) return error.CorruptStringBlock;
+        return out;
+    }
+
+    fn readRange(self: MappedBlockStringCol, start: u64, count: usize, alloc: std.mem.Allocator, out: [][]const u8) !void {
+        var produced: usize = 0;
+        var row = start;
+        while (produced < count) {
+            const bi: usize = @intCast(row / self.block_rows);
+            if (bi >= self.block_count) return error.InvalidStringBlock;
+            const e = self.entry(bi);
+            const raw = try self.decode(e, alloc);
+            const rows_in: usize = @intCast(@min(@as(u64, self.block_rows), self.row_count - e.row_start));
+            if (raw.len < rows_in * 4) return error.InvalidStringBlock;
+            const lens = @as([*]const u32, @ptrCast(@alignCast(raw.ptr)))[0..rows_in];
+            var rr: usize = @intCast(row - e.row_start);
+            var byte_pos: usize = rows_in * 4;
+            var j: usize = 0;
+            while (j < rr) : (j += 1) byte_pos += lens[j];
+            while (rr < rows_in and produced < count) : (rr += 1) {
+                const len = lens[rr];
+                out[produced] = raw[byte_pos .. byte_pos + len];
+                byte_pos += len;
+                produced += 1;
+            }
+            row = e.row_start + rows_in;
+        }
+    }
+};
+
 const ColData = union(enum) {
     fixed: MappedFixedCol,
     string: MappedStringCol,
+    block_string: MappedBlockStringCol,
     none, // pruned / skipped
 };
 
@@ -265,16 +337,33 @@ const ScanState = struct {
                 }
                 // Hint: we will scan sequentially; OS should use aggressive read-ahead.
                 std.posix.madvise(ptr.ptr, stat.size, std.posix.MADV.SEQUENTIAL) catch {};
-                const row_count = std.mem.readInt(u64, ptr[0..8], .little);
-                const offsets_bytes = (row_count + 1) * 8;
-                const offsets = std.mem.bytesAsSlice(u64, ptr[8..][0..offsets_bytes]);
-                const bytes = ptr[8 + offsets_bytes .. stat.size];
-                self.col_data[ci] = .{ .string = .{
-                    .ptr = ptr,
-                    .row_count = row_count,
-                    .offsets = offsets,
-                    .bytes = bytes,
-                } };
+                if (stat.size >= 32 and std.mem.eql(u8, ptr[0..8], STR_BLOCK_MAGIC)) {
+                    const row_count = std.mem.readInt(u64, ptr[8..16], .little);
+                    const block_rows = std.mem.readInt(u32, ptr[16..20], .little);
+                    const block_count = std.mem.readInt(u32, ptr[20..24], .little);
+                    const dir_offset = std.mem.readInt(u64, ptr[24..32], .little);
+                    if (block_rows == 0 or dir_offset + @as(u64, block_count) * 32 > stat.size)
+                        return error.InvalidStringBlock;
+                    self.col_data[ci] = .{ .block_string = .{
+                        .ptr = ptr,
+                        .row_count = row_count,
+                        .block_rows = block_rows,
+                        .block_count = block_count,
+                        .dir_offset = dir_offset,
+                    } };
+                } else {
+                    const row_count = std.mem.readInt(u64, ptr[0..8], .little);
+                    const offsets_bytes = (row_count + 1) * 8;
+                    if (8 + offsets_bytes > stat.size) return error.InvalidStringColumn;
+                    const offsets = std.mem.bytesAsSlice(u64, ptr[8..][0..offsets_bytes]);
+                    const bytes = ptr[8 + offsets_bytes .. stat.size];
+                    self.col_data[ci] = .{ .string = .{
+                        .ptr = ptr,
+                        .row_count = row_count,
+                        .offsets = offsets,
+                        .bytes = bytes,
+                    } };
+                }
             } else {
                 // Fixed-width columns are always Store V2 block files.
                 const path = try generic_store.columnBinPath(self.alloc, self.part_dir, col.name);
@@ -313,6 +402,7 @@ const ScanState = struct {
             switch (cd) {
                 .fixed => |m| m.deinit(self.alloc),
                 .string => |m| m.deinit(),
+                .block_string => |m| m.deinit(),
                 .none => {},
             }
         }
@@ -589,23 +679,20 @@ const ScanState = struct {
                     if (is_pruned) break :blk .{ .string = zero_str_slice };
                     // Fast path: column only needed for non-empty check — decode as bool_u8
                     // (1=non-empty, 0=empty). Avoids building 16-byte fat pointers per row.
-                    if (ci < 256 and self.nonempty_bool[ci]) {
-                        const bbuf = try chunk_alloc.alloc(u8, n);
-                        null_mask = try chunk_alloc.alloc(u64, null_words);
-                        @memset(null_mask, 0);
-                        const sc = &self.col_data[ci].string;
-                        for (0..n) |i| {
-                            const row = abs_start + i;
-                            bbuf[i] = if (sc.offsets[row + 1] > sc.offsets[row]) 1 else 0;
-                        }
-                        break :blk .{ .bool_u8 = bbuf };
-                    }
                     const sbuf = try chunk_alloc.alloc([]const u8, n);
                     null_mask = try chunk_alloc.alloc(u64, null_words);
                     @memset(null_mask, 0);
-                    const sc = &self.col_data[ci].string;
-                    for (0..n) |i| {
-                        sbuf[i] = sc.str(abs_start + i);
+                    switch (self.col_data[ci]) {
+                        .string => |*sc| for (0..n) |i| {
+                            sbuf[i] = sc.str(abs_start + i);
+                        },
+                        .block_string => |*sc| try sc.readRange(abs_start, n, chunk_alloc, sbuf),
+                        else => @memset(sbuf, ""),
+                    }
+                    if (ci < 256 and self.nonempty_bool[ci]) {
+                        const bbuf = try chunk_alloc.alloc(u8, n);
+                        for (0..n) |i| bbuf[i] = if (sbuf[i].len > 0) 1 else 0;
+                        break :blk .{ .bool_u8 = bbuf };
                     }
                     break :blk .{ .string = sbuf };
                 },
