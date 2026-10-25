@@ -3876,22 +3876,9 @@ fn executeTopKFromChunkResult(
     k: usize,
     alloc: std.mem.Allocator,
 ) !RowBuffer {
-    var collector = try TopKCollector.init(alloc, keys, k);
-    const key_buf = try alloc.alloc(?Value, res.metas.len);
-    @memset(key_buf, null);
-    for (res.chunks) |*c| {
-        for (0..c.num_rows) |r| {
-            for (keys) |key| {
-                if (key.col_idx >= c.columns.len) continue;
-                const col = &c.columns[key.col_idx];
-                key_buf[key.col_idx] = if (col.isRowNull(r)) null else col.data.get(r);
-            }
-            if (!collector.shouldOfferKeys(key_buf)) continue;
-            collector.offer(try materializeChunkRowOwned(c, r, alloc));
-        }
-    }
-    const metas = try alloc.dupe(result.ColMeta, res.metas);
-    return try collector.finish(metas);
+    var sink = try TopNSink.init(alloc, res.metas, keys, k);
+    for (res.chunks) |*c| try sink.pushChunk(c);
+    return sink.finish();
 }
 
 /// Temporary bridge for callers that still consume RowBuffer. The chunk sink
@@ -5756,13 +5743,60 @@ test "TopKCollector keeps best k by count desc" {
     try std.testing.expectEqual(@as(u64, 5), rl.rows.items[2][0].?.uint64);
 }
 
+/// Chunk/row sink built on the bounded TopKCollector.  Producers can push
+/// chunks without materialising every accepted row; rejected rows are compared
+/// only through their sort-key columns.
+const TopNSink = struct {
+    alloc: std.mem.Allocator,
+    collector: TopKCollector,
+    metas: []result.ColMeta,
+    key_buf: []?Value,
+
+    fn init(
+        alloc: std.mem.Allocator,
+        metas: []const result.ColMeta,
+        keys: []const plan.SortKey,
+        k: usize,
+    ) !TopNSink {
+        const owned_metas = try alloc.dupe(result.ColMeta, metas);
+        errdefer alloc.free(owned_metas);
+        return .{
+            .alloc = alloc,
+            .collector = try TopKCollector.init(alloc, keys, k),
+            .metas = owned_metas,
+            .key_buf = try alloc.alloc(?Value, metas.len),
+        };
+    }
+
+    fn pushRow(self: *TopNSink, row: []?Value) void {
+        self.collector.offer(row);
+    }
+
+    fn pushChunk(self: *TopNSink, c: *const DataChunk) !void {
+        @memset(self.key_buf, null);
+        for (0..c.num_rows) |r| {
+            for (self.collector.keys) |key| {
+                if (key.col_idx >= c.columns.len) continue;
+                const col = &c.columns[key.col_idx];
+                self.key_buf[key.col_idx] = if (col.isRowNull(r)) null else col.data.get(r);
+            }
+            if (!self.collector.shouldOfferKeys(self.key_buf)) continue;
+            self.collector.offer(try materializeChunkRowOwned(c, r, self.alloc));
+        }
+    }
+
+    fn finish(self: *TopNSink) !RowBuffer {
+        return self.collector.finish(self.metas);
+    }
+};
+
 fn executeTopK(inner: RowBuffer, keys: []const plan.SortKey, k: usize, alloc: std.mem.Allocator) !RowBuffer {
     const rows = inner.rows.items;
     if (rows.len == 0 or k == 0) return RowBuffer.init(inner.metas);
 
-    var collector = try TopKCollector.init(alloc, keys, k);
-    for (rows) |row| collector.offer(row);
-    return collector.finish(inner.metas);
+    var sink = try TopNSink.init(alloc, inner.metas, keys, k);
+    for (rows) |row| sink.pushRow(row);
+    return sink.finish();
 }
 
 /// Stream a scannable node (scan/filter/project/limit) directly into a min-heap
@@ -11333,27 +11367,14 @@ fn executeHashAggParallelCompactTopK(
         // Updated whenever the heap changes. Avoids double pointer dereference in hot path.
         heap_min_cached: i64 = std.math.minInt(i64),
 
-        fn rowLessThan(sk: []const plan.SortKey, a: []?Value, b: []?Value) bool {
-            for (sk) |key| {
-                const av: ?Value = if (key.col_idx < a.len) a[key.col_idx] else null;
-                const bv: ?Value = if (key.col_idx < b.len) b[key.col_idx] else null;
-                const ord: std.math.Order = if (av != null and bv != null)
-                    Value.order(av.?, bv.?)
-                else if (av == null and bv == null) .eq else if (av == null) .lt else .gt;
-                if (ord == .eq) continue;
-                return if (key.desc) ord == .gt else ord == .lt;
-            }
-            return false;
-        }
-
         fn heapSiftDown(self: *@This(), i: usize) void {
             var cur = i;
             while (true) {
                 var worst = cur;
                 const l = cur * 2 + 1;
                 const r = cur * 2 + 2;
-                if (l < self.heap_len and @This().rowLessThan(self.sort_keys, self.heap.?[worst], self.heap.?[l])) worst = l;
-                if (r < self.heap_len and @This().rowLessThan(self.sort_keys, self.heap.?[worst], self.heap.?[r])) worst = r;
+                if (l < self.heap_len and rowLessThan(self.sort_keys, self.heap.?[worst], self.heap.?[l])) worst = l;
+                if (r < self.heap_len and rowLessThan(self.sort_keys, self.heap.?[worst], self.heap.?[r])) worst = r;
                 if (worst == cur) break;
                 const tmp = self.heap.?[cur];
                 self.heap.?[cur] = self.heap.?[worst];
@@ -11366,7 +11387,7 @@ fn executeHashAggParallelCompactTopK(
             var cur = i;
             while (cur > 0) {
                 const parent = (cur - 1) / 2;
-                if (@This().rowLessThan(self.sort_keys, self.heap.?[parent], self.heap.?[cur])) {
+                if (rowLessThan(self.sort_keys, self.heap.?[parent], self.heap.?[cur])) {
                     const tmp = self.heap.?[cur];
                     self.heap.?[cur] = self.heap.?[parent];
                     self.heap.?[parent] = tmp;
@@ -11469,7 +11490,7 @@ fn executeHashAggParallelCompactTopK(
                     self.heap_len += 1;
                     self.heapSiftUp(self.heap_len - 1);
                     self.updateHeapMinCache();
-                } else if (@This().rowLessThan(self.sort_keys, row, heap[0])) {
+                } else if (rowLessThan(self.sort_keys, row, heap[0])) {
                     heap[0] = row;
                     self.heapSiftDown(0);
                     self.updateHeapMinCache();
@@ -12577,24 +12598,14 @@ fn executeTwoPhaseHashAgg(
         heap_min_cached: i64 = std.math.minInt(i64),
         err: ?anyerror = null,
 
-        fn rowLessThan(sk: []const plan.SortKey, a: []?Value, b: []?Value) bool {
-            for (sk) |key| {
-                const av: ?Value = if (key.col_idx < a.len) a[key.col_idx] else null;
-                const bv: ?Value = if (key.col_idx < b.len) b[key.col_idx] else null;
-                const ord: std.math.Order = if (av != null and bv != null) Value.order(av.?, bv.?) else if (av == null and bv == null) .eq else if (av == null) .lt else .gt;
-                if (ord == .eq) continue;
-                return if (key.desc) ord == .gt else ord == .lt;
-            }
-            return false;
-        }
         fn heapSiftDown(self: *@This(), i: usize) void {
             var cur = i;
             while (true) {
                 var worst = cur;
                 const l = cur * 2 + 1;
                 const r = cur * 2 + 2;
-                if (l < self.heap_len and @This().rowLessThan(self.sort_keys, self.heap.?[worst], self.heap.?[l])) worst = l;
-                if (r < self.heap_len and @This().rowLessThan(self.sort_keys, self.heap.?[worst], self.heap.?[r])) worst = r;
+                if (l < self.heap_len and rowLessThan(self.sort_keys, self.heap.?[worst], self.heap.?[l])) worst = l;
+                if (r < self.heap_len and rowLessThan(self.sort_keys, self.heap.?[worst], self.heap.?[r])) worst = r;
                 if (worst == cur) break;
                 const tmp = self.heap.?[cur];
                 self.heap.?[cur] = self.heap.?[worst];
@@ -12606,7 +12617,7 @@ fn executeTwoPhaseHashAgg(
             var cur = i;
             while (cur > 0) {
                 const parent = (cur - 1) / 2;
-                if (@This().rowLessThan(self.sort_keys, self.heap.?[parent], self.heap.?[cur])) {
+                if (rowLessThan(self.sort_keys, self.heap.?[parent], self.heap.?[cur])) {
                     const tmp = self.heap.?[cur];
                     self.heap.?[cur] = self.heap.?[parent];
                     self.heap.?[parent] = tmp;
@@ -12715,7 +12726,7 @@ fn executeTwoPhaseHashAgg(
                     self.heap_len += 1;
                     self.heapSiftUp(self.heap_len - 1);
                     self.updateHeapMinCache();
-                } else if (@This().rowLessThan(self.sort_keys, row, heap[0])) {
+                } else if (rowLessThan(self.sort_keys, row, heap[0])) {
                     heap[0] = row;
                     self.heapSiftDown(0);
                     self.updateHeapMinCache();
