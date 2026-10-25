@@ -37,102 +37,6 @@ const http_client = @import("clickhouse_native/http_client.zig");
 ///   table       — schema of the table to import (column order must match file)
 ///
 /// Returns the number of rows imported.
-/// Convert a raw .str.bin into ZHDICT1 when the dictionary is smaller.
-/// Raw format: u64 row_count; (row_count+1) u64 offsets; bytes.
-fn dictionaryEncodeStringFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !void {
-    const MAX_DICT_VALUES: usize = 20_000_000;
-    const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch return;
-    defer file.close(io);
-    const stat = try file.stat(io);
-    if (stat.size < 8) return;
-    const ptr = try std.posix.mmap(null, stat.size, .{ .READ = true }, .{ .TYPE = .PRIVATE }, file.handle, 0);
-    var mapped = true;
-    defer if (mapped) std.posix.munmap(ptr);
-    const row_count = std.mem.readInt(u64, ptr[0..8], .little);
-    const offsets_bytes = (row_count + 1) * @sizeOf(u64);
-    if (8 + offsets_bytes > stat.size) return;
-    const offsets = @as([*]const u64, @ptrCast(@alignCast(ptr.ptr + 8)))[0..@intCast(row_count + 1)];
-    const bytes = ptr[8 + offsets_bytes .. stat.size];
-
-    var dict = std.StringHashMap(u32).init(allocator);
-    defer dict.deinit();
-    var vals: std.ArrayListUnmanaged([]const u8) = .empty;
-    defer vals.deinit(allocator);
-    var dict_bytes_len: usize = 0;
-    var i: usize = 0;
-    while (i < row_count) : (i += 1) {
-        const s = bytes[offsets[i]..offsets[i + 1]];
-        const gop = try dict.getOrPut(s);
-        if (!gop.found_existing) {
-            if (vals.items.len >= MAX_DICT_VALUES) return;
-            const id = std.math.cast(u32, vals.items.len) orelse return;
-            gop.value_ptr.* = id;
-            try vals.append(allocator, s);
-            dict_bytes_len += s.len;
-        }
-    }
-    const dict_count = vals.items.len;
-    const ids_bytes = row_count * @sizeOf(u32);
-    const ids_offset: u64 = 64;
-    const offsets_offset = std.mem.alignForward(u64, ids_offset + ids_bytes, 8);
-    const bytes_offset = offsets_offset + (dict_count + 1) * @sizeOf(u64);
-    const new_size = bytes_offset + dict_bytes_len;
-    if (new_size >= stat.size) return; // dictionary is not smaller
-
-    const dict_bytes = try allocator.alloc(u8, dict_bytes_len);
-    defer allocator.free(dict_bytes);
-    const dict_offsets = try allocator.alloc(u64, dict_count + 1);
-    defer allocator.free(dict_offsets);
-    dict_offsets[0] = 0;
-    var pos: usize = 0;
-    for (vals.items, 0..) |v, vi| {
-        @memcpy(dict_bytes[pos .. pos + v.len], v);
-        pos += v.len;
-        dict_offsets[vi + 1] = pos;
-    }
-
-    const tmp_path = try std.fmt.allocPrint(allocator, "{s}.dict.tmp", .{path});
-    defer allocator.free(tmp_path);
-    const out = try std.Io.Dir.cwd().createFile(io, tmp_path, .{ .truncate = true });
-    defer out.close(io);
-    var hdr: [64]u8 = @splat(0);
-    @memcpy(hdr[0..8], "ZHDICT1\x00");
-    std.mem.writeInt(u64, hdr[8..16], row_count, .little);
-    std.mem.writeInt(u64, hdr[16..24], dict_count, .little);
-    std.mem.writeInt(u64, hdr[24..32], ids_offset, .little);
-    std.mem.writeInt(u64, hdr[32..40], offsets_offset, .little);
-    std.mem.writeInt(u64, hdr[40..48], bytes_offset, .little);
-    std.mem.writeInt(u64, hdr[48..56], dict_bytes_len, .little);
-    try out.writeStreamingAll(io, &hdr);
-
-    var idbuf: [65536]u8 = undefined;
-    var idlen: usize = 0;
-    i = 0;
-    while (i < row_count) : (i += 1) {
-        const s = bytes[offsets[i]..offsets[i + 1]];
-        const id = dict.get(s).?;
-        std.mem.writeInt(u32, idbuf[idlen..][0..4], id, .little);
-        idlen += 4;
-        if (idlen == idbuf.len) {
-            try out.writeStreamingAll(io, idbuf[0..idlen]);
-            idlen = 0;
-        }
-    }
-    if (idlen > 0) try out.writeStreamingAll(io, idbuf[0..idlen]);
-    const pad = offsets_offset - (ids_offset + ids_bytes);
-    if (pad > 0) {
-        var zeros: [8]u8 = @splat(0);
-        try out.writeStreamingAll(io, zeros[0..@intCast(pad)]);
-    }
-    try out.writeStreamingAll(io, std.mem.sliceAsBytes(dict_offsets));
-    try out.writeStreamingAll(io, dict_bytes);
-
-    std.posix.munmap(ptr);
-    mapped = false;
-    std.Io.Dir.cwd().deleteFile(io, path) catch {};
-    try std.Io.Dir.rename(std.Io.Dir.cwd(), tmp_path, std.Io.Dir.cwd(), path, io);
-}
-
 pub fn importParquet(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -323,16 +227,6 @@ pub fn importParquet(
             std.Io.Dir.cwd().deleteFile(io, src_path) catch {};
         }
         // str_offset_bufs / str_offset_paths are freed by the deferred loops above.
-    }
-
-    // Dictionary-encode string columns on large imports, where the on-disk
-    // reduction outweighs per-query decode. Small stores keep raw strings.
-    if (total_rows > 20_000_000 or std.c.getenv("ZIGHOUSE_DICT_FORCE") != null) {
-        for (str_table_indices.items) |ti| {
-            const str_path = try generic_store.columnStrBinPath(allocator, part_path, table.columns[ti].name);
-            defer allocator.free(str_path);
-            try dictionaryEncodeStringFile(allocator, io, str_path);
-        }
     }
 
     // Write count.txt last (so a partial import leaves no count.txt).
@@ -1094,157 +988,74 @@ fn importStringColumn(
     col_idx: usize,
     total_rows: u64,
 ) !void {
-    // Dictionary encoding:
-    //   [8] magic, [u64] row_count, dict_count, ids_offset,
-    //   offsets_offset, bytes_offset, bytes_len
-    //   u32 ids[row_count], u64 dict_offsets[dict_count+1], dict bytes
-    const header_size: usize = 64;
-    const magic = "ZHDICT1\x00";
+    // Allocate offset table (total_rows+1 entries × 8 bytes = ~80 MB for 10M rows).
+    const offsets = try allocator.alloc(u64, total_rows + 1);
+    defer allocator.free(offsets);
+    offsets[0] = 0;
+    var row: u64 = 0;
+    var total_bytes: u64 = 0;
 
+    // Stream bytes to a temp file so we never hold the full blob in RAM.
     const str_path = try generic_store.columnStrBinPath(allocator, part, col_name);
     defer allocator.free(str_path);
-    const ids_path = try std.fmt.allocPrint(allocator, "{s}.ids.tmp", .{str_path});
-    defer allocator.free(ids_path);
-    const dict_path = try std.fmt.allocPrint(allocator, "{s}.dict.tmp", .{str_path});
-    defer allocator.free(dict_path);
 
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-    var dict = std.StringHashMap(u32).init(allocator);
-    defer dict.deinit();
-    var dict_vals: std.ArrayListUnmanaged([]const u8) = .empty;
-    defer dict_vals.deinit(allocator);
+    // Build a temp path alongside the final file.
+    const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp", .{str_path});
+    defer allocator.free(tmp_path);
 
-    const ids_file = try std.Io.Dir.cwd().createFile(io, ids_path, .{ .truncate = true });
-    defer ids_file.close(io);
-    const dict_file = try std.Io.Dir.cwd().createFile(io, dict_path, .{ .truncate = true });
-    defer dict_file.close(io);
+    {
+        const tmp_file = try std.Io.Dir.cwd().createFile(io, tmp_path, .{ .truncate = true });
+        defer tmp_file.close(io);
 
-    const Ctx = struct {
-        io: std.Io,
-        ids_file: std.Io.File,
-        dict_file: std.Io.File,
-        dict: *std.StringHashMap(u32),
-        vals: *std.ArrayListUnmanaged([]const u8),
-        ids: std.ArrayListUnmanaged(u32),
-        arena: std.mem.Allocator,
-        rows: u64,
-        bytes_len: u64,
-
-        fn flush(self: *@This()) !void {
-            if (self.ids.items.len == 0) return;
-            try self.ids_file.writeStreamingAll(self.io, std.mem.sliceAsBytes(self.ids.items));
-            self.ids.clearRetainingCapacity();
-        }
-
-        fn put(self: *@This(), value: []const u8) !void {
-            const gop = try self.dict.getOrPut(value);
-            var id: u32 = undefined;
-            if (gop.found_existing) {
-                id = gop.value_ptr.*;
-            } else {
-                const key = try self.arena.alloc(u8, value.len);
-                @memcpy(key, value);
-                gop.key_ptr.* = key;
-                id = std.math.cast(u32, self.vals.items.len) orelse return error.DictionaryTooLarge;
-                gop.value_ptr.* = id;
-                try self.vals.append(self.arena, key);
-                try self.dict_file.writeStreamingAll(self.io, value);
-                self.bytes_len += value.len;
-            }
-            try self.ids.append(self.arena, id);
-            if (self.ids.items.len >= 65536) try self.flush();
-            self.rows += 1;
-        }
-    };
-
-    var ctx = Ctx{
-        .io = io,
-        .ids_file = ids_file,
-        .dict_file = dict_file,
-        .dict = &dict,
-        .vals = &dict_vals,
-        .ids = .empty,
-        .arena = arena.allocator(),
-        .rows = 0,
-        .bytes_len = 0,
-    };
-    _ = try parquet.streamByteArrayColumnPath(
-        allocator,
-        io,
-        parquet_path,
-        col_idx,
-        null,
-        &ctx,
-        struct {
-            fn cb(c: *Ctx, value: []const u8) anyerror!void {
-                try c.put(value);
-            }
-        }.cb,
-    );
-    try ctx.flush();
-    if (ctx.rows != total_rows) return error.RowCountMismatch;
-
-    const dict_count: usize = dict_vals.items.len;
-    const ids_bytes = @as(u64, total_rows) * @sizeOf(u32);
-    const offsets_bytes = @as(u64, dict_count + 1) * @sizeOf(u64);
-    const ids_offset: u64 = header_size;
-    const offsets_offset: u64 = std.mem.alignForward(u64, ids_offset + ids_bytes, 8);
-    const bytes_offset: u64 = offsets_offset + offsets_bytes;
-
-    const out = try std.Io.Dir.cwd().createFile(io, str_path, .{ .truncate = true });
-    defer out.close(io);
-    var hdr: [header_size]u8 = @splat(0);
-    @memcpy(hdr[0..magic.len], magic);
-    std.mem.writeInt(u64, hdr[8..16], total_rows, .little);
-    std.mem.writeInt(u64, hdr[16..24], dict_count, .little);
-    std.mem.writeInt(u64, hdr[24..32], ids_offset, .little);
-    std.mem.writeInt(u64, hdr[32..40], offsets_offset, .little);
-    std.mem.writeInt(u64, hdr[40..48], bytes_offset, .little);
-    std.mem.writeInt(u64, hdr[48..56], ctx.bytes_len, .little);
-    try out.writeStreamingAll(io, &hdr);
-
-    // Copy ids.
-    const ids_in = try std.Io.Dir.cwd().openFile(io, ids_path, .{});
-    defer ids_in.close(io);
-    var buf: [65536]u8 = undefined;
-    while (true) {
-        const n = ids_in.readStreaming(io, &.{&buf}) catch |err| switch (err) {
-            error.EndOfStream => 0,
-            else => return err,
+        const ctx = StringStreamCtx{
+            .io = io,
+            .file = tmp_file,
+            .offsets = offsets,
+            .row = &row,
+            .total_bytes = &total_bytes,
         };
-        if (n == 0) break;
-        try out.writeStreamingAll(io, buf[0..n]);
+
+        _ = try parquet.streamByteArrayColumnPath(
+            allocator,
+            io,
+            parquet_path,
+            col_idx,
+            null,
+            ctx,
+            streamStringValue,
+        );
     }
 
-    // Align the u64 dictionary offsets.
-    const pad = offsets_offset - (ids_offset + ids_bytes);
-    if (pad > 0) {
-        var zeros: [8]u8 = @splat(0);
-        try out.writeStreamingAll(io, zeros[0..@intCast(pad)]);
+    // Assemble final .str.bin: header + offsets + bytes blob from temp file.
+    {
+        const out = try std.Io.Dir.cwd().createFile(io, str_path, .{ .truncate = true });
+        defer out.close(io);
+
+        // Write row_count header.
+        var hdr: [8]u8 = undefined;
+        std.mem.writeInt(u64, &hdr, total_rows, .little);
+        try out.writeStreamingAll(io, &hdr);
+
+        // Write offsets table.
+        try out.writeStreamingAll(io, std.mem.sliceAsBytes(offsets[0 .. total_rows + 1]));
+
+        // Copy bytes blob from temp file.
+        const tmp_in = try std.Io.Dir.cwd().openFile(io, tmp_path, .{});
+        defer tmp_in.close(io);
+
+        var buf: [65536]u8 = undefined;
+        while (true) {
+            const n = tmp_in.readStreaming(io, &.{&buf}) catch |err| switch (err) {
+                error.EndOfStream => 0,
+                else => return err,
+            };
+            if (n == 0) break;
+            try out.writeStreamingAll(io, buf[0..n]);
+        }
     }
 
-    // Dictionary offsets.
-    const dict_offsets = try allocator.alloc(u64, dict_count + 1);
-    defer allocator.free(dict_offsets);
-    dict_offsets[0] = 0;
-    for (dict_vals.items, 0..) |v, i| dict_offsets[i + 1] = dict_offsets[i] + v.len;
-    try out.writeStreamingAll(io, std.mem.sliceAsBytes(dict_offsets));
-
-    // Dictionary bytes.
-    const dict_in = try std.Io.Dir.cwd().openFile(io, dict_path, .{});
-    defer dict_in.close(io);
-    while (true) {
-        const n = dict_in.readStreaming(io, &.{&buf}) catch |err| switch (err) {
-            error.EndOfStream => 0,
-            else => return err,
-        };
-        if (n == 0) break;
-        try out.writeStreamingAll(io, buf[0..n]);
-    }
-
-    std.Io.Dir.cwd().deleteFile(io, ids_path) catch {};
-    std.Io.Dir.cwd().deleteFile(io, dict_path) catch {};
+    // Remove temp file.
+    std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
 }
 
 const StringStreamCtx = struct {
