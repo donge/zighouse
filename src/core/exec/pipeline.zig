@@ -182,10 +182,6 @@ fn envFlag(name: [:0]const u8) bool {
         std.ascii.eqlIgnoreCase(val, "off"));
 }
 
-fn topkCollectorDisabled() bool {
-    return envFlag("ZIGHOUSE_NO_TOPK_COLLECTOR");
-}
-
 /// Per-query execution context. Holds the arena for all intermediate
 /// allocations during one query's lifetime.
 pub const QueryContext = struct {
@@ -8386,7 +8382,7 @@ fn executeHashAggParallelTripleCount(
 
     const out_metas = try buildAggResultMetas(keys, aggs, alloc);
     var rl = RowBuffer.init(out_metas);
-    var topk: ?TopKCollector = if (!topkCollectorDisabled() and top_k > 0 and sort_keys.len > 0)
+    var topk: ?TopKCollector = if (top_k > 0 and sort_keys.len > 0)
         try TopKCollector.init(alloc, sort_keys, top_k)
     else
         null;
@@ -9645,7 +9641,7 @@ fn executeHashAggParallelStrKey(
     // K groups while emitting instead of materialising every group into RowBuffer.
     var topk: ?TopKCollector = null;
     var topk_sort_ai: ?usize = null;
-    if (!topkCollectorDisabled() and top_k > 0 and sort_keys.len == 1 and sort_keys[0].desc) {
+    if (top_k > 0 and sort_keys.len == 1 and sort_keys[0].desc) {
         const sc = sort_keys[0].col_idx;
         if (sc >= keys.len and sc < keys.len + aggs.len and compact_kinds[sc - keys.len] == .count) {
             topk = try TopKCollector.init(alloc, sort_keys, top_k);
