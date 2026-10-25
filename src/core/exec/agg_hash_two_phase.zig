@@ -672,7 +672,7 @@ pub fn executeTwoPhaseHashAgg(
                 @max(@as(usize, 1), base_expected_rows / 8)
             else
                 base_expected_rows;
-            const reserve_mul: usize = if (int_filter != null) 1 else 4;
+            const reserve_mul: usize = if (total_rows > 20_000_000) 1 else 4;
             const expected_per_part: usize = expected_rows * row_stride * reserve_mul + row_stride * 64;
             const ba = sc.buf_arena.allocator();
             for (&sc.bufs) |*b| {
