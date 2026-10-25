@@ -267,48 +267,6 @@ pub fn executeHashAggChunked(
         try distinct_pair_set.ensureTotalCapacity(cap);
     }
 
-    // Detect Q29-style regexp_replace(col_ref, lit_str_pattern, lit_str_repl) key.
-    // Cache col_idx + whether it's the URL-domain pattern to avoid per-row checks.
-    const RegexpReplaceKeyDesc = struct {
-        col_idx: usize,
-        is_url_domain: bool, // true = Q29 fast path
-    };
-    var regexp_replace_key_descs: ?[]RegexpReplaceKeyDesc = null;
-    check_rr: {
-        if (keys.len == 0) break :check_rr;
-        // Quick pre-check: first key must be a fn_call named regexp_replace.
-        if (keys[0].expr != .fn_call) break :check_rr;
-        const fc0 = keys[0].expr.fn_call;
-        if (!(std.mem.eql(u8, fc0.name, "regexp_replace") or
-            std.mem.eql(u8, fc0.name, "replaceRegexpOne"))) break :check_rr;
-        // All keys must be regexp_replace(col_ref, lit_str, lit_str).
-        const descs_buf = try alloc.alloc(RegexpReplaceKeyDesc, keys.len);
-        for (keys, 0..) |k, ki| {
-            if (k.expr != .fn_call) break :check_rr;
-            const fc = k.expr.fn_call;
-            if (!(std.mem.eql(u8, fc.name, "regexp_replace") or
-                std.mem.eql(u8, fc.name, "replaceRegexpOne")) or
-                fc.args.len < 3 or
-                fc.args[0] != .col_ref or
-                fc.args[1] != .lit_str or
-                fc.args[2] != .lit_str)
-            {
-                break :check_rr;
-            }
-            const pattern = fc.args[1].lit_str;
-            const is_url = std.mem.eql(u8, pattern, "^https?://(?:www\\.)?([^/]+)/.*$") or
-                std.mem.eql(u8, pattern, "^https?://(?:www\\.)?([^/]+)/.*");
-            descs_buf[ki] = .{ .col_idx = fc.args[0].col_ref.index, .is_url_domain = is_url };
-        }
-        regexp_replace_key_descs = descs_buf;
-    }
-
-    // StrAggHashTable for regexp_replace single-key path (e.g. Q29).
-    // Initialized here if rr_descs is single-key and aggs are compact-numeric.
-    const rr_can_use_str_agg = compact_kinds != null and
-        regexp_replace_key_descs != null and
-        regexp_replace_key_descs.?.len == 1;
-
     var ht_agg = try ht.AggHashTable.initWithCapacity(alloc, keys.len, aggs.len, est_rows);
     // Use CompactIntKeyHashTable when keys are all-int AND aggs are all pure-numeric.
     // Falls back to IntKeyHashTable when compact_kinds is null (e.g. any_val agg).
@@ -320,36 +278,6 @@ pub fn executeHashAggChunked(
         try ht.IntKeyHashTable.initWithCapacity(alloc, keys.len, aggs.len, est_rows)
     else
         null;
-
-    // StrAggHashTable fast path: exactly one col_ref key (others may be literals) + all-compact aggs.
-    // Handles Q34 (GROUP BY URL), Q35 (GROUP BY 1, URL), Q22/Q23 (GROUP BY SearchPhrase + MIN/COUNT).
-    // Also triggered for regexp_replace single-key path (e.g. Q29).
-    const str_agg_col_idx: ?usize = blk: {
-        if (maybe_int_keys) break :blk null;
-        if (compact_kinds == null) break :blk null;
-        // Allow exactly one col_ref key with optional literal keys.
-        var col_ref_count: usize = 0;
-        var col_ref_idx: usize = 0;
-        for (keys) |k| {
-            switch (k.expr) {
-                .col_ref => |cr| {
-                    col_ref_count += 1;
-                    col_ref_idx = cr.index;
-                },
-                .lit_i64, .lit_str => {},
-                else => break :blk null,
-            }
-        }
-        if (col_ref_count != 1) break :blk null;
-        break :blk col_ref_idx;
-    };
-    var ht_str_agg: ?ht.StrAggHashTable = if (str_agg_col_idx != null or rr_can_use_str_agg)
-        try ht.StrAggHashTable.initWithCapacity(alloc, aggs.len, num_str_aggs, est_rows)
-    else
-        null;
-    var use_str_agg_path: bool = false;
-    // Set to true when regexp_replace key path routes to ht_str_agg (e.g. Q29).
-    var rr_used_str_agg: bool = false;
 
     const init_accums = try initAggAccums(aggs, alloc);
     const key_buf = try alloc.alloc(Value, keys.len);
@@ -434,12 +362,6 @@ pub fn executeHashAggChunked(
                     int_key_descs[ki] = .{ .col_idx = col_idx, .addend = addend };
                 }
                 use_int_path = all_int;
-            }
-            // Verify str-agg eligibility: string col_ref key + compact aggs.
-            if (str_agg_col_idx) |col_idx| {
-                if (col_idx < c.columns.len and c.columns[col_idx].data == .string) {
-                    use_str_agg_path = true;
-                }
             }
             // Verify pair-count eligibility: exactly two col_refs, one i64 and one string.
         }
@@ -527,88 +449,6 @@ pub fn executeHashAggChunked(
                     }
                 }
             } // end else (regular path)
-        } else if (use_str_agg_path) {
-            // ── String-key compact agg path (e.g. Q22/Q23 GROUP BY SearchPhrase) ──
-            const col_idx = str_agg_col_idx.?;
-            const ck = compact_kinds.?;
-            const strs = c.columns[col_idx].data.string;
-            for (0..c.num_rows) |r| {
-                if (c.columns[col_idx].isRowNull(r)) continue;
-                const s = strs[r];
-                const res = try ht_str_agg.?.getOrInsert(s, compact_init_vals);
-                // COUNT(DISTINCT) deduplication for string-key path.
-                if (has_distinct_compact) {
-                    const str_h: u64 = ht.StrAggHashTable.hashStr(s);
-                    for (ck, 0..) |kind, ci| {
-                        if (kind != .count_distinct_u64) continue;
-                        const darg = aggs[ci].expr.agg_call.arg orelse continue;
-                        if (darg != .col_ref) continue;
-                        const dcol = c.columns[darg.col_ref.index];
-                        if (dcol.isRowNull(r)) continue;
-                        const dval: u64 = switch (dcol.data) {
-                            .int64 => |v| @bitCast(v[r]),
-                            .uint64 => |v| v[r],
-                            .date_u16 => |v| @as(u64, v[r]),
-                            else => continue,
-                        };
-                        const pair: u128 = (@as(u128, str_h) << 64) | dval;
-                        const gop = try distinct_pair_set.getOrPut(pair);
-                        if (!gop.found_existing) res.vals[ci] += 1;
-                    }
-                }
-                try updateCompactVals(res.vals, ck, aggs, &c, r, &ht_str_agg.?, res.slot, str_agg_sidecar_idx);
-            }
-        } else if (regexp_replace_key_descs) |rr_descs| {
-            // ── regexp_replace key fast path (e.g. Q29) ───────────────────────
-            // Avoids per-row pattern string comparison in evalFnCall.
-            const use_rr_str_agg = ht_str_agg != null and rr_descs.len == 1;
-            if (use_rr_str_agg) rr_used_str_agg = true;
-            const ck = compact_kinds;
-            for (0..c.num_rows) |r| {
-                for (refs) |j| {
-                    const col = c.columns[j];
-                    row_buf[j] = if (col.isRowNull(r)) null else col.data.get(r);
-                }
-                var key_valid = true;
-                var domain_str: []const u8 = "";
-                for (rr_descs, 0..) |desc, ki| {
-                    const s_opt = row_buf[desc.col_idx];
-                    const s = if (s_opt) |v| (v.toStr() orelse null) else null;
-                    const domain: ?Value = if (s) |str| d: {
-                        if (desc.is_url_domain) {
-                            const after_proto = if (std.mem.startsWith(u8, str, "https://"))
-                                str[8..]
-                            else if (std.mem.startsWith(u8, str, "http://"))
-                                str[7..]
-                            else
-                                break :d Value{ .string = str };
-                            const slash = std.mem.indexOfScalar(u8, after_proto, '/') orelse
-                                break :d Value{ .string = str };
-                            var host = after_proto[0..slash];
-                            if (std.mem.startsWith(u8, host, "www.")) host = host[4..];
-                            break :d Value{ .string = host };
-                        }
-                        break :d Value{ .string = str };
-                    } else null;
-                    if (domain == null) {
-                        key_valid = false;
-                        break;
-                    }
-                    key_buf[ki] = domain.?;
-                    if (ki == 0) domain_str = domain.?.string;
-                }
-                if (!key_valid) continue;
-                if (use_rr_str_agg) {
-                    const res = try ht_str_agg.?.getOrInsert(domain_str, compact_init_vals);
-                    try updateCompactVals(res.vals, ck.?, aggs, &c, r, &ht_str_agg.?, res.slot, str_agg_sidecar_idx);
-                } else {
-                    const bucket = try ht_agg.getOrInsert(key_buf, init_accums);
-                    for (aggs, 0..) |item, ci| {
-                        const v_opt = try evalAggArg(item.expr, row_buf, alloc);
-                        try kernels.updateAccum(&bucket[ci], v_opt, alloc);
-                    }
-                }
-            }
         } else {
             // ── General path ──────────────────────────────────────────────────
             for (0..c.num_rows) |r| {
@@ -710,45 +550,7 @@ pub fn executeHashAggChunked(
     var sink = try chunk_sink_mod.ChunkSink.init(alloc, out_metas);
     var rl = ChunkRowSink{ .sink = &sink };
 
-    if (use_str_agg_path or rr_used_str_agg) {
-        // Emit from StrAggHashTable: string key + compact aggs → Values.
-        // Handles literal keys alongside the col_ref key (e.g. Q35: GROUP BY 1, URL).
-        // Also used when regexp_replace key path routed to ht_str_agg (Q29).
-        const EmitCtxSA = struct {
-            rl: *ChunkRowSink,
-            alloc: std.mem.Allocator,
-            aggs: []const plan.ProjectItem,
-            keys: []const plan.ProjectItem,
-            kinds: []const ht.CompactAggKind,
-            str_ht: *ht.StrAggHashTable,
-            sidecar_idx: []const usize,
-        };
-        var emit_ctx_sa = EmitCtxSA{
-            .rl = &rl,
-            .alloc = alloc,
-            .aggs = aggs,
-            .keys = keys,
-            .kinds = compact_kinds.?,
-            .str_ht = &ht_str_agg.?,
-            .sidecar_idx = str_agg_sidecar_idx,
-        };
-        ht_str_agg.?.iterateWithSlot(&emit_ctx_sa, struct {
-            fn cb(ec: *EmitCtxSA, s: []const u8, vals: []const u64, slot: usize) void {
-                const row = ec.alloc.alloc(?Value, ec.keys.len + vals.len) catch return;
-                for (ec.keys, 0..) |k, i| {
-                    row[i] = switch (k.expr) {
-                        // col_ref and fn_call (e.g. regexp_replace) both map to the string key s.
-                        .col_ref, .fn_call => Value{ .string = s },
-                        .lit_i64 => |v| Value{ .int64 = v },
-                        .lit_str => |v| Value{ .string = v },
-                        else => Value{ .string = s },
-                    };
-                }
-                emitCompactValsWithSidecar(vals, ec.kinds, ec.aggs, row[ec.keys.len..], ec.str_ht, slot, ec.sidecar_idx);
-                ec.rl.append(ec.alloc, row) catch {};
-            }
-        }.cb);
-    } else if (use_int_path) {
+    if (use_int_path) {
         if (ht_compact) |*htc| {
             // Emit from CompactIntKeyHashTable: u64 vals → Values.
             const EmitCtxC = struct {
