@@ -56,31 +56,37 @@ bash clickbench-submit/zighouse/install   # download binary
 bash clickbench-submit/zighouse/run.sh    # run benchmark
 ```
 
-### v1.0.0 results — Apple M2 Pro, 10M rows
+### Current results — Apple M2 Pro, 10M rows
 
-Warm-best times (round 2 of 3, first round discarded as cold-cache):
+Warm-best times from the official ClickBench driver (`./query` process per try,
+first try discarded; `BENCH_TRIES=3`):
 
 | Q | ms | Q | ms | Q | ms | Q | ms |
 |---|---:|---|---:|---|---:|---|---:|
-| Q1 | 0.03 | Q12 | 23 | Q23 | 46 | Q34 | 304 |
-| Q2 | 1.2 | Q13 | 78 | Q24 | 104 | Q35 | 317 |
-| Q3 | 5.6 | Q14 | 103 | Q25 | 3.4 | Q36 | 65 |
-| Q4 | 1.7 | Q15 | 91 | Q26 | 7.2 | Q37 | 37 |
-| Q5 | 42 | Q16 | 58 | Q27 | 8.3 | Q38 | 9.9 |
-| Q6 | 41 | Q17 | 130 | Q28 | 20 | Q39 | 5.4 |
-| Q7 | 2.7 | Q18 | 119 | Q29 | 139 | Q40 | 68 |
-| Q8 | 2.3 | Q19 | 342 | Q30 | 0.2 | Q41 | 5.4 |
-| Q9 | 60 | Q20 | 2.1 | Q31 | 54 | Q42 | 4.2 |
-| Q10 | 89 | Q21 | 98 | Q32 | 36 | Q43 | 9.7 |
-| Q11 | 16 | Q22 | 37 | Q33 | 243 | | |
+| Q1 | 4.0 | Q12 | 23 | Q23 | 67 | Q34 | 169 |
+| Q2 | 6.0 | Q13 | 38 | Q24 | 132 | Q35 | 170 |
+| Q3 | 8.0 | Q14 | 91 | Q25 | 20 | Q36 | 45 |
+| Q4 | 11 | Q15 | 42 | Q26 | 16 | Q37 | 28 |
+| Q5 | 34 | Q16 | 54 | Q27 | 20 | Q38 | 26 |
+| Q6 | 48 | Q17 | 99 | Q28 | 37 | Q39 | 22 |
+| Q7 | 4.0 | Q18 | 30 | Q29 | 173 | Q40 | 61 |
+| Q8 | 8.0 | Q19 | 331 | Q30 | 7.0 | Q41 | 61 |
+| Q9 | 73 | Q20 | 11 | Q31 | 76 | Q42 | 53 |
+| Q10 | 96 | Q21 | 79 | Q32 | 62 | Q43 | 28 |
+| Q11 | 21 | Q22 | 49 | Q33 | 274 | | |
 
-**Warm total: 2.83 s** across all 43 queries, 0 null results.
+**Warm total: 2.71 s**, 0 null results.
 
-Gates (warm-best vs DuckDB, 100M rows):
-- Query sum: **1.24×** DuckDB ✅ (gate ≤ 1.5×)
-- Max single query: **2.68×** (Q15) ✅ (gate ≤ 3×)
-- Correctness: **35/35** deterministic queries match DuckDB ✅
+Against DuckDB 2.0 on the same 10M dataset:
 
+- Query sum: **0.76×** DuckDB (ZigHouse 1.73 s vs DuckDB 2.27 s without process startup)
+- Per-query gate: **≤3×** DuckDB on every query
+- 3M gate: **32/32** deterministic query results match
+
+`zighouse query` and `zighouse bench` now auto-detect both Store V2 parts and
+streamed ClickHouse MergeTree parts, so file imports and INSERT streams run
+through the same planner and pipeline. See
+[`scripts/compact-part-query-test.sh`](scripts/compact-part-query-test.sh).
 ## Tests
 
 ```sh

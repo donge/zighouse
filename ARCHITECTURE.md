@@ -74,6 +74,8 @@ Already streaming:
 - parallel top-K (`TopKCollector`, late materialisation)
 - inner/left hash-join probe side; output chunks
 - generic Parquet import string offsets spill to temp files
+- file imports and streamed MergeTree parts share `store_query.zig`; both use
+  the same planner and pipeline, and the CLI auto-detects either layout
 
 Still materialising or unbounded:
 
@@ -138,9 +140,10 @@ final result.
   with per-block LZ4/raw selection, checksums, and min/max stats.
 - mmap for local files. No eager whole-file copy. Raw (uncompressed) blocks
   are exposed as zero-copy slices; whole-block LZ4 decodes straight into the
-  destination. Use range reads + morsels and sequential read-ahead.
-- Block min/max stats are written but not yet used for scan pruning; wiring
-  them into the fixed plan is the next I/O win.
+  destination, and large columns decode blocks across worker threads. Use
+  range reads + morsels and sequential read-ahead.
+- Block min/max stats answer `MIN`/`MAX` without decoding. Wiring per-block
+  stats into filter pruning is the next I/O win.
 - Spill hash aggregation, sort, and join build to local SSD with a global
   memory budget. Single-node means spill is the scale-out mechanism.
 
@@ -191,9 +194,12 @@ python3 scripts/bench-vs-duckdb.py \
 Current reference (Apple M2 Pro, 4 performance cores):
 
 - 3M: ZigHouse 605.7ms vs DuckDB 2.0 849.0ms (0.713x), 32/32 results.
-- 10M: ZigHouse 1730.7ms vs DuckDB 2.0 2266.0ms (0.764x), best of 3 rounds.
-- Q7 `MIN/MAX(EventDate)`: 10M in ~1.3ms via raw integer min/max.
+- 10M in-process: ZigHouse 1730.7ms vs DuckDB 2.0 2266.0ms (0.764x).
+- 10M official driver: 2.71s warm-best (process per try, first discarded).
+- Q7 `MIN/MAX(EventDate)`: 10M in ~1.3ms in-process (~4ms per process) from
+  block min/max stats, without decoding the column.
 - Q20 `UserID = literal`: 10M in ~1.1ms via SIMD raw equality.
+- File-import vs streamed-write parity: `scripts/compact-part-query-test.sh`.
 
 For each phase record:
 
