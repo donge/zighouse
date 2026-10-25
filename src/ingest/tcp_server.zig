@@ -14,7 +14,7 @@ const schema_persist = @import("schema_persist");
 const generic_sql = @import("generic_sql");
 const ir_planner = @import("ir_planner");
 const core = @import("core");
-const part_scan_bridge = @import("part_scan_bridge");
+const store_query = @import("store_query");
 const serializer = @import("serializer");
 const part_scanner = @import("part_scanner");
 
@@ -1242,19 +1242,36 @@ fn handleSelect(ctx: *ServerCtx, a: std.mem.Allocator, w: *Io.Writer, sql: []con
             break :ir_exec null;
         }
         const pruned_cols = ir_planner.findPrunedCols(node.?);
-        var bridge = part_scan_bridge.PartScanBridge.init(
-            a,
-            ctx.io,
-            table.*,
-            parts.dirs(),
-            pruned_cols,
-        ) catch |err| {
-            std.log.warn("tcp part_scan_bridge error: {}", .{err});
+        if (parts.dirs().len == 0) {
+            arena.deinit();
+            break :ir_exec null;
+        }
+        const parts_dir = std.fs.path.dirname(parts.dirs()[0]) orelse {
             arena.deinit();
             break :ir_exec null;
         };
-        defer bridge.deinit();
-        var qctx = core.exec.pipeline.QueryContext.init(a, bridge.source());
+        const table_dir = std.fs.path.dirname(parts_dir) orelse {
+            arena.deinit();
+            break :ir_exec null;
+        };
+        const store_dir = std.fs.path.dirname(table_dir) orelse {
+            arena.deinit();
+            break :ir_exec null;
+        };
+        var table_source = store_query.StoreSource.open(
+            a,
+            ctx.io,
+            store_dir,
+            std.fs.path.basename(table_dir),
+            table.*,
+            pruned_cols,
+        ) catch |err| {
+            std.log.warn("tcp store source error: {}", .{err});
+            arena.deinit();
+            break :ir_exec null;
+        };
+        defer table_source.deinit();
+        var qctx = core.exec.pipeline.QueryContext.init(a, table_source.source());
         qctx.setProfileLabel(sql);
         defer qctx.deinit();
         const rs = core.exec.pipeline.executePlan(node.?, &qctx) catch |err| {

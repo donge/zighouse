@@ -31,8 +31,8 @@ This is a tuned ClickBench-specific implementation. It uses native Parquet decod
 
 The same store reader handles data written by file import and by streaming
 `INSERT` through `zighouse serve` (ClickHouse compact/wide parts).  Both paths
-share the SQL planner, physical plan, and pipeline; the CLI detects Store V2
-parts versus MergeTree parts automatically.  `scripts/compact-part-query-test.sh`
+share the SQL planner, physical plan, and pipeline; query/bench/serve detect
+Store V2 parts versus MergeTree parts automatically.  `scripts/compact-part-query-test.sh`
 contains the file-import vs streamed-write parity check.
 
 The sidecars include per-row flags, low-cardinality dictionaries, hash/string resolvers, and aggregate statistics needed by specific ClickBench query shapes. They are included in the reported data size.

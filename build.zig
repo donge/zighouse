@@ -771,15 +771,9 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addImport("core", core_mod);
     exe.root_module.addImport("parallel", parallel_mod);
     exe.root_module.addImport("generic_store_bridge", generic_store_bridge_mod);
-    exe.root_module.addImport("part_scan_bridge", part_scan_bridge_mod);
-    exe.root_module.addImport("part_scanner", part_scanner_mod);
-    exe.root_module.addImport("schema_persist", schema_persist_mod);
-    exe.root_module.addImport("schema_config", schema_config_mod);
+    exe.root_module.addImport("store_query", store_query_mod);
     unit_tests.root_module.addImport("generic_store_bridge", generic_store_bridge_mod);
-    unit_tests.root_module.addImport("part_scan_bridge", part_scan_bridge_mod);
-    unit_tests.root_module.addImport("part_scanner", part_scanner_mod);
-    unit_tests.root_module.addImport("schema_persist", schema_persist_mod);
-    unit_tests.root_module.addImport("schema_config", schema_config_mod);
+    unit_tests.root_module.addImport("store_query", store_query_mod);
 
     // ── serializer module (ResultSet → Native block) ─────────────────────────
     const serializer_mod = b.createModule(.{
@@ -801,6 +795,7 @@ pub fn build(b: *std.Build) void {
     tcp_server_mod.addImport("ir_planner", ir_planner_mod);
     tcp_server_mod.addImport("core", core_mod);
     tcp_server_mod.addImport("part_scan_bridge", part_scan_bridge_mod);
+    tcp_server_mod.addImport("store_query", store_query_mod);
     const tcp_server_tests = b.addTest(.{ .root_module = tcp_server_mod });
     const tcp_server_test_cmd = b.addRunArtifact(tcp_server_tests);
 
@@ -809,6 +804,7 @@ pub fn build(b: *std.Build) void {
     ingest_server_mod.addImport("serializer", serializer_mod);
     ingest_server_mod.addImport("ir_planner", ir_planner_mod);
     ingest_server_mod.addImport("part_scan_bridge", part_scan_bridge_mod);
+    ingest_server_mod.addImport("store_query", store_query_mod);
 
     exe.root_module.addImport("serializer", serializer_mod);
 

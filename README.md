@@ -83,8 +83,8 @@ Against DuckDB 2.0 on the same 10M dataset:
 - Per-query gate: **≤3×** DuckDB on every query
 - 3M gate: **32/32** deterministic query results match
 
-`zighouse query` and `zighouse bench` now auto-detect both Store V2 parts and
-streamed ClickHouse MergeTree parts, so file imports and INSERT streams run
+`zighouse query`, `zighouse bench`, and `zighouse serve` now auto-detect both
+Store V2 parts and streamed ClickHouse MergeTree parts, so file imports and INSERT streams run
 through the same planner and pipeline. See
 [`scripts/compact-part-query-test.sh`](scripts/compact-part-query-test.sh).
 ## Tests

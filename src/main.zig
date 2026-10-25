@@ -11,7 +11,7 @@ const parquet = @import("parquet");
 const storage = @import("storage.zig");
 const schema = @import("schema");
 const generic_store = @import("generic_store");
-const store_query = @import("store_query.zig");
+const store_query = @import("store_query");
 
 const usage =
     \\zighouse - ClickHouse-compatible analytical database

@@ -48,6 +48,7 @@ const serializer = @import("serializer");
 const core = @import("core");
 const ir_planner = @import("ir_planner");
 const part_scan_bridge = @import("part_scan_bridge");
+const store_query = @import("store_query");
 const tcp_server = @import("tcp_server");
 
 /// Server configuration.
@@ -943,23 +944,43 @@ pub const Server = struct {
             return null;
         }
 
-        // ── 2. Build SourceIface via PartScanBridge ───────────────────────────
+        // ── 2. Build SourceIface for the table's physical layout ─────────────
+        // Imported Parquet stores use Store V2 parts; streaming INSERTs write
+        // ClickHouse MergeTree parts.  Both go through the same pipeline.
         const pruned_cols: []const []const u8 = findPrunedCols(node.?);
-        var bridge = part_scan_bridge.PartScanBridge.init(
-            self.allocator,
-            self.io,
-            table.*,
-            part_dirs,
-            pruned_cols,
-        ) catch |err| {
-            std.log.warn("part_scan_bridge init error: {}", .{err});
+        if (part_dirs.len == 0) {
+            arena.deinit();
+            return null;
+        }
+        const parts_dir = std.fs.path.dirname(part_dirs[0]) orelse {
             arena.deinit();
             return null;
         };
-        defer bridge.deinit();
+        const table_dir = std.fs.path.dirname(parts_dir) orelse {
+            arena.deinit();
+            return null;
+        };
+        const store_dir = std.fs.path.dirname(table_dir) orelse {
+            arena.deinit();
+            return null;
+        };
+        const table_name = std.fs.path.basename(table_dir);
+        var table_source = store_query.StoreSource.open(
+            self.allocator,
+            self.io,
+            store_dir,
+            table_name,
+            table.*,
+            pruned_cols,
+        ) catch |err| {
+            std.log.warn("store source init error: {}", .{err});
+            arena.deinit();
+            return null;
+        };
+        defer table_source.deinit();
 
         // ── 3. Execute plan through pipeline ─────────────────────────────────
-        var qctx = core.exec.pipeline.QueryContext.init(self.allocator, bridge.source());
+        var qctx = core.exec.pipeline.QueryContext.init(self.allocator, table_source.source());
         qctx.setProfileLabel(orig_sql);
         defer qctx.deinit();
 

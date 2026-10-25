@@ -75,7 +75,7 @@ Already streaming:
 - inner/left hash-join probe side; output chunks
 - generic Parquet import string offsets spill to temp files
 - file imports and streamed MergeTree parts share `store_query.zig`; both use
-  the same planner and pipeline, and the CLI auto-detects either layout
+  the same planner and pipeline, and query/bench/serve auto-detect either layout
 
 Still materialising or unbounded:
 
