@@ -24,6 +24,7 @@ const result = core.result;
 const pipeline = core.exec.pipeline;
 const generic_store = @import("generic_store");
 const generic_store_bridge = @import("generic_store_bridge");
+const scan_common = @import("scan_common");
 const part_mod = @import("part"); // clickhouse_format/part.zig
 
 pub const DataChunk = chunk.DataChunk;
@@ -64,18 +65,6 @@ const RawColData = union(enum) {
     }
 };
 
-// ── schema.ColumnType → core.ColumnType ──────────────────────────────────────
-
-fn toCoreColType(ty: schema.ColumnType) ColumnType {
-    return switch (ty) {
-        .int8, .int16, .int32, .int64 => .int64,
-        .float32, .float64 => .float64,
-        .date => .date_u16,
-        .timestamp => .datetime64_ms,
-        .text, .char, .low_card => .string,
-    };
-}
-
 /// Like toCoreColType, but also checks ch_type for Array(String) types.
 /// Map columns still use .string (custom blob format for Map(String,String)).
 fn toCoreColTypeFull(col: schema.Column) ColumnType {
@@ -83,7 +72,7 @@ fn toCoreColTypeFull(col: schema.Column) ColumnType {
         if (std.mem.startsWith(u8, ch, "Array("))
             return .array_string;
     }
-    return toCoreColType(col.ty);
+    return scan_common.toCoreColType(col.ty);
 }
 
 // ── ScanState — per-query state across all parts ──────────────────────────────
@@ -145,20 +134,7 @@ const ScanState = struct {
             }
         }
 
-        // Build needed_cols mask if pruned list is provided.
-        const needed_cols: ?[]bool = if (pruned_columns.len == 0) null else blk: {
-            const mask = try alloc.alloc(bool, table.columns.len);
-            @memset(mask, false);
-            for (pruned_columns) |name| {
-                for (table.columns, 0..) |col, i| {
-                    if (std.mem.eql(u8, col.name, name)) {
-                        mask[i] = true;
-                        break;
-                    }
-                }
-            }
-            break :blk mask;
-        };
+        const needed_cols = try scan_common.buildNeededMask(alloc, table.columns, pruned_columns);
 
         return .{
             .alloc = alloc,
@@ -207,29 +183,23 @@ const ScanState = struct {
     }
 
     inline fn isNeeded(self: *const ScanState, ci: usize) bool {
-        if (self.override_active) {
-            return ci < 256 and self.override_needed[ci];
-        }
-        if (self.needed_cols) |nc| return ci < nc.len and nc[ci];
-        return true;
+        return scan_common.isNeeded(self.needed_cols, self.override_active, &self.override_needed, ci);
     }
 
     inline fn effectiveLo(self: *const ScanState) u64 {
-        return @min(self.scan_lo, self.row_count);
+        return scan_common.effectiveLo(self.scan_lo, self.row_count);
     }
 
     inline fn effectiveHi(self: *const ScanState) u64 {
-        return @min(self.scan_hi, self.row_count);
+        return scan_common.effectiveHi(self.scan_hi, self.row_count);
     }
 
     inline fn effectiveCount(self: *const ScanState) u64 {
-        const lo = self.effectiveLo();
-        const hi = self.effectiveHi();
-        return if (hi > lo) hi - lo else 0;
+        return scan_common.effectiveCount(self.scan_lo, self.scan_hi, self.row_count);
     }
 
     inline fn rangeActive(self: *const ScanState) bool {
-        return self.effectiveLo() != 0 or self.effectiveHi() != self.row_count;
+        return scan_common.rangeActive(self.scan_lo, self.scan_hi, self.row_count);
     }
 
     fn colIndex(self: *const ScanState, col_name: []const u8) ?usize {
@@ -1029,23 +999,7 @@ pub const PartScanBridge = struct {
         s.override_active = false;
         @memset(&s.nonempty_bool, false);
 
-        if (pruned_cols.len == 0) {
-            if (s.needed_cols) |nc| s.alloc.free(nc);
-            s.needed_cols = null;
-            return;
-        }
-        if (s.needed_cols == null) {
-            s.needed_cols = s.alloc.alloc(bool, s.table.columns.len) catch return;
-        }
-        @memset(s.needed_cols.?, false);
-        for (pruned_cols) |name| {
-            for (s.table.columns, 0..) |col, i| {
-                if (std.mem.eql(u8, col.name, name)) {
-                    s.needed_cols.?[i] = true;
-                    break;
-                }
-            }
-        }
+        scan_common.resetNeededMask(s.alloc, &s.needed_cols, s.table.columns, pruned_cols);
     }
 
     pub fn source(self: *PartScanBridge) SourceIface {
@@ -1080,38 +1034,20 @@ pub const PartScanBridge = struct {
     fn setNeededColsFn(ptr: *anyopaque, col_names: ?[]const []const u8) void {
         const self: *PartScanBridge = @ptrCast(@alignCast(ptr));
         const s = self.state;
-        if (col_names == null) {
-            s.override_active = false;
-            return;
-        }
-        @memset(&s.override_needed, false);
-        for (col_names.?) |name| {
-            for (s.table.columns, 0..) |col, ci| {
-                if (ci >= 256) break;
-                if (std.mem.eql(u8, col.name, name)) {
-                    s.override_needed[ci] = true;
-                    s.nonempty_bool[ci] = false;
-                    break;
+        scan_common.setNeededOverride(&s.override_needed, &s.override_active, s.table.columns, col_names);
+        if (col_names != null) {
+            for (col_names.?) |name| {
+                if (scan_common.findColumn(s.table.columns, name)) |ci| {
+                    if (ci < 256) s.nonempty_bool[ci] = false;
                 }
             }
         }
-        s.override_active = true;
     }
 
     fn setStringNonEmptyBoolFn(ptr: *anyopaque, col_name: ?[]const u8) void {
         const self: *PartScanBridge = @ptrCast(@alignCast(ptr));
         const s = self.state;
-        if (col_name == null) {
-            @memset(&s.nonempty_bool, false);
-            return;
-        }
-        for (s.table.columns, 0..) |col, ci| {
-            if (ci >= 256) break;
-            if (std.mem.eql(u8, col.name, col_name.?)) {
-                s.nonempty_bool[ci] = true;
-                break;
-            }
-        }
+        scan_common.setNonEmptyBool(&s.nonempty_bool, s.table.columns, col_name);
     }
 
     fn getSortKeysFn(ptr: *anyopaque) []const []const u8 {

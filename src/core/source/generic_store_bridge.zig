@@ -31,6 +31,7 @@ const chunk = core.chunk;
 const result = core.result;
 const pipeline = core.exec.pipeline;
 const generic_store = @import("generic_store");
+const scan_common = @import("scan_common");
 
 pub const DataChunk = chunk.DataChunk;
 pub const ColumnType = chunk.ColumnType;
@@ -42,18 +43,6 @@ fn elapsedNs(started_ns: i128) u64 {
     if (started_ns == 0) return 0;
     const elapsed = pipeline.profileNowNs() - started_ns;
     return if (elapsed > 0) @intCast(elapsed) else 0;
-}
-
-// ── schema.ColumnType → core.ColumnType ──────────────────────────────────────
-
-fn toCoreColType(ty: schema.ColumnType) ColumnType {
-    return switch (ty) {
-        .int8, .int16, .int32, .int64 => .int64,
-        .float32, .float64 => .float64,
-        .date => .date_u16,
-        .timestamp => .datetime64_ms,
-        .text, .char, .low_card => .string,
-    };
 }
 
 // ── Mapped column data ────────────────────────────────────────────────────────
@@ -156,26 +145,13 @@ const ScanState = struct {
             };
             metas[i] = .{
                 .name = col.name,
-                .col_type = toCoreColType(col.ty),
+                .col_type = scan_common.toCoreColType(col.ty),
                 .is_narrow_int = (col.ty == .int8 or col.ty == .int16),
                 .hash_col_name = hash_col_name,
             };
         }
 
-        // Build needed_cols mask.
-        const needed_cols: ?[]bool = if (pruned_columns.len == 0) null else blk: {
-            const mask = try alloc.alloc(bool, table.columns.len);
-            @memset(mask, false);
-            for (pruned_columns) |name| {
-                for (table.columns, 0..) |col, i| {
-                    if (std.mem.eql(u8, col.name, name)) {
-                        mask[i] = true;
-                        break;
-                    }
-                }
-            }
-            break :blk mask;
-        };
+        const needed_cols = try scan_common.buildNeededMask(alloc, table.columns, pruned_columns);
 
         const col_data = try alloc.alloc(ColData, table.columns.len);
         @memset(col_data, .none);
@@ -236,11 +212,7 @@ const ScanState = struct {
 
     /// Returns true if column ci should be decoded (not pruned).
     inline fn isNeeded(self: *const ScanState, ci: usize) bool {
-        if (self.override_active) {
-            return ci < 256 and self.override_needed[ci];
-        }
-        if (self.needed_cols) |nc| return ci < nc.len and nc[ci];
-        return true; // null = all needed
+        return scan_common.isNeeded(self.needed_cols, self.override_active, &self.override_needed, ci);
     }
 
     fn loadColumns(self: *ScanState) !void {
@@ -363,19 +335,14 @@ const ScanState = struct {
         // The caller is responsible for restoring them via setRowRange(0, maxInt(u64)).
     }
 
-    /// Effective start row (absolute) for the current scan.
     inline fn effectiveLo(self: *const ScanState) u64 {
-        return @min(self.scan_lo, self.row_count);
+        return scan_common.effectiveLo(self.scan_lo, self.row_count);
     }
-    /// Effective end row (exclusive, absolute).
     inline fn effectiveHi(self: *const ScanState) u64 {
-        return @min(self.scan_hi, self.row_count);
+        return scan_common.effectiveHi(self.scan_hi, self.row_count);
     }
-    /// Number of rows visible under the current row-range restriction.
     inline fn effectiveCount(self: *const ScanState) u64 {
-        const hi = self.effectiveHi();
-        const lo = self.effectiveLo();
-        return if (hi > lo) hi - lo else 0;
+        return scan_common.effectiveCount(self.scan_lo, self.scan_hi, self.row_count);
     }
 
     const FixedRange = struct {
@@ -459,7 +426,7 @@ const ScanState = struct {
         var zb = ZeroBufs{};
 
         for (self.table.columns, 0..) |col, ci| {
-            const core_ty = toCoreColType(col.ty);
+            const core_ty = scan_common.toCoreColType(col.ty);
             const is_pruned = self.col_data[ci] == .none or !self.isNeeded(ci);
 
             // Lazily allocate zero buffers from chunk_alloc when n > CHUNK_SIZE.
@@ -734,28 +701,7 @@ pub const GenericStoreBridge = struct {
     /// from previous queries.  This keeps column pages warm across queries.
     pub fn resetForNewQuery(self: *GenericStoreBridge, pruned_cols: []const []const u8) void {
         const s = self.state;
-        // Reset the per-query needed_cols mask.
-        if (pruned_cols.len == 0) {
-            // No pruning: load all columns.
-            if (s.needed_cols) |nc| {
-                s.alloc.free(nc);
-            }
-            s.needed_cols = null;
-        } else {
-            // Reuse or allocate the mask.
-            if (s.needed_cols == null) {
-                s.needed_cols = s.alloc.alloc(bool, s.table.columns.len) catch return;
-            }
-            @memset(s.needed_cols.?, false);
-            for (pruned_cols) |name| {
-                for (s.table.columns, 0..) |col, i| {
-                    if (std.mem.eql(u8, col.name, name)) {
-                        s.needed_cols.?[i] = true;
-                        break;
-                    }
-                }
-            }
-        }
+        scan_common.resetNeededMask(s.alloc, &s.needed_cols, s.table.columns, pruned_cols);
         // Clear the `loaded` flag so loadColumns runs again for any new columns.
         @atomicStore(bool, &s.loaded, false, .release);
         // Reset per-query pipeline state.
@@ -799,21 +745,8 @@ pub const GenericStoreBridge = struct {
     fn setNeededColsFn(ptr: *anyopaque, col_names: ?[]const []const u8) void {
         const self: *GenericStoreBridge = @ptrCast(@alignCast(ptr));
         const s = self.state;
-        if (col_names == null) {
-            s.override_active = false;
-            return;
-        }
-        @memset(&s.override_needed, false);
-        for (col_names.?) |name| {
-            for (s.table.columns, 0..) |col, ci| {
-                if (ci >= 256) break;
-                if (std.mem.eql(u8, col.name, name)) {
-                    s.override_needed[ci] = true;
-                    break;
-                }
-            }
-        }
-        s.override_active = true;
+        scan_common.setNeededOverride(&s.override_needed, &s.override_active, s.table.columns, col_names);
+        if (col_names == null) return;
         // Reset loaded so the next loadColumns call picks up the newly-needed columns.
         // loadColumns skips columns already mmap'd (col_data != .none), so this is
         // incremental: only truly new columns are opened.
@@ -823,17 +756,7 @@ pub const GenericStoreBridge = struct {
     fn setStringNonEmptyBoolFn(ptr: *anyopaque, col_name: ?[]const u8) void {
         const self: *GenericStoreBridge = @ptrCast(@alignCast(ptr));
         const s = self.state;
-        if (col_name == null) {
-            @memset(&s.nonempty_bool, false);
-            return;
-        }
-        for (s.table.columns, 0..) |col, ci| {
-            if (ci >= 256) break;
-            if (std.mem.eql(u8, col.name, col_name.?)) {
-                s.nonempty_bool[ci] = true;
-                break;
-            }
-        }
+        scan_common.setNonEmptyBool(&s.nonempty_bool, s.table.columns, col_name);
     }
 
     fn getRawInt16ColFn(ptr: *anyopaque, col_name: []const u8) ?[]const i16 {

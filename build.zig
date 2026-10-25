@@ -703,6 +703,15 @@ pub fn build(b: *std.Build) void {
     const ir_planner_tests = b.addTest(.{ .root_module = ir_planner_mod });
     const ir_planner_test_cmd = b.addRunArtifact(ir_planner_tests);
 
+    // ── shared scan helpers for the two physical source backends ─────────────
+    const scan_common_mod = b.createModule(.{
+        .root_source_file = b.path("src/core/source/scan_common.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    scan_common_mod.addImport("schema", schema_mod);
+    scan_common_mod.addImport("core", core_mod);
+
     // ── generic_store_bridge module (generic part → SourceIface bridge) ─────
     const generic_store_bridge_mod = b.createModule(.{
         .root_source_file = b.path("src/core/source/generic_store_bridge.zig"),
@@ -712,6 +721,7 @@ pub fn build(b: *std.Build) void {
     generic_store_bridge_mod.addImport("schema", schema_mod);
     generic_store_bridge_mod.addImport("core", core_mod);
     generic_store_bridge_mod.addImport("generic_store", generic_store_mod);
+    generic_store_bridge_mod.addImport("scan_common", scan_common_mod);
     const generic_store_bridge_tests = b.addTest(.{ .root_module = generic_store_bridge_mod });
     const generic_store_bridge_test_cmd = b.addRunArtifact(generic_store_bridge_tests);
 
@@ -726,6 +736,7 @@ pub fn build(b: *std.Build) void {
     part_scan_bridge_mod.addImport("part", ch_part_mod);
     part_scan_bridge_mod.addImport("generic_store", generic_store_mod);
     part_scan_bridge_mod.addImport("generic_store_bridge", generic_store_bridge_mod);
+    part_scan_bridge_mod.addImport("scan_common", scan_common_mod);
     part_scan_bridge_mod.link_libc = true;
     lz4ctx.link(part_scan_bridge_mod);
     const part_scan_bridge_tests = b.addTest(.{ .root_module = part_scan_bridge_mod });
