@@ -119,8 +119,10 @@ Migration status:
 
 - done: `TopNSink` owns the bounded heap for row/chunk producers; scannable
   top-K streams chunks through it; top-K comparator is shared.
-- next: move the wide-row late-materialisation path onto the same sink, then
-  make hash aggregation a local/global sink and remove fused agg+top-K paths.
+- done: `LateTopNHeap` is shared by parallel phase-1 workers and the sequential
+  wide-row late-materialisation path.
+- next: make hash aggregation a local/global sink and remove fused agg+top-K
+  paths.
 
 ## Refactor phases
 
