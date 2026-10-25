@@ -5762,96 +5762,9 @@ fn executeTopK(inner: RowBuffer, keys: []const plan.SortKey, k: usize, alloc: st
     const rows = inner.rows.items;
     if (rows.len == 0 or k == 0) return RowBuffer.init(inner.metas);
 
-    // SortCtx: lessThan(a, b) = true means a should appear before b in the output.
-    const SortCtx = struct {
-        keys: []const plan.SortKey,
-        fn lessThan(self: @This(), a: []?Value, b: []?Value) bool {
-            for (self.keys) |key| {
-                const av: ?Value = if (key.col_idx < a.len) a[key.col_idx] else null;
-                const bv: ?Value = if (key.col_idx < b.len) b[key.col_idx] else null;
-                const ord: std.math.Order = if (av != null and bv != null)
-                    Value.order(av.?, bv.?)
-                else if (av == null and bv == null)
-                    .eq
-                else if (av == null)
-                    .lt
-                else
-                    .gt;
-                if (ord == .eq) continue;
-                return if (key.desc) ord == .gt else ord == .lt;
-            }
-            // Stable tiebreaker: full lexicographic comparison on all row values.
-            // Ensures pdq sort produces a total order even when all sort keys are equal,
-            // making output deterministic regardless of parallel worker ordering.
-            for (0..@min(a.len, b.len)) |ci| {
-                const av2 = a[ci];
-                const bv2 = b[ci];
-                const ord2: std.math.Order = if (av2 != null and bv2 != null)
-                    Value.order(av2.?, bv2.?)
-                else if (av2 == null and bv2 == null) .eq else if (av2 == null) .lt else .gt;
-                if (ord2 == .eq) continue;
-                return ord2 == .lt;
-            }
-            return a.len < b.len;
-        }
-        // heapLess(a,b): for a min-heap of the BEST k rows, the "min" is the
-        // worst element (the one we'd evict). So heapLess = !lessThan.
-        fn heapLess(self: @This(), a: []?Value, b: []?Value) std.math.Order {
-            if (self.lessThan(a, b)) return .lt;
-            if (self.lessThan(b, a)) return .gt;
-            return .eq;
-        }
-    };
-    const ctx = SortCtx{ .keys = keys };
-
-    // Build a min-heap (worst-of-best k) to track the top-k rows.
-    const heap_buf = try alloc.alloc([]?Value, k);
-    var heap_len: usize = 0;
-
-    for (rows) |row| {
-        if (heap_len < k) {
-            heap_buf[heap_len] = row;
-            heap_len += 1;
-            // Sift up: worst-at-root heap — parent is worse than or equal to children.
-            // If parent is better than child, child (worse) should move up toward root.
-            var i = heap_len - 1;
-            while (i > 0) {
-                const parent = (i - 1) / 2;
-                if (ctx.lessThan(heap_buf[parent], heap_buf[i])) {
-                    const tmp = heap_buf[i];
-                    heap_buf[i] = heap_buf[parent];
-                    heap_buf[parent] = tmp;
-                    i = parent;
-                } else break;
-            }
-        } else {
-            // If this row is better than the heap root (worst of current best), replace root.
-            if (ctx.lessThan(row, heap_buf[0])) {
-                heap_buf[0] = row;
-                // Sift down: find the worst child and swap to maintain worst-at-root.
-                var i: usize = 0;
-                while (true) {
-                    const l = 2 * i + 1;
-                    const r = 2 * i + 2;
-                    var smallest = i;
-                    if (l < heap_len and ctx.lessThan(heap_buf[smallest], heap_buf[l])) smallest = l;
-                    if (r < heap_len and ctx.lessThan(heap_buf[smallest], heap_buf[r])) smallest = r;
-                    if (smallest == i) break;
-                    const tmp = heap_buf[i];
-                    heap_buf[i] = heap_buf[smallest];
-                    heap_buf[smallest] = tmp;
-                    i = smallest;
-                }
-            }
-        }
-    }
-
-    // Sort the heap to get the final ordered result.
-    std.sort.pdq([]?Value, heap_buf[0..heap_len], ctx, SortCtx.lessThan);
-
-    var rl = RowBuffer.init(inner.metas);
-    for (heap_buf[0..heap_len]) |row| try rl.append(alloc, row);
-    return rl;
+    var collector = try TopKCollector.init(alloc, keys, k);
+    for (rows) |row| collector.offer(row);
+    return collector.finish(inner.metas);
 }
 
 /// Stream a scannable node (scan/filter/project/limit) directly into a min-heap
@@ -6669,32 +6582,7 @@ fn executeTopKFromScannable(
         // If late_mat failed for any reason, fall through to standard path.
     }
 
-    const SortCtx = struct {
-        keys: []const plan.SortKey,
-        fn lessThan(self: @This(), a: []?Value, b: []?Value) bool {
-            for (self.keys) |key| {
-                const av: ?Value = if (key.col_idx < a.len) a[key.col_idx] else null;
-                const bv: ?Value = if (key.col_idx < b.len) b[key.col_idx] else null;
-                const ord: std.math.Order = if (av != null and bv != null)
-                    Value.order(av.?, bv.?)
-                else if (av == null and bv == null) .eq else if (av == null) .lt else .gt;
-                if (ord == .eq) continue;
-                return if (key.desc) ord == .gt else ord == .lt;
-            }
-            // Stable tiebreaker: full lexicographic comparison on all row values.
-            for (0..@min(a.len, b.len)) |ci| {
-                const av2 = a[ci];
-                const bv2 = b[ci];
-                const ord2: std.math.Order = if (av2 != null and bv2 != null)
-                    Value.order(av2.?, bv2.?)
-                else if (av2 == null and bv2 == null) .eq else if (av2 == null) .lt else .gt;
-                if (ord2 == .eq) continue;
-                return ord2 == .lt;
-            }
-            return a.len < b.len;
-        }
-    };
-    const sctx = SortCtx{ .keys = effective_keys };
+    const sctx = TopKSortCtx{ .keys = effective_keys };
 
     // If narrow_scan was applied, restore all cols after the scan is done.
     defer scan_scope.deinit();
@@ -6726,7 +6614,7 @@ fn executeTopKFromScannable(
             k2: usize,
             ks: []const plan.SortKey,
             kscratch: []?Value,
-            sctx2: SortCtx,
+            sctx2: TopKSortCtx,
             lim: ?*LimitState,
             fs: ?*FilterState,
             qctx: *QueryContext,
@@ -6839,7 +6727,7 @@ fn executeTopKFromScannable(
         }
     }
 
-    std.sort.pdq([]?Value, heap_buf[0..heap_len], sctx, SortCtx.lessThan);
+    std.sort.pdq([]?Value, heap_buf[0..heap_len], sctx, TopKSortCtx.lessThan);
 
     // Project the K winners (only K rows — negligible cost).
     var rl = RowBuffer.init(out_metas);
@@ -6862,37 +6750,7 @@ fn executeTopKFromScannable(
 fn executeOrderBy(inner: RowBuffer, keys: []const plan.SortKey, alloc: std.mem.Allocator) !RowBuffer {
     const rows_copy = try alloc.dupe([]?Value, inner.rows.items);
 
-    const SortCtx = struct {
-        keys: []const plan.SortKey,
-        fn lessThan(self: @This(), a: []?Value, b: []?Value) bool {
-            for (self.keys) |key| {
-                const av: ?Value = if (key.col_idx < a.len) a[key.col_idx] else null;
-                const bv: ?Value = if (key.col_idx < b.len) b[key.col_idx] else null;
-                const ord: std.math.Order = if (av != null and bv != null)
-                    Value.order(av.?, bv.?)
-                else if (av == null and bv == null)
-                    .eq
-                else if (av == null)
-                    .lt // NULL sorts first
-                else
-                    .gt;
-                if (ord == .eq) continue;
-                return if (key.desc) ord == .gt else ord == .lt;
-            }
-            // Stable tiebreaker: full lexicographic comparison on all row values.
-            for (0..@min(a.len, b.len)) |ci| {
-                const av2 = a[ci];
-                const bv2 = b[ci];
-                const ord2: std.math.Order = if (av2 != null and bv2 != null)
-                    Value.order(av2.?, bv2.?)
-                else if (av2 == null and bv2 == null) .eq else if (av2 == null) .lt else .gt;
-                if (ord2 == .eq) continue;
-                return ord2 == .lt;
-            }
-            return a.len < b.len;
-        }
-    };
-    std.sort.pdq([]?Value, rows_copy, SortCtx{ .keys = keys }, SortCtx.lessThan);
+    std.sort.pdq([]?Value, rows_copy, TopKSortCtx{ .keys = keys }, TopKSortCtx.lessThan);
 
     var rl = RowBuffer.init(inner.metas);
     for (rows_copy) |row| try rl.append(alloc, row);
@@ -11654,30 +11512,7 @@ fn executeHashAggParallelCompactTopK(
         // Sort the heap buffer and emit top-k rows in order.
         const heap_rows = emit_ctx.heap.?[0..emit_ctx.heap_len];
         // Sort descending (reverse of heap order = best first).
-        const SortCtx2 = struct {
-            sort_keys: []const plan.SortKey,
-            fn lessThan(self2: @This(), a: []?Value, b: []?Value) bool {
-                for (self2.sort_keys) |key| {
-                    const av = if (key.col_idx < a.len) a[key.col_idx] else null;
-                    const bv = if (key.col_idx < b.len) b[key.col_idx] else null;
-                    const ord: std.math.Order = if (av != null and bv != null) Value.order(av.?, bv.?) else if (av == null and bv == null) .eq else if (av == null) .lt else .gt;
-                    if (ord == .eq) continue;
-                    return if (key.desc) ord == .gt else ord == .lt;
-                }
-                // Stable tiebreaker: full lexicographic comparison on all row values.
-                for (0..@min(a.len, b.len)) |ci| {
-                    const av2 = a[ci];
-                    const bv2 = b[ci];
-                    const ord2: std.math.Order = if (av2 != null and bv2 != null)
-                        Value.order(av2.?, bv2.?)
-                    else if (av2 == null and bv2 == null) .eq else if (av2 == null) .lt else .gt;
-                    if (ord2 == .eq) continue;
-                    return ord2 == .lt;
-                }
-                return a.len < b.len;
-            }
-        };
-        std.sort.pdq([]?Value, heap_rows, SortCtx2{ .sort_keys = sort_keys }, SortCtx2.lessThan);
+        std.sort.pdq([]?Value, heap_rows, TopKSortCtx{ .keys = sort_keys }, TopKSortCtx.lessThan);
         var result_rl = RowBuffer.init(out_metas);
         for (heap_rows) |row| try result_rl.append(alloc, row);
         return result_rl;
@@ -12923,30 +12758,7 @@ fn executeTwoPhaseHashAgg(
 
     if (use_heap) {
         const heap_rows = emit_ctx.heap.?[0..emit_ctx.heap_len];
-        const SortCtx2 = struct {
-            sort_keys: []const plan.SortKey,
-            fn lessThan(self2: @This(), a: []?Value, b: []?Value) bool {
-                for (self2.sort_keys) |key| {
-                    const av = if (key.col_idx < a.len) a[key.col_idx] else null;
-                    const bv = if (key.col_idx < b.len) b[key.col_idx] else null;
-                    const ord: std.math.Order = if (av != null and bv != null) Value.order(av.?, bv.?) else if (av == null and bv == null) .eq else if (av == null) .lt else .gt;
-                    if (ord == .eq) continue;
-                    return if (key.desc) ord == .gt else ord == .lt;
-                }
-                // Stable tiebreaker: full lexicographic comparison on all row values.
-                for (0..@min(a.len, b.len)) |ci| {
-                    const av2 = a[ci];
-                    const bv2 = b[ci];
-                    const ord2: std.math.Order = if (av2 != null and bv2 != null)
-                        Value.order(av2.?, bv2.?)
-                    else if (av2 == null and bv2 == null) .eq else if (av2 == null) .lt else .gt;
-                    if (ord2 == .eq) continue;
-                    return ord2 == .lt;
-                }
-                return a.len < b.len;
-            }
-        };
-        std.sort.pdq([]?Value, heap_rows, SortCtx2{ .sort_keys = sort_keys }, SortCtx2.lessThan);
+        std.sort.pdq([]?Value, heap_rows, TopKSortCtx{ .keys = sort_keys }, TopKSortCtx.lessThan);
         var result_rl = RowBuffer.init(out_metas);
         for (heap_rows) |row| try result_rl.append(alloc, row);
         return result_rl;
@@ -14108,20 +13920,7 @@ fn executeTwoPhaseHashAggStrKeySimple(
 
     if (use_heap) {
         const items = ec.heap.items;
-        const SortCtxTP = struct {
-            sk: []const plan.SortKey,
-            fn lessThan(s: @This(), a: []?Value, b: []?Value) bool {
-                for (s.sk) |key| {
-                    const ai = if (key.col_idx < a.len) a[key.col_idx] else null;
-                    const bi = if (key.col_idx < b.len) b[key.col_idx] else null;
-                    const ord: std.math.Order = if (ai != null and bi != null) Value.order(ai.?, bi.?) else if (ai == null and bi == null) .eq else if (ai == null) .lt else .gt;
-                    if (ord == .eq) continue;
-                    return if (key.desc) (ord == .gt) else (ord == .lt);
-                }
-                return false;
-            }
-        };
-        std.sort.pdq([]?Value, items, SortCtxTP{ .sk = sort_keys }, SortCtxTP.lessThan);
+        std.sort.pdq([]?Value, items, TopKSortCtx{ .keys = sort_keys }, TopKSortCtx.lessThan);
         var tp_rl = RowBuffer.init(out_metas);
         for (items) |row| try tp_rl.append(alloc, row);
         return tp_rl;
