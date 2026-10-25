@@ -5,6 +5,8 @@ const result = @import("../result.zig");
 const plan = @import("plan.zig");
 const ht = @import("hash_table.zig");
 const topn = @import("topn.zig");
+const chunk_sink = @import("chunk_sink.zig");
+const chunk_sink_mod = chunk_sink;
 const row_buffer = @import("row_buffer.zig");
 
 pub const Value = types.Value;
@@ -325,3 +327,10 @@ pub fn executeOrderBy(inner: RowBuffer, keys: []const plan.SortKey, alloc: std.m
     for (rows_copy) |row| try rl.append(alloc, row);
     return rl;
 }
+
+pub const ChunkRowSink = struct {
+    sink: *chunk_sink_mod.ChunkSink,
+    pub fn append(self: *ChunkRowSink, _: std.mem.Allocator, row: []const ?Value) !void {
+        try self.sink.append(row);
+    }
+};
