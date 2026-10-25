@@ -2344,12 +2344,13 @@ fn executeHashAggScannable(
     top_offset: usize,
     ctx: *QueryContext,
 ) !ChunkResult {
-    // Strategy selection happens once in agg_strategy.select(). If the chosen
-    // implementation rejects the query at runtime, try the one generic fallback
-    // for its key shape (string-key or compact-int) and then the chunked path.
-    // Older code probed up to eight strategies, rescanning the input each time.
+    // The planner selects one layout. Fast implementations may reject a chunk
+    // shape (e.g. pair-count with a filtered input); fall back once to the
+    // generic layout for the key type, then to the chunked aggregation. This is
+    // a layout fallback, not a query-shape strategy probe.
     if (ha.strategy != .auto) {
-        if (try executeHashAggStrategy(ha.strategy, ha, sort_keys, top_k, top_offset, ctx)) |rl| return try rowListToChunkResult(rl, ctx.allocator());
+        if (try executeHashAggStrategy(ha.strategy, ha, sort_keys, top_k, top_offset, ctx)) |rl|
+            return try rowListToChunkResult(rl, ctx.allocator());
     }
     var has_string_key = false;
     for (ha.keys) |k| {
@@ -2360,7 +2361,8 @@ fn executeHashAggScannable(
     }
     const fallback_strategy: plan.HashAggNode.Strategy = if (has_string_key) .string_key else .compact_int;
     if (fallback_strategy != ha.strategy) {
-        if (try executeHashAggStrategy(fallback_strategy, ha, sort_keys, top_k, top_offset, ctx)) |rl| return try rowListToChunkResult(rl, ctx.allocator());
+        if (try executeHashAggStrategy(fallback_strategy, ha, sort_keys, top_k, top_offset, ctx)) |rl|
+            return try rowListToChunkResult(rl, ctx.allocator());
     }
     var res = try executeHashAggChunked(ha.input, ha.keys, ha.aggs, ctx);
     if (top_k > 0 and sort_keys.len > 0) {
@@ -2381,7 +2383,7 @@ fn executeHashAggStrategy(
 ) !?RowBuffer {
     return switch (strategy) {
         .auto => null,
-        .compact_int, .single_int_count_topk, .single_int_distinct_topk, .grouped_distinct => blk: {
+        .compact_int => blk: {
             if (top_k > 0 and sort_keys.len > 0) {
                 break :blk try executeHashAggParallelCompactTopK(ha.input, ha.keys, ha.aggs, sort_keys, top_k, top_offset, ctx);
             }
@@ -2389,7 +2391,7 @@ fn executeHashAggStrategy(
         },
         .pair_count => try executeHashAggParallelPairCount(ha.input, ha.keys, ha.aggs, sort_keys, top_k, ctx),
         .triple_count => try executeHashAggParallelTripleCount(ha.input, ha.keys, ha.aggs, sort_keys, top_k, ctx),
-        .string_key, .string_distinct_topk, .case_string_key_topk => try executeHashAggParallelStrKey(ha.input, ha.keys, ha.aggs, sort_keys, top_k, ctx),
+        .string_key => try executeHashAggParallelStrKey(ha.input, ha.keys, ha.aggs, sort_keys, top_k, ctx),
     };
 }
 

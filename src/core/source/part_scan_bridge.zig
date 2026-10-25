@@ -1702,7 +1702,7 @@ test "generic and compact sources produce consistent pipeline results" {
         .input = &scan,
         .keys = group_keys[0..],
         .aggs = count_aggs[0..],
-        .strategy = .single_int_count_topk,
+        .strategy = .compact_int,
     } };
     var count_sort_keys = [_]plan.SortKey{.{ .col_idx = 1, .desc = true, .nulls_first = false }};
     var grouped_topk = plan.PhysicalNode{ .top_k = .{ .input = &grouped_count, .keys = count_sort_keys[0..], .k = 2 } };

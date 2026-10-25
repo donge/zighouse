@@ -31,13 +31,11 @@ pub fn select(keys: []const ProjectItem, aggs: []const ProjectItem) Strategy {
     }
 
     if (has_distinct) {
-        if (keys.len == 1 and str_keys == 0) return .single_int_distinct_topk;
-        if (str_keys == 1) return .string_distinct_topk;
-        return .grouped_distinct;
+        if (str_keys == 0) return .compact_int;
+        return .string_key;
     }
-    if (count_only and keys.len == 1 and str_keys == 0) return .single_int_count_topk;
-    if (count_only and has_case_str_key and str_keys >= 1) return .case_string_key_topk;
     if (str_keys == 0) return .compact_int;
+    if (count_only and has_case_str_key) return .string_key;
     if (count_only and str_keys == 1 and keys.len == 2) return .pair_count;
     if (count_only and str_keys == 1 and keys.len == 3) return .triple_count;
     return .string_key;
@@ -53,8 +51,8 @@ test "agg strategy recognizes core physical agg shapes" {
     const count_agg = ProjectItem{ .expr = .{ .agg_call = &count_call }, .alias = "c", .out_type = .uint64 };
     const distinct_agg = ProjectItem{ .expr = .{ .agg_call = &distinct_call }, .alias = "u", .out_type = .uint64 };
 
-    try std.testing.expectEqual(Strategy.single_int_count_topk, select(&.{int_key}, &.{count_agg}));
-    try std.testing.expectEqual(Strategy.single_int_distinct_topk, select(&.{int_key}, &.{distinct_agg}));
-    try std.testing.expectEqual(Strategy.string_distinct_topk, select(&.{str_key}, &.{distinct_agg}));
+    try std.testing.expectEqual(Strategy.compact_int, select(&.{int_key}, &.{count_agg}));
+    try std.testing.expectEqual(Strategy.compact_int, select(&.{int_key}, &.{distinct_agg}));
+    try std.testing.expectEqual(Strategy.string_key, select(&.{str_key}, &.{distinct_agg}));
     try std.testing.expectEqual(Strategy.pair_count, select(&.{ int_key, str_key }, &.{count_agg}));
 }

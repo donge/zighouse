@@ -285,15 +285,14 @@ pub const LimitNode = struct {
 pub const HashAggNode = struct {
     pub const Strategy = enum {
         auto,
+        /// Integer keys, including COUNT/SUM/AVG/MIN/MAX and DISTINCT.
         compact_int,
-        single_int_count_topk,
-        single_int_distinct_topk,
+        /// (int, string) key with COUNT(*).
         pair_count,
+        /// (int, int, string) key with COUNT(*).
         triple_count,
+        /// Any layout whose keys contain a string.
         string_key,
-        string_distinct_topk,
-        case_string_key_topk,
-        grouped_distinct,
     };
 
     input: *PhysicalNode,
