@@ -6614,132 +6614,20 @@ fn executeTopKFromScannable(
         // If late_mat failed for any reason, fall through to standard path.
     }
 
-    const sctx = TopKSortCtx{ .keys = effective_keys };
-
-    // If narrow_scan was applied, restore all cols after the scan is done.
     defer scan_scope.deinit();
 
-    // Strategy: accumulate up to K raw (pre-projection) schema rows in the heap.
-    // Project only the final K winners — avoids projecting all 300K+ matching rows.
-    // sort key col_idx = schema column index (same in pre- and post-projection).
-    const heap_buf = try alloc.alloc([]?Value, k);
-    var heap_len: usize = 0;
-
-    // Scratch: only key columns need to be read for heap-root comparison.
-    const num_schema_cols = schema_metas.len;
-    const key_scratch = try alloc.alloc(?Value, num_schema_cols);
-    @memset(key_scratch, null);
-
-    // When narrow_scan is active and source supports range queries, use large fetchRange
-    // morsels (65536 rows) to reduce per-chunk overhead vs nextChunk (CHUNK_SIZE=2048).
-    const use_fetchrange = narrow_scan_possible and ctx.source.supportsRange();
-    const morsel_sz: usize = 65536;
-
+    // Stream filtered rows straight into the bounded TopN sink. Only accepted
+    // rows are materialised; rejected rows are compared on sort-key columns.
+    var topn = try TopNSink.init(alloc, schema_metas, effective_keys, k);
     var chunk_arena = std.heap.ArenaAllocator.init(alloc);
     defer chunk_arena.deinit();
 
-    const HeapChunkLoop = struct {
-        fn process(
-            c: *DataChunk,
-            heap_b: [][]?Value,
-            heap_l: *usize,
-            k2: usize,
-            ks: []const plan.SortKey,
-            kscratch: []?Value,
-            sctx2: TopKSortCtx,
-            lim: ?*LimitState,
-            fs: ?*FilterState,
-            qctx: *QueryContext,
-        ) !bool {
-            if (fs) |f| try f.apply(c, qctx);
-            if (lim) |ls| ls.apply(c);
-            if (c.num_rows == 0) {
-                if (lim) |ls| if (ls.done()) return true;
-                return false;
-            }
-            const a = qctx.allocator();
-            for (0..c.num_rows) |r| {
-                if (heap_l.* < k2) {
-                    const row_raw = try c.readRow(r, a);
-                    // Deep-copy string content: readRow returns slices into DataChunk
-                    // column buffers which are in chunk_arena (reset each morsel).
-                    for (row_raw) |*v| {
-                        if (v.*) |val| switch (val) {
-                            .string => |s| v.* = .{ .string = try a.dupe(u8, s) },
-                            .array_string => |arr| {
-                                const arr2 = try a.alloc([]const u8, arr.len);
-                                for (arr, 0..) |s, i| arr2[i] = try a.dupe(u8, s);
-                                v.* = .{ .array_string = arr2 };
-                            },
-                            else => {},
-                        };
-                    }
-                    const row = row_raw;
-                    heap_b[heap_l.*] = row;
-                    heap_l.* += 1;
-                    var i = heap_l.* - 1;
-                    while (i > 0) {
-                        const parent = (i - 1) / 2;
-                        // MAX-heap: worse (larger for ASC) element bubbles to root.
-                        // Swap when parent is BETTER than i (i.e., i is WORSE → move i up).
-                        if (sctx2.lessThan(heap_b[parent], heap_b[i])) {
-                            const tmp = heap_b[i];
-                            heap_b[i] = heap_b[parent];
-                            heap_b[parent] = tmp;
-                            i = parent;
-                        } else break;
-                    }
-                } else {
-                    for (ks) |key| {
-                        if (key.col_idx < c.columns.len) {
-                            const col = &c.columns[key.col_idx];
-                            kscratch[key.col_idx] = if (col.isRowNull(r)) null else col.data.get(r);
-                        }
-                    }
-                    if (sctx2.lessThan(kscratch, heap_b[0])) {
-                        const row_raw2 = try c.readRow(r, a);
-                        for (row_raw2) |*v| {
-                            if (v.*) |val| switch (val) {
-                                .string => |s| v.* = .{ .string = try a.dupe(u8, s) },
-                                .array_string => |arr| {
-                                    const arr2 = try a.alloc([]const u8, arr.len);
-                                    for (arr, 0..) |s, i| arr2[i] = try a.dupe(u8, s);
-                                    v.* = .{ .array_string = arr2 };
-                                },
-                                else => {},
-                            };
-                        }
-                        heap_b[0] = row_raw2;
-                        var i: usize = 0;
-                        while (true) {
-                            const l = 2 * i + 1;
-                            const r2 = 2 * i + 2;
-                            var smallest = i;
-                            // MAX-heap sift-down: track the WORSE child to swap with.
-                            // "smallest" is misnamed — it's actually the WORSE (larger) index.
-                            if (l < heap_b.len and sctx2.lessThan(heap_b[smallest], heap_b[l])) smallest = l;
-                            if (r2 < heap_b.len and sctx2.lessThan(heap_b[smallest], heap_b[r2])) smallest = r2;
-                            if (smallest == i) break;
-                            const tmp = heap_b[i];
-                            heap_b[i] = heap_b[smallest];
-                            heap_b[smallest] = tmp;
-                            i = smallest;
-                        }
-                    }
-                }
-            }
-            if (lim) |ls| if (ls.done()) return true;
-            return false;
-        }
-    };
-
     var fs_mut = filter_state;
     var ls_mut = lim_state;
-    const fs_ptr: ?*FilterState = if (fs_mut != null) &fs_mut.? else null;
-    const ls_ptr: ?*LimitState = if (ls_mut != null) &ls_mut.? else null;
+    const total_rows = ctx.source.rowCount();
+    const morsel_sz: usize = 65536;
 
-    if (use_fetchrange) {
-        const total_rows = ctx.source.rowCount();
+    if (narrow_scan_possible and ctx.source.supportsRange()) {
         var pos: u64 = 0;
         while (pos < total_rows) {
             const n = @min(morsel_sz, total_rows - pos);
@@ -6747,25 +6635,27 @@ fn executeTopKFromScannable(
             _ = chunk_arena.reset(.retain_capacity);
             try ctx.source.fetchRange(pos, n, &c, chunk_arena.allocator());
             pos += n;
-            const done = try HeapChunkLoop.process(&c, heap_buf, &heap_len, k, effective_keys, key_scratch, sctx, ls_ptr, fs_ptr, ctx);
-            if (done) break;
+            if (fs_mut) |*fs| try fs.apply(&c, ctx);
+            if (ls_mut) |*ls| ls.apply(&c);
+            if (c.num_rows > 0) try topn.pushChunk(&c);
+            if (ls_mut) |*ls| if (ls.done()) break;
         }
     } else {
         ctx.source.reset();
         var c: DataChunk = undefined;
         while (try ctx.source.nextChunk(&c, ctx)) {
-            const done = try HeapChunkLoop.process(&c, heap_buf, &heap_len, k, effective_keys, key_scratch, sctx, ls_ptr, fs_ptr, ctx);
-            if (done) break;
+            if (fs_mut) |*fs| try fs.apply(&c, ctx);
+            if (ls_mut) |*ls| ls.apply(&c);
+            if (c.num_rows > 0) try topn.pushChunk(&c);
+            if (ls_mut) |*ls| if (ls.done()) break;
         }
     }
 
-    std.sort.pdq([]?Value, heap_buf[0..heap_len], sctx, TopKSortCtx.lessThan);
-
-    // Project the K winners (only K rows — negligible cost).
+    const raw = try topn.finish();
     var rl = RowBuffer.init(out_metas);
     if (project_items) |items| {
         const row_buf = try alloc.alloc(?Value, schema_metas.len);
-        for (heap_buf[0..heap_len]) |raw_row| {
+        for (raw.rows.items) |raw_row| {
             const proj_row = try alloc.alloc(?Value, items.len);
             @memcpy(row_buf[0..raw_row.len], raw_row);
             for (items, 0..) |item, ci| {
@@ -6774,7 +6664,7 @@ fn executeTopKFromScannable(
             try rl.append(alloc, proj_row);
         }
     } else {
-        for (heap_buf[0..heap_len]) |row| try rl.append(alloc, row);
+        for (raw.rows.items) |row| try rl.append(alloc, row);
     }
     return rl;
 }
