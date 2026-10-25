@@ -387,7 +387,6 @@ def run_zighouse(zighouse: str, store: str, queries_file: str) -> Tuple[List[Opt
     We take min(T2, T3) as the warm best.
     """
     env = dict(os.environ)
-    env["ZIGHOUSE_CLICKBENCH_SUBMIT"] = "1"
     proc = subprocess.run(
         [zighouse, "bench", "--store=" + store, "hits", queries_file],
         stdout=subprocess.PIPE,

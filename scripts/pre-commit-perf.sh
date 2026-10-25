@@ -75,8 +75,7 @@ else
 fi
 
 for i in $(seq 1 "$BENCH_REPEATS"); do
-  "${TIME_CMD[@]}" sh -c "env ZIGHOUSE_CLICKBENCH_SUBMIT=1 \
-    '$ZIGHOUSE' bench '--store=$STORE_DIR' hits clickbench-submit/zighouse/queries.sql 2>/dev/null" \
+  "${TIME_CMD[@]}" sh -c "'$ZIGHOUSE' bench '--store=$STORE_DIR' hits clickbench-submit/zighouse/queries.sql 2>/dev/null" \
     > "$TMP_BENCH/bench-${i}.log" 2>&1
 done
 
@@ -86,7 +85,7 @@ import_store="$WORK_DIR/import_store"
 IMPORT_SAMPLE_PARQUET="${ZIGHOUSE_PERF_IMPORT_SAMPLE:-data/hits_1m_snappy.parquet}"
 if [[ -f "$IMPORT_SAMPLE_PARQUET" ]]; then
   import_start=$(python3 -c "import time; print(time.time())")
-  env ZIGHOUSE_IMPORT_TRACE=1 ZIGHOUSE_CLICKBENCH_SUBMIT=1 \
+  env ZIGHOUSE_IMPORT_TRACE=1 \
     "$ZIGHOUSE" import-parquet --format=generic "$IMPORT_SAMPLE_PARQUET" "$import_store" hits \
     > "$import_log" 2>&1
   import_end=$(python3 -c "import time; print(time.time())")

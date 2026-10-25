@@ -9,7 +9,7 @@ ZH=${ZIGHOUSE:-./zighouse}
 run() {
 	echo "== $1 [$2] =="
 	echo "SQL: $3"
-	ZIGHOUSE_CLICKBENCH_SUBMIT=1 "$ZH" query "$STORE" hits "$3" || echo " -> error"
+	"$ZH" query "$STORE" hits "$3" || echo " -> error"
 	echo
 }
 

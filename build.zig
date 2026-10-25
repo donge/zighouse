@@ -205,15 +205,6 @@ pub fn build(b: *std.Build) void {
     zstdctx_early.link(unit_tests.root_module);
     const test_cmd = b.addRunArtifact(unit_tests);
 
-    const simd_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/simd.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    const simd_test_cmd = b.addRunArtifact(simd_tests);
-
     const parallel_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/parallel.zig"),
@@ -242,15 +233,6 @@ pub fn build(b: *std.Build) void {
     generic_sql_tests.root_module.link_libc = true;
     zstdctx_early.link(generic_sql_tests.root_module);
     const generic_sql_test_cmd = b.addRunArtifact(generic_sql_tests);
-
-    const lowcard_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/lowcard.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    const lowcard_test_cmd = b.addRunArtifact(lowcard_tests);
 
     const parquet_tests = b.addTest(.{
         .root_module = b.createModule(.{
@@ -819,11 +801,9 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&core_test_cmd.step);
     test_step.dependOn(&serializer_test_cmd.step);
     test_step.dependOn(&test_cmd.step);
-    test_step.dependOn(&simd_test_cmd.step);
     test_step.dependOn(&parallel_test_cmd.step);
     test_step.dependOn(&hashmap_test_cmd.step);
     test_step.dependOn(&generic_sql_test_cmd.step);
-    test_step.dependOn(&lowcard_test_cmd.step);
     test_step.dependOn(&parquet_test_cmd.step);
     test_step.dependOn(&schema_test_cmd.step);
     test_step.dependOn(&schema_infer_test_cmd.step);
@@ -855,48 +835,8 @@ pub fn build(b: *std.Build) void {
 
     if (!install_bench_tools) return;
 
-    const bench_simd = b.addExecutable(.{
-        .name = "bench-simd",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/bench_simd.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    b.installArtifact(bench_simd);
-    const bench_simd_run = b.addRunArtifact(bench_simd);
-    bench_simd_run.step.dependOn(b.getInstallStep());
-    const bench_simd_step = b.step("bench-simd", "Run A.1 SIMD vs scalar micro-benchmarks");
-    bench_simd_step.dependOn(&bench_simd_run.step);
 
-    const bench_parallel = b.addExecutable(.{
-        .name = "bench-parallel",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/bench_parallel.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    b.installArtifact(bench_parallel);
-    const bench_parallel_run = b.addRunArtifact(bench_parallel);
-    bench_parallel_run.step.dependOn(b.getInstallStep());
-    const bench_parallel_step = b.step("bench-parallel", "Run A.3 parallel fan-out micro-benchmark");
-    bench_parallel_step.dependOn(&bench_parallel_run.step);
 
-    const bench_mmap = b.addExecutable(.{
-        .name = "bench-mmap",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/bench_mmap.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    bench_mmap.root_module.link_libc = true;
-    b.installArtifact(bench_mmap);
-    const bench_mmap_run = b.addRunArtifact(bench_mmap);
-    bench_mmap_run.step.dependOn(b.getInstallStep());
-    const bench_mmap_step = b.step("bench-mmap", "Run A.4 mmap vs readAlloc micro-benchmark");
-    bench_mmap_step.dependOn(&bench_mmap_run.step);
 
     const bench_filter = b.addExecutable(.{
         .name = "bench-filter",

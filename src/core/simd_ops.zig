@@ -1,6 +1,5 @@
 /// SIMD reduction primitives for the core execution engine.
 /// These are inlined into pipeline.zig via @import("simd_ops.zig").
-/// Separate from src/simd.zig to avoid cross-module file ownership conflicts.
 const std = @import("std");
 
 /// SIMD sum of i16 slice, sign-extended and returned as i64 (wrapping).

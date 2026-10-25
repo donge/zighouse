@@ -27,7 +27,7 @@ The script downloads `hits.parquet`, downloads the fixed Linux x86_64 ZigHouse r
 
 ## Notes
 
-This is a tuned ClickBench-specific implementation. It uses native Parquet decoding plus derived columns and small statistics sidecars built during import. Query result caches are disabled in `ZIGHOUSE_CLICKBENCH_SUBMIT=1` mode.
+This is a tuned ClickBench-specific implementation. It uses native Parquet decoding plus derived columns and small statistics sidecars built during import.
 
 The same store reader handles data written by file import and by streaming
 `INSERT` through `zighouse serve` (ClickHouse compact/wide parts).  Both paths

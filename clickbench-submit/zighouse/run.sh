@@ -13,6 +13,5 @@ if [ ! -f "${queries_file}" ]; then
     queries_file="${CLICKBENCH_DIR}/duckdb/queries.sql"
 fi
 
-ZIGHOUSE_CLICKBENCH_SUBMIT=1 \
-  "${ZIGHOUSE_REPO}/zig-out/bin/zighouse" bench "${ZIGHOUSE_STORE}" hits "${queries_file}" \
+"${ZIGHOUSE_REPO}/zig-out/bin/zighouse" bench "${ZIGHOUSE_STORE}" hits "${queries_file}" \
   | grep '^\['

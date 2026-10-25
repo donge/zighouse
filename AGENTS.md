@@ -30,7 +30,6 @@ Key build options:
 ## Environment Variables
 
 - `ZIGHOUSE_IMPORT_TRACE`: print import phase timings
-- `ZIGHOUSE_CLICKBENCH_SUBMIT`: enable ClickBench submission format (JSON timing rows)
 
 ## Architecture
 

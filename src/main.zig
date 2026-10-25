@@ -8,7 +8,6 @@ const mv_persist = @import("mv_persist");
 const loader = @import("loader.zig");
 const generic_sql = @import("generic_sql");
 const parquet = @import("parquet");
-const storage = @import("storage.zig");
 const schema = @import("schema");
 const generic_store = @import("generic_store");
 const store_query = @import("store_query");
@@ -24,7 +23,6 @@ const usage =
     \\  zighouse compact [--once] [--interval=<secs>]
     \\  zighouse query <sql>
     \\  zighouse inspect <parquet>
-    \\  zighouse info [<data_dir>]
     \\  zighouse --help / --version
     \\
 ;
@@ -131,7 +129,7 @@ fn runCommand(init: std.process.Init, allocator: std.mem.Allocator, args: *std.p
             .ch_http => .ch_mergetree,
         };
         if (format != .ch_http) {
-            try catalog.Catalog.writeManifest(init.io, allocator, store_path, table_name, parquet_path, part_fmt);
+            try catalog.writeManifest(init.io, allocator, store_path, table_name, parquet_path, part_fmt);
         }
         const sort_keys: []const []const u8 = &.{};
         var table_with_keys = inferred.table;
@@ -217,20 +215,6 @@ fn runCommand(init: std.process.Init, allocator: std.mem.Allocator, args: *std.p
         const output = try parquet.scanByteArrayPath(allocator, init.io, parquet_path, column, limit_rows);
         defer allocator.free(output);
         try writeOut(init.io, output);
-    } else if (std.mem.eql(u8, command, "info")) {
-        const data_dir = args.next() orelse return error.MissingDataDir;
-        try storage.ensureStore(init.io, data_dir);
-        const manifest = try storage.readStoreManifest(init.io, allocator, data_dir);
-        defer allocator.free(manifest);
-        const import_manifest = try storage.readImportManifest(init.io, allocator, data_dir);
-        defer allocator.free(import_manifest);
-        try printOut(init.io, "store={s}\n", .{data_dir});
-        try writeOut(init.io, "[manifest.zig-house]\n");
-        try writeOut(init.io, manifest);
-        if (manifest.len == 0 or manifest[manifest.len - 1] != '\n') try writeOut(init.io, "\n");
-        try writeOut(init.io, "[import.zig-house]\n");
-        try writeOut(init.io, import_manifest);
-        if (import_manifest.len == 0 or import_manifest[import_manifest.len - 1] != '\n') try writeOut(init.io, "\n");
     } else if (std.mem.eql(u8, command, "bench")) {
         const duckdb = @import("query_bench.zig");
         const QueryRange = duckdb.QueryRange;

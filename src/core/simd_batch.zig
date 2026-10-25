@@ -1,20 +1,18 @@
 /// Vectorized predicate evaluation helpers for the core execution engine.
 ///
-/// These routines mirror the SIMD primitives in src/simd.zig but live inside
-/// the `core` module so that kernels.zig can import them without crossing
-/// module boundaries (simd.zig is in the root module; core is its own module).
+/// Predicate-mask SIMD helpers.  Reduction primitives live next door in
+/// simd_ops.zig; both are part of the core module so kernels and the pipeline
+/// can import them without crossing module boundaries.
 ///
 /// Supported element types for cmpBatch: i16, u16, i32, u32, i64, u64.
-/// Mask format: []i16, value 1 = match, 0 = no match (compatible with the
-/// predicate slices used by filteredSumNonZero / filteredMinMaxNonZero in
-/// simd.zig).
+/// Mask format: []i16, value 1 = match, 0 = no match.
 const std = @import("std");
 
 // ── Lane widths ───────────────────────────────────────────────────────────────
 
 fn lanesFor(comptime T: type) comptime_int {
     return switch (T) {
-        u8       => 64,
+        u8 => 64,
         i16, u16 => 32,
         i32, u32 => 16,
         i64, u64 => 8,
@@ -28,11 +26,11 @@ pub const CmpKind = enum { eq, neq, lt, lte, gt, gte };
 
 pub fn flipCmp(op: CmpKind) CmpKind {
     return switch (op) {
-        .eq  => .eq,
+        .eq => .eq,
         .neq => .neq,
-        .lt  => .gt,
+        .lt => .gt,
         .lte => .gte,
-        .gt  => .lt,
+        .gt => .lt,
         .gte => .lte,
     };
 }
@@ -53,22 +51,22 @@ pub fn cmpBatch(comptime T: type, values: []const T, comptime op: CmpKind, rhs: 
     while (i + lanes <= values.len) : (i += lanes) {
         const v: VT = values[i..][0..lanes].*;
         const mask = switch (op) {
-            .eq  => v == rhs_vec,
+            .eq => v == rhs_vec,
             .neq => v != rhs_vec,
-            .lt  => v < rhs_vec,
+            .lt => v < rhs_vec,
             .lte => v <= rhs_vec,
-            .gt  => v > rhs_vec,
+            .gt => v > rhs_vec,
             .gte => v >= rhs_vec,
         };
         out[i..][0..lanes].* = @select(i16, mask, one_vec, zero_vec);
     }
     while (i < values.len) : (i += 1) {
         out[i] = switch (op) {
-            .eq  => if (values[i] == rhs) @as(i16, 1) else 0,
+            .eq => if (values[i] == rhs) @as(i16, 1) else 0,
             .neq => if (values[i] != rhs) @as(i16, 1) else 0,
-            .lt  => if (values[i] < rhs)  @as(i16, 1) else 0,
+            .lt => if (values[i] < rhs) @as(i16, 1) else 0,
             .lte => if (values[i] <= rhs) @as(i16, 1) else 0,
-            .gt  => if (values[i] > rhs)  @as(i16, 1) else 0,
+            .gt => if (values[i] > rhs) @as(i16, 1) else 0,
             .gte => if (values[i] >= rhs) @as(i16, 1) else 0,
         };
     }
@@ -199,17 +197,20 @@ test "andMasks / orMasks / notMask match scalar" {
 
     andMasks(&a, &b, &out);
     for (a, b, out) |ai, bi, oi| try std.testing.expectEqual(
-        if (ai != 0 and bi != 0) @as(i16, 1) else 0, oi,
+        if (ai != 0 and bi != 0) @as(i16, 1) else 0,
+        oi,
     );
 
     orMasks(&a, &b, &out);
     for (a, b, out) |ai, bi, oi| try std.testing.expectEqual(
-        if (ai != 0 or bi != 0) @as(i16, 1) else 0, oi,
+        if (ai != 0 or bi != 0) @as(i16, 1) else 0,
+        oi,
     );
 
     var not_in = a;
     notMask(&not_in);
     for (a, not_in) |ai, ni| try std.testing.expectEqual(
-        if (ai == 0) @as(i16, 1) else 0, ni,
+        if (ai == 0) @as(i16, 1) else 0,
+        ni,
     );
 }
