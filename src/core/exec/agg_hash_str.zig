@@ -1748,9 +1748,10 @@ pub fn executeTwoPhaseHashAggStrKeySimple(
                             break :blk base_h;
                         };
                         const part_id = @as(usize, @truncate(h)) & (N_PARTS - 1);
+                        const s_store = if (use_raw_key) s else try ba.dupe(u8, s);
                         rec[0] = h;
-                        rec[1] = @intFromPtr(s.ptr);
-                        rec[2] = s.len;
+                        rec[1] = @intFromPtr(s_store.ptr);
+                        rec[2] = s_store.len;
                         if (self.sidecar_col_idx != null) rec[3] = @bitCast(sidecar_val);
                         if (!self.count_only) {
                             const agg_base: usize = if (self.sidecar_col_idx != null) 4 else 3;
@@ -1853,9 +1854,10 @@ pub fn executeTwoPhaseHashAggStrKeySimple(
                         break :blk base_h;
                     };
                     const part_id = @as(usize, @truncate(h)) & (N_PARTS - 1);
+                    const s_store = if (use_raw_key) s else try ba.dupe(u8, s);
                     rec[0] = h;
-                    rec[1] = @intFromPtr(s.ptr);
-                    rec[2] = s.len;
+                    rec[1] = @intFromPtr(s_store.ptr);
+                    rec[2] = s_store.len;
                     if (self.sidecar_col_idx != null) rec[3] = @bitCast(sidecar_val);
                     if (!self.count_only) {
                         const agg_base: usize = if (self.sidecar_col_idx != null) 4 else 3;
@@ -2033,6 +2035,7 @@ pub fn executeTwoPhaseHashAggStrKeySimple(
     for (scatter_ctxs) |*sc| {
         if (sc.err) |e| return e;
     }
+    defer for (scatter_ctxs) |*sc| sc.buf_arena.deinit();
 
     // ── Phase 2: parallel aggregate, one HT per partition ────────────────────
     // Each partition gets its own c_allocator-backed arena so threads never
@@ -2325,8 +2328,7 @@ pub fn executeTwoPhaseHashAggStrKeySimple(
         if (ac.err) |e| return e;
     }
 
-    // Release scatter buffers.
-    for (scatter_ctxs) |*sc| sc.buf_arena.deinit();
+    // Scatter buffers stay alive through emit: key strings may be borrowed from them.
 
     // ── Emit: iterate all partition HTs, build output RowBuffer ────────────────
     const out_metas = try buildAggResultMetas(keys, aggs, alloc);
