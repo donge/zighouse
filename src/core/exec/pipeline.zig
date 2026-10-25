@@ -285,6 +285,8 @@ pub const SourceIface = struct {
         getRawInt32Col: ?*const fn (ptr: *anyopaque, col_name: []const u8) ?[]const i32 = null,
         /// Optional: return raw int64 slice for a column.
         getRawInt64Col: ?*const fn (ptr: *anyopaque, col_name: []const u8) ?[]const i64 = null,
+        /// Optional: return [min, max] from block statistics without decoding.
+        getIntMinMax: ?*const fn (ptr: *anyopaque, col_name: []const u8) ?[2]i64 = null,
         /// Optional: return raw string offsets for a column.
         getRawStrOffsets: ?*const fn (ptr: *anyopaque, col_name: []const u8) ?[]const u64 = null,
         /// Optional: return raw string bytes for a column.
@@ -335,6 +337,12 @@ pub const SourceIface = struct {
     /// Pass null to restore all columns. Only has effect if source supports it.
     pub fn setNeededCols(self: SourceIface, col_names: ?[]const []const u8) void {
         if (self.vtable.setNeededCols) |f| f(self.ptr, col_names);
+    }
+
+    /// Block-level min/max for an integer column, when the source has stats.
+    pub fn getIntMinMax(self: SourceIface, col_name: []const u8) ?[2]i64 {
+        if (self.vtable.getIntMinMax) |f| return f(self.ptr, col_name);
+        return null;
     }
 
     /// Mark a string column for lightweight bool_u8 decoding (1=non-empty, 0=empty).
@@ -2718,14 +2726,20 @@ fn executeRawIntPointLookup(input: *const plan.PhysicalNode, items: []const plan
         var dummy: DataChunk = undefined;
         ctx.source.fetchRange(0, 0, &dummy, alloc) catch {};
     }
-    const raw_filter = RawColSlice.resolve(ctx.source, sm, filter_ci) orelse return null;
-    const matches = try collectRawEqIndices(raw_filter, target, alloc);
-    defer alloc.free(matches);
-
     const metas = try alloc.alloc(result.ColMeta, items.len);
     for (items, 0..) |item, i| {
         metas[i] = .{ .name = item.alias, .col_type = item.out_type, .ch_type = item.ch_type };
     }
+
+    // Block stats can prove the value is outside the column range.
+    if (ctx.source.getIntMinMax(sm[filter_ci].name)) |stats| {
+        if (target < stats[0] or target > stats[1]) return RowBuffer.init(metas);
+    }
+
+    const raw_filter = RawColSlice.resolve(ctx.source, sm, filter_ci) orelse return null;
+    const matches = try collectRawEqIndices(raw_filter, target, alloc);
+    defer alloc.free(matches);
+
     var rl = RowBuffer.init(metas);
     for (matches) |row_idx| {
         const row = try alloc.alloc(?Value, items.len);
@@ -2772,9 +2786,13 @@ fn executeRawMinMaxAgg(input: *const plan.PhysicalNode, aggs: []const plan.Proje
         const ac = item.expr.agg_call;
         const ci = ac.arg.?.col_ref.index;
         if (ci >= sm.len) return null;
-        const raw = RawColSlice.resolve(ctx.source, sm, ci) orelse return null;
-        const mm = raw.minMax();
-        const v = if (ac.kind == .min) mm.min else mm.max;
+        const v = if (ctx.source.getIntMinMax(sm[ci].name)) |stats|
+            (if (ac.kind == .min) stats[0] else stats[1])
+        else blk: {
+            const raw = RawColSlice.resolve(ctx.source, sm, ci) orelse return null;
+            const mm = raw.minMax();
+            break :blk if (ac.kind == .min) mm.min else mm.max;
+        };
         row[i] = switch (item.out_type) {
             .int64 => .{ .int64 = v },
             .uint64 => .{ .uint64 = @intCast(v) },

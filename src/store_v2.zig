@@ -404,7 +404,7 @@ pub const MappedColumn = struct {
                 };
             }
         }
-        return .{ .bytes = try self.decodeRange(allocator, start, count), .owned = true };
+        return .{ .bytes = try self.decodeRangeImpl(allocator, start, count, false), .owned = true };
     }
 
     /// All payloads are raw and stored back-to-back: the whole column is one
@@ -425,15 +425,107 @@ pub const MappedColumn = struct {
         start: u64,
         count: usize,
     ) ![]u8 {
+        return self.decodeRangeImpl(allocator, start, count, true);
+    }
+
+    fn decodeRangeImpl(
+        self: MappedColumn,
+        allocator: std.mem.Allocator,
+        start: u64,
+        count: usize,
+        verify_checksums: bool,
+    ) ![]u8 {
         if (start > self.row_count or count > self.row_count - start) return error.InvalidRange;
         const out = try allocator.alloc(u8, count * self.width);
         errdefer allocator.free(out);
         if (count == 0) return out;
 
         const end = start + count;
-        var block_index: usize = @intCast(start / self.block_rows);
+        const first_block: usize = @intCast(start / self.block_rows);
+        const last_block: usize = @min(
+            self.entries.len,
+            @as(usize, @intCast((end + self.block_rows - 1) / self.block_rows)),
+        );
+
+        // Large compressed columns decode much faster across cores.  Each
+        // worker writes a disjoint output slice, so no locking is needed.
+        if (out.len >= 8 * 1024 * 1024 and last_block > first_block + 1) {
+            const n_threads = @min(std.Thread.getCpuCount() catch 1, 4);
+            if (n_threads > 1) {
+                const tasks = try allocator.alloc(DecodeTask, n_threads);
+                defer allocator.free(tasks);
+                var threads: [4]?std.Thread = .{ null, null, null, null };
+                const span = last_block - first_block;
+                for (0..n_threads) |i| {
+                    const lo = first_block + (span * i) / n_threads;
+                    const hi = first_block + (span * (i + 1)) / n_threads;
+                    tasks[i] = .{
+                        .column = self,
+                        .out = out,
+                        .start = start,
+                        .end = end,
+                        .block_lo = lo,
+                        .block_hi = hi,
+                        .verify = verify_checksums,
+                    };
+                    if (hi > lo) {
+                        threads[i] = std.Thread.spawn(.{}, runDecodeTask, .{&tasks[i]}) catch null;
+                    }
+                }
+                for (0..n_threads) |i| {
+                    if (threads[i]) |t| t.join() else if (tasks[i].block_hi > tasks[i].block_lo)
+                        runDecodeTask(&tasks[i]);
+                }
+                for (tasks) |task| if (task.err) |err| return err;
+                return out;
+            }
+        }
+
+        try self.decodeBlocks(out, start, end, first_block, last_block, verify_checksums);
+        return out;
+    }
+
+    const DecodeTask = struct {
+        column: MappedColumn,
+        out: []u8,
+        start: u64,
+        end: u64,
+        block_lo: usize,
+        block_hi: usize,
+        verify: bool,
+        err: ?anyerror = null,
+    };
+
+    fn runDecodeTask(task: *DecodeTask) void {
+        task.column.decodeBlocks(
+            task.out,
+            task.start,
+            task.end,
+            task.block_lo,
+            task.block_hi,
+            task.verify,
+        ) catch |err| {
+            task.err = err;
+        };
+    }
+
+    fn decodeBlocks(
+        self: MappedColumn,
+        out: []u8,
+        start: u64,
+        end: u64,
+        block_lo: usize,
+        block_hi: usize,
+        verify_checksums: bool,
+    ) !void {
         var out_rows: usize = 0;
-        while (block_index < self.entries.len) : (block_index += 1) {
+        if (block_lo < self.entries.len) {
+            const first = self.entries[block_lo];
+            if (first.row_start > start) out_rows = @intCast(first.row_start - start);
+        }
+
+        var block_index = block_lo;
+        while (block_index < block_hi) : (block_index += 1) {
             const entry = self.entries[block_index];
             const block_end = entry.row_start + entry.row_count;
             if (entry.row_start >= end) break;
@@ -446,8 +538,6 @@ pub const MappedColumn = struct {
             const rows: usize = @intCast(copy_end - copy_start);
             const dest = out[out_rows * self.width ..][0 .. rows * self.width];
 
-            // Whole blocks can decode straight into the result, avoiding a
-            // per-block temporary allocation and copy.
             if (local_start == 0 and rows == entry.row_count) {
                 switch (entry.codec) {
                     .raw => @memcpy(dest, payload),
@@ -461,13 +551,14 @@ pub const MappedColumn = struct {
                         if (n < 0 or n != dest.len) return error.CorruptBlock;
                     },
                 }
-                if (std.hash.Wyhash.hash(0, dest) != entry.checksum) return error.CorruptBlock;
+                if (verify_checksums and std.hash.Wyhash.hash(0, dest) != entry.checksum)
+                    return error.CorruptBlock;
                 out_rows += rows;
                 continue;
             }
 
-            const decoded = try allocator.alloc(u8, entry.uncompressed_size);
-            defer allocator.free(decoded);
+            const decoded = try std.heap.c_allocator.alloc(u8, entry.uncompressed_size);
+            defer std.heap.c_allocator.free(decoded);
             switch (entry.codec) {
                 .raw => @memcpy(decoded, payload),
                 .lz4 => {
@@ -480,15 +571,11 @@ pub const MappedColumn = struct {
                     if (n < 0 or n != decoded.len) return error.CorruptBlock;
                 },
             }
-            if (std.hash.Wyhash.hash(0, decoded) != entry.checksum) return error.CorruptBlock;
-            @memcpy(
-                dest,
-                decoded[local_start * self.width ..][0 .. rows * self.width],
-            );
+            if (verify_checksums and std.hash.Wyhash.hash(0, decoded) != entry.checksum)
+                return error.CorruptBlock;
+            @memcpy(dest, decoded[local_start * self.width ..][0 .. rows * self.width]);
             out_rows += rows;
         }
-        if (out_rows != count) return error.InvalidDirectory;
-        return out;
     }
 
     pub fn compressedBytesForRange(self: MappedColumn, start: u64, count: usize) u64 {

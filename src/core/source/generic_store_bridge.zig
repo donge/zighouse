@@ -962,6 +962,36 @@ pub const GenericStoreBridge = struct {
         return self.state.table.sort_keys;
     }
 
+    fn getIntMinMaxFn(ptr: *anyopaque, col_name: []const u8) ?[2]i64 {
+        const self: *GenericStoreBridge = @ptrCast(@alignCast(ptr));
+        const s = self.state;
+        s.loadColumns() catch return null;
+        const ci = blk: {
+            for (s.table.columns, 0..) |col, i| {
+                if (std.mem.eql(u8, col.name, col_name)) break :blk i;
+            }
+            return null;
+        };
+        switch (s.table.columns[ci].ty) {
+            .int8, .int16, .int32, .int64, .date, .timestamp => {},
+            else => return null,
+        }
+        return switch (s.col_data[ci]) {
+            .fixed => |m| blk: {
+                if (m.mapped.row_count == 0) return null;
+                var lo: i64 = std.math.maxInt(i64);
+                var hi: i64 = std.math.minInt(i64);
+                for (m.mapped.entries) |entry| {
+                    if (entry.stats_kind != .signed) return null;
+                    lo = @min(lo, @as(i64, @bitCast(entry.min_bits)));
+                    hi = @max(hi, @as(i64, @bitCast(entry.max_bits)));
+                }
+                break :blk .{ lo, hi };
+            },
+            else => null,
+        };
+    }
+
     fn profileStatsFn(ptr: *anyopaque) SourceIface.ProfileStats {
         const self: *GenericStoreBridge = @ptrCast(@alignCast(ptr));
         return .{
@@ -985,6 +1015,7 @@ pub const GenericStoreBridge = struct {
         .getRawStrOffsets = getRawStrOffsetsFn,
         .getRawStrBytes = getRawStrBytesFn,
         .getRawInt32Col = getRawInt32ColFn,
+        .getIntMinMax = getIntMinMaxFn,
         .setRowRange = setRowRangeFn,
         .getSortKeys = getSortKeysFn,
         .findIntRange = findIntRangeFn,
