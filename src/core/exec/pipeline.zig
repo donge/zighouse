@@ -428,13 +428,6 @@ fn filterChunkResult(res: ChunkResult, predicate: plan.Expr, ctx: *QueryContext)
     return res;
 }
 
-fn rowListToChunkResult(rl: RowBuffer, alloc: std.mem.Allocator) !ChunkResult {
-    var sink = try chunk_sink_mod.ChunkSink.init(alloc, rl.metas);
-    defer sink.deinit();
-    for (rl.rows.items) |row| try sink.append(row);
-    return try sink.finishResult();
-}
-
 fn chunkResultToResultSet(res: ChunkResult, query_alloc: std.mem.Allocator, result_alloc: std.mem.Allocator) !ResultSet {
     var sink = ResultSink.init(result_alloc);
     for (res.chunks) |c| try sink.consume(c);
@@ -651,6 +644,9 @@ const finalizeScalarAgg = agg.finalizeScalarAgg;
 const extractLimit = agg.extractLimit;
 const initAccumForAgg = agg.initAccumForAgg;
 const deinitAccum = agg.deinitAccum;
+const rowListToChunkResult = row_buffer.rowListToChunkResult;
+const chunkResultToRowBuffer = row_buffer.chunkResultToRowBuffer;
+const executeTopKFromChunkResult = topn_mod.executeTopKFromChunkResult;
 const agg = @import("agg.zig");
 const initAggAccums = agg.initAggAccums;
 const executeScalarAggChunked = agg.executeScalarAggChunked;
@@ -1148,30 +1144,9 @@ const ChunkRowSink = struct {
 
 /// Streaming top-K over a chunk result. Only rows that can enter the heap are
 /// materialized; everything else is compared on the sort-key columns.
-fn executeTopKFromChunkResult(
-    res: chunk_sink_mod.ChunkSink.Result,
-    keys: []const plan.SortKey,
-    k: usize,
-    alloc: std.mem.Allocator,
-) !RowBuffer {
-    var sink = try TopNSink.init(alloc, res.metas, keys, k);
-    for (res.chunks) |*c| try sink.pushChunk(c);
-    return sink.finish();
-}
-
 /// Temporary bridge for callers that still consume RowBuffer. The chunk sink
 /// owns its chunks; chunk pages stay alive in the query arena, so row string
 /// slices remain valid until the result is materialized.
-fn chunkResultToRowBuffer(res: chunk_sink_mod.ChunkSink.Result, alloc: std.mem.Allocator) !RowBuffer {
-    var rl = RowBuffer.init(res.metas);
-    for (res.chunks) |*c| {
-        for (0..c.num_rows) |r| {
-            try rl.append(alloc, try c.readRow(r, alloc));
-        }
-    }
-    return rl;
-}
-
 fn executeHashAggChunked(
     input: *const plan.PhysicalNode,
     keys: []const plan.ProjectItem,

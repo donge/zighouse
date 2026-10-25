@@ -5,10 +5,13 @@ const result = @import("../result.zig");
 const types = @import("../types.zig");
 const chunk = @import("../chunk.zig");
 const row_buffer = @import("row_buffer.zig");
+const chunk_sink = @import("chunk_sink.zig");
+const chunk_sink_mod = chunk_sink;
 
 pub const Value = types.Value;
 pub const DataChunk = chunk.DataChunk;
 pub const RowBuffer = row_buffer.RowBuffer;
+pub const ChunkResult = chunk_sink.ChunkSink.Result;
 
 fn dupeOwnedValue(alloc: std.mem.Allocator, v: Value) !Value {
     return switch (v) {
@@ -363,3 +366,14 @@ pub const LateTopNHeap = struct {
         return out;
     }
 };
+
+pub fn executeTopKFromChunkResult(
+    res: chunk_sink_mod.ChunkSink.Result,
+    keys: []const plan.SortKey,
+    k: usize,
+    alloc: std.mem.Allocator,
+) !RowBuffer {
+    var sink = try TopNSink.init(alloc, res.metas, keys, k);
+    for (res.chunks) |*c| try sink.pushChunk(c);
+    return sink.finish();
+}

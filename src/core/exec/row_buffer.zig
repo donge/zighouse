@@ -3,10 +3,13 @@ const std = @import("std");
 const types = @import("../types.zig");
 const chunk = @import("../chunk.zig");
 const result = @import("../result.zig");
+const chunk_sink = @import("chunk_sink.zig");
+const chunk_sink_mod = chunk_sink;
 
 pub const Value = types.Value;
 pub const ColumnType = types.ColumnType;
 pub const ResultSet = result.ResultSet;
+pub const ChunkResult = chunk_sink.ChunkSink.Result;
 
 pub const RowBuffer = struct {
     metas: []result.ColMeta,
@@ -125,4 +128,21 @@ fn setColValue(data: *chunk.ColumnData, r: usize, v: Value, ra: std.mem.Allocato
             else => &.{},
         },
     }
+}
+
+pub fn rowListToChunkResult(rl: RowBuffer, alloc: std.mem.Allocator) !ChunkResult {
+    var sink = try chunk_sink_mod.ChunkSink.init(alloc, rl.metas);
+    defer sink.deinit();
+    for (rl.rows.items) |row| try sink.append(row);
+    return try sink.finishResult();
+}
+
+pub fn chunkResultToRowBuffer(res: chunk_sink_mod.ChunkSink.Result, alloc: std.mem.Allocator) !RowBuffer {
+    var rl = RowBuffer.init(res.metas);
+    for (res.chunks) |*c| {
+        for (0..c.num_rows) |r| {
+            try rl.append(alloc, try c.readRow(r, alloc));
+        }
+    }
+    return rl;
 }
