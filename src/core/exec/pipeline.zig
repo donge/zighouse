@@ -5799,6 +5799,128 @@ fn executeTopK(inner: RowBuffer, keys: []const plan.SortKey, k: usize, alloc: st
     return sink.finish();
 }
 
+/// Entry used by the late-materialization top-N path. `key_vals` is compact
+/// (one slot per sort key) and empty for the raw integer/string fast path.
+const HeapEntry = struct {
+    global_row: u64,
+    key_vals: []?Value,
+    sort_key_i64: i64 = 0,
+    sort_key_str: []const u8 = &.{},
+};
+
+fn lateLess(keys: []const plan.SortKey, a: HeapEntry, b: HeapEntry) bool {
+    if (a.key_vals.len == 0 and b.key_vals.len == 0) {
+        const ord = std.math.order(a.sort_key_i64, b.sort_key_i64);
+        if (ord != .eq) {
+            const desc = keys.len > 0 and keys[0].desc;
+            return if (desc) ord == .gt else ord == .lt;
+        }
+        if (keys.len > 1) {
+            const s_ord = std.mem.order(u8, a.sort_key_str, b.sort_key_str);
+            if (s_ord != .eq) return if (keys[1].desc) s_ord == .gt else s_ord == .lt;
+        }
+        return a.global_row < b.global_row;
+    }
+    for (keys, 0..) |key, ki| {
+        const av = if (ki < a.key_vals.len) a.key_vals[ki] else null;
+        const bv = if (ki < b.key_vals.len) b.key_vals[ki] else null;
+        const ord: std.math.Order = if (av != null and bv != null)
+            Value.order(av.?, bv.?)
+        else if (av == null and bv == null) .eq else if (av == null) .lt else .gt;
+        if (ord == .eq) continue;
+        return if (key.desc) ord == .gt else ord == .lt;
+    }
+    return a.global_row < b.global_row;
+}
+
+const LateSortCtx = struct {
+    keys: []const plan.SortKey,
+    fn lessThan(self: @This(), a: HeapEntry, b: HeapEntry) bool {
+        return lateLess(self.keys, a, b);
+    }
+};
+
+/// Bounded worst-at-root heap over HeapEntry values. Used by both the
+/// per-worker parallel phase and the sequential late-materialization scan.
+const LateTopNHeap = struct {
+    alloc: std.mem.Allocator,
+    keys: []const plan.SortKey,
+    k: usize,
+    heap: []HeapEntry,
+    len: usize = 0,
+
+    fn init(alloc: std.mem.Allocator, keys: []const plan.SortKey, k: usize) !LateTopNHeap {
+        return .{ .alloc = alloc, .keys = keys, .k = k, .heap = try alloc.alloc(HeapEntry, k) };
+    }
+
+    fn offer(self: *LateTopNHeap, entry: HeapEntry) void {
+        if (self.k == 0) return;
+        if (self.len < self.k) {
+            self.heap[self.len] = entry;
+            self.len += 1;
+            var i = self.len - 1;
+            while (i > 0) {
+                const parent = (i - 1) / 2;
+                if (lateLess(self.keys, self.heap[parent], self.heap[i])) {
+                    const tmp = self.heap[i];
+                    self.heap[i] = self.heap[parent];
+                    self.heap[parent] = tmp;
+                    i = parent;
+                } else break;
+            }
+        } else if (lateLess(self.keys, entry, self.heap[0])) {
+            self.heap[0] = entry;
+            self.siftDown(0);
+        }
+    }
+
+    fn offerKeys(self: *LateTopNHeap, global_row: u64, key_vals: []const ?Value) !void {
+        const candidate = HeapEntry{ .global_row = global_row, .key_vals = @constCast(key_vals) };
+        if (self.len >= self.k and !lateLess(self.keys, candidate, self.heap[0])) return;
+        const owned = try self.alloc.alloc(?Value, self.keys.len);
+        @memcpy(owned, key_vals[0..self.keys.len]);
+        self.offer(.{ .global_row = global_row, .key_vals = owned });
+    }
+
+    fn offerRaw(self: *LateTopNHeap, global_row: u64, sort_i64: i64, sort_str: []const u8) void {
+        self.offer(.{ .global_row = global_row, .key_vals = &.{}, .sort_key_i64 = sort_i64, .sort_key_str = sort_str });
+    }
+
+    fn siftDown(self: *LateTopNHeap, start: usize) void {
+        var i = start;
+        while (true) {
+            const l = 2 * i + 1;
+            const r = 2 * i + 2;
+            var worst = i;
+            if (l < self.len and lateLess(self.keys, self.heap[worst], self.heap[l])) worst = l;
+            if (r < self.len and lateLess(self.keys, self.heap[worst], self.heap[r])) worst = r;
+            if (worst == i) break;
+            const tmp = self.heap[i];
+            self.heap[i] = self.heap[worst];
+            self.heap[worst] = tmp;
+            i = worst;
+        }
+    }
+
+    fn finish(self: *LateTopNHeap) []HeapEntry {
+        std.sort.pdq(HeapEntry, self.heap[0..self.len], LateSortCtx{ .keys = self.keys }, LateSortCtx.lessThan);
+        return self.heap[0..self.len];
+    }
+
+    fn copyTo(self: *LateTopNHeap, alloc: std.mem.Allocator) ![]HeapEntry {
+        const out = try alloc.alloc(HeapEntry, self.len);
+        for (out, 0..) |*dst, i| {
+            dst.* = self.heap[i];
+            if (self.heap[i].key_vals.len > 0) {
+                const kv = try alloc.alloc(?Value, self.heap[i].key_vals.len);
+                @memcpy(kv, self.heap[i].key_vals);
+                dst.key_vals = kv;
+            }
+        }
+        return out;
+    }
+};
+
 /// Stream a scannable node (scan/filter/project/limit) directly into a min-heap
 /// of at most K rows, avoiding materialisation of all rows into a RowBuffer.
 /// Late-materialization top-K: phase 1 scans only filter+sort columns using fetchRange
@@ -5824,51 +5946,9 @@ fn executeTopKLateMat(
     const scan_scope = scan_request.apply(ctx.source, .any_reduction);
     defer scan_scope.deinit();
 
-    const HeapEntry = struct {
-        global_row: u64,
-        key_vals: []?Value,
-        /// Only used in parallel raw fast path (key_vals = &.{}, no alloc per row).
-        sort_key_i64: i64 = 0,
-        sort_key_str: []const u8 = &.{},
-    };
-    const heap_e = try alloc.alloc(HeapEntry, k);
-    var heap_e_len: usize = 0;
-    const key_scratch = try alloc.alloc(?Value, schema_metas.len);
+    var late = try LateTopNHeap.init(alloc, keys, k);
+    const key_scratch = try alloc.alloc(?Value, keys.len);
     @memset(key_scratch, null);
-
-    const SortCtxE = struct {
-        keys: []const plan.SortKey,
-        fn lessThan(self: @This(), a: HeapEntry, b: HeapEntry) bool {
-            // Raw fast path: no key_vals allocated; compare directly on sort_key_i64.
-            if (a.key_vals.len == 0 and b.key_vals.len == 0) {
-                const ord = std.math.order(a.sort_key_i64, b.sort_key_i64);
-                if (ord != .eq) {
-                    const desc = self.keys.len > 0 and self.keys[0].desc;
-                    return if (desc) ord == .gt else ord == .lt;
-                }
-                if (self.keys.len > 1) {
-                    const s_ord = std.mem.order(u8, a.sort_key_str, b.sort_key_str);
-                    if (s_ord != .eq) {
-                        return if (self.keys[1].desc) s_ord == .gt else s_ord == .lt;
-                    }
-                }
-                return a.global_row < b.global_row;
-            }
-            // Standard path: key_vals is COMPACT (size = keys.len), indexed 0..keys.len-1.
-            for (self.keys, 0..) |key, ki| {
-                const av = if (ki < a.key_vals.len) a.key_vals[ki] else null;
-                const bv = if (ki < b.key_vals.len) b.key_vals[ki] else null;
-                const ord: std.math.Order = if (av != null and bv != null)
-                    Value.order(av.?, bv.?)
-                else if (av == null and bv == null) .eq else if (av == null) .lt else .gt;
-                if (ord == .eq) continue;
-                return if (key.desc) ord == .gt else ord == .lt;
-            }
-            // Stable tiebreaker: use physical row index (always unique).
-            return a.global_row < b.global_row;
-        }
-    };
-    const sctx_e = SortCtxE{ .keys = keys };
 
     const morsel_size: usize = 65536;
     var pos: u64 = 0;
@@ -5967,45 +6047,9 @@ fn executeTopKLateMat(
                 var arena = std.heap.ArenaAllocator.init(self.parent_alloc);
                 defer arena.deinit();
                 const talloc = arena.allocator();
-                const heap_buf = try talloc.alloc(HeapEntry, self.k);
-                var heap_len: usize = 0;
-                // Scratch buffer for the heap's candidate-eviction check (compact, keys.len slots).
+                var local = try LateTopNHeap.init(talloc, self.keys, self.k);
                 const local_key_scratch = try talloc.alloc(?Value, @max(1, self.keys.len));
                 @memset(local_key_scratch, null);
-
-                const SCtx = struct {
-                    keys: []const plan.SortKey,
-                    fn lt(sc: @This(), a: HeapEntry, b: HeapEntry) bool {
-                        // Raw fast path: no key_vals; compare directly on sort_key_i64.
-                        if (a.key_vals.len == 0 and b.key_vals.len == 0) {
-                            const ord = std.math.order(a.sort_key_i64, b.sort_key_i64);
-                            if (ord != .eq) {
-                                const desc = sc.keys.len > 0 and sc.keys[0].desc;
-                                return if (desc) ord == .gt else ord == .lt;
-                            }
-                            if (sc.keys.len > 1) {
-                                const s_ord = std.mem.order(u8, a.sort_key_str, b.sort_key_str);
-                                if (s_ord != .eq) {
-                                    return if (sc.keys[1].desc) s_ord == .gt else s_ord == .lt;
-                                }
-                            }
-                            return a.global_row < b.global_row;
-                        }
-                        // Standard path: key_vals is COMPACT (size = keys.len), indexed 0..keys.len-1.
-                        for (sc.keys, 0..) |key, ki| {
-                            const av = if (ki < a.key_vals.len) a.key_vals[ki] else null;
-                            const bv = if (ki < b.key_vals.len) b.key_vals[ki] else null;
-                            const ord: std.math.Order = if (av != null and bv != null)
-                                Value.order(av.?, bv.?)
-                            else if (av == null and bv == null) .eq else if (av == null) .lt else .gt;
-                            if (ord == .eq) continue;
-                            return if (key.desc) ord == .gt else ord == .lt;
-                        }
-                        // Stable tiebreaker: use physical row index (always unique).
-                        return a.global_row < b.global_row;
-                    }
-                };
-                const sctx2 = SCtx{ .keys = self.keys };
 
                 while (self.morsel_src.next()) |m| {
                     // ── Raw fast path: skip fetchRange, no per-row allocation ─
@@ -6030,41 +6074,7 @@ fn executeTopKLateMat(
                                 const hi: usize = @intCast(ro[r + 1]);
                                 break :blk rb[lo..hi];
                             } else &.{};
-                            const candidate = HeapEntry{ .global_row = global_row, .key_vals = &.{}, .sort_key_i64 = sk_val, .sort_key_str = sk_str };
-                            if (heap_len < self.k) {
-                                heap_buf[heap_len] = candidate;
-                                heap_len += 1;
-                                // MAX-heap sift-up: worse (larger) values bubble to root.
-                                var hi2 = heap_len - 1;
-                                while (hi2 > 0) {
-                                    const parent = (hi2 - 1) / 2;
-                                    if (sctx2.lt(heap_buf[parent], heap_buf[hi2])) {
-                                        const tmp = heap_buf[hi2];
-                                        heap_buf[hi2] = heap_buf[parent];
-                                        heap_buf[parent] = tmp;
-                                        hi2 = parent;
-                                    } else break;
-                                }
-                            } else {
-                                // heap[0] = worst (largest) kept value; evict if candidate is better.
-                                if (sctx2.lt(candidate, heap_buf[0])) {
-                                    heap_buf[0] = candidate;
-                                    // MAX-heap sift-down: swap with largest child.
-                                    var i: usize = 0;
-                                    while (true) {
-                                        const l = 2 * i + 1;
-                                        const r2 = 2 * i + 2;
-                                        var lg = i;
-                                        if (l < heap_len and sctx2.lt(heap_buf[lg], heap_buf[l])) lg = l;
-                                        if (r2 < heap_len and sctx2.lt(heap_buf[lg], heap_buf[r2])) lg = r2;
-                                        if (lg == i) break;
-                                        const tmp = heap_buf[i];
-                                        heap_buf[i] = heap_buf[lg];
-                                        heap_buf[lg] = tmp;
-                                        i = lg;
-                                    }
-                                }
-                            }
+                            local.offerRaw(global_row, sk_val, sk_str);
                         }
                         continue; // next morsel, raw path done
                     }
@@ -6102,63 +6112,12 @@ fn executeTopKLateMat(
                             }
                         }
 
-                        if (heap_len < self.k) {
-                            // Heap not full yet: always push, allocate key_vals now.
-                            const key_vals = try talloc.alloc(?Value, self.keys.len);
-                            @memcpy(key_vals, local_key_scratch[0..self.keys.len]);
-                            heap_buf[heap_len] = .{ .global_row = @intCast(global_row), .key_vals = key_vals };
-                            heap_len += 1;
-                            // MAX-heap sift-up: worse (larger) values bubble to root.
-                            var i = heap_len - 1;
-                            while (i > 0) {
-                                const parent = (i - 1) / 2;
-                                if (sctx2.lt(heap_buf[parent], heap_buf[i])) {
-                                    const tmp = heap_buf[i];
-                                    heap_buf[i] = heap_buf[parent];
-                                    heap_buf[parent] = tmp;
-                                    i = parent;
-                                } else break;
-                            }
-                        } else {
-                            // Heap full: heap[0] = worst (largest) kept; evict if candidate is better.
-                            const candidate = HeapEntry{ .global_row = @intCast(global_row), .key_vals = local_key_scratch };
-                            if (sctx2.lt(candidate, heap_buf[0])) {
-                                // Candidate enters the heap: allocate now (O(k log n) total).
-                                const key_vals = try talloc.alloc(?Value, self.keys.len);
-                                @memcpy(key_vals, local_key_scratch[0..self.keys.len]);
-                                heap_buf[0] = .{ .global_row = @intCast(global_row), .key_vals = key_vals };
-                                // MAX-heap sift-down: swap with largest child.
-                                var i: usize = 0;
-                                while (true) {
-                                    const l = 2 * i + 1;
-                                    const r2 = 2 * i + 2;
-                                    var lg = i;
-                                    if (l < heap_len and sctx2.lt(heap_buf[lg], heap_buf[l])) lg = l;
-                                    if (r2 < heap_len and sctx2.lt(heap_buf[lg], heap_buf[r2])) lg = r2;
-                                    if (lg == i) break;
-                                    const tmp = heap_buf[i];
-                                    heap_buf[i] = heap_buf[lg];
-                                    heap_buf[lg] = tmp;
-                                    i = lg;
-                                }
-                            }
-                        }
+                        try local.offerKeys(@intCast(global_row), local_key_scratch);
                     }
                 }
 
-                // Copy heap to parent-alloc'd memory (talloc will be freed after this fn).
-                const out_heap = try self.parent_alloc.alloc(HeapEntry, heap_len);
-                for (out_heap, 0..) |*e, i| {
-                    e.global_row = heap_buf[i].global_row;
-                    e.sort_key_i64 = heap_buf[i].sort_key_i64; // preserve raw-path sort key
-                    e.sort_key_str = heap_buf[i].sort_key_str;
-                    // Copy key_vals to parent alloc.
-                    const kv = try self.parent_alloc.alloc(?Value, heap_buf[i].key_vals.len);
-                    @memcpy(kv, heap_buf[i].key_vals);
-                    e.key_vals = kv;
-                }
-                self.local_heap = out_heap;
-                self.local_len = heap_len;
+                self.local_heap = try local.copyTo(self.parent_alloc);
+                self.local_len = local.len;
             }
         };
 
@@ -6227,7 +6186,7 @@ fn executeTopKLateMat(
             @memcpy(merged[mi .. mi + pc.local_len], pc.local_heap[0..pc.local_len]);
             mi += pc.local_len;
         }
-        std.sort.pdq(HeapEntry, merged, sctx_e, SortCtxE.lessThan);
+        std.sort.pdq(HeapEntry, merged, LateSortCtx{ .keys = keys }, LateSortCtx.lessThan);
         const take = @min(k, merged.len);
 
         // Phase 2: load columns for top-k rows and project to output schema.
@@ -6410,58 +6369,15 @@ fn executeTopKLateMat(
         for (0..c.num_rows) |r| {
             if (!pass_mask[r]) continue;
             const global_row = pos + r;
-
-            // Read sort key values.
-            const key_vals = try alloc.alloc(?Value, schema_metas.len);
-            @memset(key_vals, null);
-            for (keys) |key| {
+            for (keys, 0..) |key, ki| {
                 if (key.col_idx < c.columns.len) {
                     const col = &c.columns[key.col_idx];
-                    key_vals[key.col_idx] = if (col.isRowNull(r)) null else col.data.get(r);
+                    key_scratch[ki] = if (col.isRowNull(r)) null else col.data.get(r);
+                } else {
+                    key_scratch[ki] = null;
                 }
             }
-
-            if (heap_e_len < k) {
-                heap_e[heap_e_len] = .{ .global_row = global_row, .key_vals = key_vals };
-                heap_e_len += 1;
-                // MAX-heap sift-up: worse (larger) values bubble to root.
-                var i = heap_e_len - 1;
-                while (i > 0) {
-                    const parent = (i - 1) / 2;
-                    if (sctx_e.lessThan(heap_e[parent], heap_e[i])) {
-                        const tmp = heap_e[i];
-                        heap_e[i] = heap_e[parent];
-                        heap_e[parent] = tmp;
-                        i = parent;
-                    } else break;
-                }
-            } else {
-                for (keys) |key| {
-                    if (key.col_idx < c.columns.len) {
-                        const col = &c.columns[key.col_idx];
-                        key_scratch[key.col_idx] = if (col.isRowNull(r)) null else col.data.get(r);
-                    }
-                }
-                // heap_e[0] = worst (largest) kept; evict if candidate is better.
-                const candidate = HeapEntry{ .global_row = global_row, .key_vals = key_scratch };
-                if (sctx_e.lessThan(candidate, heap_e[0])) {
-                    heap_e[0] = .{ .global_row = global_row, .key_vals = key_vals };
-                    // MAX-heap sift-down: swap with largest child.
-                    var i: usize = 0;
-                    while (true) {
-                        const l = 2 * i + 1;
-                        const r2 = 2 * i + 2;
-                        var lg = i;
-                        if (l < heap_e_len and sctx_e.lessThan(heap_e[lg], heap_e[l])) lg = l;
-                        if (r2 < heap_e_len and sctx_e.lessThan(heap_e[lg], heap_e[r2])) lg = r2;
-                        if (lg == i) break;
-                        const tmp = heap_e[i];
-                        heap_e[i] = heap_e[lg];
-                        heap_e[lg] = tmp;
-                        i = lg;
-                    }
-                }
-            }
+            try late.offerKeys(global_row, key_scratch);
         }
 
         pos += n;
@@ -6469,13 +6385,12 @@ fn executeTopKLateMat(
         fake_ctx.arena = std.heap.ArenaAllocator.init(chunk_arena.allocator());
     }
 
-    // Sort K winners.
-    std.sort.pdq(HeapEntry, heap_e[0..heap_e_len], sctx_e, SortCtxE.lessThan);
+    const winners = late.finish();
 
     // Phase 2: fetch all columns for the K winner rows.
     ctx.source.setNeededCols(null); // restore full decode
     var rl = RowBuffer.init(@constCast(out_metas));
-    for (heap_e[0..heap_e_len]) |entry| {
+    for (winners) |entry| {
         var full_chunk: DataChunk = undefined;
         try ctx.source.fetchRange(entry.global_row, 1, &full_chunk, alloc);
         const row = try full_chunk.readRow(0, alloc);
