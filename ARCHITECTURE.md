@@ -71,7 +71,8 @@ Already streaming:
 - mmap/range reads and `fetchRange` / `nextChunk`
 - scan -> filter -> project -> limit scannable path
 - hash-aggregation input and output chunks (`executeHashAggChunked`, `ChunkSink`)
-- parallel top-K (`TopKCollector`, late materialisation)
+- parallel top-K (`TopKSink` / `TopKCollector`; legacy late-materialisation path
+  still exists for wide `SELECT *`)
 - inner/left hash-join probe side; output chunks
 - generic Parquet import string offsets spill to temp files
 - file imports and streamed MergeTree parts share `store_query.zig`; both use
@@ -90,6 +91,36 @@ Still materialising or unbounded:
 `RowBuffer` is now an internal breaker buffer, not the executor boundary.
 Remaining work is spill/budgeting for unbounded operators and streaming the
 final result.
+
+## Compute architecture decision (DuckDB 2.0 / ClickHouse review)
+
+Both reference engines select physical work by **data layout**, never by a
+query-specific shape:
+
+- DuckDB 2.0: one `PhysicalHashAggregate` feeding a radix-partitioned grouped
+  hash table; perfect/partitioned aggregation are layout specialisations.
+  Top-N is an independent sink with encoded sort keys, and full order uses
+  sort runs plus merge.
+- ClickHouse: an aggregating processor with type-specific hash maps and
+  single/two-level aggregation selected by key layout and memory; Top-N is
+  partial-sort + limit; full sort uses merge sorter runs.
+
+Consequently ZigHouse keeps only these hash-aggregation layouts:
+
+```text
+auto / compact_int / pair_count / triple_count / string_key
+```
+
+DISTINCT, top-K, CASE keys, and grouped distinct are properties of the input
+or output, not separate strategies. Top-N is a separate sink. Runtime fallback
+is limited to a key-layout fallback, never a probe over query-shape executors.
+
+Migration status:
+
+- done: `TopNSink` owns the bounded heap for row/chunk producers; scannable
+  top-K streams chunks through it; top-K comparator is shared.
+- next: move the wide-row late-materialisation path onto the same sink, then
+  make hash aggregation a local/global sink and remove fused agg+top-K paths.
 
 ## Refactor phases
 
