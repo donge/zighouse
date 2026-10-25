@@ -78,9 +78,42 @@ const MappedStringCol = struct {
     }
 };
 
+const DICT_MAGIC = "ZHDICT1\x00";
+const RAW_STRING_BUDGET: usize = 12 * 1024 * 1024 * 1024;
+
+/// Dictionary-encoded string column (ZHDICT1).
+const MappedDictStringCol = struct {
+    ptr: []align(std.heap.page_size_min) u8,
+    row_count: u64,
+    ids: []const u32,
+    dict_offsets: []const u64,
+    dict_bytes: []const u8,
+
+    fn deinit(self: MappedDictStringCol) void {
+        std.posix.munmap(self.ptr);
+    }
+
+    fn str(self: MappedDictStringCol, row: u64) []const u8 {
+        const id = self.ids[row];
+        const start = self.dict_offsets[id];
+        const end = self.dict_offsets[id + 1];
+        return self.dict_bytes[start..end];
+    }
+};
+
+const RawStringView = struct {
+    offsets: []u64,
+    bytes: []u8,
+    fn deinit(self: RawStringView, alloc: std.mem.Allocator) void {
+        alloc.free(self.offsets);
+        alloc.free(self.bytes);
+    }
+};
+
 const ColData = union(enum) {
     fixed: MappedFixedCol,
     string: MappedStringCol,
+    dict_string: MappedDictStringCol,
     none, // pruned / skipped
 };
 
@@ -94,6 +127,8 @@ const ScanState = struct {
     row_count: u64,
     rows_read: u64,
     col_data: []ColData, // one per table column; loaded lazily
+    dict_raw: []?RawStringView, // lazily materialized dict strings for raw fast paths
+    raw_bytes_used: usize,
     metas: []ColMeta,
     needed_cols: ?[]bool, // null = read all
     /// Temporary column restriction set by setNeededCols() for late materialization.
@@ -155,6 +190,8 @@ const ScanState = struct {
 
         const col_data = try alloc.alloc(ColData, table.columns.len);
         @memset(col_data, .none);
+        const dict_raw = try alloc.alloc(?RawStringView, table.columns.len);
+        @memset(dict_raw, null);
 
         // Pre-allocate zero buffers large enough for morsel-sized fetchRange calls.
         // default_morsel_size = 122_880; use 131_072 (next power of 2) as the upper bound
@@ -186,6 +223,8 @@ const ScanState = struct {
             .row_count = row_count,
             .rows_read = 0,
             .col_data = col_data,
+            .dict_raw = dict_raw,
+            .raw_bytes_used = 0,
             .metas = metas,
             .needed_cols = needed_cols,
             .override_needed = @as([256]bool, @splat(false)),
@@ -265,16 +304,42 @@ const ScanState = struct {
                 }
                 // Hint: we will scan sequentially; OS should use aggressive read-ahead.
                 std.posix.madvise(ptr.ptr, stat.size, std.posix.MADV.SEQUENTIAL) catch {};
-                const row_count = std.mem.readInt(u64, ptr[0..8], .little);
-                const offsets_bytes = (row_count + 1) * 8;
-                const offsets = std.mem.bytesAsSlice(u64, ptr[8..][0..offsets_bytes]);
-                const bytes = ptr[8 + offsets_bytes .. stat.size];
-                self.col_data[ci] = .{ .string = .{
-                    .ptr = ptr,
-                    .row_count = row_count,
-                    .offsets = offsets,
-                    .bytes = bytes,
-                } };
+                if (stat.size >= 64 and std.mem.eql(u8, ptr[0..8], DICT_MAGIC)) {
+                    const row_count = std.mem.readInt(u64, ptr[8..16], .little);
+                    const dict_count = std.mem.readInt(u64, ptr[16..24], .little);
+                    const ids_offset = std.mem.readInt(u64, ptr[24..32], .little);
+                    const offsets_offset = std.mem.readInt(u64, ptr[32..40], .little);
+                    const bytes_offset = std.mem.readInt(u64, ptr[40..48], .little);
+                    const bytes_len = std.mem.readInt(u64, ptr[48..56], .little);
+                    const ids_end = ids_offset + row_count * @sizeOf(u32);
+                    const offsets_end = offsets_offset + (dict_count + 1) * @sizeOf(u64);
+                    if (ids_end > stat.size or offsets_end > stat.size or
+                        bytes_offset + bytes_len > stat.size or dict_count > std.math.maxInt(u32))
+                        return error.InvalidStringDictionary;
+                    const ids = @as([*]const u32, @ptrCast(@alignCast(ptr.ptr + ids_offset)))[0..@intCast(row_count)];
+                    const dict_offsets = @as([*]const u64, @ptrCast(@alignCast(ptr.ptr + offsets_offset)))[0..@intCast(dict_count + 1)];
+                    const dict_bytes = ptr[@intCast(bytes_offset)..@intCast(bytes_offset + bytes_len)];
+                    self.col_data[ci] = .{ .dict_string = .{
+                        .ptr = ptr,
+                        .row_count = row_count,
+                        .ids = ids,
+                        .dict_offsets = dict_offsets,
+                        .dict_bytes = dict_bytes,
+                    } };
+                    _ = self.materializeRawStr(ci);
+                } else {
+                    const row_count = std.mem.readInt(u64, ptr[0..8], .little);
+                    const offsets_bytes = (row_count + 1) * 8;
+                    if (8 + offsets_bytes > stat.size) return error.InvalidStringColumn;
+                    const offsets = std.mem.bytesAsSlice(u64, ptr[8..][0..offsets_bytes]);
+                    const bytes = ptr[8 + offsets_bytes .. stat.size];
+                    self.col_data[ci] = .{ .string = .{
+                        .ptr = ptr,
+                        .row_count = row_count,
+                        .offsets = offsets,
+                        .bytes = bytes,
+                    } };
+                }
             } else {
                 // Fixed-width columns are always Store V2 block files.
                 const path = try generic_store.columnBinPath(self.alloc, self.part_dir, col.name);
@@ -308,14 +373,51 @@ const ScanState = struct {
         @atomicStore(bool, &self.loaded, true, .release);
     }
 
+    fn materializeRawStr(self: *ScanState, ci: usize) ?RawStringView {
+        if (ci >= self.dict_raw.len) return null;
+        if (self.dict_raw[ci]) |v| return v;
+        const dc = switch (self.col_data[ci]) {
+            .dict_string => |d| d,
+            else => return null,
+        };
+        const offsets_bytes = (dc.row_count + 1) * @sizeOf(u64);
+        var total: usize = 0;
+        for (dc.ids) |id| {
+            total += dc.dict_offsets[id + 1] - dc.dict_offsets[id];
+            if (self.raw_bytes_used + offsets_bytes + total > RAW_STRING_BUDGET) return null;
+        }
+        const offsets = self.alloc.alloc(u64, @intCast(dc.row_count + 1)) catch return null;
+        const bytes = self.alloc.alloc(u8, total) catch {
+            self.alloc.free(offsets);
+            return null;
+        };
+        offsets[0] = 0;
+        var pos: usize = 0;
+        for (dc.ids, 0..) |id, i| {
+            const start = dc.dict_offsets[id];
+            const end = dc.dict_offsets[id + 1];
+            @memcpy(bytes[pos .. pos + (end - start)], dc.dict_bytes[start..end]);
+            pos += end - start;
+            offsets[i + 1] = pos;
+        }
+        const view = RawStringView{ .offsets = offsets, .bytes = bytes };
+        self.dict_raw[ci] = view;
+        self.raw_bytes_used += offsets_bytes + total;
+        return view;
+    }
+
     fn deinit(self: *ScanState) void {
-        for (self.col_data) |cd| {
+        for (self.col_data, self.dict_raw) |cd, *raw| {
+            if (raw.*) |r| r.deinit(self.alloc);
+            raw.* = null;
             switch (cd) {
                 .fixed => |m| m.deinit(self.alloc),
                 .string => |m| m.deinit(),
+                .dict_string => |m| m.deinit(),
                 .none => {},
             }
         }
+        self.alloc.free(self.dict_raw);
         self.alloc.free(self.col_data);
         self.alloc.free(self.metas);
         if (self.needed_cols) |nc| self.alloc.free(nc);
@@ -593,19 +695,39 @@ const ScanState = struct {
                         const bbuf = try chunk_alloc.alloc(u8, n);
                         null_mask = try chunk_alloc.alloc(u64, null_words);
                         @memset(null_mask, 0);
-                        const sc = &self.col_data[ci].string;
-                        for (0..n) |i| {
-                            const row = abs_start + i;
-                            bbuf[i] = if (sc.offsets[row + 1] > sc.offsets[row]) 1 else 0;
+                        switch (self.col_data[ci]) {
+                            .string => |*sc| for (0..n) |i| {
+                                const row = abs_start + i;
+                                bbuf[i] = if (sc.offsets[row + 1] > sc.offsets[row]) 1 else 0;
+                            },
+                            .dict_string => |*sc| if (self.dict_raw[ci]) |raw| {
+                                for (0..n) |i| {
+                                    const row = abs_start + i;
+                                    bbuf[i] = if (raw.offsets[row + 1] > raw.offsets[row]) 1 else 0;
+                                }
+                            } else for (0..n) |i| {
+                                bbuf[i] = if (sc.str(abs_start + i).len > 0) 1 else 0;
+                            },
+                            else => {},
                         }
                         break :blk .{ .bool_u8 = bbuf };
                     }
                     const sbuf = try chunk_alloc.alloc([]const u8, n);
                     null_mask = try chunk_alloc.alloc(u64, null_words);
                     @memset(null_mask, 0);
-                    const sc = &self.col_data[ci].string;
-                    for (0..n) |i| {
-                        sbuf[i] = sc.str(abs_start + i);
+                    switch (self.col_data[ci]) {
+                        .string => |*sc| for (0..n) |i| {
+                            sbuf[i] = sc.str(abs_start + i);
+                        },
+                        .dict_string => |*sc| if (self.dict_raw[ci]) |raw| {
+                            for (0..n) |i| {
+                                const row = abs_start + i;
+                                sbuf[i] = raw.bytes[raw.offsets[row]..raw.offsets[row + 1]];
+                            }
+                        } else for (0..n) |i| {
+                            sbuf[i] = sc.str(abs_start + i);
+                        },
+                        else => @memset(sbuf, ""),
                     }
                     break :blk .{ .string = sbuf };
                 },
@@ -701,6 +823,13 @@ pub const GenericStoreBridge = struct {
     /// from previous queries.  This keeps column pages warm across queries.
     pub fn resetForNewQuery(self: *GenericStoreBridge, pruned_cols: []const []const u8) void {
         const s = self.state;
+        if (s.row_count > 5_000_000) {
+            for (s.dict_raw) |*raw| {
+                if (raw.*) |v| v.deinit(s.alloc);
+                raw.* = null;
+            }
+            s.raw_bytes_used = 0;
+        }
         scan_common.resetNeededMask(s.alloc, &s.needed_cols, s.table.columns, pruned_cols);
         // Clear the `loaded` flag so loadColumns runs again for any new columns.
         @atomicStore(bool, &s.loaded, false, .release);
@@ -795,8 +924,11 @@ pub const GenericStoreBridge = struct {
             if (!std.mem.eql(u8, col.name, col_name)) continue;
             if (col.ty != .text and col.ty != .char and col.ty != .low_card) return null;
             if (ci >= s.col_data.len) return null;
-            if (s.col_data[ci] != .string) return null;
-            return s.col_data[ci].string.offsets;
+            return switch (s.col_data[ci]) {
+                .string => |m| m.offsets,
+                .dict_string => if (s.materializeRawStr(ci)) |v| v.offsets else null,
+                else => null,
+            };
         }
         return null;
     }
@@ -809,8 +941,11 @@ pub const GenericStoreBridge = struct {
             if (!std.mem.eql(u8, col.name, col_name)) continue;
             if (col.ty != .text and col.ty != .char and col.ty != .low_card) return null;
             if (ci >= s.col_data.len) return null;
-            if (s.col_data[ci] != .string) return null;
-            return s.col_data[ci].string.bytes;
+            return switch (s.col_data[ci]) {
+                .string => |m| m.bytes,
+                .dict_string => if (s.materializeRawStr(ci)) |v| v.bytes else null,
+                else => null,
+            };
         }
         return null;
     }
