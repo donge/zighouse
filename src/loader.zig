@@ -234,7 +234,7 @@ pub fn importParquet(
 
     // Compress large string columns into LZ4 blocks. Keep small stores raw so
     // short scans do not pay decompression + arena allocation.
-    if (total_rows > 20_000_000 or std.c.getenv("ZIGHOUSE_STR_BLOCK_FORCE") != null) {
+    if (std.c.getenv("ZIGHOUSE_STR_BLOCK") != null) {
         for (str_table_indices.items) |ti| {
             const str_path = try generic_store.columnStrBinPath(allocator, part_path, table.columns[ti].name);
             defer allocator.free(str_path);
