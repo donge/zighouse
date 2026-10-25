@@ -1001,7 +1001,7 @@ pub fn executeTwoPhaseHashAgg(
                                     self.part_hts[p].prefetchH(buf[i + PDIST2 * rs]);
                                 const h = buf[i];
                                 for (0..self.n_eff_keys) |ki| key_buf[ki] = @bitCast(buf[i + 1 + ki]);
-                                const slot_vals = try self.part_hts[p].getOrInsertH(key_buf[0..self.n_eff_keys], h, self.compact_init_vals);
+                                const slot_vals = try self.part_hts[p].getOrInsertPreallocH(key_buf[0..self.n_eff_keys], h, self.compact_init_vals);
                                 slot_vals[0] += 1;
                             }
                         } else {
@@ -1009,7 +1009,7 @@ pub fn executeTwoPhaseHashAgg(
                                 const h = buf[i];
                                 for (0..self.n_eff_keys) |ki| key_buf[ki] = @bitCast(buf[i + 1 + ki]);
                                 const partial = buf[i + 1 + self.n_eff_keys .. i + rs];
-                                const slot_vals = try self.part_hts[p].getOrInsertH(key_buf[0..self.n_eff_keys], h, self.compact_init_vals);
+                                const slot_vals = try self.part_hts[p].getOrInsertPreallocH(key_buf[0..self.n_eff_keys], h, self.compact_init_vals);
                                 for (self.compact_kinds, 0..) |kind, ci| {
                                     if (self.omit_first_count and ci == 0) {
                                         slot_vals[ci] += 1;

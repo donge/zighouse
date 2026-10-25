@@ -961,6 +961,8 @@ pub fn executeHashAggParallelTripleCount(
             // Scatter phase: distribute local_ht entries into per-worker partition buffers.
             // Each worker writes exclusively to its own part_bufs — no synchronization needed.
             const part_mask: u64 = N_TRIPLE_PARTS - 1;
+            const reserve_per_part = (self.local_ht.count / N_TRIPLE_PARTS) * 3 / 2 + 32;
+            for (self.part_bufs) |*b| b.ensureTotalCapacity(self.scatter_alloc, reserve_per_part) catch {};
             for (0..self.local_ht.capacity) |i| {
                 if (self.local_ht.slots[i].hash == ht.TripleCountHashTable.EMPTY) continue;
                 const s = self.local_ht.slots[i];

@@ -1324,13 +1324,33 @@ pub const CompactIntKeyHashTable = struct {
     }
 
     /// Same as getOrInsert but takes precomputed hash (avoids rehashing during merge).
-    pub fn getOrInsertH(
+    pub inline fn getOrInsertH(
         self: *CompactIntKeyHashTable,
         key:       []const i64,
         h:         u64,
         init_vals: []const u64,
     ) ![]u64 {
-        if (self.count + 1 > (self.capacity * 7) / 10) try self.grow();
+        return self.getOrInsertHImpl(key, h, init_vals, true);
+    }
+
+    /// Caller guarantees the table is pre-sized for all inserts (load factor < 0.7).
+    pub inline fn getOrInsertPreallocH(
+        self: *CompactIntKeyHashTable,
+        key:       []const i64,
+        h:         u64,
+        init_vals: []const u64,
+    ) ![]u64 {
+        return self.getOrInsertHImpl(key, h, init_vals, false);
+    }
+
+    fn getOrInsertHImpl(
+        self: *CompactIntKeyHashTable,
+        key:       []const i64,
+        h:         u64,
+        init_vals: []const u64,
+        comptime check_grow: bool,
+    ) ![]u64 {
+        if (check_grow and self.count + 1 > (self.capacity * 7) / 10) try self.grow();
         const mask = self.capacity - 1;
         const es   = self.entry_size;
         var   slot = h & mask;

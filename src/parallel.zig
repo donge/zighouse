@@ -42,24 +42,15 @@ pub const MorselSource = struct {
     }
 };
 
-/// Default worker count. On Apple Silicon we restrict to performance
-/// cores (`hw.perflevel0.physicalcpu`) because efficiency-core stragglers
-/// dominate wall-clock latency for short morsel workloads. Falls back to
-/// `getCpuCount()` on other platforms. Capped at 16 to bound per-thread
-/// state allocations (Q12 bitsets are 140 MB each; T=16 would be 2.2 GB).
+/// Default worker count. Uses all available cores: at multi-million-row
+/// scale the extra efficiency cores outweigh morsel stragglers. Capped at
+/// 16 to bound per-thread state allocations (Q12 bitsets are 140 MB each;
+/// T=16 would be 2.2 GB).
 pub fn defaultThreads() usize {
     if (std.c.getenv("ZIGHOUSE_THREADS")) |raw| {
         const value = std.mem.span(raw);
         const requested = std.fmt.parseInt(usize, value, 10) catch 0;
         if (requested > 0) return @min(requested, 16);
-    }
-    if (@import("builtin").os.tag == .macos) {
-        var p_cores: c_int = 0;
-        var len: usize = @sizeOf(c_int);
-        const rc = std.c.sysctlbyname("hw.perflevel0.physicalcpu", &p_cores, &len, null, 0);
-        if (rc == 0 and p_cores > 0) {
-            return @min(@as(usize, @intCast(p_cores)), 16);
-        }
     }
     const n = std.Thread.getCpuCount() catch 4;
     return @min(n, 16);
