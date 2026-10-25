@@ -136,23 +136,6 @@ pub fn executeHashAggStrategy(
     };
 }
 
-pub fn keysAreIntExpr(keys: []const plan.ProjectItem) bool {
-    for (keys) |k| {
-        if (k.out_type == .string) return false; // string columns cannot use the int-key path
-        switch (k.expr) {
-            .col_ref => {},
-            .add => |op| {
-                if (op.left != .col_ref or op.right != .lit_i64) return false;
-            },
-            .sub => |op| {
-                if (op.left != .col_ref or op.right != .lit_i64) return false;
-            },
-            else => return false,
-        }
-    }
-    return true;
-}
-
 pub fn executeHashAggChunked(
     input: *const plan.PhysicalNode,
     keys: []const plan.ProjectItem,
@@ -168,131 +151,10 @@ pub fn executeHashAggChunked(
         else => 0,
     };
 
-    // Fast path: if all keys are integer col_ref / col_ref±lit expressions, try
-    // IntKeyHashTable (no []Value boxing, inline key storage).
-    const maybe_int_keys = keysAreIntExpr(keys);
-
-    // Compact accum fast path: if all aggs are pure-numeric, use
-    // CompactIntKeyHashTable (8B/agg vs 32B/agg), cutting the accum slab 4×.
-    // Only active when maybe_int_keys is true.
-    const compact_kinds: ?[]ht.CompactAggKind = blk: {
-        const kinds = try alloc.alloc(ht.CompactAggKind, aggs.len);
-        for (aggs, 0..) |item, ci| {
-            if (item.expr != .agg_call) break :blk null;
-            kinds[ci] = switch (item.expr.agg_call.kind) {
-                .count_star => .count,
-                .count => blk2: {
-                    if (!item.expr.agg_call.distinct) break :blk2 .count;
-                    // COUNT(DISTINCT col_ref int) → compact distinct path.
-                    const arg = item.expr.agg_call.arg orelse break :blk null;
-                    if (arg != .col_ref) break :blk null;
-                    break :blk2 .count_distinct_u64;
-                },
-                .sum => if (item.out_type == .float64) .f64_sum else .i64_sum,
-                .avg => blk2: {
-                    const avg_arg = item.expr.agg_call.arg orelse break :blk null;
-                    if (avg_arg == .col_ref) break :blk2 .f64_sum;
-                    // avg(length(str_col)) — accumulate string length sum; finalize as avg.
-                    if (avg_arg == .fn_call and
-                        std.mem.eql(u8, avg_arg.fn_call.name, "length") and
-                        avg_arg.fn_call.args.len == 1 and
-                        avg_arg.fn_call.args[0] == .col_ref)
-                        break :blk2 .f64_str_len_sum;
-                    break :blk null;
-                },
-                // min/max: string args use str_min/str_max (StrAggHashTable sidecar);
-                // numeric args use the appropriate numeric kind (refined at runtime).
-                .min => if (item.out_type == .string) .str_min else .i64_min,
-                .max => if (item.out_type == .string) .str_max else .i64_max,
-                .group_uniq_array, .group_array, .any => break :blk null,
-            };
-        }
-        break :blk kinds;
-    };
-    // init_vals: u64 encoding of the initial value per compact agg kind.
-    const compact_init_vals: []u64 = if (compact_kinds) |ck| blk: {
-        const iv = try alloc.alloc(u64, ck.len);
-        for (ck, 0..) |kind, ci| {
-            iv[ci] = switch (kind) {
-                .count, .i64_sum, .u64_sum, .u64_max, .f64_str_len_sum, .count_distinct_u64 => 0,
-                .f64_sum => @bitCast(@as(f64, 0.0)),
-                .i64_min => @bitCast(@as(i64, std.math.maxInt(i64))),
-                .i64_max => @bitCast(@as(i64, std.math.minInt(i64))),
-                .u64_min => std.math.maxInt(u64),
-                .f64_min => @bitCast(std.math.inf(f64)),
-                .f64_max => @bitCast(-std.math.inf(f64)),
-                // str_min/str_max: vals_flat slot unused; sidecar handles the string.
-                .str_min, .str_max => 0,
-            };
-        }
-        break :blk iv;
-    } else &.{};
-
-    // Count str_min/str_max aggs for StrAggHashTable sidecar sizing.
-    const num_str_aggs: usize = if (compact_kinds) |ck| blk: {
-        var n: usize = 0;
-        for (ck) |k| {
-            if (k == .str_min or k == .str_max) n += 1;
-        }
-        break :blk n;
-    } else 0;
-    // Map compact_kind index → sidecar index (only valid for str_min/str_max entries).
-    const str_agg_sidecar_idx: []usize = if (compact_kinds) |ck| blk: {
-        const m = try alloc.alloc(usize, ck.len);
-        var si: usize = 0;
-        for (ck, 0..) |k, ci| {
-            if (k == .str_min or k == .str_max) {
-                m[ci] = si;
-                si += 1;
-            } else m[ci] = 0;
-        }
-        break :blk m;
-    } else &.{};
-
-    // Flat pair-set for COUNT(DISTINCT) deduplication in the compact path.
-    // Key = (group_key_bits | distinct_val_bits) packed into u128 for exact uniqueness.
-    // Only allocated when at least one compact kind is count_distinct_u64.
-    const has_distinct_compact: bool = if (compact_kinds) |ck| blk: {
-        for (ck) |k| {
-            if (k == .count_distinct_u64) break :blk true;
-        }
-        break :blk false;
-    } else false;
-
-    var distinct_pair_set = std.AutoHashMap(u128, void).init(std.heap.c_allocator);
-    defer distinct_pair_set.deinit();
-    if (has_distinct_compact) {
-        // Reserve capacity for up to est_rows distinct (group, value) pairs.
-        const cap: u32 = @intCast(@min(est_rows, 12_000_000));
-        try distinct_pair_set.ensureTotalCapacity(cap);
-    }
-
     var ht_agg = try ht.AggHashTable.initWithCapacity(alloc, keys.len, aggs.len, est_rows);
-    // Use CompactIntKeyHashTable when keys are all-int AND aggs are all pure-numeric.
-    // Falls back to IntKeyHashTable when compact_kinds is null (e.g. any_val agg).
-    var ht_compact: ?ht.CompactIntKeyHashTable = if (compact_kinds != null and maybe_int_keys and num_str_aggs == 0)
-        try ht.CompactIntKeyHashTable.initWithCapacity(alloc, keys.len, aggs.len, est_rows)
-    else
-        null;
-    var ht_int: ?ht.IntKeyHashTable = if (maybe_int_keys and (compact_kinds == null or num_str_aggs > 0))
-        try ht.IntKeyHashTable.initWithCapacity(alloc, keys.len, aggs.len, est_rows)
-    else
-        null;
-
-    const init_accums = try initAggAccums(aggs, alloc);
     const key_buf = try alloc.alloc(Value, keys.len);
-    const int_key_buf = try alloc.alloc(i64, keys.len);
-
+    const init_accums = try initAggAccums(aggs, alloc);
     var filter_state: ?FilterState = extractFilter(input);
-    // Once we've verified on the first chunk that all key columns are int64/uint64,
-    // this flag is set to true and we use ht_int for all subsequent rows.
-    var use_int_path: bool = false;
-    var int_path_checked: bool = false;
-
-    // Column descriptors for int key path: per key, col index and addend.
-    const IntKeyDesc = struct { col_idx: usize, addend: i64 };
-    const int_key_descs = try alloc.alloc(IntKeyDesc, keys.len);
-
     var scan_request: ScanRequest = .{};
     scan_request.addItems(keys);
     scan_request.addItems(aggs);
@@ -330,126 +192,9 @@ pub fn executeHashAggChunked(
             }
             ref_indices = idxs;
         }
-        // Verify int-key eligibility on first chunk.
-        if (!int_path_checked) {
-            int_path_checked = true;
-            if (maybe_int_keys) {
-                var all_int = true;
-                for (keys, 0..) |k, ki| {
-                    const col_idx: usize = switch (k.expr) {
-                        .col_ref => |cr| cr.index,
-                        .add => |op| op.left.col_ref.index,
-                        .sub => |op| op.left.col_ref.index,
-                        else => {
-                            all_int = false;
-                            break;
-                        },
-                    };
-                    const addend: i64 = switch (k.expr) {
-                        .col_ref => 0,
-                        .add => |op| op.right.lit_i64,
-                        .sub => |op| -op.right.lit_i64,
-                        else => 0,
-                    };
-                    const cd = c.columns[col_idx];
-                    switch (cd.data) {
-                        .int64, .uint64 => {},
-                        else => {
-                            all_int = false;
-                            break;
-                        },
-                    }
-                    int_key_descs[ki] = .{ .col_idx = col_idx, .addend = addend };
-                }
-                use_int_path = all_int;
-            }
-            // Verify pair-count eligibility: exactly two col_refs, one i64 and one string.
-        }
         const refs = ref_indices.?;
 
-        if (use_int_path) {
-            // ── Integer-key fast path ──────────────────────────────────────────
-            if (ht_compact) |*htc| {
-                // ── Compact accum sub-path: 8B/agg instead of 32B/agg ─────────
-                const ck = compact_kinds.?;
-                for (0..c.num_rows) |r| {
-                    var key_valid = true;
-                    for (int_key_descs, 0..) |desc, ki| {
-                        const col = c.columns[desc.col_idx];
-                        if (chunk.isNull(col.null_mask, r)) {
-                            key_valid = false;
-                            break;
-                        }
-                        int_key_buf[ki] = switch (col.data) {
-                            .int64 => |v| v[r] +% desc.addend,
-                            .uint64 => |v| @as(i64, @bitCast(v[r])) +% desc.addend,
-                            else => {
-                                key_valid = false;
-                                break;
-                            },
-                        };
-                    }
-                    if (!key_valid) continue;
-                    const slot_vals = try htc.getOrInsert(int_key_buf, compact_init_vals);
-                    // COUNT(DISTINCT) deduplication via global flat pair-set.
-                    if (has_distinct_compact) {
-                        for (ck, 0..) |kind, ci| {
-                            if (kind != .count_distinct_u64) continue;
-                            const darg = aggs[ci].expr.agg_call.arg orelse continue;
-                            if (darg != .col_ref) continue;
-                            const dcol = c.columns[darg.col_ref.index];
-                            if (dcol.isRowNull(r)) continue;
-                            const dval: u64 = switch (dcol.data) {
-                                .int64 => |v| @bitCast(v[r]),
-                                .uint64 => |v| v[r],
-                                .date_u16 => |v| @as(u64, v[r]),
-                                else => continue,
-                            };
-                            // Pack (first group key u64, distinct_val u64) into u128.
-                            // For multi-key groups hash the tail into the high bits.
-                            const gk: u64 = @bitCast(int_key_buf[0]);
-                            const pair: u128 = (@as(u128, gk) << 64) | dval;
-                            const gop = try distinct_pair_set.getOrPut(pair);
-                            if (!gop.found_existing) slot_vals[ci] += 1;
-                        }
-                    }
-                    try updateCompactVals(slot_vals, ck, aggs, &c, r, null, 0, str_agg_sidecar_idx);
-                }
-            } else {
-                // ── Regular AggAccum sub-path ──────────────────────────────────────
-                for (0..c.num_rows) |r| {
-                    // Build int key without Value boxing.
-                    var key_valid = true;
-                    for (int_key_descs, 0..) |desc, ki| {
-                        const col = c.columns[desc.col_idx];
-                        if (chunk.isNull(col.null_mask, r)) {
-                            key_valid = false;
-                            break;
-                        }
-                        const raw: i64 = switch (col.data) {
-                            .int64 => |v| v[r],
-                            .uint64 => |v| @bitCast(v[r]),
-                            else => {
-                                key_valid = false;
-                                break;
-                            },
-                        };
-                        int_key_buf[ki] = raw +% desc.addend;
-                    }
-                    if (!key_valid) continue;
-                    const bucket = try ht_int.?.getOrInsert(int_key_buf, init_accums);
-                    // Update accumulators (still uses row_buf for agg args).
-                    for (refs) |j| {
-                        const col = c.columns[j];
-                        row_buf[j] = if (col.isRowNull(r)) null else col.data.get(r);
-                    }
-                    for (aggs, 0..) |item, ci| {
-                        const v_opt = try evalAggArg(item.expr, row_buf, alloc);
-                        try kernels.updateAccum(&bucket[ci], v_opt, alloc);
-                    }
-                }
-            } // end else (regular path)
-        } else {
+        {
             // ── General path ──────────────────────────────────────────────────
             for (0..c.num_rows) |r| {
                 // Fill only referenced columns.
@@ -550,68 +295,7 @@ pub fn executeHashAggChunked(
     var sink = try chunk_sink_mod.ChunkSink.init(alloc, out_metas);
     var rl = ChunkRowSink{ .sink = &sink };
 
-    if (use_int_path) {
-        if (ht_compact) |*htc| {
-            // Emit from CompactIntKeyHashTable: u64 vals → Values.
-            const EmitCtxC = struct {
-                rl: *ChunkRowSink,
-                alloc: std.mem.Allocator,
-                keys: []const plan.ProjectItem,
-                aggs: []const plan.ProjectItem,
-                kinds: []const ht.CompactAggKind,
-                descs: []const IntKeyDesc,
-            };
-            var emit_ctx_c = EmitCtxC{
-                .rl = &rl,
-                .alloc = alloc,
-                .keys = keys,
-                .aggs = aggs,
-                .kinds = compact_kinds.?,
-                .descs = int_key_descs,
-            };
-            htc.iterate(&emit_ctx_c, struct {
-                fn cb(ec: *EmitCtxC, k: []const i64, vals: []const u64) void {
-                    const row = ec.alloc.alloc(?Value, ec.keys.len + vals.len) catch return;
-                    for (k, 0..) |raw_val, i| {
-                        _ = ec.descs[i];
-                        row[i] = Value{ .int64 = raw_val };
-                    }
-                    emitCompactVals(vals, ec.kinds, ec.aggs, row[ec.keys.len..]);
-                    ec.rl.append(ec.alloc, row) catch {};
-                }
-            }.cb);
-        } else {
-            // Emit from IntKeyHashTable: convert i64 keys back to Values.
-            const EmitCtxI = struct {
-                rl: *ChunkRowSink,
-                alloc: std.mem.Allocator,
-                keys: []const plan.ProjectItem,
-                aggs: []const plan.ProjectItem,
-                descs: []const IntKeyDesc,
-            };
-            var emit_ctx_i = EmitCtxI{
-                .rl = &rl,
-                .alloc = alloc,
-                .keys = keys,
-                .aggs = aggs,
-                .descs = int_key_descs,
-            };
-            ht_int.?.iterate(&emit_ctx_i, struct {
-                fn cb(ec: *EmitCtxI, k: []const i64, bucket: []const AggAccum) void {
-                    const row = ec.alloc.alloc(?Value, ec.keys.len + bucket.len) catch return;
-                    for (k, ec.descs, 0..) |raw_val, desc, i| {
-                        // Convert back: if column was uint64, re-interpret; otherwise int64.
-                        _ = desc;
-                        row[i] = Value{ .int64 = raw_val };
-                    }
-                    for (bucket, ec.aggs, 0..) |acc, item, i| {
-                        row[ec.keys.len + i] = finalizeAccum(acc, item, ec.alloc) catch null;
-                    }
-                    ec.rl.append(ec.alloc, row) catch {};
-                }
-            }.cb);
-        } // end else (regular IntKeyHashTable emit)
-    } else {
+    {
         const CtxT = struct {
             rl: *ChunkRowSink,
             alloc: std.mem.Allocator,
@@ -644,7 +328,6 @@ pub fn executeHashAgg(
     var ht_agg = try ht.AggHashTable.init(alloc, keys.len, aggs.len);
 
     const init_accums = try initAggAccums(aggs, alloc);
-
     const key_buf = try alloc.alloc(Value, keys.len);
     for (inner.rows.items) |row| {
         for (keys, 0..) |k, ki| {
