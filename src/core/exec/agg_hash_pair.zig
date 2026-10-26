@@ -355,13 +355,20 @@ pub fn executeHashAggParallelPairCount(
         const rso = raw_str_offsets_pre.?;
         const rsb = raw_str_bytes_pre.?;
 
-        const N_P2: usize = 128;
+        const N_P2_MAX: usize = 2048;
+        const n_p2: usize = blk: {
+            var p: usize = 128;
+            const target = total_rows / 160_000;
+            while (p < target and p < N_P2_MAX) p <<= 1;
+            break :blk p;
+        };
         // Scatter record: 24 bytes (3 × u64 layout for alignment convenience).
         // Fields: hash (u64), i64_key (as u64 bits), str_meta (str_start<<32 | str_len).
         const P2Rec = extern struct { hash: u64, i64_key_bits: u64, str_meta: u64 };
 
         const P2Scatter = struct {
-            bufs: [N_P2]std.ArrayListUnmanaged(P2Rec),
+            bufs: [N_P2_MAX]std.ArrayListUnmanaged(P2Rec),
+            n_p2: usize,
             buf_arena: std.heap.ArenaAllocator,
             morsel_src: *parallel.MorselSource,
             ri64: []const i64,
@@ -390,7 +397,7 @@ pub fn executeHashAggParallelPairCount(
                         const sl: u32 = @truncate(self.rso[row + 1] - self.rso[row]);
                         const s = self.rsb[ss .. ss + sl];
                         const h = ht.PairCountHashTable.tagHash(ht.PairCountHashTable.hashPair(iv, s));
-                        const p = @as(usize, @truncate(h)) & (N_P2 - 1);
+                        const p = @as(usize, @truncate(h)) & (self.n_p2 - 1);
                         try self.bufs[p].append(ba, .{
                             .hash = h,
                             .i64_key_bits = @bitCast(iv),
@@ -404,7 +411,8 @@ pub fn executeHashAggParallelPairCount(
         const sc2_ctxs = try alloc.alloc(P2Scatter, n_threads);
         for (sc2_ctxs) |*sc| {
             sc.* = .{
-                .bufs = @as([N_P2]std.ArrayListUnmanaged(P2Rec), @splat(.empty)),
+                .bufs = @as([N_P2_MAX]std.ArrayListUnmanaged(P2Rec), @splat(.empty)),
+                .n_p2 = n_p2,
                 .buf_arena = std.heap.ArenaAllocator.init(std.heap.c_allocator),
                 .morsel_src = undefined,
                 .ri64 = ri64,
@@ -412,7 +420,7 @@ pub fn executeHashAggParallelPairCount(
                 .rsb = rsb,
             };
             const ba = sc.buf_arena.allocator();
-            const exp: usize = total_rows / @max(n_threads, 1) / N_P2 + 64;
+            const exp: usize = total_rows / @max(n_threads, 1) / n_p2 + 64;
             for (&sc.bufs) |*b| b.ensureTotalCapacity(ba, exp) catch {};
         }
         var ms2 = parallel.MorselSource.init(total_rows, parallel.default_morsel_size);
@@ -520,8 +528,8 @@ pub fn executeHashAggParallelPairCount(
         var rl2 = RowBuffer.init(metas);
 
         // Pre-allocate per-partition result arrays (all start empty; doWork fills them).
-        const part_slots2 = try alloc.alloc([]P2Slot, N_P2);
-        const part_caps2 = try alloc.alloc(usize, N_P2);
+        const part_slots2 = try alloc.alloc([]P2Slot, n_p2);
+        const part_caps2 = try alloc.alloc(usize, n_p2);
         for (part_slots2) |*ps| ps.* = &.{};
         @memset(part_caps2, 0);
 
@@ -529,7 +537,7 @@ pub fn executeHashAggParallelPairCount(
         const slot_arenas2 = try alloc.alloc(std.heap.ArenaAllocator, n_threads);
         for (slot_arenas2) |*a| a.* = std.heap.ArenaAllocator.init(std.heap.c_allocator);
 
-        var ms2b = parallel.MorselSource.init(N_P2, 1);
+        var ms2b = parallel.MorselSource.init(n_p2, 1);
         const agg2_ctxs = try alloc.alloc(P2AggCtx, n_threads);
         for (agg2_ctxs, 0..) |*ac, ti| {
             ac.* = .{
@@ -574,7 +582,7 @@ pub fn executeHashAggParallelPairCount(
         const top_buf: ?[]P2Out = if (count_top) try alloc.alloc(P2Out, top_k) else null;
         var top_len: usize = 0;
         var emitted_p2: usize = 0;
-        p2_emit: for (0..N_P2) |p| {
+        p2_emit: for (0..n_p2) |p| {
             const slots = part_slots2[p];
             if (slots.len == 0) continue;
             for (slots[0..part_caps2[p]]) |s| {
