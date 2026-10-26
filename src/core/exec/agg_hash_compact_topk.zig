@@ -172,10 +172,14 @@ pub fn executeHashAggParallelCompactTopK(
             break;
         };
         if (has_distinct) {
-            n_threads = @min(n_threads, 4);
+            n_threads = @min(n_threads, 8);
         } else if (filter_pred != null) {
             n_threads = if (keys.len >= 2 and aggs.len > 1) @min(n_threads, 4) else @min(n_threads, 8);
         }
+    }
+    if (std.c.getenv("ZIGHOUSE_AGG_THREADS")) |raw| {
+        const v = std.fmt.parseInt(usize, std.mem.span(raw), 10) catch 0;
+        if (v > 0) n_threads = @min(v, 16);
     }
 
     // No-filter path now supports COUNT, i64_sum, f64_sum, and count_distinct_u64.

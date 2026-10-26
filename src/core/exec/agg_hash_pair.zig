@@ -356,12 +356,12 @@ pub fn executeHashAggParallelPairCount(
         const rsb = raw_str_bytes_pre.?;
 
         const N_P2_MAX: usize = 2048;
-        const n_p2: usize = blk: {
-            var p: usize = 128;
-            const target = total_rows / 160_000;
-            while (p < target and p < N_P2_MAX) p <<= 1;
-            break :blk p;
-        };
+        var n_p2: usize = 128;
+        if (total_rows > 50_000_000) n_p2 = 16;
+        if (std.c.getenv("ZIGHOUSE_PAIR_PARTS")) |raw| {
+            const v = std.fmt.parseInt(usize, std.mem.span(raw), 10) catch 0;
+            if (v > 0) n_p2 = @min(std.math.ceilPowerOfTwo(usize, v) catch N_P2_MAX, N_P2_MAX);
+        }
         // Scatter record: 24 bytes (3 × u64 layout for alignment convenience).
         // Fields: hash (u64), i64_key (as u64 bits), str_meta (str_start<<32 | str_len).
         const P2Rec = extern struct { hash: u64, i64_key_bits: u64, str_meta: u64 };
@@ -874,12 +874,12 @@ pub fn executeHashAggParallelTripleCount(
 
     // Number of hash partitions for the two-phase parallel merge.
     // 64 partitions × ~1M unique groups / 64 = ~16K entries each → HT fits in L3 cache.
-    const n_parts: usize = blk: {
-        var p: usize = 64;
-        const target = total_rows / 160_000;
-        while (p < target and p < 2048) p <<= 1;
-        break :blk p;
-    };
+    var n_parts: usize = 64;
+    if (total_rows > 50_000_000) n_parts = 16;
+    if (std.c.getenv("ZIGHOUSE_TRIPLE_PARTS")) |raw| {
+        const v = std.fmt.parseInt(usize, std.mem.span(raw), 10) catch 0;
+        if (v > 0) n_parts = @min(std.math.ceilPowerOfTwo(usize, v) catch 2048, 2048);
+    }
 
     const TripleParWorker = struct {
         source: SourceIface,

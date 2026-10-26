@@ -1385,7 +1385,7 @@ pub fn executeTwoPhaseHashAggStrKeySimple(
 ) !?RowBuffer {
     if (!ctx.source.supportsRange()) return null;
 
-    const N_PARTS: usize = 64;
+    const N_PARTS: usize = 1024;
     const total_rows = ctx.source.rowCount();
     const n_threads = parallel.defaultThreads();
     const alloc = ctx.allocator();

@@ -75,12 +75,29 @@ pub fn executeTwoPhaseHashAgg(
     int_filter: ?[]const IntCmpCond,
 ) !?RowBuffer {
     const N_PARTS_MAX: usize = 2048;
-    const n_parts: usize = blk: {
-        var p: usize = 128;
-        const target = total_rows / 80_000;
-        while (p < target and p < N_PARTS_MAX) p <<= 1;
-        break :blk p;
-    };
+    var n_parts: usize = 128;
+    if (total_rows > 50_000_000) {
+        var has_distinct = false;
+        for (aggs) |ag| {
+            if (ag.expr == .agg_call and ag.expr.agg_call.distinct) {
+                has_distinct = true;
+                break;
+            }
+        }
+        const has_filter = str_filter != null or int_filter != null;
+        n_parts = if (has_distinct)
+            32
+        else if (has_filter and keys.len >= 2 and aggs.len > 1)
+            128
+        else if (keys.len >= 2)
+            16
+        else
+            128;
+    }
+    if (std.c.getenv("ZIGHOUSE_RADIX_PARTS")) |raw| {
+        const v = std.fmt.parseInt(usize, std.mem.span(raw), 10) catch 0;
+        if (v > 0) n_parts = @min(std.math.ceilPowerOfTwo(usize, v) catch N_PARTS_MAX, N_PARTS_MAX);
+    }
     const n_keys = keys.len;
     const n_aggs = aggs.len;
     var key_ci: [4]usize = @as([4]usize, @splat(0));
