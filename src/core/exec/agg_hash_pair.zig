@@ -866,7 +866,12 @@ pub fn executeHashAggParallelTripleCount(
 
     // Number of hash partitions for the two-phase parallel merge.
     // 64 partitions × ~1M unique groups / 64 = ~16K entries each → HT fits in L3 cache.
-    const N_TRIPLE_PARTS: usize = 64;
+    const n_parts: usize = blk: {
+        var p: usize = 64;
+        const target = total_rows / 160_000;
+        while (p < target and p < 2048) p <<= 1;
+        break :blk p;
+    };
 
     const TripleParWorker = struct {
         source: SourceIface,
@@ -879,7 +884,8 @@ pub fn executeHashAggParallelTripleCount(
         raw_str_offsets: ?[]const u64,
         raw_str_bytes: ?[]const u8,
         local_ht: ht.TripleCountHashTable,
-        part_bufs: []std.ArrayListUnmanaged(ht.TripleCountHashTable.Slot), // len = N_TRIPLE_PARTS
+        part_bufs: []std.ArrayListUnmanaged(ht.TripleCountHashTable.Slot), // len = n_parts
+        n_parts: usize,
         err: ?anyerror = null,
 
         fn work(self: *@This(), _: *parallel.MorselSource) void {
@@ -959,8 +965,8 @@ pub fn executeHashAggParallelTripleCount(
             }
             // Scatter phase: distribute local_ht entries into per-worker partition buffers.
             // Each worker writes exclusively to its own part_bufs — no synchronization needed.
-            const part_mask: u64 = N_TRIPLE_PARTS - 1;
-            const reserve_per_part = (self.local_ht.count / N_TRIPLE_PARTS) * 3 / 2 + 32;
+            const part_mask: u64 = self.n_parts - 1;
+            const reserve_per_part = (self.local_ht.count / self.n_parts) * 3 / 2 + 32;
             for (self.part_bufs) |*b| b.ensureTotalCapacity(self.scatter_alloc, reserve_per_part) catch {};
             for (0..self.local_ht.capacity) |i| {
                 if (self.local_ht.slots[i].hash == ht.TripleCountHashTable.EMPTY) continue;
@@ -980,7 +986,7 @@ pub fn executeHashAggParallelTripleCount(
     // Backed by the per-thread arena (c_allocator) so each worker allocates independently.
     const per_worker_bufs = try alloc.alloc([]std.ArrayListUnmanaged(ht.TripleCountHashTable.Slot), n_threads);
     for (per_worker_bufs, 0..) |*pb, t| {
-        pb.* = try ht_arenas[t].allocator().alloc(std.ArrayListUnmanaged(ht.TripleCountHashTable.Slot), N_TRIPLE_PARTS);
+        pb.* = try ht_arenas[t].allocator().alloc(std.ArrayListUnmanaged(ht.TripleCountHashTable.Slot), n_parts);
         for (pb.*) |*list| list.* = .empty;
     }
 
@@ -1003,6 +1009,7 @@ pub fn executeHashAggParallelTripleCount(
             .raw_str_bytes = raw_str_bytes_pre,
             .local_ht = try ht.TripleCountHashTable.initWithCapacity(ht_arenas[t].allocator(), est_per_thread),
             .part_bufs = per_worker_bufs[t],
+            .n_parts = n_parts,
             .err = null,
         };
     }
@@ -1017,10 +1024,10 @@ pub fn executeHashAggParallelTripleCount(
     // Two-phase parallel aggregate: scatter was done inline in each worker's runWork.
     // Now each of the N_TRIPLE_PARTS partitions is aggregated independently in parallel.
     // Each partition HT is ~(total_unique/N_TRIPLE_PARTS) entries ≈ fits in L3 cache.
-    const part_arenas_triple = try alloc.alloc(std.heap.ArenaAllocator, N_TRIPLE_PARTS);
+    const part_arenas_triple = try alloc.alloc(std.heap.ArenaAllocator, n_parts);
     for (part_arenas_triple) |*a| a.* = std.heap.ArenaAllocator.init(std.heap.c_allocator);
     defer for (part_arenas_triple) |*a| a.deinit();
-    const part_hts_triple = try alloc.alloc(ht.TripleCountHashTable, N_TRIPLE_PARTS);
+    const part_hts_triple = try alloc.alloc(ht.TripleCountHashTable, n_parts);
 
     const TriplePartAggWorker = struct {
         per_worker_bufs: []const []std.ArrayListUnmanaged(ht.TripleCountHashTable.Slot),
@@ -1066,7 +1073,7 @@ pub fn executeHashAggParallelTripleCount(
             .err = null,
         };
     }
-    var part_agg_src = parallel.MorselSource.init(N_TRIPLE_PARTS, 1);
+    var part_agg_src = parallel.MorselSource.init(n_parts, 1);
     try parallel.parallelFor(alloc, TriplePartAggWorker, TriplePartAggWorker.work, part_agg_workers, &part_agg_src);
     for (part_agg_workers) |aw| {
         if (aw.err) |e| return e;
@@ -1091,7 +1098,7 @@ pub fn executeHashAggParallelTripleCount(
         .alloc = alloc,
         .key_order = td.key_order,
     };
-    for (0..N_TRIPLE_PARTS) |p| {
+    for (0..n_parts) |p| {
         part_hts_triple[p].iterate(&emit_ctx, struct {
             fn cb(ec: *EmitCtxTriple, n0: i64, n1: i64, s: []const u8, count: u64) void {
                 if (ec.topk) |tk| {

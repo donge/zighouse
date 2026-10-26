@@ -74,7 +74,13 @@ pub fn executeTwoPhaseHashAgg(
     str_filter: ?SimpleStrFilter,
     int_filter: ?[]const IntCmpCond,
 ) !?RowBuffer {
-    const N_PARTS: usize = 128;
+    const N_PARTS_MAX: usize = 2048;
+    const n_parts: usize = blk: {
+        var p: usize = 128;
+        const target = total_rows / 80_000;
+        while (p < target and p < N_PARTS_MAX) p <<= 1;
+        break :blk p;
+    };
     const n_keys = keys.len;
     const n_aggs = aggs.len;
     var key_ci: [4]usize = @as([4]usize, @splat(0));
@@ -145,7 +151,7 @@ pub fn executeTwoPhaseHashAgg(
     const ScatterCtx = struct {
         // Flat u64 scatter buffers per partition (stride=row_stride per record).
         // Each entry: [hash, k0, k1?, agg0, agg1, ...]
-        bufs: [N_PARTS]std.ArrayListUnmanaged(u64),
+        bufs: [N_PARTS_MAX]std.ArrayListUnmanaged(u64),
         // Per-ctx arena backed by raw_c_allocator (malloc/free).
         // Using raw_c_allocator instead of page_allocator so that freed pages are
         // returned to the malloc pool and reused on the next query run without
@@ -159,6 +165,7 @@ pub fn executeTwoPhaseHashAgg(
         n_eff_keys: usize, // <= n_keys; =1 when all keys share one source column
         n_aggs: usize,
         row_stride: usize,
+        n_parts: usize,
         key_ci: [4]usize,
         key_offs: [4]i64,
         agg_infos: []const AggInfo,
@@ -273,7 +280,7 @@ pub fn executeTwoPhaseHashAgg(
                                     rec[1 + self.n_eff_keys + out_ai] = if (kind == .count) 1 else ra[ai].getAggPartial(row, kind);
                                 }
                             }
-                            try self.bufs[h & (N_PARTS - 1)].appendSlice(buf_alloc, rec[0..self.row_stride]);
+                            try self.bufs[h & (self.n_parts - 1)].appendSlice(buf_alloc, rec[0..self.row_stride]);
                         }
                     }
                     return;
@@ -352,7 +359,7 @@ pub fn executeTwoPhaseHashAgg(
                                 hh ^= hh >> 31;
                                 break :blk hh | (1 << 63);
                             };
-                            const part_id = h & (N_PARTS - 1);
+                            const part_id = h & (self.n_parts - 1);
                             rec[0] = h;
                             for (0..self.n_eff_keys) |ki| rec[1 + ki] = @bitCast(kv[ki]);
                             if (!self.count_only) {
@@ -397,7 +404,7 @@ pub fn executeTwoPhaseHashAgg(
                             hh ^= hh >> 31;
                             break :blk hh | (1 << 63);
                         };
-                        const part_id = h & (N_PARTS - 1);
+                        const part_id = h & (self.n_parts - 1);
                         rec[0] = h;
                         for (0..self.n_eff_keys) |ki| rec[1 + ki] = @bitCast(kv[ki]);
                         if (!self.count_only) {
@@ -536,7 +543,7 @@ pub fn executeTwoPhaseHashAgg(
                         break :blk hh | (1 << 63);
                     };
 
-                    const part_id = h & (N_PARTS - 1);
+                    const part_id = h & (self.n_parts - 1);
                     rec[0] = h;
                     for (0..self.n_eff_keys) |ki| rec[1 + ki] = @bitCast(kv[ki]);
                     // Agg partial contributions — skipped in count_only mode (Phase 2 adds 1).
@@ -642,7 +649,7 @@ pub fn executeTwoPhaseHashAgg(
     const scatter_ctxs = try alloc.alloc(ScatterCtx, n_threads);
     for (scatter_ctxs) |*sc| {
         sc.* = .{
-            .bufs = @as([N_PARTS]std.ArrayListUnmanaged(u64), @splat(.empty)),
+            .bufs = @as([N_PARTS_MAX]std.ArrayListUnmanaged(u64), @splat(.empty)),
             .buf_arena = std.heap.ArenaAllocator.init(std.heap.c_allocator),
             .source = ctx.source,
             .morsel_src = &morsel_src1,
@@ -651,6 +658,7 @@ pub fn executeTwoPhaseHashAgg(
             .n_eff_keys = n_eff_keys,
             .n_aggs = n_aggs,
             .row_stride = row_stride,
+            .n_parts = n_parts,
             .key_ci = key_ci,
             .key_offs = key_offs,
             .agg_infos = agg_infos,
@@ -661,13 +669,13 @@ pub fn executeTwoPhaseHashAgg(
             .omit_first_count = omit_first_count,
         };
         // ── Pre-allocate scatter buffers to expected size ──────────────────────────
-        // With N_PARTS=128 partitions and exponential doubling from 0, each buffer
+        // With n_parts partitions and exponential doubling from 0, each buffer
         // undergoes ~log2(rows_per_part) doublings. Reserve by per-worker share
         // with slack instead of reserving a full-table partition in every worker.
         // Using c_allocator avoids new page faults on hot runs (memory recycled from
         // previous query run; same rationale as buf_arena using c_allocator).
         {
-            const base_expected_rows = total_rows / @max(n_threads, 1) / N_PARTS;
+            const base_expected_rows = total_rows / @max(n_threads, 1) / n_parts;
             const expected_rows = if (str_filter != null)
                 @max(@as(usize, 1), base_expected_rows / 8)
             else
@@ -675,7 +683,7 @@ pub fn executeTwoPhaseHashAgg(
             const reserve_mul: usize = if (total_rows > 20_000_000) 1 else 4;
             const expected_per_part: usize = expected_rows * row_stride * reserve_mul + row_stride * 64;
             const ba = sc.buf_arena.allocator();
-            for (&sc.bufs) |*b| {
+            for (sc.bufs[0..n_parts]) |*b| {
                 b.ensureTotalCapacity(ba, expected_per_part) catch {};
             }
         }
@@ -690,7 +698,7 @@ pub fn executeTwoPhaseHashAgg(
         sort_keys[0].col_idx == n_keys and total_rows <= std.math.maxInt(u32))
     {
         const Candidate = struct { key: i64 = 0, count: u64 = 0 };
-        const part_candidates = try alloc.alloc(Candidate, N_PARTS * top_k);
+        const part_candidates = try alloc.alloc(Candidate, n_parts * top_k);
         @memset(part_candidates, .{});
 
         const FlatPartCtx = struct {
@@ -764,7 +772,7 @@ pub fn executeTwoPhaseHashAgg(
             }
         };
 
-        var flat_morsels = parallel.MorselSource.init(N_PARTS, 1);
+        var flat_morsels = parallel.MorselSource.init(n_parts, 1);
         const flat_ctxs = try alloc.alloc(FlatPartCtx, n_threads);
         for (flat_ctxs) |*fc| {
             fc.* = .{
@@ -875,7 +883,7 @@ pub fn executeTwoPhaseHashAgg(
             }
         };
 
-        var dense_morsels = parallel.MorselSource.init(N_PARTS, 1);
+        var dense_morsels = parallel.MorselSource.init(n_parts, 1);
         const dense_ctxs = try alloc.alloc(DenseDistinctCtx, n_threads);
         for (dense_ctxs) |*dc| {
             dc.* = .{
@@ -914,7 +922,7 @@ pub fn executeTwoPhaseHashAgg(
     // ── Phase 2: parallel aggregate per partition ─────────────────────────────
 
     // Allocate output partition HTs (filled by Phase 2 workers).
-    const part_hts = try alloc.alloc(ht.CompactIntKeyHashTable, N_PARTS);
+    const part_hts = try alloc.alloc(ht.CompactIntKeyHashTable, n_parts);
     // Initialize all with minimal capacity (Phase 2 will resize as needed).
     for (part_hts) |*ph| {
         ph.* = try ht.CompactIntKeyHashTable.initWithCapacity(alloc, n_eff_keys, n_aggs, 0);
@@ -1053,7 +1061,7 @@ pub fn executeTwoPhaseHashAgg(
         }
     };
 
-    var morsel_src2 = parallel.MorselSource.init(N_PARTS, 1);
+    var morsel_src2 = parallel.MorselSource.init(n_parts, 1);
     const agg_ctxs = try alloc.alloc(AggCtx, n_threads);
     for (agg_ctxs) |*ac| {
         ac.* = .{
