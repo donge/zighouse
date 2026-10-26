@@ -15,6 +15,40 @@ pub const AggAccum = types.AggAccum;
 // ── Key hashing ───────────────────────────────────────────────────────────────
 
 /// Hash a composite key (slice of Values) using a single Wyhash pass.
+
+/// DuckDB-style avalanche finalizer.
+pub inline fn murmur64(x_in: u64) u64 {
+    var x = x_in;
+    x ^= x >> 32;
+    x *%= 0xd6e8feb86659fd93;
+    x ^= x >> 32;
+    x *%= 0xd6e8feb86659fd93;
+    x ^= x >> 32;
+    return x;
+}
+
+/// DuckDB HashBytes: 8-byte blocks, one final avalanche.
+pub fn duckHashBytes(bytes: []const u8) u64 {
+    var h: u64 = 0xe17a1465 ^ (@as(u64, @intCast(bytes.len)) *% 0xc6a4a7935bd1e995);
+    const n8 = bytes.len & ~@as(usize, 7);
+    var i: usize = 0;
+    while (i < n8) : (i += 8) {
+        h ^= std.mem.readInt(u64, bytes[i..][0..8], .little);
+        h *%= 0xd6e8feb86659fd93;
+    }
+    const rem = bytes.len - n8;
+    if (rem != 0) {
+        var tail: [8]u8 = @splat(0);
+        @memcpy(tail[0..rem], bytes[n8..]);
+        h ^= std.mem.readInt(u64, &tail, .little);
+        h *%= 0xd6e8feb86659fd93;
+    }
+    return murmur64(h);
+}
+
+pub inline fn duckHashI64(v: i64) u64 {
+    return murmur64(@bitCast(v));
+}
 /// All key components are fed into one hasher for better throughput.
 pub fn hashKey(key: []const Value) u64 {
     var h = std.hash.Wyhash.init(0);
@@ -599,11 +633,7 @@ pub const TripleCountHashTable = struct {
     }
 
     fn hashTriple(n0: i64, n1: i64, s: []const u8) u64 {
-        var h = std.hash.Wyhash.init(0);
-        h.update(std.mem.asBytes(&n0));
-        h.update(std.mem.asBytes(&n1));
-        h.update(s);
-        return h.final();
+        return duckHashI64(n0) ^ duckHashI64(n1) ^ duckHashBytes(s);
     }
 };
 
@@ -847,7 +877,7 @@ pub const StrAggHashTable = struct {
     }
 
     pub fn hashStr(s: []const u8) u64 {
-        return std.hash.Wyhash.hash(0, s) | (1 << 63);
+        return duckHashBytes(s) | (1 << 63);
     }
 
     pub const InsertResult = struct {
